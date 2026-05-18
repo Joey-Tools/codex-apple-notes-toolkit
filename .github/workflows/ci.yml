@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Shell syntax
+        run: bash -n scripts/apple_notes_helper.sh scripts/apple_notes_osascript_context_probe.sh
+      - name: Run tests
+        run: python3 -m unittest tests.test_apple_notes_helper
