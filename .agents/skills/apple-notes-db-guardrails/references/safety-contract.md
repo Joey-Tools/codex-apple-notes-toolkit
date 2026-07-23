@@ -39,6 +39,13 @@ content or access-policy mutation. A metadata-only transition is acceptable only
 descriptor stays bound to the same object, both byte hashes match, size is stable, and the selected
 access-policy signals are unchanged.
 
+For `validate-snapshot` and patch-stage validation, hold the manifest and every declared regular
+file descriptor through recovery-clone creation, WAL/SHM inspection, SQLite integrity checking,
+directory revalidation, and the terminal protected-property check. A same-byte inode replacement
+is an identity mismatch; a mode/owner/group/flags change is an access-policy mismatch; an in-place
+byte change is a content mismatch. Do not accept a fresh pathname open as proof about the object
+that supplied earlier validation evidence.
+
 Treat these outcomes separately:
 
 - missing before or after the read;
@@ -108,6 +115,11 @@ Use the following recovery boundary:
 
 Keep the original snapshot manifest and raw file set until the task is complete.
 
+`recover-snapshot` must consume the private recovery clone produced by its exact successful
+validation context. Do not reopen the original snapshot main/WAL/SHM paths between validation and
+recovery. The validation artifact exposes the clone and evidence, not the held source descriptors,
+and its private lifetime covers the complete standalone backup operation.
+
 ## Snapshot And Stage Publication
 
 Publish a completed snapshot or patch stage from its private partial directory with an atomic
@@ -116,12 +128,32 @@ no-replace operation: `renamex_np(..., RENAME_EXCL)` on macOS or
 instead of falling back to a check-then-rename sequence. An existing destination, including an
 empty directory that appeared after an earlier check, must remain untouched.
 
+Create the partial root through a parent directory descriptor, immediately bind its directory
+descriptor, identity, and access policy, and hold that descriptor through publication. Bind every
+prepared regular file and compare it with its creation receipt: exact identity, SHA-256, size, and
+access policy. Parse the installed manifest and require it to equal the in-memory payload. Verify
+the exact no-follow root and nested name/type sets plus every held file immediately before rename,
+then revalidate those same descriptors at their destination paths after rename. A replaced partial
+root must never be removed as though it were the helper-owned directory.
+
 After any publication error, compare the private source and destination namespaces with the
 prepared directory's object identity. Report a proved pre-existing destination as
 `destination-exists`, a proved uncommitted failure as `destination-install-failed`, and a
 commit-then-error or any namespace state that cannot prove commit/non-commit as
 `destination-install-uncertain`. Preserve an uncertain path for inspection and do not retry into
 the same destination.
+
+Standalone database publication uses a no-replace hard link from a descriptor-bound private file.
+Every link, private-link unlink, parent fsync, and final fingerprint error must be classified:
+
+- `uncommitted`: publication is proved not to have committed; `retry_safe` is true only when the
+  destination is absent and the prepared object is still bound;
+- `committed`: the destination is proved installed but private-link cleanup failed;
+- `uncertain`: the destination may be committed or its durability/final fingerprint is not proved.
+
+Return `publication_state`, `retry_safe`, and `recovery_locators` in error details. Never encourage
+a retry for `committed` or `uncertain`. Preserve available prepared and destination locators for
+manual recovery.
 
 ## Patch And Writeback Boundary
 
@@ -180,11 +212,23 @@ The helper emits stable error codes, including:
 - `notes-started-during-capture`, `notes-started-during-preflight`;
 - `notes-started-during-verification`;
 - `snapshot-content-mismatch`, `snapshot-file-set-mismatch`;
+- `snapshot-file-identity-mismatch`, `snapshot-file-access-policy-mismatch`;
+- `snapshot-file-revalidation-inconclusive`;
 - `backup-not-writeback-grade`, `baseline-identity-mismatch`;
 - `baseline-content-mismatch`, `baseline-access-policy-mismatch`;
 - `patch-file-set-mismatch`, `patch-content-mismatch`;
+- `patch-file-identity-mismatch`, `patch-file-access-policy-mismatch`;
+- `patch-file-revalidation-inconclusive`;
+- `prepared-directory-identity-mismatch`;
+- `prepared-directory-access-policy-mismatch`;
+- `prepared-directory-revalidation-inconclusive`;
+- `prepared-file-identity-mismatch`, `prepared-file-content-mismatch`;
+- `prepared-file-access-policy-mismatch`, `prepared-file-revalidation-inconclusive`;
+- `prepared-file-missing`, `prepared-file-set-mismatch`;
+- `prepared-manifest-mismatch`;
 - `destination-exists`, `destination-install-failed`;
 - `destination-install-uncertain`;
+- `destination-install-committed-cleanup-incomplete`;
 - `post-writeback-identity-mismatch`, `post-writeback-file-set-mismatch`;
 - `post-writeback-content-mismatch`, `post-writeback-access-policy-mismatch`.
 

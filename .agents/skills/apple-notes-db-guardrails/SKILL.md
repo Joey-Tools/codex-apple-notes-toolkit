@@ -64,6 +64,8 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" copy-db \
 
 Keep `snapshot-manifest.json` with the copied file set.
 Snapshot publication is atomic and no-replace on supported macOS/Linux filesystems.
+The helper binds the private partial directory at creation, verifies every prepared file against
+its creation receipt immediately before rename, and revalidates the same objects after rename.
 If publication reports `destination-install-uncertain`, preserve the reported paths, do not retry
 into that destination, and inspect whether the prepared directory committed.
 Use `validate-snapshot` before relying on an older snapshot:
@@ -72,6 +74,11 @@ Use `validate-snapshot` before relying on an older snapshot:
 python3 "$SKILL_DIR/scripts/apple_notes_db.py" validate-snapshot \
   --snapshot-dir /tmp/<task-backup>
 ```
+
+Validation holds the manifest and every declared database-file descriptor through recovery-clone
+creation, SQLite integrity checking, and terminal revalidation. Object replacement, byte mutation,
+and access-policy change have distinct failure codes; timestamp-only changes do not fail when the
+protected properties remain stable.
 
 ## Recover For Analysis
 
@@ -83,6 +90,9 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" recover-snapshot \
   --out /tmp/<task-snapshot>/NoteStore-analysis.sqlite
 ```
 
+`recover-snapshot` consumes the private clone produced by that exact validation pass. It never
+reopens the mutable snapshot paths after validation.
+
 Use `merge-db` only for a copied database file without a snapshot manifest:
 
 ```bash
@@ -92,6 +102,10 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" merge-db \
 ```
 
 Run queries against the recovered standalone database, never against the live container.
+For single-file publication failures, inspect `details.publication_state`,
+`details.retry_safe`, and `details.recovery_locators`. Never retry when the state is `committed` or
+`uncertain`; preserve every reported locator. A committed output whose private link could not be
+removed reports `destination-install-committed-cleanup-incomplete`.
 
 ## Stage And Preflight A Patch
 

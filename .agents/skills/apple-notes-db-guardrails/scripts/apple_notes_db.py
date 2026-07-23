@@ -17,11 +17,11 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from contextlib import closing
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 
 GROUP_CONTAINER = Path.home() / "Library/Group Containers/group.com.apple.notes"
@@ -48,9 +48,16 @@ RENAME_EXCL = 0x00000004
 class StoreSafetyError(RuntimeError):
     """A classified safety failure that must not be treated as absence."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.details = details or {}
 
 
 @dataclass(frozen=True)
@@ -69,6 +76,62 @@ class _OpenedSource:
     before: os.stat_result
     first_sha256: str | None = None
     copied: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _FileProtectionCodes:
+    missing: str
+    identity: str
+    content: str
+    access_policy: str
+    inconclusive: str
+
+
+@dataclass
+class _BoundRegularFile:
+    path: Path
+    fd: int
+    opened: os.stat_result
+    sha256: str
+
+
+@dataclass
+class _BoundDirectory:
+    path: Path
+    fd: int
+    opened: os.stat_result
+
+
+@dataclass(frozen=True)
+class _ValidatedSnapshotArtifact:
+    public_result: dict[str, Any]
+    recovered_main: Path
+    recovery_evidence: dict[str, Any]
+    source_integrity: dict[str, Any]
+    revalidate_recovery_clone: Callable[[], None]
+
+
+SNAPSHOT_FILE_CODES = _FileProtectionCodes(
+    missing="snapshot-missing",
+    identity="snapshot-file-identity-mismatch",
+    content="snapshot-content-mismatch",
+    access_policy="snapshot-file-access-policy-mismatch",
+    inconclusive="snapshot-file-revalidation-inconclusive",
+)
+PATCH_FILE_CODES = _FileProtectionCodes(
+    missing="stage-missing",
+    identity="patch-file-identity-mismatch",
+    content="patch-content-mismatch",
+    access_policy="patch-file-access-policy-mismatch",
+    inconclusive="patch-file-revalidation-inconclusive",
+)
+PREPARED_FILE_CODES = _FileProtectionCodes(
+    missing="prepared-file-missing",
+    identity="prepared-file-identity-mismatch",
+    content="prepared-file-content-mismatch",
+    access_policy="prepared-file-access-policy-mismatch",
+    inconclusive="prepared-file-revalidation-inconclusive",
+)
 
 
 def _json_default(value: Any) -> Any:
@@ -195,21 +258,35 @@ def _observe_path(path: Path) -> tuple[str, os.stat_result | None]:
     return "present", value
 
 
-def _publish_directory_no_replace(source: Path, destination: Path) -> None:
-    try:
-        source_before = os.stat(source, follow_symlinks=False)
-    except OSError as exc:
-        raise StoreSafetyError(
-            "destination-install-failed",
-            f"Cannot inspect private publication source {source}: {exc}",
-        ) from exc
-    if not stat.S_ISDIR(source_before.st_mode):
-        raise StoreSafetyError(
-            "destination-install-failed",
-            f"Private publication source is not a directory: {source}",
-        )
+def _publish_directory_no_replace(
+    source: Path,
+    destination: Path,
+    *,
+    binding: _BoundDirectory | None = None,
+    before_rename: Callable[[], None] | None = None,
+) -> None:
+    if binding is not None:
+        _verify_bound_directory(binding, path=source)
+        source_before = os.fstat(binding.fd)
+    else:
+        try:
+            source_before = os.stat(source, follow_symlinks=False)
+        except OSError as exc:
+            raise StoreSafetyError(
+                "destination-install-failed",
+                f"Cannot inspect private publication source {source}: {exc}",
+            ) from exc
+        if not stat.S_ISDIR(source_before.st_mode):
+            raise StoreSafetyError(
+                "destination-install-failed",
+                f"Private publication source is not a directory: {source}",
+            )
     source_identity = _identity(source_before)
     source_access_policy = _access_policy(source_before)
+    if before_rename is not None:
+        before_rename()
+    if binding is not None:
+        _verify_bound_directory(binding, path=source)
 
     try:
         _rename_directory_no_replace(source, destination)
@@ -269,6 +346,15 @@ def _publish_directory_no_replace(source: Path, destination: Path) -> None:
             "The no-replace syscall returned success, but namespace revalidation "
             f"could not bind the installed directory: {destination}",
         )
+    if binding is not None:
+        try:
+            _verify_bound_directory(binding, path=destination)
+        except StoreSafetyError as exc:
+            raise StoreSafetyError(
+                "destination-install-uncertain",
+                "The directory was published, but its creation-time descriptor "
+                f"cannot be rebound to the destination: {destination}: {exc}",
+            ) from exc
     try:
         _fsync_directory(destination.parent)
     except OSError as exc:
@@ -337,6 +423,305 @@ def _hash_fd(fd: int) -> str:
             break
         digest.update(chunk)
     return digest.hexdigest()
+
+
+def _translate_bound_open_error(
+    path: Path,
+    codes: _FileProtectionCodes,
+    error: StoreSafetyError,
+) -> StoreSafetyError:
+    if error.code in {"source-missing", "source-missing-after-read"}:
+        code = codes.missing
+    elif error.code in {
+        "source-identity-mismatch",
+        "source-not-regular",
+    }:
+        code = codes.identity
+    else:
+        code = codes.inconclusive
+    return StoreSafetyError(
+        code,
+        f"Cannot bind regular file for protected validation: {path}: {error}",
+    )
+
+
+def _verify_bound_regular_file(
+    bound: _BoundRegularFile,
+    codes: _FileProtectionCodes,
+    *,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    target = path or bound.path
+
+    def stat_descriptor() -> os.stat_result:
+        try:
+            return os.fstat(bound.fd)
+        except OSError as exc:
+            raise StoreSafetyError(
+                codes.inconclusive,
+                f"Cannot revalidate opened file descriptor for {target}: {exc}",
+            ) from exc
+
+    def stat_path() -> os.stat_result:
+        try:
+            return os.stat(target, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise StoreSafetyError(
+                codes.missing,
+                f"Bound regular-file path is missing during revalidation: {target}",
+            ) from exc
+        except OSError as exc:
+            raise StoreSafetyError(
+                codes.inconclusive,
+                f"Cannot revalidate bound regular-file path {target}: {exc}",
+            ) from exc
+
+    def verify_properties(
+        descriptor: os.stat_result,
+        path_stat: os.stat_result,
+    ) -> None:
+        if (
+            not stat.S_ISREG(descriptor.st_mode)
+            or not stat.S_ISREG(path_stat.st_mode)
+            or not _same_identity(bound.opened, descriptor)
+            or not _same_identity(descriptor, path_stat)
+        ):
+            raise StoreSafetyError(
+                codes.identity,
+                f"Regular-file object identity changed during validation: {target}",
+            )
+        baseline_access = _access_policy(bound.opened)
+        if (
+            _access_policy(descriptor) != baseline_access
+            or _access_policy(path_stat) != baseline_access
+        ):
+            raise StoreSafetyError(
+                codes.access_policy,
+                f"Regular-file access policy changed during validation: {target}",
+            )
+
+    descriptor_before = stat_descriptor()
+    path_before = stat_path()
+    verify_properties(descriptor_before, path_before)
+    try:
+        first_sha256 = _hash_fd(bound.fd)
+    except OSError as exc:
+        raise StoreSafetyError(
+            codes.inconclusive,
+            f"Cannot hash bound regular file during revalidation: {target}: {exc}",
+        ) from exc
+    descriptor_between = stat_descriptor()
+    path_between = stat_path()
+    verify_properties(descriptor_between, path_between)
+    try:
+        second_sha256 = _hash_fd(bound.fd)
+    except OSError as exc:
+        raise StoreSafetyError(
+            codes.inconclusive,
+            f"Cannot repeat bound regular-file hash during revalidation: "
+            f"{target}: {exc}",
+        ) from exc
+    descriptor_after = stat_descriptor()
+    path_after = stat_path()
+    verify_properties(descriptor_after, path_after)
+    if (
+        first_sha256 != bound.sha256
+        or second_sha256 != bound.sha256
+        or descriptor_before.st_size != bound.opened.st_size
+        or descriptor_between.st_size != bound.opened.st_size
+        or descriptor_after.st_size != bound.opened.st_size
+    ):
+        raise StoreSafetyError(
+            codes.content,
+            f"Regular-file content changed during validation: {target}",
+        )
+    before_metadata = _metadata(bound.opened)
+    after_metadata = _metadata(descriptor_after)
+    return {
+        "path": target,
+        "sha256": bound.sha256,
+        "size": descriptor_after.st_size,
+        "identity": _identity(descriptor_after),
+        "access_policy": _access_policy(descriptor_after),
+        "metadata": after_metadata,
+        "metadata_transitions": {
+            key: {"before": before_metadata[key], "after": after_metadata[key]}
+            for key in before_metadata
+            if before_metadata[key] != after_metadata[key]
+        },
+    }
+
+
+@contextmanager
+def _bind_regular_file(
+    path: Path,
+    codes: _FileProtectionCodes,
+) -> Iterator[_BoundRegularFile]:
+    try:
+        fd, opened = _open_regular_readonly(path)
+    except StoreSafetyError as exc:
+        raise _translate_bound_open_error(path, codes, exc) from exc
+    try:
+        try:
+            sha256 = _hash_fd(fd)
+        except OSError as exc:
+            raise StoreSafetyError(
+                codes.inconclusive,
+                f"Cannot hash regular file while binding it: {path}: {exc}",
+            ) from exc
+        bound = _BoundRegularFile(
+            path=path,
+            fd=fd,
+            opened=opened,
+            sha256=sha256,
+        )
+        _verify_bound_regular_file(bound, codes)
+        yield bound
+    finally:
+        os.close(fd)
+
+
+def _read_bound_file_bytes(
+    bound: _BoundRegularFile,
+    codes: _FileProtectionCodes,
+    *,
+    max_bytes: int,
+    too_large_code: str,
+    path: Path | None = None,
+) -> bytes:
+    if bound.opened.st_size > max_bytes:
+        raise StoreSafetyError(
+            too_large_code,
+            f"File exceeds {max_bytes} bytes: {bound.path}",
+        )
+    os.lseek(bound.fd, 0, os.SEEK_SET)
+    payload = bytearray()
+    while True:
+        chunk = os.read(
+            bound.fd,
+            min(CHUNK_SIZE, max_bytes + 1 - len(payload)),
+        )
+        if not chunk:
+            break
+        payload.extend(chunk)
+        if len(payload) > max_bytes:
+            raise StoreSafetyError(
+                too_large_code,
+                f"File exceeds {max_bytes} bytes: {bound.path}",
+            )
+    if hashlib.sha256(payload).hexdigest() != bound.sha256:
+        raise StoreSafetyError(
+            codes.content,
+            f"Bound file bytes changed while reading: {bound.path}",
+        )
+    _verify_bound_regular_file(bound, codes, path=path)
+    return bytes(payload)
+
+
+@contextmanager
+def _create_bound_directory(path: Path) -> Iterator[_BoundDirectory]:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    parent_fd = os.open(path.parent, flags)
+    fd: int | None = None
+    created_and_bound = False
+    try:
+        os.mkdir(path.name, mode=0o700, dir_fd=parent_fd)
+        fd = os.open(path.name, flags, dir_fd=parent_fd)
+        created_path = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        created_fd = os.fstat(fd)
+        if not _same_identity(created_path, created_fd):
+            raise StoreSafetyError(
+                "prepared-directory-identity-mismatch",
+                f"Prepared directory was replaced while being created: {path}",
+            )
+        created_and_bound = True
+    except StoreSafetyError:
+        raise
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Cannot create and bind private prepared directory {path}: {exc}",
+        ) from exc
+    finally:
+        os.close(parent_fd)
+        if not created_and_bound and fd is not None:
+            os.close(fd)
+    assert fd is not None
+    binding = _BoundDirectory(path=path, fd=fd, opened=os.fstat(fd))
+    try:
+        _verify_bound_directory(binding)
+        yield binding
+    finally:
+        os.close(fd)
+
+
+def _verify_bound_directory(
+    binding: _BoundDirectory,
+    *,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    target = path or binding.path
+    try:
+        descriptor = os.fstat(binding.fd)
+        path_stat = os.stat(target, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            f"Bound prepared directory is missing: {target}",
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Cannot revalidate bound prepared directory {target}: {exc}",
+        ) from exc
+    if (
+        not stat.S_ISDIR(descriptor.st_mode)
+        or not stat.S_ISDIR(path_stat.st_mode)
+        or not _same_identity(binding.opened, descriptor)
+        or not _same_identity(descriptor, path_stat)
+    ):
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            f"Prepared directory object identity changed: {target}",
+        )
+    baseline_access = _access_policy(binding.opened)
+    if (
+        _access_policy(descriptor) != baseline_access
+        or _access_policy(path_stat) != baseline_access
+    ):
+        raise StoreSafetyError(
+            "prepared-directory-access-policy-mismatch",
+            f"Prepared directory access policy changed: {target}",
+        )
+    return {
+        "identity": _identity(descriptor),
+        "access_policy": _access_policy(descriptor),
+        "metadata": _metadata(descriptor),
+    }
+
+
+def _remove_bound_directory_if_owned(
+    binding: _BoundDirectory | None,
+    path: Path,
+) -> bool:
+    if binding is None:
+        return False
+    state, path_stat = _observe_path(path)
+    if (
+        state != "present"
+        or path_stat is None
+        or not stat.S_ISDIR(path_stat.st_mode)
+        or not _same_identity(binding.opened, path_stat)
+    ):
+        return False
+    shutil.rmtree(path)
+    return True
 
 
 def _write_all(fd: int, payload: bytes) -> None:
@@ -733,26 +1118,80 @@ def _scan_exact_directory_entries(
     }
 
 
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
     temp_path = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     fd = os.open(temp_path, flags, 0o600)
     try:
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
-                json.dump(
-                    payload, handle, indent=2, ensure_ascii=False, default=_json_default
-                )
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-        finally:
-            os.close(fd)
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
+            json.dump(
+                payload, handle, indent=2, ensure_ascii=False, default=_json_default
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        opened = os.fstat(fd)
+        sha256 = _hash_fd(fd)
         os.replace(temp_path, path)
         _fsync_directory(path.parent)
+        bound = _BoundRegularFile(
+            path=path,
+            fd=fd,
+            opened=opened,
+            sha256=sha256,
+        )
+        return _verify_bound_regular_file(bound, PREPARED_FILE_CODES)
     finally:
-        if temp_path.exists():
-            temp_path.unlink()
+        os.close(fd)
+        if _lexists(temp_path):
+            os.unlink(temp_path)
+
+
+def _parse_manifest_bytes(
+    payload_bytes: bytes,
+    *,
+    path: Path,
+    expected_schema: str,
+) -> dict[str, Any]:
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise StoreSafetyError(
+            "manifest-unreadable", f"Cannot read manifest {path}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("schema") != expected_schema:
+        raise StoreSafetyError(
+            "manifest-schema-mismatch",
+            f"Unexpected manifest schema in {path}; expected {expected_schema}",
+        )
+    return payload
+
+
+def _normalized_json_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = json.loads(
+        json.dumps(payload, ensure_ascii=False, default=_json_default)
+    )
+    if not isinstance(normalized, dict):
+        raise TypeError("Expected a JSON object")
+    return normalized
+
+
+def _load_bound_manifest(
+    bound: _BoundRegularFile,
+    codes: _FileProtectionCodes,
+    expected_schema: str,
+) -> dict[str, Any]:
+    payload_bytes = _read_bound_file_bytes(
+        bound,
+        codes,
+        max_bytes=MANIFEST_MAX_BYTES,
+        too_large_code="manifest-too-large",
+    )
+    return _parse_manifest_bytes(
+        payload_bytes,
+        path=bound.path,
+        expected_schema=expected_schema,
+    )
 
 
 def _load_manifest(path: Path, expected_schema: str) -> dict[str, Any]:
@@ -794,18 +1233,135 @@ def _load_manifest(path: Path, expected_schema: str) -> dict[str, Any]:
         _revalidate_open_source(opened, second_sha256)
     finally:
         os.close(fd)
-    try:
-        payload = json.loads(payload_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    return _parse_manifest_bytes(
+        bytes(payload_bytes),
+        path=path,
+        expected_schema=expected_schema,
+    )
+
+
+def _assert_bound_matches_receipt(
+    bound: _BoundRegularFile,
+    receipt: dict[str, Any],
+    *,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    current = _verify_bound_regular_file(
+        bound,
+        PREPARED_FILE_CODES,
+        path=path,
+    )
+    if current["identity"] != receipt.get("identity"):
         raise StoreSafetyError(
-            "manifest-unreadable", f"Cannot read manifest {path}: {exc}"
-        ) from exc
-    if not isinstance(payload, dict) or payload.get("schema") != expected_schema:
-        raise StoreSafetyError(
-            "manifest-schema-mismatch",
-            f"Unexpected manifest schema in {path}; expected {expected_schema}",
+            "prepared-file-identity-mismatch",
+            f"Prepared file identity differs from its creation receipt: "
+            f"{path or bound.path}",
         )
-    return payload
+    if current["access_policy"] != receipt.get("access_policy"):
+        raise StoreSafetyError(
+            "prepared-file-access-policy-mismatch",
+            f"Prepared file access policy differs from its creation receipt: "
+            f"{path or bound.path}",
+        )
+    if current["sha256"] != receipt.get("sha256") or current["size"] != receipt.get(
+        "size"
+    ):
+        raise StoreSafetyError(
+            "prepared-file-content-mismatch",
+            f"Prepared file bytes differ from its creation receipt: "
+            f"{path or bound.path}",
+        )
+    return current
+
+
+@contextmanager
+def _bind_prepared_regular_files(
+    root: Path,
+    *,
+    manifest_name: str,
+    manifest_payload: dict[str, Any],
+    manifest_receipt: dict[str, Any],
+    file_receipts: dict[Path, dict[str, Any]],
+) -> Iterator[dict[Path, _BoundRegularFile]]:
+    with ExitStack() as stack:
+        manifest_relative = Path(manifest_name)
+        bindings = {
+            manifest_relative: stack.enter_context(
+                _bind_regular_file(
+                    root / manifest_relative,
+                    PREPARED_FILE_CODES,
+                )
+            )
+        }
+        for relative_path in file_receipts:
+            bindings[relative_path] = stack.enter_context(
+                _bind_regular_file(
+                    root / relative_path,
+                    PREPARED_FILE_CODES,
+                )
+            )
+        loaded_manifest = _load_bound_manifest(
+            bindings[manifest_relative],
+            PREPARED_FILE_CODES,
+            str(manifest_payload["schema"]),
+        )
+        if loaded_manifest != _normalized_json_payload(manifest_payload):
+            raise StoreSafetyError(
+                "prepared-manifest-mismatch",
+                f"Prepared manifest differs from the in-memory payload: "
+                f"{root / manifest_relative}",
+            )
+        _assert_bound_matches_receipt(
+            bindings[manifest_relative],
+            manifest_receipt,
+        )
+        for relative_path, receipt in file_receipts.items():
+            _assert_bound_matches_receipt(
+                bindings[relative_path],
+                receipt,
+            )
+        yield bindings
+
+
+def _revalidate_published_regular_files(
+    destination: Path,
+    bindings: dict[Path, _BoundRegularFile],
+    *,
+    manifest_name: str,
+    manifest_payload: dict[str, Any],
+    manifest_receipt: dict[str, Any],
+    file_receipts: dict[Path, dict[str, Any]],
+) -> None:
+    manifest_relative = Path(manifest_name)
+    _assert_bound_matches_receipt(
+        bindings[manifest_relative],
+        manifest_receipt,
+        path=destination / manifest_relative,
+    )
+    for relative_path, receipt in file_receipts.items():
+        _assert_bound_matches_receipt(
+            bindings[relative_path],
+            receipt,
+            path=destination / relative_path,
+        )
+    manifest_bytes = _read_bound_file_bytes(
+        bindings[manifest_relative],
+        PREPARED_FILE_CODES,
+        max_bytes=MANIFEST_MAX_BYTES,
+        too_large_code="manifest-too-large",
+        path=destination / manifest_relative,
+    )
+    installed_manifest = _parse_manifest_bytes(
+        manifest_bytes,
+        path=destination / manifest_relative,
+        expected_schema=str(manifest_payload["schema"]),
+    )
+    if installed_manifest != _normalized_json_payload(manifest_payload):
+        raise StoreSafetyError(
+            "prepared-manifest-mismatch",
+            f"Published manifest differs from the in-memory payload: "
+            f"{destination / manifest_relative}",
+        )
 
 
 def notes_is_running() -> bool:
@@ -1110,6 +1666,46 @@ def _make_recovery_clone(
     return copied_main, {"capture": records, "sidecars": sidecars}
 
 
+def _make_recovery_clone_from_bound(
+    files: dict[str, _BoundRegularFile],
+    destination: Path,
+    codes: _FileProtectionCodes,
+) -> tuple[Path, dict[str, Any]]:
+    """Copy an already-bound store without reopening mutable source paths."""
+
+    if NOTE_STORE_MAIN not in files:
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "The bound recovery file set has no main SQLite database",
+        )
+    destination.mkdir(mode=0o700, parents=True, exist_ok=False)
+    records: list[dict[str, Any]] = []
+    for basename in NOTE_STORE_BASENAMES:
+        bound = files.get(basename)
+        if bound is None:
+            continue
+        source = _verify_bound_regular_file(bound, codes)
+        copied = _copy_fd(bound.fd, destination / basename)
+        if copied["sha256"] != bound.sha256 or copied["size"] != bound.opened.st_size:
+            raise StoreSafetyError(
+                codes.content,
+                f"Bound source changed while creating recovery clone: {bound.path}",
+            )
+        records.append(
+            {
+                "basename": basename,
+                "source": source,
+                "copy": copied,
+            }
+        )
+    copied_main = destination / NOTE_STORE_MAIN
+    sidecars = _inspect_sidecars(copied_main)
+    copied_shm = copied_main.with_name(f"{copied_main.name}-shm")
+    if copied_shm.exists():
+        copied_shm.unlink()
+    return copied_main, {"capture": records, "sidecars": sidecars}
+
+
 def validate_database_recovery(src_main: Path) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="apple-notes-recovery-") as temp_dir:
         recovered_main, evidence = _make_recovery_clone(
@@ -1129,7 +1725,266 @@ def _fingerprint_file(path: Path) -> dict[str, Any]:
     return records[0]["source"]
 
 
-def _recover_to_standalone(src: Path, out: Path) -> dict[str, Any]:
+def _publication_details(
+    state: str,
+    *,
+    prepared: Path | None,
+    destination: Path,
+    retry_safe: bool,
+) -> dict[str, Any]:
+    locators: dict[str, str] = {"destination": str(destination)}
+    if prepared is not None and _lexists(prepared):
+        locators["prepared"] = str(prepared)
+    return {
+        "publication_state": state,
+        "retry_safe": retry_safe,
+        "recovery_locators": locators,
+    }
+
+
+def _publish_file_no_replace(
+    prepared: _BoundRegularFile,
+    destination: Path,
+) -> dict[str, Any]:
+    """Install one bound file and classify every publication failure."""
+
+    _verify_bound_regular_file(prepared, PREPARED_FILE_CODES)
+    try:
+        os.link(prepared.path, destination, follow_symlinks=False)
+    except OSError as exc:
+        source_state, source_after = _observe_path(prepared.path)
+        destination_state, destination_after = _observe_path(destination)
+        destination_is_prepared = (
+            destination_state == "present"
+            and destination_after is not None
+            and _same_identity(prepared.opened, destination_after)
+        )
+        source_is_prepared = (
+            source_state == "present"
+            and source_after is not None
+            and _same_identity(prepared.opened, source_after)
+        )
+        if destination_is_prepared:
+            raise StoreSafetyError(
+                "destination-install-uncertain",
+                "The destination is linked to the prepared database, but the "
+                f"publication syscall reported an error: {destination}: {exc}",
+                details=_publication_details(
+                    "uncertain",
+                    prepared=prepared.path,
+                    destination=destination,
+                    retry_safe=False,
+                ),
+            ) from exc
+        if (
+            exc.errno == errno.EEXIST
+            and source_is_prepared
+            and destination_state == "present"
+        ):
+            raise StoreSafetyError(
+                "destination-exists",
+                f"Recovery destination appeared before installation: {destination}",
+                details=_publication_details(
+                    "uncommitted",
+                    prepared=prepared.path,
+                    destination=destination,
+                    retry_safe=False,
+                ),
+            ) from exc
+        if source_is_prepared and destination_state == "absent":
+            raise StoreSafetyError(
+                "destination-install-failed",
+                f"Cannot install recovered database at {destination}: {exc}",
+                details=_publication_details(
+                    "uncommitted",
+                    prepared=prepared.path,
+                    destination=destination,
+                    retry_safe=True,
+                ),
+            ) from exc
+        raise StoreSafetyError(
+            "destination-install-uncertain",
+            "Cannot prove whether recovered-file publication committed; preserve "
+            f"the reported locators: prepared={prepared.path}, "
+            f"destination={destination}: {exc}",
+            details=_publication_details(
+                "uncertain",
+                prepared=prepared.path,
+                destination=destination,
+                retry_safe=False,
+            ),
+        ) from exc
+
+    try:
+        fingerprint = _verify_bound_regular_file(
+            prepared,
+            PREPARED_FILE_CODES,
+            path=destination,
+        )
+    except StoreSafetyError as exc:
+        raise StoreSafetyError(
+            "destination-install-uncertain",
+            "The link syscall succeeded, but the installed object could not be "
+            f"revalidated: {destination}: {exc}",
+            details=_publication_details(
+                "uncertain",
+                prepared=prepared.path,
+                destination=destination,
+                retry_safe=False,
+            ),
+        ) from exc
+
+    try:
+        os.unlink(prepared.path)
+    except OSError as exc:
+        source_state, source_after = _observe_path(prepared.path)
+        destination_state, destination_after = _observe_path(destination)
+        committed_and_retained = (
+            source_state == "present"
+            and source_after is not None
+            and _same_identity(prepared.opened, source_after)
+            and destination_state == "present"
+            and destination_after is not None
+            and _same_identity(prepared.opened, destination_after)
+        )
+        if not committed_and_retained:
+            raise StoreSafetyError(
+                "destination-install-uncertain",
+                "The link syscall succeeded, but cleanup failed and the current "
+                "prepared/destination namespace cannot prove a retained committed "
+                f"object: prepared={prepared.path}, destination={destination}: "
+                f"{exc}",
+                details=_publication_details(
+                    "uncertain",
+                    prepared=prepared.path,
+                    destination=destination,
+                    retry_safe=False,
+                ),
+            ) from exc
+        raise StoreSafetyError(
+            "destination-install-committed-cleanup-incomplete",
+            "The recovered database is committed, but its private prepared link "
+            f"could not be removed: {prepared.path}: {exc}",
+            details=_publication_details(
+                "committed",
+                prepared=prepared.path,
+                destination=destination,
+                retry_safe=False,
+            ),
+        ) from exc
+
+    try:
+        fingerprint = _verify_bound_regular_file(
+            prepared,
+            PREPARED_FILE_CODES,
+            path=destination,
+        )
+        _fsync_directory(destination.parent)
+        fingerprint = _verify_bound_regular_file(
+            prepared,
+            PREPARED_FILE_CODES,
+            path=destination,
+        )
+    except (OSError, StoreSafetyError) as exc:
+        raise StoreSafetyError(
+            "destination-install-uncertain",
+            "The recovered database was linked into place, but final durability "
+            f"or fingerprint validation is unconfirmed: {destination}: {exc}",
+            details=_publication_details(
+                "uncertain",
+                prepared=None,
+                destination=destination,
+                retry_safe=False,
+            ),
+        ) from exc
+    return fingerprint
+
+
+def _backup_sqlite_to_standalone(
+    source: Path,
+    output: Path,
+) -> dict[str, Any]:
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        output_fd = os.open(output, flags, 0o600)
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Cannot exclusively create standalone recovery output {output}: {exc}",
+        ) from exc
+    created = os.fstat(output_fd)
+    try:
+        try:
+            path_before = os.stat(output, follow_symlinks=False)
+            if not _same_identity(created, path_before):
+                raise StoreSafetyError(
+                    "prepared-file-identity-mismatch",
+                    f"Standalone recovery output was replaced before backup: {output}",
+                )
+            with (
+                closing(sqlite3.connect(source)) as source_conn,
+                closing(sqlite3.connect(output)) as output_conn,
+            ):
+                source_conn.backup(output_conn)
+                output_conn.execute("PRAGMA journal_mode = DELETE")
+                output_conn.commit()
+        except sqlite3.Error as exc:
+            raise StoreSafetyError(
+                "sqlite-recovery-failed",
+                f"SQLite backup could not create a standalone database: {exc}",
+            ) from exc
+        os.fchmod(output_fd, 0o600)
+        descriptor_after = os.fstat(output_fd)
+        path_after = os.stat(output, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(descriptor_after.st_mode)
+            or not _same_identity(created, descriptor_after)
+            or not _same_identity(descriptor_after, path_after)
+        ):
+            raise StoreSafetyError(
+                "prepared-file-identity-mismatch",
+                f"Standalone recovery output was replaced during backup: {output}",
+            )
+        if _access_policy(descriptor_after) != _access_policy(path_after):
+            raise StoreSafetyError(
+                "prepared-file-access-policy-mismatch",
+                f"Standalone recovery output access policy changed during backup: "
+                f"{output}",
+            )
+        sha256 = _hash_fd(output_fd)
+        return {
+            "path": output,
+            "sha256": sha256,
+            "size": descriptor_after.st_size,
+            "identity": _identity(descriptor_after),
+            "access_policy": _access_policy(descriptor_after),
+        }
+    except StoreSafetyError:
+        raise
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Cannot revalidate standalone recovery output {output}: {exc}",
+        ) from exc
+    finally:
+        os.close(output_fd)
+
+
+def _recover_validated_clone_to_standalone(
+    recovered_main: Path,
+    out: Path,
+    *,
+    source_db: Path,
+    recovery_evidence: dict[str, Any],
+    source_integrity: dict[str, Any],
+    source_revalidate: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     if any(
         _lexists(candidate)
         for candidate in (
@@ -1144,60 +1999,72 @@ def _recover_to_standalone(src: Path, out: Path) -> dict[str, Any]:
         )
     out.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temp_out = out.parent / f".{out.name}.tmp-{uuid.uuid4().hex}"
+    retain_temp = False
     try:
-        with tempfile.TemporaryDirectory(prefix="apple-notes-merge-") as temp_dir:
-            recovered_main, recovery_evidence = _make_recovery_clone(
-                src, Path(temp_dir) / "store"
-            )
-            source_integrity = _sqlite_integrity(recovered_main)
+        if source_revalidate is not None:
+            source_revalidate()
+        temp_receipt = _backup_sqlite_to_standalone(recovered_main, temp_out)
+        if source_revalidate is not None:
+            source_revalidate()
+        with _bind_regular_file(temp_out, PREPARED_FILE_CODES) as prepared:
             try:
-                with (
-                    closing(sqlite3.connect(recovered_main)) as source_conn,
-                    closing(sqlite3.connect(temp_out)) as output_conn,
-                ):
-                    source_conn.backup(output_conn)
-                    output_conn.execute("PRAGMA journal_mode = DELETE")
-                    output_conn.commit()
-            except sqlite3.Error as exc:
-                raise StoreSafetyError(
-                    "sqlite-recovery-failed",
-                    f"SQLite backup could not create a standalone database: {exc}",
-                ) from exc
-        os.chmod(temp_out, 0o600)
-        output_integrity = _sqlite_integrity(temp_out)
-        with temp_out.open("rb") as handle:
-            os.fsync(handle.fileno())
-        try:
-            os.link(temp_out, out, follow_symlinks=False)
-        except FileExistsError as exc:
-            raise StoreSafetyError(
-                "destination-exists",
-                f"Recovery destination appeared before installation: {out}",
-            ) from exc
-        except OSError as exc:
-            raise StoreSafetyError(
-                "destination-install-failed",
-                f"Cannot install recovered database at {out}: {exc}",
-            ) from exc
-        temp_out.unlink()
-        _fsync_directory(out.parent)
-        fingerprint = _fingerprint_file(out)
+                _assert_bound_matches_receipt(prepared, temp_receipt)
+                output_integrity = _sqlite_integrity(temp_out)
+                _verify_bound_regular_file(prepared, PREPARED_FILE_CODES)
+                try:
+                    os.fsync(prepared.fd)
+                except OSError as exc:
+                    raise StoreSafetyError(
+                        "destination-install-failed",
+                        "The prepared recovered database could not be made durable "
+                        f"before publication: {temp_out}: {exc}",
+                        details=_publication_details(
+                            "uncommitted",
+                            prepared=temp_out,
+                            destination=out,
+                            retry_safe=True,
+                        ),
+                    ) from exc
+                fingerprint = _publish_file_no_replace(prepared, out)
+            except StoreSafetyError as exc:
+                retain_temp = exc.details.get("publication_state") in {
+                    "committed",
+                    "uncertain",
+                }
+                raise
         return {
-            "source_db": src,
+            "source_db": source_db,
             "standalone_db": out,
             "source_recovery": recovery_evidence,
             "source_integrity": source_integrity,
             "output_integrity": output_integrity,
             "sha256": fingerprint["sha256"],
             "size": fingerprint["size"],
+            "identity": fingerprint["identity"],
+            "access_policy": fingerprint["access_policy"],
         }
     finally:
-        if temp_out.exists():
-            temp_out.unlink()
+        if not retain_temp and _lexists(temp_out):
+            os.unlink(temp_out)
         for suffix in ("-wal", "-shm", "-journal"):
             temp_sidecar = temp_out.with_name(f"{temp_out.name}{suffix}")
-            if temp_sidecar.exists():
-                temp_sidecar.unlink()
+            if not retain_temp and _lexists(temp_sidecar):
+                os.unlink(temp_sidecar)
+
+
+def _recover_to_standalone(src: Path, out: Path) -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="apple-notes-merge-") as temp_dir:
+        recovered_main, recovery_evidence = _make_recovery_clone(
+            src, Path(temp_dir) / "store"
+        )
+        source_integrity = _sqlite_integrity(recovered_main)
+        return _recover_validated_clone_to_standalone(
+            recovered_main,
+            out,
+            source_db=src,
+            recovery_evidence=recovery_evidence,
+            source_integrity=source_integrity,
+        )
 
 
 def copy_db(
@@ -1220,77 +2087,182 @@ def copy_db(
             "destination-exists", f"Destination already exists: {destination}"
         )
     partial = destination.parent / f".{destination.name}.partial-{uuid.uuid4().hex}"
-    partial.mkdir(mode=0o700)
     retain_partial = False
+    partial_binding: _BoundDirectory | None = None
     try:
-        store_dir = partial / "group.com.apple.notes"
-        captured = _capture_database_files(
-            paths.group_container / NOTE_STORE_MAIN,
-            store_dir,
-        )
-        copied_main = store_dir / NOTE_STORE_MAIN
-        sidecars = _inspect_sidecars(copied_main)
-        sqlite_validation = validate_database_recovery(copied_main)
-        manifest_files = []
-        for record in captured:
-            source = record["source"]
-            copied = record["copy"]
-            manifest_files.append(
+        with _create_bound_directory(partial) as bound_root:
+            partial_binding = bound_root
+            store_dir = partial / "group.com.apple.notes"
+            captured = _capture_database_files(
+                paths.group_container / NOTE_STORE_MAIN,
+                store_dir,
+            )
+            _verify_bound_directory(bound_root)
+            copied_main = store_dir / NOTE_STORE_MAIN
+            sidecars = _inspect_sidecars(copied_main)
+            sqlite_validation = validate_database_recovery(copied_main)
+            manifest_files = []
+            for record in captured:
+                source = record["source"]
+                copied = record["copy"]
+                manifest_files.append(
+                    {
+                        "basename": record["basename"],
+                        "relative_path": str(
+                            Path("group.com.apple.notes") / record["basename"]
+                        ),
+                        "sha256": copied["sha256"],
+                        "size": copied["size"],
+                        "source": source,
+                        "copy": {
+                            "identity": copied["identity"],
+                            "access_policy": copied["access_policy"],
+                        },
+                    }
+                )
+            manifest = {
+                "schema": SNAPSHOT_SCHEMA,
+                "created_at": _utc_now(),
+                "source_root": str(paths.group_container),
+                "notes_running": notes_running,
+                "notes_quit_required": require_notes_quit,
+                "classification": (
+                    "tentative-open-notes"
+                    if notes_running
+                    else "writeback-baseline"
+                    if require_notes_quit
+                    else "read-only-snapshot"
+                ),
+                "protected_properties": {
+                    "object_identity": ["device", "inode", "file_type"],
+                    "content_stability": ["sha256", "size"],
+                    "access_policy": ["mode", "uid", "gid", "flags"],
+                    "metadata_only_transitions_are_reported": [
+                        "mtime_ns",
+                        "ctime_ns",
+                        "link_count",
+                    ],
+                },
+                "files": manifest_files,
+                "sidecar_consistency": sidecars,
+                "sqlite_validation": sqlite_validation["sqlite_integrity"],
+            }
+            if require_notes_quit and notes_is_running():
+                raise StoreSafetyError(
+                    "notes-started-during-capture",
+                    "Notes.app started before the writeback-grade snapshot was "
+                    "finalized",
+                )
+            manifest_receipt = _write_json_atomic(
+                partial / SNAPSHOT_MANIFEST,
+                manifest,
+            )
+            expected_names = {
+                str(record["basename"]): stat.S_IFREG for record in captured
+            }
+            root_receipt = _scan_exact_directory_entries(
+                partial,
                 {
-                    "basename": record["basename"],
-                    "relative_path": str(
-                        Path("group.com.apple.notes") / record["basename"]
-                    ),
-                    "sha256": copied["sha256"],
-                    "size": copied["size"],
-                    "source": source,
-                    "copy": {
-                        "identity": copied["identity"],
-                        "access_policy": copied["access_policy"],
-                    },
-                }
+                    "group.com.apple.notes": stat.S_IFDIR,
+                    SNAPSHOT_MANIFEST: stat.S_IFREG,
+                },
+                missing_code="prepared-directory-identity-mismatch",
+                mismatch_code="prepared-file-set-mismatch",
+                bound_identity=_identity(bound_root.opened),
+                bound_access_policy=_access_policy(bound_root.opened),
             )
-        manifest = {
-            "schema": SNAPSHOT_SCHEMA,
-            "created_at": _utc_now(),
-            "source_root": str(paths.group_container),
-            "notes_running": notes_running,
-            "notes_quit_required": require_notes_quit,
-            "classification": (
-                "tentative-open-notes"
-                if notes_running
-                else "writeback-baseline"
-                if require_notes_quit
-                else "read-only-snapshot"
-            ),
-            "protected_properties": {
-                "object_identity": ["device", "inode", "file_type"],
-                "content_stability": ["sha256", "size"],
-                "access_policy": ["mode", "uid", "gid", "flags"],
-                "metadata_only_transitions_are_reported": [
-                    "mtime_ns",
-                    "ctime_ns",
-                    "link_count",
-                ],
-            },
-            "files": manifest_files,
-            "sidecar_consistency": sidecars,
-            "sqlite_validation": sqlite_validation["sqlite_integrity"],
-        }
-        if require_notes_quit and notes_is_running():
-            raise StoreSafetyError(
-                "notes-started-during-capture",
-                "Notes.app started before the writeback-grade snapshot was finalized",
+            store_receipt = _scan_exact_directory_entries(
+                store_dir,
+                expected_names,
+                missing_code="prepared-file-missing",
+                mismatch_code="prepared-file-set-mismatch",
             )
-        _write_json_atomic(partial / SNAPSHOT_MANIFEST, manifest)
-        _publish_directory_no_replace(partial, destination)
+            file_receipts = {
+                Path("group.com.apple.notes") / str(record["basename"]): record["copy"]
+                for record in captured
+            }
+            with _bind_prepared_regular_files(
+                partial,
+                manifest_name=SNAPSHOT_MANIFEST,
+                manifest_payload=manifest,
+                manifest_receipt=manifest_receipt,
+                file_receipts=file_receipts,
+            ) as prepared_files:
+
+                def verify_before_snapshot_rename() -> None:
+                    _scan_exact_directory_entries(
+                        store_dir,
+                        expected_names,
+                        missing_code="prepared-file-missing",
+                        mismatch_code="prepared-file-set-mismatch",
+                        bound_identity=store_receipt["identity"],
+                        bound_access_policy=store_receipt["access_policy"],
+                    )
+                    _revalidate_published_regular_files(
+                        partial,
+                        prepared_files,
+                        manifest_name=SNAPSHOT_MANIFEST,
+                        manifest_payload=manifest,
+                        manifest_receipt=manifest_receipt,
+                        file_receipts=file_receipts,
+                    )
+
+                _verify_bound_directory(bound_root)
+                _publish_directory_no_replace(
+                    partial,
+                    destination,
+                    binding=bound_root,
+                    before_rename=verify_before_snapshot_rename,
+                )
+                try:
+                    _scan_exact_directory_entries(
+                        destination,
+                        {
+                            "group.com.apple.notes": stat.S_IFDIR,
+                            SNAPSHOT_MANIFEST: stat.S_IFREG,
+                        },
+                        missing_code="prepared-directory-identity-mismatch",
+                        mismatch_code="prepared-file-set-mismatch",
+                        bound_identity=root_receipt["identity"],
+                        bound_access_policy=root_receipt["access_policy"],
+                    )
+                    _scan_exact_directory_entries(
+                        destination / "group.com.apple.notes",
+                        expected_names,
+                        missing_code="prepared-file-missing",
+                        mismatch_code="prepared-file-set-mismatch",
+                        bound_identity=store_receipt["identity"],
+                        bound_access_policy=store_receipt["access_policy"],
+                    )
+                    _revalidate_published_regular_files(
+                        destination,
+                        prepared_files,
+                        manifest_name=SNAPSHOT_MANIFEST,
+                        manifest_payload=manifest,
+                        manifest_receipt=manifest_receipt,
+                        file_receipts=file_receipts,
+                    )
+                except StoreSafetyError as exc:
+                    raise StoreSafetyError(
+                        "destination-install-uncertain",
+                        "Snapshot publication committed, but the exact prepared "
+                        f"tree could not be revalidated: {destination}: {exc}",
+                        details=_publication_details(
+                            "uncertain",
+                            prepared=None,
+                            destination=destination,
+                            retry_safe=False,
+                        ),
+                    ) from exc
     except StoreSafetyError as exc:
-        if exc.code == "destination-install-uncertain":
+        if exc.code == "destination-install-uncertain" or exc.details.get(
+            "publication_state"
+        ) in {"committed", "uncertain"}:
             retain_partial = True
         raise
     finally:
-        if not retain_partial and partial.exists():
-            shutil.rmtree(partial)
+        if not retain_partial:
+            _remove_bound_directory_if_owned(partial_binding, partial)
 
     return {
         "dest": destination,
@@ -1312,54 +2284,91 @@ def copy_db(
     }
 
 
-def validate_snapshot(snapshot_dir: Path) -> dict[str, Any]:
-    manifest = _load_manifest(snapshot_dir / SNAPSHOT_MANIFEST, SNAPSHOT_SCHEMA)
-    rows = manifest.get("files")
-    if (
-        not isinstance(rows, list)
-        or not rows
-        or any(not isinstance(row, dict) for row in rows)
-    ):
-        raise StoreSafetyError("manifest-invalid", "Snapshot manifest has no files")
-    manifest_names = [row.get("basename") for row in rows]
-    expected_names = set(manifest_names)
-    if (
-        len(expected_names) != len(manifest_names)
-        or NOTE_STORE_MAIN not in expected_names
-        or not expected_names.issubset(NOTE_STORE_BASENAMES)
-    ):
-        raise StoreSafetyError(
-            "manifest-invalid",
-            "Snapshot manifest has duplicate or unsupported database file entries",
-        )
+@contextmanager
+def _validated_snapshot_artifact(
+    snapshot_dir: Path,
+) -> Iterator[_ValidatedSnapshotArtifact]:
+    """Bind snapshot inputs and expose only a private validated recovery clone."""
+
+    manifest_path = snapshot_dir / SNAPSHOT_MANIFEST
     store_dir = snapshot_dir / "group.com.apple.notes"
-    expected_store_types = {name: stat.S_IFREG for name in expected_names}
-    store_directory = _scan_exact_directory_entries(
-        store_dir,
-        expected_store_types,
-        missing_code="snapshot-missing",
-        mismatch_code="snapshot-file-set-mismatch",
-    )
-    copied_main = store_dir / NOTE_STORE_MAIN
-    manifest_by_name = {row.get("basename"): row for row in rows}
-    for basename, row in manifest_by_name.items():
-        expected_relative = Path("group.com.apple.notes") / str(basename)
+    with (
+        tempfile.TemporaryDirectory(
+            prefix="apple-notes-snapshot-validation-"
+        ) as temp_dir,
+        ExitStack() as stack,
+    ):
+        try:
+            manifest_bound = stack.enter_context(
+                _bind_regular_file(manifest_path, SNAPSHOT_FILE_CODES)
+            )
+        except StoreSafetyError as exc:
+            if exc.code == SNAPSHOT_FILE_CODES.missing:
+                raise StoreSafetyError(
+                    "manifest-missing",
+                    f"Manifest is missing: {manifest_path}",
+                ) from exc
+            raise
+        manifest = _load_bound_manifest(
+            manifest_bound,
+            SNAPSHOT_FILE_CODES,
+            SNAPSHOT_SCHEMA,
+        )
+        rows = manifest.get("files")
         if (
-            basename not in NOTE_STORE_BASENAMES
-            or Path(str(row.get("relative_path"))) != expected_relative
+            not isinstance(rows, list)
+            or not rows
+            or any(not isinstance(row, dict) for row in rows)
         ):
             raise StoreSafetyError(
                 "manifest-invalid",
-                f"Manifest path is not canonical for {basename}: {row.get('relative_path')}",
+                "Snapshot manifest has no files",
             )
-    with tempfile.TemporaryDirectory(
-        prefix="apple-notes-snapshot-validation-"
-    ) as temp_dir:
-        recovered_main, recovery = _make_recovery_clone(
-            copied_main,
-            Path(temp_dir) / "store",
+        manifest_names = [row.get("basename") for row in rows]
+        expected_names = set(manifest_names)
+        if (
+            len(expected_names) != len(manifest_names)
+            or NOTE_STORE_MAIN not in expected_names
+            or not expected_names.issubset(NOTE_STORE_BASENAMES)
+        ):
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Snapshot manifest has duplicate or unsupported database file entries",
+            )
+        expected_store_types = {str(name): stat.S_IFREG for name in expected_names}
+        store_directory = _scan_exact_directory_entries(
+            store_dir,
+            expected_store_types,
+            missing_code="snapshot-missing",
+            mismatch_code="snapshot-file-set-mismatch",
         )
-        verified = [record["source"] for record in recovery["capture"]]
+        manifest_by_name = {row.get("basename"): row for row in rows}
+        for basename, row in manifest_by_name.items():
+            expected_relative = Path("group.com.apple.notes") / str(basename)
+            if (
+                basename not in NOTE_STORE_BASENAMES
+                or Path(str(row.get("relative_path"))) != expected_relative
+            ):
+                raise StoreSafetyError(
+                    "manifest-invalid",
+                    f"Manifest path is not canonical for {basename}: "
+                    f"{row.get('relative_path')}",
+                )
+
+        bound_files: dict[str, _BoundRegularFile] = {}
+        for basename in NOTE_STORE_BASENAMES:
+            if basename in expected_names:
+                bound_files[basename] = stack.enter_context(
+                    _bind_regular_file(
+                        store_dir / basename,
+                        SNAPSHOT_FILE_CODES,
+                    )
+                )
+        recovered_main, recovery = _make_recovery_clone_from_bound(
+            bound_files,
+            Path(temp_dir) / "store",
+            SNAPSHOT_FILE_CODES,
+        )
         for record in recovery["capture"]:
             basename = record["basename"]
             row = manifest_by_name.get(basename)
@@ -1374,21 +2383,84 @@ def validate_snapshot(snapshot_dir: Path) -> dict[str, Any]:
                     f"Snapshot bytes no longer match the manifest: {basename}",
                 )
         sqlite_integrity = _sqlite_integrity(recovered_main)
-    _scan_exact_directory_entries(
-        store_dir,
-        expected_store_types,
-        missing_code="snapshot-missing",
-        mismatch_code="snapshot-file-set-mismatch",
-        bound_identity=store_directory["identity"],
-        bound_access_policy=store_directory["access_policy"],
-    )
-    return {
-        "snapshot_dir": snapshot_dir,
-        "manifest": manifest,
-        "verified_files": verified,
-        "sidecar_consistency": recovery["sidecars"],
-        "sqlite_validation": sqlite_integrity,
-    }
+        validated_recovery = Path(temp_dir) / "validated-recovery.sqlite"
+        validated_recovery_receipt = _backup_sqlite_to_standalone(
+            recovered_main,
+            validated_recovery,
+        )
+        validated_recovery_bound = stack.enter_context(
+            _bind_regular_file(
+                validated_recovery,
+                PREPARED_FILE_CODES,
+            )
+        )
+        validated_recovery_integrity = _sqlite_integrity(validated_recovery)
+        _assert_bound_matches_receipt(
+            validated_recovery_bound,
+            validated_recovery_receipt,
+        )
+
+        def revalidate_recovery_clone() -> None:
+            _assert_bound_matches_receipt(
+                validated_recovery_bound,
+                validated_recovery_receipt,
+            )
+
+        _scan_exact_directory_entries(
+            store_dir,
+            expected_store_types,
+            missing_code="snapshot-missing",
+            mismatch_code="snapshot-file-set-mismatch",
+            bound_identity=store_directory["identity"],
+            bound_access_policy=store_directory["access_policy"],
+        )
+        verified = [
+            _verify_bound_regular_file(
+                bound_files[basename],
+                SNAPSHOT_FILE_CODES,
+            )
+            for basename in NOTE_STORE_BASENAMES
+            if basename in bound_files
+        ]
+        manifest_integrity = _verify_bound_regular_file(
+            manifest_bound,
+            SNAPSHOT_FILE_CODES,
+        )
+        source_integrity = {
+            "protected_properties": {
+                "object_identity": ["device", "inode", "file_type"],
+                "content_stability": ["sha256", "size"],
+                "access_policy": ["mode", "uid", "gid", "flags"],
+                "benign_metadata_transitions": [
+                    "mtime_ns",
+                    "ctime_ns",
+                    "link_count",
+                ],
+            },
+            "manifest": manifest_integrity,
+            "files": verified,
+        }
+        public_result = {
+            "snapshot_dir": snapshot_dir,
+            "manifest": manifest,
+            "verified_files": verified,
+            "sidecar_consistency": recovery["sidecars"],
+            "sqlite_validation": sqlite_integrity,
+            "validated_recovery_integrity": validated_recovery_integrity,
+            "source_integrity": source_integrity,
+        }
+        yield _ValidatedSnapshotArtifact(
+            public_result=public_result,
+            recovered_main=validated_recovery,
+            recovery_evidence=recovery,
+            source_integrity=source_integrity,
+            revalidate_recovery_clone=revalidate_recovery_clone,
+        )
+
+
+def validate_snapshot(snapshot_dir: Path) -> dict[str, Any]:
+    with _validated_snapshot_artifact(snapshot_dir) as artifact:
+        return artifact.public_result
 
 
 def merge_db(src: Path, out: Path | None) -> dict[str, Any]:
@@ -1397,17 +2469,25 @@ def merge_db(src: Path, out: Path | None) -> dict[str, Any]:
 
 
 def recover_snapshot(snapshot_dir: Path, out: Path) -> dict[str, Any]:
-    validation = validate_snapshot(snapshot_dir)
     source = snapshot_dir / "group.com.apple.notes" / NOTE_STORE_MAIN
-    recovered = _recover_to_standalone(source, out)
-    return {
-        "snapshot_dir": snapshot_dir,
-        "snapshot_validation": {
-            "sqlite_validation": validation["sqlite_validation"],
-            "sidecar_consistency": validation["sidecar_consistency"],
-        },
-        "recovered": recovered,
-    }
+    with _validated_snapshot_artifact(snapshot_dir) as artifact:
+        validation = artifact.public_result
+        recovered = _recover_validated_clone_to_standalone(
+            artifact.recovered_main,
+            out,
+            source_db=source,
+            recovery_evidence=artifact.recovery_evidence,
+            source_integrity=validation["sqlite_validation"],
+            source_revalidate=artifact.revalidate_recovery_clone,
+        )
+        return {
+            "snapshot_dir": snapshot_dir,
+            "snapshot_validation": {
+                "sqlite_validation": validation["sqlite_validation"],
+                "sidecar_consistency": validation["sidecar_consistency"],
+            },
+            "recovered": recovered,
+        }
 
 
 def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
@@ -1417,37 +2497,119 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
             "destination-exists", f"Patch stage already exists: {dest}"
         )
     partial = dest.parent / f".{dest.name}.partial-{uuid.uuid4().hex}"
-    partial.mkdir(mode=0o700)
     retain_partial = False
+    partial_binding: _BoundDirectory | None = None
     try:
-        staged_db = partial / NOTE_STORE_MAIN
-        recovery = _recover_to_standalone(src, staged_db)
-        fingerprint = _fingerprint_file(staged_db)
-        manifest = {
-            "schema": PATCH_SCHEMA,
-            "created_at": _utc_now(),
-            "source_db": str(src),
-            "database": {
-                "basename": NOTE_STORE_MAIN,
-                "relative_path": NOTE_STORE_MAIN,
-                "sha256": fingerprint["sha256"],
-                "size": fingerprint["size"],
-            },
-            "sqlite_validation": recovery["output_integrity"],
-            "sidecar_policy": {
-                "allowed": False,
-                "reason": "A patch stage must be a standalone SQLite database",
-            },
-        }
-        _write_json_atomic(partial / PATCH_MANIFEST, manifest)
-        _publish_directory_no_replace(partial, dest)
+        with _create_bound_directory(partial) as bound_root:
+            partial_binding = bound_root
+            staged_db = partial / NOTE_STORE_MAIN
+            recovery = _recover_to_standalone(src, staged_db)
+            fingerprint = {
+                "path": staged_db,
+                "sha256": recovery["sha256"],
+                "size": recovery["size"],
+                "identity": recovery["identity"],
+                "access_policy": recovery["access_policy"],
+            }
+            _verify_bound_directory(bound_root)
+            manifest = {
+                "schema": PATCH_SCHEMA,
+                "created_at": _utc_now(),
+                "source_db": str(src),
+                "database": {
+                    "basename": NOTE_STORE_MAIN,
+                    "relative_path": NOTE_STORE_MAIN,
+                    "sha256": fingerprint["sha256"],
+                    "size": fingerprint["size"],
+                },
+                "sqlite_validation": recovery["output_integrity"],
+                "sidecar_policy": {
+                    "allowed": False,
+                    "reason": "A patch stage must be a standalone SQLite database",
+                },
+            }
+            manifest_receipt = _write_json_atomic(
+                partial / PATCH_MANIFEST,
+                manifest,
+            )
+            root_receipt = _scan_exact_directory_entries(
+                partial,
+                {
+                    NOTE_STORE_MAIN: stat.S_IFREG,
+                    PATCH_MANIFEST: stat.S_IFREG,
+                },
+                missing_code="prepared-directory-identity-mismatch",
+                mismatch_code="prepared-file-set-mismatch",
+                bound_identity=_identity(bound_root.opened),
+                bound_access_policy=_access_policy(bound_root.opened),
+            )
+            file_receipts = {Path(NOTE_STORE_MAIN): fingerprint}
+            with _bind_prepared_regular_files(
+                partial,
+                manifest_name=PATCH_MANIFEST,
+                manifest_payload=manifest,
+                manifest_receipt=manifest_receipt,
+                file_receipts=file_receipts,
+            ) as prepared_files:
+
+                def verify_before_stage_rename() -> None:
+                    _revalidate_published_regular_files(
+                        partial,
+                        prepared_files,
+                        manifest_name=PATCH_MANIFEST,
+                        manifest_payload=manifest,
+                        manifest_receipt=manifest_receipt,
+                        file_receipts=file_receipts,
+                    )
+
+                _verify_bound_directory(bound_root)
+                _publish_directory_no_replace(
+                    partial,
+                    dest,
+                    binding=bound_root,
+                    before_rename=verify_before_stage_rename,
+                )
+                try:
+                    _scan_exact_directory_entries(
+                        dest,
+                        {
+                            NOTE_STORE_MAIN: stat.S_IFREG,
+                            PATCH_MANIFEST: stat.S_IFREG,
+                        },
+                        missing_code="prepared-directory-identity-mismatch",
+                        mismatch_code="prepared-file-set-mismatch",
+                        bound_identity=root_receipt["identity"],
+                        bound_access_policy=root_receipt["access_policy"],
+                    )
+                    _revalidate_published_regular_files(
+                        dest,
+                        prepared_files,
+                        manifest_name=PATCH_MANIFEST,
+                        manifest_payload=manifest,
+                        manifest_receipt=manifest_receipt,
+                        file_receipts=file_receipts,
+                    )
+                except StoreSafetyError as exc:
+                    raise StoreSafetyError(
+                        "destination-install-uncertain",
+                        "Patch-stage publication committed, but the exact prepared "
+                        f"tree could not be revalidated: {dest}: {exc}",
+                        details=_publication_details(
+                            "uncertain",
+                            prepared=None,
+                            destination=dest,
+                            retry_safe=False,
+                        ),
+                    ) from exc
     except StoreSafetyError as exc:
-        if exc.code == "destination-install-uncertain":
+        if exc.code == "destination-install-uncertain" or exc.details.get(
+            "publication_state"
+        ) in {"committed", "uncertain"}:
             retain_partial = True
         raise
     finally:
-        if not retain_partial and partial.exists():
-            shutil.rmtree(partial)
+        if not retain_partial:
+            _remove_bound_directory_if_owned(partial_binding, partial)
     return {
         "stage_dir": dest,
         "manifest": dest / PATCH_MANIFEST,
@@ -1470,50 +2632,90 @@ def validate_patch_stage(stage_dir: Path) -> dict[str, Any]:
         missing_code="stage-missing",
         mismatch_code="patch-file-set-mismatch",
     )
-    manifest = _load_manifest(stage_dir / PATCH_MANIFEST, PATCH_SCHEMA)
-    database = manifest.get("database")
-    if not isinstance(database, dict):
-        raise StoreSafetyError(
-            "manifest-invalid", "Patch manifest has no database entry"
-        )
-    if (
-        database.get("basename") != NOTE_STORE_MAIN
-        or database.get("relative_path") != NOTE_STORE_MAIN
-    ):
-        raise StoreSafetyError(
-            "manifest-invalid",
-            "Patch manifest database path is not canonical",
-        )
-    with tempfile.TemporaryDirectory(
-        prefix="apple-notes-stage-validation-"
-    ) as temp_dir:
-        recovered_main, recovery = _make_recovery_clone(
-            stage_dir / NOTE_STORE_MAIN,
-            Path(temp_dir) / "store",
-        )
-        fingerprint = recovery["capture"][0]["source"]
-        if fingerprint["sha256"] != database.get("sha256") or fingerprint[
-            "size"
-        ] != database.get("size"):
-            raise StoreSafetyError(
-                "patch-content-mismatch",
-                "Patch database no longer matches its manifest",
+    with ExitStack() as stack:
+        manifest_bound = stack.enter_context(
+            _bind_regular_file(
+                stage_dir / PATCH_MANIFEST,
+                PATCH_FILE_CODES,
             )
-        integrity = _sqlite_integrity(recovered_main)
-    _scan_exact_directory_entries(
-        stage_dir,
-        expected_stage_types,
-        missing_code="stage-missing",
-        mismatch_code="patch-file-set-mismatch",
-        bound_identity=stage_directory["identity"],
-        bound_access_policy=stage_directory["access_policy"],
-    )
-    return {
-        "stage_dir": stage_dir,
-        "manifest": manifest,
-        "fingerprint": fingerprint,
-        "sqlite_validation": integrity,
-    }
+        )
+        manifest = _load_bound_manifest(
+            manifest_bound,
+            PATCH_FILE_CODES,
+            PATCH_SCHEMA,
+        )
+        database = manifest.get("database")
+        if not isinstance(database, dict):
+            raise StoreSafetyError(
+                "manifest-invalid", "Patch manifest has no database entry"
+            )
+        if (
+            database.get("basename") != NOTE_STORE_MAIN
+            or database.get("relative_path") != NOTE_STORE_MAIN
+        ):
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Patch manifest database path is not canonical",
+            )
+        database_bound = stack.enter_context(
+            _bind_regular_file(
+                stage_dir / NOTE_STORE_MAIN,
+                PATCH_FILE_CODES,
+            )
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="apple-notes-stage-validation-"
+        ) as temp_dir:
+            recovered_main, recovery = _make_recovery_clone_from_bound(
+                {NOTE_STORE_MAIN: database_bound},
+                Path(temp_dir) / "store",
+                PATCH_FILE_CODES,
+            )
+            fingerprint = recovery["capture"][0]["source"]
+            if fingerprint["sha256"] != database.get("sha256") or fingerprint[
+                "size"
+            ] != database.get("size"):
+                raise StoreSafetyError(
+                    "patch-content-mismatch",
+                    "Patch database no longer matches its manifest",
+                )
+            integrity = _sqlite_integrity(recovered_main)
+        _scan_exact_directory_entries(
+            stage_dir,
+            expected_stage_types,
+            missing_code="stage-missing",
+            mismatch_code="patch-file-set-mismatch",
+            bound_identity=stage_directory["identity"],
+            bound_access_policy=stage_directory["access_policy"],
+        )
+        database_integrity = _verify_bound_regular_file(
+            database_bound,
+            PATCH_FILE_CODES,
+        )
+        manifest_integrity = _verify_bound_regular_file(
+            manifest_bound,
+            PATCH_FILE_CODES,
+        )
+        return {
+            "stage_dir": stage_dir,
+            "manifest": manifest,
+            "fingerprint": fingerprint,
+            "sqlite_validation": integrity,
+            "source_integrity": {
+                "protected_properties": {
+                    "object_identity": ["device", "inode", "file_type"],
+                    "content_stability": ["sha256", "size"],
+                    "access_policy": ["mode", "uid", "gid", "flags"],
+                    "benign_metadata_transitions": [
+                        "mtime_ns",
+                        "ctime_ns",
+                        "link_count",
+                    ],
+                },
+                "manifest": manifest_integrity,
+                "database": database_integrity,
+            },
+        }
 
 
 def fingerprint_note_store(paths: NoteStorePaths) -> dict[str, Any]:
@@ -1921,7 +3123,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         else:
             parser.error(f"Unsupported command: {args.command}")
     except StoreSafetyError as exc:
-        emit_json({"error": str(exc), "error_code": exc.code, "command": args.command})
+        payload = {
+            "error": str(exc),
+            "error_code": exc.code,
+            "command": args.command,
+        }
+        if exc.details:
+            payload["details"] = exc.details
+        emit_json(payload)
         return 1
     except Exception as exc:  # noqa: BLE001
         emit_json(
