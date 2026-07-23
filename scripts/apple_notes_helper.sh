@@ -2,6 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_DIR="${SCRIPT_DIR}/../.agents/skills/apple-notes-db-guardrails"
+DB_HELPER="${SKILL_DIR}/scripts/apple_notes_db.py"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 OSASCRIPT_BIN="${OSASCRIPT_BIN:-/usr/bin/osascript}"
 
@@ -14,12 +16,18 @@ Usage:
   bash scripts/apple_notes_helper.sh probe-db-access
   bash scripts/apple_notes_helper.sh copy-db [--dest PATH] [--require-notes-quit]
   bash scripts/apple_notes_helper.sh merge-db --src PATH [--out PATH]
+  bash scripts/apple_notes_helper.sh validate-snapshot --snapshot-dir PATH
+  bash scripts/apple_notes_helper.sh recover-snapshot --snapshot-dir PATH --out PATH
+  bash scripts/apple_notes_helper.sh stage-patch --src PATH --dest PATH
+  bash scripts/apple_notes_helper.sh preflight-writeback --backup-dir PATH --stage-dir PATH
+  bash scripts/apple_notes_helper.sh verify-writeback --backup-dir PATH --stage-dir PATH
   bash scripts/apple_notes_helper.sh note-tags --db PATH --title TITLE
   bash scripts/apple_notes_helper.sh fingerprint-db
 
 Notes:
   - Notes app-level preflight is performed via osascript inside this wrapper.
-  - DB-heavy subcommands delegate to python3 scripts/apple_notes_helper.py.
+  - DB-heavy subcommands delegate to the helper packaged with apple-notes-db-guardrails.
+  - No subcommand mutates the live Notes store; writeback remains an explicit separate phase.
   - In Codex, prefer this wrapper under an approved/escalated prefix when Notes automation is needed.
 EOF
 }
@@ -140,8 +148,8 @@ main() {
       shift
       show_note_prefix "$@"
       ;;
-    probe-db-access|copy-db|merge-db|note-tags|fingerprint-db)
-      exec "$PYTHON_BIN" "$SCRIPT_DIR/apple_notes_helper.py" "$@"
+    probe-db-access|copy-db|merge-db|validate-snapshot|recover-snapshot|stage-patch|preflight-writeback|verify-writeback|note-tags|fingerprint-db)
+      exec "$PYTHON_BIN" "$DB_HELPER" "$@"
       ;;
     -h|--help|help)
       usage

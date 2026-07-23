@@ -1,0 +1,4 @@
+interface:
+  display_name: "Apple Notes DB Guardrails"
+  short_description: "Safely audit and stage Apple Notes databases"
+  default_prompt: "Use $apple-notes-db-guardrails to inspect or prepare this Apple Notes database task safely."
