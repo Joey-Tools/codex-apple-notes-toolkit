@@ -86,6 +86,49 @@ raise SystemExit(2)
         self.assertIsInstance(context.exception, MODULE.StoreSafetyError)
         self.assertEqual(context.exception.code, expected)
 
+    def _assert_snapshot_and_stage_reject_extra_entry(self, entry_kind: str) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = MODULE.copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            stage = Path(MODULE.stage_patch(edited, root / "stage")["stage_dir"])
+            targets = (
+                (
+                    Path(snapshot["dest"]) / "group.com.apple.notes",
+                    MODULE.validate_snapshot,
+                    Path(snapshot["dest"]),
+                    "snapshot-file-set-mismatch",
+                ),
+                (
+                    stage,
+                    MODULE.validate_patch_stage,
+                    stage,
+                    "patch-file-set-mismatch",
+                ),
+            )
+            for target, validator, argument, expected_code in targets:
+                with self.subTest(entry_kind=entry_kind, target=target.name):
+                    extra = target / f"unexpected-{entry_kind}"
+                    if entry_kind == "directory":
+                        extra.mkdir()
+                    elif entry_kind == "fifo":
+                        os.mkfifo(extra)
+                    elif entry_kind == "broken-symlink":
+                        extra.symlink_to("missing-target")
+                    else:
+                        self.fail(f"Unsupported test entry kind: {entry_kind}")
+                    with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                        validator(argument)
+                    self._assert_safety_code(expected_code, raised)
+
     def test_packaged_skill_is_self_contained(self) -> None:
         self.assertTrue((SKILL_DIR / "SKILL.md").is_file())
         self.assertTrue((SKILL_DIR / "agents/openai.yaml").is_file())
@@ -290,6 +333,122 @@ raise SystemExit(2)
             self._assert_safety_code("destination-exists", recover_raised)
             self.assertEqual(recovered.read_text(encoding="utf-8"), "keep")
 
+    def test_snapshot_publication_does_not_replace_directory_appearing_after_check(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = root / "snapshot"
+            original_rename = MODULE._rename_directory_no_replace
+
+            def destination_appears(source: Path, target: Path) -> None:
+                target.mkdir()
+                original_rename(source, target)
+
+            with (
+                mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                mock.patch.object(
+                    MODULE,
+                    "_rename_directory_no_replace",
+                    side_effect=destination_appears,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.copy_db(
+                    paths,
+                    dest=destination,
+                    require_notes_quit=False,
+                )
+            self._assert_safety_code("destination-exists", raised)
+            self.assertEqual(list(destination.iterdir()), [])
+            self.assertEqual(list(root.glob(".snapshot.partial-*")), [])
+
+    def test_patch_publication_does_not_replace_directory_appearing_after_check(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            destination = root / "stage"
+            original_rename = MODULE._rename_directory_no_replace
+
+            def destination_appears(source: Path, target: Path) -> None:
+                target.mkdir()
+                original_rename(source, target)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_rename_directory_no_replace",
+                    side_effect=destination_appears,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.stage_patch(edited, destination)
+            self._assert_safety_code("destination-exists", raised)
+            self.assertEqual(list(destination.iterdir()), [])
+            self.assertEqual(list(root.glob(".stage.partial-*")), [])
+
+    def test_snapshot_publication_reports_commit_then_error_as_uncertain(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = root / "snapshot"
+            original_rename = MODULE._rename_directory_no_replace
+
+            def commit_then_error(source: Path, target: Path) -> None:
+                original_rename(source, target)
+                raise OSError(MODULE.errno.EIO, "simulated post-commit error")
+
+            with (
+                mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                mock.patch.object(
+                    MODULE,
+                    "_rename_directory_no_replace",
+                    side_effect=commit_then_error,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.copy_db(
+                    paths,
+                    dest=destination,
+                    require_notes_quit=False,
+                )
+            self._assert_safety_code("destination-install-uncertain", raised)
+            self.assertTrue((destination / MODULE.SNAPSHOT_MANIFEST).is_file())
+            self.assertEqual(list(root.glob(".snapshot.partial-*")), [])
+
+    def test_patch_publication_reports_commit_then_error_as_uncertain(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            destination = root / "stage"
+            original_rename = MODULE._rename_directory_no_replace
+
+            def commit_then_error(source: Path, target: Path) -> None:
+                original_rename(source, target)
+                raise OSError(MODULE.errno.EIO, "simulated post-commit error")
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_rename_directory_no_replace",
+                    side_effect=commit_then_error,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.stage_patch(edited, destination)
+            self._assert_safety_code("destination-install-uncertain", raised)
+            self.assertTrue((destination / MODULE.PATCH_MANIFEST).is_file())
+            self.assertEqual(list(root.glob(".stage.partial-*")), [])
+
     def test_same_descriptor_detects_path_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "file.sqlite"
@@ -479,6 +638,97 @@ raise SystemExit(2)
             with self.assertRaises(MODULE.StoreSafetyError) as raised:
                 MODULE.validate_snapshot(Path(snapshot["dest"]))
         self._assert_safety_code("snapshot-content-mismatch", raised)
+
+    def test_exact_file_sets_reject_extra_directory(self) -> None:
+        self._assert_snapshot_and_stage_reject_extra_entry("directory")
+
+    def test_exact_file_sets_reject_extra_fifo(self) -> None:
+        self._assert_snapshot_and_stage_reject_extra_entry("fifo")
+
+    def test_exact_file_sets_reject_extra_broken_symlink(self) -> None:
+        self._assert_snapshot_and_stage_reject_extra_entry("broken-symlink")
+
+    def test_directory_mtime_only_change_does_not_fail_exact_file_set(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = MODULE.copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+            snapshot_store = snapshot_dir / "group.com.apple.notes"
+            stage = Path(MODULE.stage_patch(edited, root / "stage")["stage_dir"])
+            for directory in (snapshot_store, stage):
+                current = directory.stat()
+                os.utime(
+                    directory,
+                    ns=(
+                        current.st_atime_ns,
+                        current.st_mtime_ns + 1_000_000_000,
+                    ),
+                )
+            snapshot_validation = MODULE.validate_snapshot(snapshot_dir)
+            stage_validation = MODULE.validate_patch_stage(stage)
+        self.assertEqual(snapshot_validation["sqlite_validation"]["result"], "ok")
+        self.assertEqual(stage_validation["sqlite_validation"]["result"], "ok")
+
+    def test_patch_validation_detects_directory_identity_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            stage = Path(MODULE.stage_patch(edited, root / "stage")["stage_dir"])
+            original_integrity = MODULE._sqlite_integrity
+
+            def replace_after_integrity(path: Path) -> dict[str, object]:
+                result = original_integrity(path)
+                replacement = root / "replacement-stage"
+                shutil.copytree(stage, replacement)
+                stage.rename(root / "original-stage")
+                replacement.rename(stage)
+                return result
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_sqlite_integrity",
+                    side_effect=replace_after_integrity,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.validate_patch_stage(stage)
+        self._assert_safety_code("directory-identity-mismatch", raised)
+
+    def test_patch_validation_detects_directory_access_policy_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            stage = Path(MODULE.stage_patch(edited, root / "stage")["stage_dir"])
+            stage.chmod(0o700)
+            original_integrity = MODULE._sqlite_integrity
+
+            def chmod_after_integrity(path: Path) -> dict[str, object]:
+                result = original_integrity(path)
+                stage.chmod(0o750)
+                return result
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_sqlite_integrity",
+                    side_effect=chmod_after_integrity,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.validate_patch_stage(stage)
+        self._assert_safety_code("directory-access-policy-mismatch", raised)
 
     def test_stage_patch_normalizes_and_validates_database(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

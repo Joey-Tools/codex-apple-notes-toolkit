@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -38,6 +40,9 @@ CHUNK_SIZE = 1024 * 1024
 MANIFEST_MAX_BYTES = 4 * 1024 * 1024
 WAL_MAGIC_NUMBERS = {0x377F0682, 0x377F0683}
 WAL_VERSION = 3007000
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
+RENAME_EXCL = 0x00000004
 
 
 class StoreSafetyError(RuntimeError):
@@ -124,6 +129,154 @@ def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
 
 def _lexists(path: Path) -> bool:
     return os.path.lexists(os.fspath(path))
+
+
+def _rename_directory_no_replace(source: Path, destination: Path) -> None:
+    """Atomically rename a directory without replacing an existing name."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if sys.platform == "darwin":
+        renamex_np = getattr(libc, "renamex_np", None)
+        if renamex_np is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "renamex_np is unavailable; refusing a non-atomic publication",
+            )
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(source_bytes, destination_bytes, RENAME_EXCL)
+    elif sys.platform.startswith("linux"):
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "renameat2 is unavailable; refusing a non-atomic publication",
+            )
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            AT_FDCWD,
+            source_bytes,
+            AT_FDCWD,
+            destination_bytes,
+            RENAME_NOREPLACE,
+        )
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            f"Atomic no-replace directory publication is unsupported on {sys.platform}",
+        )
+
+    if result != 0:
+        error_number = ctypes.get_errno() or errno.EIO
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            os.fspath(source),
+            os.fspath(destination),
+        )
+
+
+def _observe_path(path: Path) -> tuple[str, os.stat_result | None]:
+    try:
+        value = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return "absent", None
+    except OSError:
+        return "unavailable", None
+    return "present", value
+
+
+def _publish_directory_no_replace(source: Path, destination: Path) -> None:
+    try:
+        source_before = os.stat(source, follow_symlinks=False)
+    except OSError as exc:
+        raise StoreSafetyError(
+            "destination-install-failed",
+            f"Cannot inspect private publication source {source}: {exc}",
+        ) from exc
+    if not stat.S_ISDIR(source_before.st_mode):
+        raise StoreSafetyError(
+            "destination-install-failed",
+            f"Private publication source is not a directory: {source}",
+        )
+    source_identity = _identity(source_before)
+    source_access_policy = _access_policy(source_before)
+
+    try:
+        _rename_directory_no_replace(source, destination)
+    except OSError as exc:
+        source_state, source_after = _observe_path(source)
+        destination_state, destination_after = _observe_path(destination)
+        committed = (
+            source_state == "absent"
+            and destination_state == "present"
+            and destination_after is not None
+            and _identity(destination_after) == source_identity
+        )
+        if committed:
+            raise StoreSafetyError(
+                "destination-install-uncertain",
+                "The destination contains the prepared directory, but the "
+                f"publication syscall reported an error: {destination}: {exc}",
+            ) from exc
+        if (
+            exc.errno in {errno.EEXIST, errno.ENOTEMPTY}
+            and source_state == "present"
+            and source_after is not None
+            and _identity(source_after) == source_identity
+            and destination_state == "present"
+        ):
+            raise StoreSafetyError(
+                "destination-exists",
+                f"Destination appeared before atomic installation: {destination}",
+            ) from exc
+        if (
+            source_state == "present"
+            and source_after is not None
+            and _identity(source_after) == source_identity
+            and destination_state == "absent"
+        ):
+            raise StoreSafetyError(
+                "destination-install-failed",
+                f"Cannot atomically install directory at {destination}: {exc}",
+            ) from exc
+        raise StoreSafetyError(
+            "destination-install-uncertain",
+            "Cannot prove whether directory publication committed; preserve both "
+            f"paths for inspection: source={source}, destination={destination}: {exc}",
+        ) from exc
+
+    source_state, _ = _observe_path(source)
+    destination_state, destination_after = _observe_path(destination)
+    if (
+        source_state != "absent"
+        or destination_state != "present"
+        or destination_after is None
+        or _identity(destination_after) != source_identity
+        or _access_policy(destination_after) != source_access_policy
+    ):
+        raise StoreSafetyError(
+            "destination-install-uncertain",
+            "The no-replace syscall returned success, but namespace revalidation "
+            f"could not bind the installed directory: {destination}",
+        )
+    try:
+        _fsync_directory(destination.parent)
+    except OSError as exc:
+        raise StoreSafetyError(
+            "destination-install-uncertain",
+            f"Directory was published but parent durability is unconfirmed: "
+            f"{destination}: {exc}",
+        ) from exc
 
 
 def _open_regular_readonly(path: Path) -> tuple[int, os.stat_result]:
@@ -427,6 +580,157 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _scan_exact_directory_entries(
+    path: Path,
+    expected_types: dict[str, int],
+    *,
+    missing_code: str,
+    mismatch_code: str,
+    bound_identity: dict[str, int] | None = None,
+    bound_access_policy: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    try:
+        path_before = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(missing_code, f"Directory is missing: {path}") from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            "directory-scan-inconclusive",
+            f"Cannot inspect directory before exact file-set validation: {path}: {exc}",
+        ) from exc
+    if not stat.S_ISDIR(path_before.st_mode):
+        raise StoreSafetyError(
+            mismatch_code,
+            f"Expected a real directory during exact file-set validation: {path}",
+        )
+
+    expected_identity = _identity(path_before)
+    expected_access_policy = _access_policy(path_before)
+    if bound_identity is not None and expected_identity != bound_identity:
+        raise StoreSafetyError(
+            "directory-identity-mismatch",
+            f"Directory object changed between validation phases: {path}",
+        )
+    if (
+        bound_access_policy is not None
+        and expected_access_policy != bound_access_policy
+    ):
+        raise StoreSafetyError(
+            "directory-access-policy-mismatch",
+            f"Directory access policy changed between validation phases: {path}",
+        )
+    scans: list[dict[str, int]] = []
+    for _ in range(2):
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError as exc:
+            raise StoreSafetyError(
+                "directory-identity-mismatch",
+                f"Directory disappeared during exact file-set validation: {path}",
+            ) from exc
+        except OSError as exc:
+            raise StoreSafetyError(
+                "directory-scan-inconclusive",
+                f"Cannot open directory for exact file-set validation: {path}: {exc}",
+            ) from exc
+        try:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or _identity(opened) != expected_identity
+            ):
+                raise StoreSafetyError(
+                    "directory-identity-mismatch",
+                    f"Directory object changed during exact file-set validation: {path}",
+                )
+            if _access_policy(opened) != expected_access_policy:
+                raise StoreSafetyError(
+                    "directory-access-policy-mismatch",
+                    f"Directory access policy changed during validation: {path}",
+                )
+            try:
+                with os.scandir(fd) as entries:
+                    scan: dict[str, int] = {}
+                    for entry in entries:
+                        name = os.fsdecode(entry.name)
+                        try:
+                            entry_stat = entry.stat(follow_symlinks=False)
+                        except FileNotFoundError as exc:
+                            raise StoreSafetyError(
+                                mismatch_code,
+                                "Directory membership changed during exact file-set "
+                                f"validation: {path}",
+                            ) from exc
+                        except OSError as exc:
+                            raise StoreSafetyError(
+                                "directory-scan-inconclusive",
+                                f"Cannot inspect directory entry without following "
+                                f"links: {path / name}: {exc}",
+                            ) from exc
+                        scan[name] = stat.S_IFMT(entry_stat.st_mode)
+            except StoreSafetyError:
+                raise
+            except OSError as exc:
+                raise StoreSafetyError(
+                    "directory-scan-inconclusive",
+                    f"Cannot enumerate directory for exact file-set validation: "
+                    f"{path}: {exc}",
+                ) from exc
+            opened_after = os.fstat(fd)
+            if _identity(opened_after) != expected_identity:
+                raise StoreSafetyError(
+                    "directory-identity-mismatch",
+                    f"Directory object changed during exact file-set validation: {path}",
+                )
+            if _access_policy(opened_after) != expected_access_policy:
+                raise StoreSafetyError(
+                    "directory-access-policy-mismatch",
+                    f"Directory access policy changed during validation: {path}",
+                )
+            scans.append(scan)
+        finally:
+            os.close(fd)
+
+    try:
+        path_after = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            "directory-identity-mismatch",
+            f"Directory disappeared during final file-set revalidation: {path}",
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            "directory-scan-inconclusive",
+            f"Cannot revalidate directory after exact file-set scan: {path}: {exc}",
+        ) from exc
+    if _identity(path_after) != expected_identity:
+        raise StoreSafetyError(
+            "directory-identity-mismatch",
+            f"Directory path was replaced during exact file-set validation: {path}",
+        )
+    if _access_policy(path_after) != expected_access_policy:
+        raise StoreSafetyError(
+            "directory-access-policy-mismatch",
+            f"Directory access policy changed during validation: {path}",
+        )
+    if scans[0] != scans[1] or scans[1] != expected_types:
+        raise StoreSafetyError(
+            mismatch_code,
+            f"Directory name/type set differs from the exact expected set: {path}",
+        )
+    return {
+        "identity": expected_identity,
+        "access_policy": expected_access_policy,
+        "entry_types": scans[1],
+    }
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -917,6 +1221,7 @@ def copy_db(
         )
     partial = destination.parent / f".{destination.name}.partial-{uuid.uuid4().hex}"
     partial.mkdir(mode=0o700)
+    retain_partial = False
     try:
         store_dir = partial / "group.com.apple.notes"
         captured = _capture_database_files(
@@ -978,15 +1283,13 @@ def copy_db(
                 "Notes.app started before the writeback-grade snapshot was finalized",
             )
         _write_json_atomic(partial / SNAPSHOT_MANIFEST, manifest)
-        if _lexists(destination):
-            raise StoreSafetyError(
-                "destination-exists",
-                f"Snapshot destination appeared before installation: {destination}",
-            )
-        os.rename(partial, destination)
-        _fsync_directory(destination.parent)
+        _publish_directory_no_replace(partial, destination)
+    except StoreSafetyError as exc:
+        if exc.code == "destination-install-uncertain":
+            retain_partial = True
+        raise
     finally:
-        if partial.exists():
+        if not retain_partial and partial.exists():
             shutil.rmtree(partial)
 
     return {
@@ -1030,17 +1333,13 @@ def validate_snapshot(snapshot_dir: Path) -> dict[str, Any]:
             "Snapshot manifest has duplicate or unsupported database file entries",
         )
     store_dir = snapshot_dir / "group.com.apple.notes"
-    try:
-        actual_names = {entry.name for entry in store_dir.iterdir() if entry.is_file()}
-    except FileNotFoundError as exc:
-        raise StoreSafetyError(
-            "snapshot-missing", f"Snapshot store is missing: {store_dir}"
-        ) from exc
-    if actual_names != expected_names:
-        raise StoreSafetyError(
-            "snapshot-file-set-mismatch",
-            f"Snapshot file set differs from its manifest: {store_dir}",
-        )
+    expected_store_types = {name: stat.S_IFREG for name in expected_names}
+    store_directory = _scan_exact_directory_entries(
+        store_dir,
+        expected_store_types,
+        missing_code="snapshot-missing",
+        mismatch_code="snapshot-file-set-mismatch",
+    )
     copied_main = store_dir / NOTE_STORE_MAIN
     manifest_by_name = {row.get("basename"): row for row in rows}
     for basename, row in manifest_by_name.items():
@@ -1075,6 +1374,14 @@ def validate_snapshot(snapshot_dir: Path) -> dict[str, Any]:
                     f"Snapshot bytes no longer match the manifest: {basename}",
                 )
         sqlite_integrity = _sqlite_integrity(recovered_main)
+    _scan_exact_directory_entries(
+        store_dir,
+        expected_store_types,
+        missing_code="snapshot-missing",
+        mismatch_code="snapshot-file-set-mismatch",
+        bound_identity=store_directory["identity"],
+        bound_access_policy=store_directory["access_policy"],
+    )
     return {
         "snapshot_dir": snapshot_dir,
         "manifest": manifest,
@@ -1111,6 +1418,7 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
         )
     partial = dest.parent / f".{dest.name}.partial-{uuid.uuid4().hex}"
     partial.mkdir(mode=0o700)
+    retain_partial = False
     try:
         staged_db = partial / NOTE_STORE_MAIN
         recovery = _recover_to_standalone(src, staged_db)
@@ -1132,15 +1440,13 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
             },
         }
         _write_json_atomic(partial / PATCH_MANIFEST, manifest)
-        if _lexists(dest):
-            raise StoreSafetyError(
-                "destination-exists",
-                f"Patch destination appeared before installation: {dest}",
-            )
-        os.rename(partial, dest)
-        _fsync_directory(dest.parent)
+        _publish_directory_no_replace(partial, dest)
+    except StoreSafetyError as exc:
+        if exc.code == "destination-install-uncertain":
+            retain_partial = True
+        raise
     finally:
-        if partial.exists():
+        if not retain_partial and partial.exists():
             shutil.rmtree(partial)
     return {
         "stage_dir": dest,
@@ -1154,6 +1460,16 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
 
 
 def validate_patch_stage(stage_dir: Path) -> dict[str, Any]:
+    expected_stage_types = {
+        NOTE_STORE_MAIN: stat.S_IFREG,
+        PATCH_MANIFEST: stat.S_IFREG,
+    }
+    stage_directory = _scan_exact_directory_entries(
+        stage_dir,
+        expected_stage_types,
+        missing_code="stage-missing",
+        mismatch_code="patch-file-set-mismatch",
+    )
     manifest = _load_manifest(stage_dir / PATCH_MANIFEST, PATCH_SCHEMA)
     database = manifest.get("database")
     if not isinstance(database, dict):
@@ -1167,18 +1483,6 @@ def validate_patch_stage(stage_dir: Path) -> dict[str, Any]:
         raise StoreSafetyError(
             "manifest-invalid",
             "Patch manifest database path is not canonical",
-        )
-    allowed_names = {NOTE_STORE_MAIN, PATCH_MANIFEST}
-    try:
-        actual_names = {entry.name for entry in stage_dir.iterdir() if entry.is_file()}
-    except FileNotFoundError as exc:
-        raise StoreSafetyError(
-            "stage-missing", f"Patch stage is missing: {stage_dir}"
-        ) from exc
-    if actual_names != allowed_names:
-        raise StoreSafetyError(
-            "patch-file-set-mismatch",
-            "Patch stage must contain only NoteStore.sqlite and patch-manifest.json",
         )
     with tempfile.TemporaryDirectory(
         prefix="apple-notes-stage-validation-"
@@ -1196,6 +1500,14 @@ def validate_patch_stage(stage_dir: Path) -> dict[str, Any]:
                 "Patch database no longer matches its manifest",
             )
         integrity = _sqlite_integrity(recovered_main)
+    _scan_exact_directory_entries(
+        stage_dir,
+        expected_stage_types,
+        missing_code="stage-missing",
+        mismatch_code="patch-file-set-mismatch",
+        bound_identity=stage_directory["identity"],
+        bound_access_policy=stage_directory["access_policy"],
+    )
     return {
         "stage_dir": stage_dir,
         "manifest": manifest,

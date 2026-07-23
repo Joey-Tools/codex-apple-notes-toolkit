@@ -7,6 +7,7 @@
 - [Stable Descriptor Capture](#stable-descriptor-capture)
 - [SQLite, WAL, And SHM Roles](#sqlite-wal-and-shm-roles)
 - [Integrity And Recovery](#integrity-and-recovery)
+- [Snapshot And Stage Publication](#snapshot-and-stage-publication)
 - [Patch And Writeback Boundary](#patch-and-writeback-boundary)
 - [Failure Classes](#failure-classes)
 - [Non-Guarantees](#non-guarantees)
@@ -26,6 +27,12 @@ Protect three properties independently:
    the pathname to resolve to that same object after the read.
 2. **Content stability**: hash the same opened descriptor twice and require equal SHA-256 and size.
 3. **Access policy**: require mode, owner, group, and platform file flags to remain unchanged.
+
+For the snapshot store directory and patch-stage directory, bind object identity and access policy
+in the same way. Treat the complete no-follow entry name/type map as directory content: an extra
+directory, FIFO, socket, device, or symlink—including a broken symlink—is a file-set mismatch.
+Scan the directory twice through opened descriptors. Do not infer mutation from directory `mtime`
+alone when identity, access policy, and both name/type scans remain stable.
 
 Record `mtime`, `ctime`, and link-count transitions, but do not classify those transitions alone as
 content or access-policy mutation. A metadata-only transition is acceptable only when the
@@ -101,6 +108,21 @@ Use the following recovery boundary:
 
 Keep the original snapshot manifest and raw file set until the task is complete.
 
+## Snapshot And Stage Publication
+
+Publish a completed snapshot or patch stage from its private partial directory with an atomic
+no-replace operation: `renamex_np(..., RENAME_EXCL)` on macOS or
+`renameat2(..., RENAME_NOREPLACE)` on Linux. If the platform primitive is unavailable, fail closed
+instead of falling back to a check-then-rename sequence. An existing destination, including an
+empty directory that appeared after an earlier check, must remain untouched.
+
+After any publication error, compare the private source and destination namespaces with the
+prepared directory's object identity. Report a proved pre-existing destination as
+`destination-exists`, a proved uncommitted failure as `destination-install-failed`, and a
+commit-then-error or any namespace state that cannot prove commit/non-commit as
+`destination-install-uncertain`. Preserve an uncertain path for inspection and do not retry into
+the same destination.
+
 ## Patch And Writeback Boundary
 
 Keep patch preparation separate from live replacement.
@@ -151,6 +173,8 @@ The helper emits stable error codes, including:
 - `source-identity-mismatch`, `source-content-mismatch`;
 - `source-access-policy-mismatch`;
 - `store-file-set-mismatch`;
+- `directory-identity-mismatch`, `directory-access-policy-mismatch`;
+- `directory-scan-inconclusive`;
 - `wal-invalid`, `sqlite-integrity-failed`;
 - `wal-shm-commit-mismatch`;
 - `notes-started-during-capture`, `notes-started-during-preflight`;
@@ -159,6 +183,8 @@ The helper emits stable error codes, including:
 - `backup-not-writeback-grade`, `baseline-identity-mismatch`;
 - `baseline-content-mismatch`, `baseline-access-policy-mismatch`;
 - `patch-file-set-mismatch`, `patch-content-mismatch`;
+- `destination-exists`, `destination-install-failed`;
+- `destination-install-uncertain`;
 - `post-writeback-identity-mismatch`, `post-writeback-file-set-mismatch`;
 - `post-writeback-content-mismatch`, `post-writeback-access-policy-mismatch`.
 

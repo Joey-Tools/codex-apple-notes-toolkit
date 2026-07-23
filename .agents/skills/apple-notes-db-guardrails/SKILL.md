@@ -63,6 +63,9 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" copy-db \
 ```
 
 Keep `snapshot-manifest.json` with the copied file set.
+Snapshot publication is atomic and no-replace on supported macOS/Linux filesystems.
+If publication reports `destination-install-uncertain`, preserve the reported paths, do not retry
+into that destination, and inspect whether the prepared directory committed.
 Use `validate-snapshot` before relying on an older snapshot:
 
 ```bash
@@ -102,6 +105,8 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" stage-patch \
 ```
 
 Require the stage to contain only `NoteStore.sqlite` and `patch-manifest.json`.
+Validation examines every no-follow directory entry and rejects extra directories, FIFOs, and
+symlinks as well as extra regular files.
 
 While Notes remains quit, bind the live store, fresh backup, and stage:
 
