@@ -206,6 +206,12 @@ non-absent or inconclusive sidecar observation, unreadable public path, persiste
 replacement, or public-main mismatch is `destination-install-uncertain`, never an uncommitted or
 successful result. Preserve the strong descriptor-bound main receipt and point-in-time sidecar
 observations, but do not call an unbound sidecar display path a verified recovery locator.
+For snapshot recovery, keep the output-parent scope and held snapshot artifact in the same
+transaction until their final revalidations finish. Once the public-main receipt has succeeded,
+translate every later output-parent, ancestor-chain, snapshot-directory, manifest, or snapshot-file
+identity/content/access-policy failure to `destination-install-uncertain`. Preserve
+`publication_state: uncertain`, `retry_safe: false`, the descriptor-bound parent/main
+identity/SHA-256/size/access-policy locator, and the underlying machine reason.
 
 The protected recovery property is that SQLite consumes exactly the image derived from the
 creation-receipt-bound main descriptor plus the last committed checksum-valid WAL prefix.
@@ -247,6 +253,17 @@ no-replace operation: `renamex_np(..., RENAME_EXCL)` on macOS or
 instead of falling back to a check-then-rename sequence. An existing destination, including an
 empty directory that appeared after an earlier check, must remain untouched.
 
+Before `copy-db` creates any destination-parent component, compare case-folded NFD path components
+against both Apple Notes live-container paths and bind those live containers plus the nearest
+existing destination ancestor. A lexical normalized overlap or a descriptor-ancestor identity
+match proves `snapshot-destination-inside-live-container`; an unavailable, replaced, or
+access-policy-mutated binding is `snapshot-destination-scope-inconclusive`. Reject
+`NoteStore.sqlite`, `NoteStore.sqlite-wal`, `NoteStore.sqlite-shm`, and
+`NoteStore.sqlite-journal` as directory components beneath either live container even when the
+corresponding sidecar is absent. Hold and revalidate live-container and destination-ancestor object
+identity, location scope, and access policy through publication. Directory child-entry churn is
+not itself content mutation outside those reserved names.
+
 Create the partial root through a parent directory descriptor, immediately bind the root and parent
 descriptors, then create and bind the nested `group.com.apple.notes` store relative to that held
 root. Hold all three descriptors, identities, and access policies through publication. Bind every
@@ -274,6 +291,10 @@ file, enforce the manifest-size bound, and require stable descriptor reads. Keep
 artifact-root binding alive after the receipt read and use it for every later root operation; bind
 nested directories and regular files only relative to that root. A consumer must not load the
 receipt, release or ignore its root binding, and then reopen the artifact pathname.
+Receipt-parent binding never leaks the generic prepared-directory taxonomy: a missing parent is
+`manifest-creation-receipt-missing`, a permission-denied parent is
+`manifest-creation-receipt-unreadable`, and symlink, identity/access-policy, open, or other
+revalidation failures are `manifest-creation-receipt-scope-inconclusive`.
 On writer failure, retain the created file and report the held parent/file descriptor identities,
 access policies, content status, and point-in-time namespace observations. Do not attempt automatic
 name-based cleanup: even descriptor-relative `stat(name)` followed by `unlink(name)` has a
@@ -441,6 +462,9 @@ The helper emits stable error codes, including:
 - `prepared-file-access-policy-mismatch`, `prepared-file-revalidation-inconclusive`;
 - `prepared-file-missing`, `prepared-file-set-mismatch`;
 - `prepared-manifest-mismatch`;
+- `snapshot-destination-inside-live-container`;
+- `snapshot-destination-reserved-store-path`;
+- `snapshot-destination-scope-inconclusive`;
 - `manifest-creation-receipt-required`, `manifest-creation-receipt-invalid`;
 - `manifest-creation-receipt-missing`, `manifest-creation-receipt-too-large`;
 - `manifest-creation-receipt-not-external`;

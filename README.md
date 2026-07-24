@@ -15,7 +15,10 @@ descriptor-backed image. Snapshot files, the nested store, and the snapshot
 root are fsynced bottom-up before publication. Publication uses held parent
 descriptors for rename, fsync, and terminal revalidation; retained sensitive
 partials and uncertain standalone destinations receive precise recovery
-locators. Snapshot sidecar and SQLite validation reuse the capture-bound file
+locators. Snapshot creation rejects case/NFD and descriptor-resolved aliases
+inside either live Notes container before creating destination parents, while
+post-publication recovery failures retain descriptor-bound uncertain-state
+evidence. Snapshot sidecar and SQLite validation reuse the capture-bound file
 descriptors, and uncertain directory publication records an exact
 descriptor-bound tree receipt. `merge-db` retains the legacy `merged_db` JSON
 key alongside `standalone_db`. The toolkit does not mutate the live Notes store.

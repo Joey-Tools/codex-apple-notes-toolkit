@@ -16,6 +16,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import uuid
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
@@ -145,6 +146,12 @@ class _ValidatedSnapshotArtifact:
         [Path, _BoundDirectory | None],
         dict[str, Any],
     ]
+
+
+@dataclass(frozen=True)
+class _SnapshotDestinationScope:
+    parent: _BoundDirectory
+    revalidate: Callable[[], dict[str, Any]]
 
 
 SNAPSHOT_FILE_CODES = _FileProtectionCodes(
@@ -4566,6 +4573,499 @@ def notes_is_running() -> bool:
     )
 
 
+def _normalized_scope_parts(path: Path) -> tuple[str, ...]:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    return tuple(
+        unicodedata.normalize("NFD", component).casefold()
+        for component in absolute.parts
+    )
+
+
+def _assert_snapshot_destination_lexically_outside_live_containers(
+    destination: Path,
+    live_containers: tuple[Path, ...],
+) -> None:
+    destination_parts = _normalized_scope_parts(destination)
+    reserved = {
+        unicodedata.normalize("NFD", basename).casefold()
+        for basename in NOTE_STORE_DISCOVERY_BASENAMES
+    }
+    for live_container in live_containers:
+        live_parts = _normalized_scope_parts(live_container)
+        if destination_parts[: len(live_parts)] != live_parts:
+            continue
+        suffix = destination_parts[len(live_parts) :]
+        reserved_component = next(
+            (component for component in suffix if component in reserved),
+            None,
+        )
+        if reserved_component is not None:
+            raise StoreSafetyError(
+                "snapshot-destination-reserved-store-path",
+                "Snapshot destination would use a live or reserved SQLite store "
+                "name as a directory, including through a case-insensitive or "
+                f"Unicode-normalized alias: {destination}",
+                details={
+                    "destination": str(destination),
+                    "live_container": str(live_container),
+                    "reserved_component_normalized": reserved_component,
+                    "overlap_detection": "normalized-lexical-scope",
+                    "mutation_performed": False,
+                },
+            )
+        raise StoreSafetyError(
+            "snapshot-destination-inside-live-container",
+            "Snapshot destination is inside an Apple Notes live container, "
+            "including through a case-insensitive or Unicode-normalized alias: "
+            f"{destination}",
+            details={
+                "destination": str(destination),
+                "live_container": str(live_container),
+                "overlap_detection": "normalized-lexical-scope",
+                "mutation_performed": False,
+            },
+        )
+
+
+def _raise_snapshot_destination_scope_inconclusive(
+    message: str,
+    *,
+    destination: Path,
+    cause: BaseException | None = None,
+) -> StoreSafetyError:
+    details: dict[str, Any] = {
+        "destination": str(destination),
+        "scope_evidence": "inconclusive",
+    }
+    if cause is not None:
+        details["underlying_error_type"] = type(cause).__name__
+        details["underlying_errno"] = getattr(cause, "errno", None)
+    return StoreSafetyError(
+        "snapshot-destination-scope-inconclusive",
+        message,
+        details=details,
+    )
+
+
+def _bind_snapshot_live_containers(
+    stack: ExitStack,
+    live_containers: tuple[Path, ...],
+    *,
+    destination: Path,
+) -> list[dict[str, Any]]:
+    bindings: list[dict[str, Any]] = []
+    for live_container in live_containers:
+        try:
+            os.stat(live_container)
+        except FileNotFoundError:
+            bindings.append(
+                {
+                    "path": live_container,
+                    "status": "absent",
+                }
+            )
+            continue
+        except OSError as exc:
+            raise _raise_snapshot_destination_scope_inconclusive(
+                "Cannot inspect an Apple Notes live container before snapshot "
+                f"destination validation: {live_container}: {exc}",
+                destination=destination,
+                cause=exc,
+            ) from exc
+        try:
+            fd, opened = stack.enter_context(
+                _bind_existing_directory_following_aliases(live_container)
+            )
+        except StoreSafetyError as exc:
+            raise _raise_snapshot_destination_scope_inconclusive(
+                "Cannot bind an Apple Notes live container while validating "
+                f"snapshot destination scope: {live_container}: {exc}",
+                destination=destination,
+                cause=exc,
+            ) from exc
+        bindings.append(
+            {
+                "path": live_container,
+                "status": "bound",
+                "fd": fd,
+                "opened": opened,
+            }
+        )
+    return bindings
+
+
+def _verify_snapshot_live_container_bindings(
+    bindings: list[dict[str, Any]],
+    *,
+    destination: Path,
+) -> list[dict[str, Any]]:
+    receipts: list[dict[str, Any]] = []
+    for binding in bindings:
+        live_container = Path(binding["path"])
+        if binding["status"] == "absent":
+            try:
+                os.stat(live_container)
+            except FileNotFoundError:
+                receipts.append(
+                    {
+                        "path": str(live_container),
+                        "status": "absent",
+                    }
+                )
+                continue
+            except OSError as exc:
+                raise _raise_snapshot_destination_scope_inconclusive(
+                    "Cannot revalidate an initially absent Apple Notes live "
+                    f"container: {live_container}: {exc}",
+                    destination=destination,
+                    cause=exc,
+                ) from exc
+            raise _raise_snapshot_destination_scope_inconclusive(
+                "An Apple Notes live container appeared during snapshot "
+                f"destination validation: {live_container}",
+                destination=destination,
+            )
+        fd = int(binding["fd"])
+        opened = binding["opened"]
+        try:
+            before = os.stat(live_container)
+            descriptor = os.fstat(fd)
+            after = os.stat(live_container)
+        except OSError as exc:
+            raise _raise_snapshot_destination_scope_inconclusive(
+                "Cannot revalidate a bound Apple Notes live container: "
+                f"{live_container}: {exc}",
+                destination=destination,
+                cause=exc,
+            ) from exc
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or not stat.S_ISDIR(descriptor.st_mode)
+            or not stat.S_ISDIR(after.st_mode)
+            or not _same_identity(opened, before)
+            or not _same_identity(before, descriptor)
+            or not _same_identity(descriptor, after)
+        ):
+            raise _raise_snapshot_destination_scope_inconclusive(
+                "An Apple Notes live-container object changed identity during "
+                f"snapshot destination validation: {live_container}",
+                destination=destination,
+            )
+        if (
+            _access_policy(opened) != _access_policy(before)
+            or _access_policy(before) != _access_policy(descriptor)
+            or _access_policy(descriptor) != _access_policy(after)
+        ):
+            raise _raise_snapshot_destination_scope_inconclusive(
+                "An Apple Notes live-container access policy changed during "
+                f"snapshot destination validation: {live_container}",
+                destination=destination,
+            )
+        receipts.append(
+            {
+                "path": str(live_container),
+                "status": "bound",
+                "identity": _identity(descriptor),
+                "access_policy": _access_policy(descriptor),
+            }
+        )
+    return receipts
+
+
+def _assert_snapshot_destination_ancestors_exclude_live_containers(
+    start_fd: int,
+    live_bindings: list[dict[str, Any]],
+    *,
+    destination: Path,
+    display_path: Path,
+) -> list[dict[str, int]]:
+    try:
+        chain = _descriptor_directory_ancestor_chain(
+            start_fd,
+            display_path=display_path,
+        )
+    except StoreSafetyError as exc:
+        raise _raise_snapshot_destination_scope_inconclusive(
+            "Cannot establish the descriptor-bound ancestor chain for the "
+            f"snapshot destination: {display_path}: {exc}",
+            destination=destination,
+            cause=exc,
+        ) from exc
+    chain_keys = {(row["device"], row["inode"]) for row in chain}
+    for binding in live_bindings:
+        if binding["status"] != "bound":
+            continue
+        opened = binding["opened"]
+        if _directory_identity_key(opened) not in chain_keys:
+            continue
+        raise StoreSafetyError(
+            "snapshot-destination-inside-live-container",
+            "Snapshot destination resolves inside an Apple Notes live "
+            "container through a descriptor-bound path or symlink alias: "
+            f"{display_path}",
+            details={
+                "destination": str(destination),
+                "live_container": str(binding["path"]),
+                "overlap_detection": "descriptor-ancestor-identity",
+            },
+        )
+    return chain
+
+
+def _create_bound_snapshot_destination_parent_components(
+    ancestor_fd: int,
+    ancestor: os.stat_result,
+    components: tuple[str, ...],
+    *,
+    live_bindings: list[dict[str, Any]],
+    destination: Path,
+    display_path: Path,
+) -> None:
+    current_fd: int | None = None
+    current_opened = ancestor
+    flags = _directory_open_flags()
+    try:
+        current_fd = os.open(".", flags, dir_fd=ancestor_fd)
+        if not _same_identity(current_opened, os.fstat(current_fd)):
+            raise _raise_snapshot_destination_scope_inconclusive(
+                "Bound snapshot-destination ancestor changed before parent "
+                f"creation: {display_path}",
+                destination=destination,
+            )
+        for component in components:
+            if component in {"", ".", ".."}:
+                raise _raise_snapshot_destination_scope_inconclusive(
+                    "Snapshot destination contains a non-canonical parent "
+                    f"component: {display_path}",
+                    destination=destination,
+                )
+            _verify_snapshot_live_container_bindings(
+                live_bindings,
+                destination=destination,
+            )
+            _assert_snapshot_destination_ancestors_exclude_live_containers(
+                current_fd,
+                live_bindings,
+                destination=destination,
+                display_path=display_path,
+            )
+            parent_before = os.fstat(current_fd)
+            if not _same_identity(
+                current_opened,
+                parent_before,
+            ) or _access_policy(current_opened) != _access_policy(parent_before):
+                raise _raise_snapshot_destination_scope_inconclusive(
+                    "Bound snapshot-destination ancestor changed before "
+                    f"descriptor-relative parent creation: {display_path}",
+                    destination=destination,
+                )
+            try:
+                os.mkdir(component, mode=0o700, dir_fd=current_fd)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise _raise_snapshot_destination_scope_inconclusive(
+                    "Cannot create the snapshot destination parent through its "
+                    f"bound ancestor: {display_path}: {exc}",
+                    destination=destination,
+                    cause=exc,
+                ) from exc
+            child_fd: int | None = None
+            try:
+                child_before = os.stat(
+                    component,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+                child_fd = os.open(component, flags, dir_fd=current_fd)
+                child_opened = os.fstat(child_fd)
+                child_after = os.stat(
+                    component,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+                parent_after = os.fstat(current_fd)
+            except OSError as exc:
+                if child_fd is not None:
+                    os.close(child_fd)
+                raise _raise_snapshot_destination_scope_inconclusive(
+                    "Cannot bind a descriptor-created snapshot destination "
+                    f"parent: {display_path}: {exc}",
+                    destination=destination,
+                    cause=exc,
+                ) from exc
+            if (
+                not stat.S_ISDIR(child_before.st_mode)
+                or not stat.S_ISDIR(child_opened.st_mode)
+                or not stat.S_ISDIR(child_after.st_mode)
+                or not _same_identity(child_before, child_opened)
+                or not _same_identity(child_opened, child_after)
+                or not _same_identity(current_opened, parent_after)
+            ):
+                os.close(child_fd)
+                raise _raise_snapshot_destination_scope_inconclusive(
+                    "A snapshot destination parent or its bound ancestor changed "
+                    f"identity during descriptor-relative creation: {display_path}",
+                    destination=destination,
+                )
+            if (
+                _access_policy(child_before) != _access_policy(child_opened)
+                or _access_policy(child_opened) != _access_policy(child_after)
+                or _access_policy(current_opened) != _access_policy(parent_after)
+            ):
+                os.close(child_fd)
+                raise _raise_snapshot_destination_scope_inconclusive(
+                    "A snapshot destination parent or its bound ancestor changed "
+                    f"access policy during descriptor-relative creation: {display_path}",
+                    destination=destination,
+                )
+            try:
+                _assert_snapshot_destination_ancestors_exclude_live_containers(
+                    child_fd,
+                    live_bindings,
+                    destination=destination,
+                    display_path=display_path,
+                )
+            except Exception:
+                os.close(child_fd)
+                raise
+            os.close(current_fd)
+            current_fd = child_fd
+            child_fd = None
+            current_opened = child_opened
+    finally:
+        if current_fd is not None:
+            os.close(current_fd)
+
+
+@contextmanager
+def _bind_snapshot_destination_parent_outside_live_containers(
+    paths: NoteStorePaths,
+    destination: Path,
+) -> Iterator[_SnapshotDestinationScope]:
+    """Bind a snapshot parent only after a zero-write live-scope proof."""
+
+    live_containers = (paths.group_container, paths.app_container)
+    _assert_snapshot_destination_lexically_outside_live_containers(
+        destination,
+        live_containers,
+    )
+    with ExitStack() as stack:
+        live_bindings = _bind_snapshot_live_containers(
+            stack,
+            live_containers,
+            destination=destination,
+        )
+        try:
+            nearest_path, missing_components = _nearest_existing_output_ancestor(
+                destination.parent
+            )
+        except StoreSafetyError as exc:
+            raise _raise_snapshot_destination_scope_inconclusive(
+                "Cannot locate a stable existing ancestor for the snapshot "
+                f"destination: {destination.parent}: {exc}",
+                destination=destination,
+                cause=exc,
+            ) from exc
+        try:
+            with _bind_existing_directory_following_aliases(nearest_path) as (
+                ancestor_fd,
+                ancestor,
+            ):
+                _verify_snapshot_live_container_bindings(
+                    live_bindings,
+                    destination=destination,
+                )
+                _assert_snapshot_destination_ancestors_exclude_live_containers(
+                    ancestor_fd,
+                    live_bindings,
+                    destination=destination,
+                    display_path=nearest_path,
+                )
+                _create_bound_snapshot_destination_parent_components(
+                    ancestor_fd,
+                    ancestor,
+                    missing_components,
+                    live_bindings=live_bindings,
+                    destination=destination,
+                    display_path=destination.parent,
+                )
+        except StoreSafetyError as exc:
+            if exc.code in {
+                "snapshot-destination-inside-live-container",
+                "snapshot-destination-reserved-store-path",
+                "snapshot-destination-scope-inconclusive",
+            }:
+                raise
+            raise _raise_snapshot_destination_scope_inconclusive(
+                "Cannot bind or create a safe snapshot destination parent: "
+                f"{destination.parent}: {exc}",
+                destination=destination,
+                cause=exc,
+            ) from exc
+        try:
+            output_parent = stack.enter_context(
+                _bind_existing_directory(destination.parent)
+            )
+        except StoreSafetyError as exc:
+            raise _raise_snapshot_destination_scope_inconclusive(
+                "Cannot bind the snapshot destination parent after descriptor-"
+                f"relative creation: {destination.parent}: {exc}",
+                destination=destination,
+                cause=exc,
+            ) from exc
+
+        def revalidate() -> dict[str, Any]:
+            _assert_snapshot_destination_lexically_outside_live_containers(
+                destination,
+                live_containers,
+            )
+            live_receipts = _verify_snapshot_live_container_bindings(
+                live_bindings,
+                destination=destination,
+            )
+            try:
+                parent_receipt = _verify_bound_directory_namespace(output_parent)
+            except StoreSafetyError as exc:
+                raise _raise_snapshot_destination_scope_inconclusive(
+                    "Cannot revalidate the descriptor-bound snapshot destination "
+                    f"parent: {destination.parent}: {exc}",
+                    destination=destination,
+                    cause=exc,
+                ) from exc
+            ancestor_chain = (
+                _assert_snapshot_destination_ancestors_exclude_live_containers(
+                    output_parent.fd,
+                    live_bindings,
+                    destination=destination,
+                    display_path=destination.parent,
+                )
+            )
+            return {
+                "schema": "apple-notes-snapshot-destination-scope/v1",
+                "destination": str(destination),
+                "parent": parent_receipt,
+                "live_containers": live_receipts,
+                "ancestor_chain": ancestor_chain,
+                "protected_properties": {
+                    "object_identity": ["device", "inode", "file_type"],
+                    "location_scope": (
+                        "normalized-lexical-and-descriptor-ancestor-exclusion"
+                    ),
+                    "access_policy": ["mode", "uid", "gid", "flags"],
+                    "directory_entry_churn": (
+                        "not-treated-as-content-mutation-outside-reserved-names"
+                    ),
+                },
+            }
+
+        revalidate()
+        yield _SnapshotDestinationScope(
+            parent=output_parent,
+            revalidate=revalidate,
+        )
+
+
 def probe_db_access(paths: NoteStorePaths) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     for path in (paths.group_container, paths.app_container):
@@ -6843,6 +7343,11 @@ def _recover_validated_clone_to_standalone(
                     prepared,
                     out,
                 )
+                descriptor_bound_destination = _descriptor_bound_destination_receipt(
+                    output_parent_binding.fd,
+                    prepared,
+                    out,
+                )
             except StoreSafetyError as exc:
                 descriptor_bound_destination: dict[str, Any] | None = None
                 try:
@@ -6885,6 +7390,7 @@ def _recover_validated_clone_to_standalone(
         "access_policy": fingerprint["access_policy"],
         "terminal_sidecar_revalidation": terminal_sidecars,
         "terminal_public_path_revalidation": terminal_public_output,
+        "descriptor_bound_destination": descriptor_bound_destination,
     }
 
 
@@ -6941,8 +7447,9 @@ def copy_db(
             "Notes.app is running; quit it before using --require-notes-quit",
         )
 
-    destination = dest or _timestamped_tmp_dir("apple-notes-probe")
-    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    destination = Path(
+        os.path.abspath(os.fspath(dest or _timestamped_tmp_dir("apple-notes-probe")))
+    )
     if _lexists(destination):
         raise StoreSafetyError(
             "destination-exists", f"Destination already exists: {destination}"
@@ -6950,9 +7457,14 @@ def copy_db(
     partial = destination.parent / f".{destination.name}.partial-{uuid.uuid4().hex}"
     try:
         with (
+            _bind_snapshot_destination_parent_outside_live_containers(
+                paths,
+                destination,
+            ) as destination_scope,
             _create_bound_directory(
                 partial,
                 retain_failure_receipt=True,
+                parent_binding=destination_scope.parent,
             ) as bound_root,
             ExitStack() as snapshot_stack,
         ):
@@ -7118,6 +7630,7 @@ def copy_db(
             ) as prepared_files:
 
                 def verify_before_snapshot_rename() -> None:
+                    destination_scope.revalidate()
                     _scan_exact_directory_entries(
                         store_dir,
                         expected_names,
@@ -7182,6 +7695,7 @@ def copy_db(
                         bound_identity=root_receipt["identity"],
                         bound_access_policy=root_receipt["access_policy"],
                     )
+                    destination_scope.revalidate()
 
                 def build_descriptor_snapshot_tree_receipt(
                     published_basename: str,
@@ -7215,6 +7729,7 @@ def copy_db(
                     ),
                 )
                 try:
+                    destination_scope.revalidate()
                     _scan_exact_directory_entries(
                         destination,
                         {
@@ -7242,6 +7757,7 @@ def copy_db(
                         manifest_receipt=manifest_receipt,
                         file_receipts=file_receipts,
                     )
+                    destination_scope.revalidate()
                 except Exception as exc:
                     raise StoreSafetyError(
                         "destination-install-uncertain",
@@ -7540,6 +8056,19 @@ def _validated_snapshot_artifact(
             inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
             mismatch_code="snapshot-file-set-mismatch",
         )
+        _verify_bound_regular_file_at(
+            manifest_bound,
+            SNAPSHOT_FILE_CODES,
+            dir_fd=artifact_root.fd,
+            basename=SNAPSHOT_MANIFEST,
+        )
+        for basename, bound_file in bound_files.items():
+            _verify_bound_regular_file_at(
+                bound_file,
+                SNAPSHOT_FILE_CODES,
+                dir_fd=store_binding.fd,
+                basename=basename,
+            )
         verified = [
             _verify_bound_regular_file_at(
                 bound_files[basename],
@@ -7614,6 +8143,19 @@ def _validated_snapshot_artifact(
             inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
             mismatch_code="snapshot-file-set-mismatch",
         )
+        _verify_bound_regular_file_at(
+            manifest_bound,
+            SNAPSHOT_FILE_CODES,
+            dir_fd=artifact_root.fd,
+            basename=SNAPSHOT_MANIFEST,
+        )
+        for basename, bound_file in bound_files.items():
+            _verify_bound_regular_file_at(
+                bound_file,
+                SNAPSHOT_FILE_CODES,
+                dir_fd=store_binding.fd,
+                basename=basename,
+            )
 
 
 def validate_snapshot(
@@ -7820,6 +8362,42 @@ def _assert_output_ancestors_exclude_snapshot(
     return chain
 
 
+def _exception_chain_contains_permission_error(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, PermissionError):
+            return True
+        current = current.__cause__
+    return False
+
+
+@contextmanager
+def _bind_manifest_creation_receipt_parent(
+    path: Path,
+) -> Iterator[_BoundDirectory]:
+    """Bind a receipt parent while preserving the public receipt taxonomy."""
+
+    entered = False
+    try:
+        with _bind_existing_directory(path) as binding:
+            entered = True
+            yield binding
+    except StoreSafetyError as exc:
+        if entered:
+            raise
+        if exc.code == "prepared-directory-missing":
+            code = "manifest-creation-receipt-missing"
+        elif _exception_chain_contains_permission_error(exc):
+            code = "manifest-creation-receipt-unreadable"
+        else:
+            code = "manifest-creation-receipt-scope-inconclusive"
+        raise StoreSafetyError(
+            code,
+            "Cannot bind the manifest creation receipt parent with stable "
+            f"identity and access-policy evidence: {path}: {exc}",
+        ) from exc
+
+
 def _load_external_manifest_creation_receipt(
     receipt_file: Path,
     *,
@@ -7861,7 +8439,9 @@ def _load_external_manifest_creation_receipt(
         inconclusive_code=inconclusive_code,
         mismatch_code=mismatch_code,
     )
-    with _bind_existing_directory(receipt_file.parent) as bound_receipt_parent:
+    with _bind_manifest_creation_receipt_parent(
+        receipt_file.parent
+    ) as bound_receipt_parent:
         try:
             _assert_output_ancestors_exclude_snapshot(
                 bound_receipt_parent.fd,
@@ -7898,14 +8478,7 @@ def _load_external_manifest_creation_receipt(
                     basename=receipt_file.name,
                 )
         except StoreSafetyError as exc:
-            cause: BaseException | None = exc
-            permission_failure = False
-            while cause is not None:
-                if isinstance(cause, PermissionError):
-                    permission_failure = True
-                    break
-                cause = cause.__cause__
-            if not permission_failure:
+            if not _exception_chain_contains_permission_error(exc):
                 raise
             code = (
                 "manifest-creation-receipt-revalidation-unreadable"
@@ -8199,36 +8772,77 @@ def recover_snapshot(
     manifest_creation_receipt_file: Path | None = None,
 ) -> dict[str, Any]:
     source = snapshot_dir / "group.com.apple.notes" / NOTE_STORE_MAIN
-    with _validated_snapshot_artifact(
-        snapshot_dir,
-        manifest_creation_receipt,
-        manifest_creation_receipt_file=manifest_creation_receipt_file,
-    ) as artifact:
-        with _bind_recovery_output_parent_outside_snapshot(
-            artifact.artifact_root,
-            out,
-        ) as output_parent:
+    recovered: dict[str, Any] | None = None
+    result: dict[str, Any] | None = None
+    try:
+        with _validated_snapshot_artifact(
+            snapshot_dir,
+            manifest_creation_receipt,
+            manifest_creation_receipt_file=manifest_creation_receipt_file,
+        ) as artifact:
             validation = artifact.public_result
-            recovered = _recover_validated_clone_to_standalone(
-                artifact.recovered_main,
+            with _bind_recovery_output_parent_outside_snapshot(
+                artifact.artifact_root,
                 out,
-                source_db=source,
-                recovery_evidence=artifact.recovery_evidence,
-                source_integrity=artifact.source_integrity,
-                source_revalidate=artifact.revalidate_recovery_clone,
-                source_backup=artifact.backup_recovery_clone,
-                output_parent_binding=output_parent,
-            )
-        return {
-            "snapshot_dir": snapshot_dir,
-            "snapshot_validation": {
-                "sqlite_validation": validation["sqlite_validation"],
-                "sidecar_consistency": validation["sidecar_consistency"],
-                "source_integrity": artifact.source_integrity,
-                "manifest_creation_receipt": validation["manifest_creation_receipt"],
-            },
-            "recovered": recovered,
-        }
+            ) as output_parent:
+                recovered = _recover_validated_clone_to_standalone(
+                    artifact.recovered_main,
+                    out,
+                    source_db=source,
+                    recovery_evidence=artifact.recovery_evidence,
+                    source_integrity=artifact.source_integrity,
+                    source_revalidate=artifact.revalidate_recovery_clone,
+                    source_backup=artifact.backup_recovery_clone,
+                    output_parent_binding=output_parent,
+                )
+            result = {
+                "snapshot_dir": snapshot_dir,
+                "snapshot_validation": {
+                    "sqlite_validation": validation["sqlite_validation"],
+                    "sidecar_consistency": validation["sidecar_consistency"],
+                    "source_integrity": artifact.source_integrity,
+                    "manifest_creation_receipt": validation[
+                        "manifest_creation_receipt"
+                    ],
+                },
+                "recovered": recovered,
+            }
+    except Exception as exc:
+        if recovered is None:
+            raise
+        descriptor_bound_destination = recovered.get("descriptor_bound_destination")
+        details = _publication_details(
+            "uncertain",
+            prepared=None,
+            destination=out,
+            retry_safe=False,
+            descriptor_bound_destination=(
+                descriptor_bound_destination
+                if isinstance(descriptor_bound_destination, dict)
+                else None
+            ),
+        )
+        if isinstance(exc, StoreSafetyError):
+            details = _merge_recovery_details(details, exc.details)
+            details["post_publication_error_code"] = exc.code
+        else:
+            details["post_publication_error_type"] = type(exc).__name__
+            details["post_publication_errno"] = getattr(exc, "errno", None)
+        details["terminal_sidecar_revalidation"] = recovered[
+            "terminal_sidecar_revalidation"
+        ]
+        details["terminal_public_path_revalidation"] = recovered[
+            "terminal_public_path_revalidation"
+        ]
+        raise StoreSafetyError(
+            "destination-install-uncertain",
+            "The standalone database was published and its public main-file "
+            "receipt completed, but a later transaction-scoped parent, ancestor, "
+            f"or snapshot revalidation failed: {out}: {exc}",
+            details=details,
+        ) from exc
+    assert result is not None
+    return result
 
 
 def stage_patch(src: Path, dest: Path) -> dict[str, Any]:

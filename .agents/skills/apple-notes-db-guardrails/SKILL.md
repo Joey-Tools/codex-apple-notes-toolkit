@@ -54,6 +54,15 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" copy-db \
   > /tmp/<task-snapshot>.creation-result.json
 ```
 
+Before creating even the destination parent, `copy-db` normalizes the requested path with
+case-folded NFD components and binds the nearest existing ancestor plus both Apple Notes live
+containers. It rejects a normalized lexical overlap or descriptor-ancestor identity match, and it
+never creates a directory at `NoteStore.sqlite`, `-wal`, `-shm`, or `-journal` under a live
+container—even when that sidecar is currently absent. Live-container and destination-ancestor
+identity and access policy remain bound through publication; unrelated child-entry churn is not a
+content mutation. Treat `snapshot-destination-scope-inconclusive` as fail-closed, distinct from a
+proved `snapshot-destination-inside-live-container` overlap.
+
 Treat a snapshot captured while Notes is running as tentative.
 Do not use it for absence claims, exact counts, patch planning, or writeback.
 
@@ -213,6 +222,12 @@ receipt, followed by a terminal no-follow destination observation through that s
 descriptor. In-place byte or mode drift, an appearing destination, or unavailable terminal
 destination evidence makes `retry_safe: false`, even when the source inode remains named and an
 earlier destination observation was absent.
+For `recover-snapshot`, the output-parent, ancestor-exclusion, and held snapshot checks remain one
+transaction after the standalone main file's public-path receipt completes. Any later parent,
+ancestor, manifest, or snapshot-file identity/content/access-policy failure is still
+`destination-install-uncertain` with `publication_state: uncertain`, `retry_safe: false`, and the
+descriptor-bound destination receipt; it must not escape as a pre-publication prepared/snapshot
+error.
 
 The packaged helper remains compatible with Python 3.9. Do not use newer runtime-only call
 arguments, such as `zip(..., strict=True)`, without adding a consistent minimum-version gate.
