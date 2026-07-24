@@ -253,16 +253,27 @@ no-replace operation: `renamex_np(..., RENAME_EXCL)` on macOS or
 instead of falling back to a check-then-rename sequence. An existing destination, including an
 empty directory that appeared after an earlier check, must remain untouched.
 
-Before `copy-db` creates any destination-parent component, compare case-folded NFD path components
+Before `copy-db`, `merge-db`, `recover-snapshot`, or `stage-patch` creates any destination-parent
+component or output, enter one shared live-container guard. Compare case-folded NFD path components
 against both Apple Notes live-container paths and bind those live containers plus the nearest
-existing destination ancestor. A lexical normalized overlap or a descriptor-ancestor identity
-match proves `snapshot-destination-inside-live-container`; an unavailable, replaced, or
-access-policy-mutated binding is `snapshot-destination-scope-inconclusive`. Reject
-`NoteStore.sqlite`, `NoteStore.sqlite-wal`, `NoteStore.sqlite-shm`, and
-`NoteStore.sqlite-journal` as directory components beneath either live container even when the
-corresponding sidecar is absent. Hold and revalidate live-container and destination-ancestor object
-identity, location scope, and access policy through publication. Directory child-entry churn is
-not itself content mutation outside those reserved names.
+existing destination ancestor. Reject either direction of normalized ancestor/descendant overlap.
+A lexical normalized overlap or a descriptor-ancestor identity match proves
+`snapshot-destination-inside-live-container`; an unavailable, replaced, or access-policy-mutated
+binding is `snapshot-destination-scope-inconclusive`. Reject `NoteStore.sqlite`,
+`NoteStore.sqlite-wal`, `NoteStore.sqlite-shm`, and `NoteStore.sqlite-journal` as destination path
+components even when the corresponding live sidecar is absent. This guard precedes the first
+mkdir, file creation, partial, backup, manifest/receipt, helper output, or rename. Hold and
+revalidate live-container and destination-ancestor object identity, location scope, and access
+policy through publication. Directory child-entry churn is not itself content mutation outside
+those reserved names.
+
+Darwin root aliases are an explicit, exact registry rather than a general symlink exception:
+`/tmp -> /private/tmp`, `/var -> /private/var`, and `/etc -> /private/etc`. Bind the alias parent,
+the no-follow alias entry identity/access policy, the exact link text, the followed canonical
+target, and the canonical target parent before descending. Use the canonical target descriptors
+for all mutation, and revalidate both alias and canonical namespaces before each write and at
+terminal boundaries. Reject unregistered symlinks, case-only spellings, NFC/NFD variants,
+retargeting, replacement, and mocked ABA observations before mutation.
 
 Create the partial root through a parent directory descriptor, immediately bind the root and parent
 descriptors, then create and bind the nested `group.com.apple.notes` store relative to that held
@@ -333,6 +344,13 @@ If source or destination namespace observation is unavailable, still report
 `publication_state: uncertain`, `retry_safe: false`, and descriptor-bound parent/prepared-root plus
 last-verified target-tree evidence. Mark unavailable namespace evidence as inconclusive instead of
 omitting the recovery locator.
+Once the no-replace rename is known to have committed, catch every ordinary `Exception` from later
+descriptor stat/read, parent fsync, receipt construction, tree scan, or public-path revalidation
+and return `destination-install-uncertain`, `publication_state: uncertain`, and `retry_safe:
+false`. This includes raw `ENOENT`, `EACCES`, `EIO`, and unexpected runtime exceptions. If a
+terminal receipt itself cannot be completed, retain last-verified descriptor-bound
+parent/prepared-root evidence and mark the sub-check inconclusive. Do not catch `BaseException`;
+`KeyboardInterrupt` and `SystemExit` retain process-control semantics.
 
 Standalone database publication uses an atomic no-replace rename from a descriptor-bound private
 file. Bind the creation-time private parent and operate on the exact source and destination leaf
@@ -348,6 +366,11 @@ Every rename, parent fsync, and final fingerprint error must be classified:
   descriptor-relative no-follow observation through that same parent still proves the destination
   absent;
 - `uncertain`: the destination may be committed or its durability/final fingerprint is not proved.
+
+After commit, the uncertain classification also covers every ordinary exception from terminal
+sidecar absence checks, descriptor-bound receipt construction, and public parent/main
+revalidation. A failed terminal evidence sub-check never falls back to a pre-publication
+`prepared-operation-failed` result.
 
 Return `publication_state`, `retry_safe`, and `recovery_locators` in error details. Never encourage
 a retry for `uncertain`. Include a verified prepared pathname only when its current parent and leaf

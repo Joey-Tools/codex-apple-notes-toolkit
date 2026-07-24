@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
@@ -700,6 +701,265 @@ raise SystemExit(2)
             )
             mkdir.assert_not_called()
             self.assertFalse(reserved.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS root alias contract")
+    def test_copy_db_supports_real_macos_tmp_alias(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            tempfile.NamedTemporaryFile(
+                prefix="apple-notes-alias-name-",
+                dir="/tmp",
+            ) as unique_name,
+        ):
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = Path(f"{unique_name.name}-snapshot")
+            try:
+                with mock.patch.object(
+                    MODULE,
+                    "notes_is_running",
+                    return_value=False,
+                ):
+                    result = self._copy_db(
+                        paths,
+                        dest=destination,
+                        require_notes_quit=True,
+                    )
+                self.assertEqual(Path(result["dest"]), destination)
+                self.assertTrue(destination.is_dir())
+                self.assertEqual(
+                    self._validate_snapshot(destination)["sqlite_validation"]["result"],
+                    "ok",
+                )
+            finally:
+                if destination.exists():
+                    shutil.rmtree(destination)
+
+    def test_trusted_alias_revalidation_rejects_retarget_and_mocked_aba(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_root = root / "live"
+            live_root.mkdir()
+            paths = self._make_paths(live_root)
+            target = root / "canonical"
+            alternate = root / "alternate"
+            target.mkdir()
+            alternate.mkdir()
+            alias = root / "trusted-alias"
+            alias.symlink_to(target, target_is_directory=True)
+            destination = alias / "output"
+            registry = ((alias, target),)
+
+            with mock.patch.object(
+                MODULE,
+                "_trusted_directory_alias_registry",
+                return_value=registry,
+            ):
+                with MODULE._bind_live_safe_destination_parent(
+                    paths,
+                    destination,
+                ) as scope:
+                    alias.unlink()
+                    alias.symlink_to(alternate, target_is_directory=True)
+                    with self.assertRaises(MODULE.StoreSafetyError) as retargeted:
+                        scope.revalidate()
+                    self._assert_safety_code(
+                        "snapshot-destination-scope-inconclusive",
+                        retargeted,
+                    )
+
+            alias.unlink()
+            alias.symlink_to(target, target_is_directory=True)
+            with mock.patch.object(
+                MODULE,
+                "_trusted_directory_alias_registry",
+                return_value=registry,
+            ):
+                with MODULE._bind_live_safe_destination_parent(
+                    paths,
+                    destination,
+                ) as scope:
+                    real_readlink = MODULE.os.readlink
+                    injected = False
+
+                    def readlink_with_mocked_aba(
+                        path: object,
+                        *args: object,
+                        **kwargs: object,
+                    ) -> str:
+                        nonlocal injected
+                        if not injected and os.fspath(path) == alias.name:
+                            injected = True
+                            return os.path.relpath(alternate, alias.parent)
+                        return real_readlink(path, *args, **kwargs)
+
+                    with (
+                        mock.patch.object(
+                            MODULE.os,
+                            "readlink",
+                            side_effect=readlink_with_mocked_aba,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as aba,
+                    ):
+                        scope.revalidate()
+                    self._assert_safety_code(
+                        "snapshot-destination-scope-inconclusive",
+                        aba,
+                    )
+                    self.assertTrue(injected)
+            self.assertEqual(list(target.iterdir()), [])
+            self.assertEqual(list(alternate.iterdir()), [])
+
+    def test_untrusted_case_and_nfd_aliases_fail_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_root = root / "live"
+            live_root.mkdir()
+            paths = self._make_paths(live_root)
+            target = root / "canonical"
+            target.mkdir()
+            registered_alias = root / "TrústAlias"
+            variants = (
+                root / "trústalias",
+                root / unicodedata.normalize("NFD", registered_alias.name),
+            )
+            for index, variant in enumerate(variants):
+                if variant.exists() or variant.is_symlink():
+                    variant.unlink()
+                variant.symlink_to(target, target_is_directory=True)
+                destination = variant / f"output-{index}"
+                with (
+                    self.subTest(variant=variant.name),
+                    mock.patch.object(
+                        MODULE,
+                        "_trusted_directory_alias_registry",
+                        return_value=((registered_alias, target),),
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    with MODULE._bind_live_safe_destination_parent(
+                        paths,
+                        destination,
+                    ):
+                        self.fail("untrusted alias must not enter the write scope")
+                self._assert_safety_code(
+                    "snapshot-destination-scope-inconclusive",
+                    raised,
+                )
+                self.assertEqual(list(target.iterdir()), [])
+                variant.unlink()
+
+    def test_all_write_commands_share_zero_write_live_container_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            live = paths.group_container / MODULE.NOTE_STORE_MAIN
+            self._create_db(live)
+            edited = root / "edited.sqlite"
+            self._create_db(edited, value="edited")
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+            snapshot_receipt = self._snapshot_manifest_receipts[snapshot_dir]
+
+            operations = (
+                (
+                    "copy-db",
+                    lambda destination: MODULE.copy_db(
+                        paths,
+                        dest=destination,
+                        require_notes_quit=False,
+                    ),
+                ),
+                (
+                    "merge-db",
+                    lambda destination: MODULE.merge_db(
+                        live,
+                        destination,
+                        paths=paths,
+                    ),
+                ),
+                (
+                    "stage-patch",
+                    lambda destination: MODULE.stage_patch(
+                        edited,
+                        destination,
+                        paths=paths,
+                    ),
+                ),
+                (
+                    "recover-snapshot",
+                    lambda destination: MODULE.recover_snapshot(
+                        snapshot_dir,
+                        destination,
+                        snapshot_receipt,
+                        paths=paths,
+                    ),
+                ),
+            )
+            for live_container in (paths.group_container, paths.app_container):
+                for command, operation in operations:
+                    destination = live_container / f"blocked-{command}"
+                    before = sorted(os.listdir(live_container))
+                    with (
+                        self.subTest(
+                            command=command,
+                            live_container=live_container.name,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "notes_is_running",
+                            return_value=False,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        operation(destination)
+                    self._assert_safety_code(
+                        "snapshot-destination-inside-live-container",
+                        raised,
+                    )
+                    self.assertEqual(sorted(os.listdir(live_container)), before)
+                    self.assertFalse(destination.exists())
+
+    def test_live_scope_rejects_reserved_aliases_and_ancestor_traps_without_writes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            destinations = (
+                root / MODULE.NOTE_STORE_MAIN / "output",
+                root / MODULE.NOTE_STORE_ROLLBACK_JOURNAL.swapcase() / "output",
+            )
+            for destination in destinations:
+                with (
+                    self.subTest(destination=destination),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    with MODULE._bind_live_safe_destination_parent(
+                        paths,
+                        destination,
+                    ):
+                        self.fail("reserved destination must not enter write scope")
+                self._assert_safety_code(
+                    "snapshot-destination-reserved-store-path",
+                    raised,
+                )
+                self.assertFalse(destination.parent.exists())
+            with self.assertRaises(MODULE.StoreSafetyError) as ancestor:
+                with MODULE._bind_live_safe_destination_parent(paths, root):
+                    self.fail("live-container ancestor must not enter write scope")
+            self._assert_safety_code(
+                "snapshot-destination-inside-live-container",
+                ancestor,
+            )
 
     def test_source_revalidation_maps_hash_eio_to_inconclusive(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5827,13 +6087,14 @@ raise SystemExit(2)
             recovered = root / "recovered.sqlite"
             original_bind = MODULE._bind_existing_directory
             snapshot_bind_count = 0
+            _, expected_bound_snapshot, _ = MODULE._trusted_alias_paths(snapshot_dir)
 
             @contextmanager
             def count_snapshot_bind(
                 path: Path,
             ) -> Iterator[MODULE._BoundDirectory]:
                 nonlocal snapshot_bind_count
-                if path == snapshot_dir:
+                if path == expected_bound_snapshot:
                     snapshot_bind_count += 1
                 with original_bind(path) as binding:
                     yield binding
@@ -7367,6 +7628,141 @@ raise SystemExit(2)
             )
             self.assertFalse(raised.exception.details["retry_safe"])
             self.assertTrue(destination.is_file())
+
+    def test_all_standalone_terminal_boundaries_translate_raw_failures_to_uncertain(
+        self,
+    ) -> None:
+        boundaries = (
+            "_verify_installed_file_path",
+            "_terminal_standalone_sidecar_absence_receipt",
+            "_terminal_public_standalone_output_receipt",
+            "_descriptor_bound_destination_receipt",
+        )
+        failures: tuple[BaseException, ...] = (
+            OSError(errno.ENOENT, "simulated terminal ENOENT"),
+            OSError(errno.EACCES, "simulated terminal EACCES"),
+            OSError(errno.EIO, "simulated terminal EIO"),
+            RuntimeError("simulated unexpected terminal descriptor failure"),
+        )
+        for boundary in boundaries:
+            for failure in failures:
+                with (
+                    self.subTest(boundary=boundary, failure=type(failure).__name__),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    root = Path(temp_dir)
+                    paths = self._make_paths(root)
+                    source = paths.group_container / MODULE.NOTE_STORE_MAIN
+                    self._create_db(source)
+                    destination = root / "recovered.sqlite"
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            boundary,
+                            side_effect=failure,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        MODULE.merge_db(
+                            source,
+                            destination,
+                            paths=paths,
+                        )
+                    self._assert_safety_code(
+                        "destination-install-uncertain",
+                        raised,
+                    )
+                    details = raised.exception.details
+                    self.assertEqual(details["publication_state"], "uncertain")
+                    self.assertFalse(details["retry_safe"])
+                    self.assertTrue(destination.is_file())
+                    locators = details["recovery_locators"]
+                    self.assertIn(
+                        "descriptor_bound_prepared_file",
+                        locators,
+                    )
+                    fallback = locators["descriptor_bound_prepared_file"]
+                    self.assertIn(
+                        fallback["evidence_status"], {"checked", "inconclusive"}
+                    )
+                    self.assertIn("namespace_observations", fallback)
+                    self.assertIn("content", fallback)
+
+    def test_directory_terminal_boundaries_translate_raw_failures_to_uncertain(
+        self,
+    ) -> None:
+        boundaries = (
+            "_verify_installed_directory_path",
+            "_descriptor_bound_directory_destination_receipt",
+        )
+        failures: tuple[BaseException, ...] = (
+            OSError(errno.ENOENT, "simulated terminal ENOENT"),
+            OSError(errno.EACCES, "simulated terminal EACCES"),
+            OSError(errno.EIO, "simulated terminal EIO"),
+            RuntimeError("simulated unexpected terminal descriptor failure"),
+        )
+        for boundary in boundaries:
+            for failure in failures:
+                with (
+                    self.subTest(boundary=boundary, failure=type(failure).__name__),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    root = Path(temp_dir)
+                    paths = self._make_paths(root)
+                    edited = root / "edited.sqlite"
+                    self._create_db(edited)
+                    destination = root / "stage"
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            boundary,
+                            side_effect=failure,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        MODULE.stage_patch(
+                            edited,
+                            destination,
+                            paths=paths,
+                        )
+                    self._assert_safety_code(
+                        "destination-install-uncertain",
+                        raised,
+                    )
+                    details = raised.exception.details
+                    self.assertEqual(details["publication_state"], "uncertain")
+                    self.assertFalse(details["retry_safe"])
+                    self.assertTrue(destination.is_dir())
+                    self.assertIn(
+                        "descriptor_bound_prepared_root",
+                        details["recovery_locators"],
+                    )
+
+    def test_post_publication_base_exceptions_are_not_overcaught(self) -> None:
+        for base_exception in (KeyboardInterrupt(), SystemExit(17)):
+            with (
+                self.subTest(exception=type(base_exception).__name__),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                source = paths.group_container / MODULE.NOTE_STORE_MAIN
+                self._create_db(source)
+                destination = root / "recovered.sqlite"
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_terminal_standalone_sidecar_absence_receipt",
+                        side_effect=base_exception,
+                    ),
+                    self.assertRaises(type(base_exception)),
+                ):
+                    MODULE.merge_db(
+                        source,
+                        destination,
+                        paths=paths,
+                    )
+                self.assertTrue(destination.is_file())
 
     def test_preflight_writeback_binds_backup_live_store_and_stage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

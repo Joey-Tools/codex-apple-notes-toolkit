@@ -100,6 +100,7 @@ class _BoundRegularFile:
     opened: os.stat_result
     sha256: str
     parent_opened: os.stat_result | None = None
+    before_write: Callable[[], dict[str, Any] | None] | None = None
 
 
 @dataclass
@@ -109,6 +110,8 @@ class _BoundDirectory:
     opened: os.stat_result
     parent_opened: os.stat_result
     parent_fd: int | None = None
+    before_write: Callable[[], dict[str, Any] | None] | None = None
+    namespace_basename: str | None = None
 
 
 @dataclass
@@ -149,9 +152,22 @@ class _ValidatedSnapshotArtifact:
 
 
 @dataclass(frozen=True)
-class _SnapshotDestinationScope:
+class _LiveDestinationScope:
+    requested_destination: Path
+    destination: Path
     parent: _BoundDirectory
     revalidate: Callable[[], dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class _TrustedDirectoryAlias:
+    alias: Path
+    target: Path
+    alias_parent_fd: int
+    alias_parent_opened: os.stat_result
+    alias_entry_opened: os.stat_result
+    alias_target_text: str
+    target_binding: _BoundDirectory
 
 
 SNAPSHOT_FILE_CODES = _FileProtectionCodes(
@@ -255,6 +271,10 @@ def _metadata(value: os.stat_result) -> dict[str, int]:
 
 def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
     return _identity(left) == _identity(right)
+
+
+def _bound_directory_basename(binding: _BoundDirectory) -> str:
+    return binding.namespace_basename or binding.path.name
 
 
 def _lexists(path: Path) -> bool:
@@ -406,7 +426,7 @@ def _observe_path(path: Path) -> tuple[str, os.stat_result | None]:
         value = os.stat(path, follow_symlinks=False)
     except FileNotFoundError:
         return "absent", None
-    except OSError:
+    except Exception:
         return "unavailable", None
     return "present", value
 
@@ -423,7 +443,7 @@ def _observe_bound_name(
         )
     except FileNotFoundError:
         return "absent", None
-    except OSError:
+    except Exception:
         return "unavailable", None
     return "present", value
 
@@ -527,9 +547,11 @@ def _descriptor_bound_directory_recovery_evidence(
             raise OSError(errno.EBADF, "bound parent descriptor is unavailable")
         parent = os.fstat(binding.parent_fd)
         prepared_root = os.fstat(binding.fd)
-    except OSError as exc:
+    except Exception as exc:
         evidence["evidence_status"] = "inconclusive"
         evidence["descriptor_error"] = str(exc)
+        evidence["descriptor_error_type"] = type(exc).__name__
+        evidence["descriptor_errno"] = getattr(exc, "errno", None)
         return evidence
     evidence["parent"] = {
         "identity": _identity(parent),
@@ -705,7 +727,7 @@ def _pre_rename_directory_publication_details(
                     descriptor_bound_destination["tree_revalidation_error"] = str(
                         tree_exc
                     )
-        except (OSError, StoreSafetyError):
+        except Exception:
             descriptor_bound_destination = None
     state = (
         "uncertain"
@@ -725,37 +747,75 @@ def _pre_rename_directory_publication_details(
     )
 
 
+def _terminal_installed_path_stats(
+    destination: Path,
+    *,
+    missing_code: str,
+    inconclusive_code: str,
+) -> tuple[os.stat_result, os.stat_result, os.stat_result, os.stat_result]:
+    """Bind one public path through only an exact trusted root alias."""
+
+    requested, canonical, alias_spec = _trusted_alias_paths(destination)
+    path_parent_fd: int | None = None
+    with ExitStack() as stack:
+        trusted_alias: _TrustedDirectoryAlias | None = None
+        if alias_spec is not None:
+            trusted_alias = stack.enter_context(
+                _bind_trusted_directory_alias(
+                    alias_spec[0],
+                    alias_spec[1],
+                    destination=requested,
+                )
+            )
+            _verify_trusted_directory_alias(
+                trusted_alias,
+                destination=requested,
+            )
+        try:
+            parent_before = os.stat(canonical.parent, follow_symlinks=False)
+            path_parent_fd = os.open(canonical.parent, _directory_open_flags())
+            parent_descriptor = os.fstat(path_parent_fd)
+            leaf = os.stat(
+                canonical.name,
+                dir_fd=path_parent_fd,
+                follow_symlinks=False,
+            )
+            parent_after = os.stat(canonical.parent, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise StoreSafetyError(
+                missing_code,
+                f"The installed destination path is missing: {requested}",
+            ) from exc
+        except OSError as exc:
+            raise StoreSafetyError(
+                inconclusive_code,
+                "Cannot terminally bind the installed destination path: "
+                f"{requested}: {exc}",
+            ) from exc
+        finally:
+            if path_parent_fd is not None:
+                os.close(path_parent_fd)
+        if trusted_alias is not None:
+            _verify_trusted_directory_alias(
+                trusted_alias,
+                destination=requested,
+            )
+    return parent_before, parent_descriptor, parent_after, leaf
+
+
 def _verify_installed_directory_path(
     binding: _BoundDirectory,
     destination: Path,
 ) -> None:
     """Terminally prove that the public path names the bound directory."""
 
-    path_parent_fd: int | None = None
-    try:
-        parent_before = os.stat(destination.parent, follow_symlinks=False)
-        path_parent_fd = os.open(destination.parent, _directory_open_flags())
-        parent_descriptor = os.fstat(path_parent_fd)
-        leaf = os.stat(
-            destination.name,
-            dir_fd=path_parent_fd,
-            follow_symlinks=False,
+    parent_before, parent_descriptor, parent_after, leaf = (
+        _terminal_installed_path_stats(
+            destination,
+            missing_code="prepared-directory-identity-mismatch",
+            inconclusive_code="prepared-directory-revalidation-inconclusive",
         )
-        parent_after = os.stat(destination.parent, follow_symlinks=False)
-    except FileNotFoundError as exc:
-        raise StoreSafetyError(
-            "prepared-directory-identity-mismatch",
-            f"The installed destination path is missing: {destination}",
-        ) from exc
-    except OSError as exc:
-        raise StoreSafetyError(
-            "prepared-directory-revalidation-inconclusive",
-            f"Cannot terminally bind the installed destination path: "
-            f"{destination}: {exc}",
-        ) from exc
-    finally:
-        if path_parent_fd is not None:
-            os.close(path_parent_fd)
+    )
     if (
         not stat.S_ISDIR(parent_before.st_mode)
         or not stat.S_ISDIR(parent_descriptor.st_mode)
@@ -838,6 +898,8 @@ def _publish_directory_no_replace(
         source_access_policy = _access_policy(source_before)
         if before_rename is not None:
             before_rename()
+        if binding.before_write is not None:
+            binding.before_write()
         _verify_bound_parent_descriptor(
             parent_fd,
             binding.parent_opened,
@@ -957,7 +1019,7 @@ def _publish_directory_no_replace(
                         descriptor_bound_destination["tree_revalidation_error"] = str(
                             tree_exc
                         )
-            except (OSError, StoreSafetyError):
+            except Exception:
                 descriptor_bound_destination = None
             raise StoreSafetyError(
                 "destination-install-uncertain",
@@ -1186,7 +1248,7 @@ def _publish_directory_no_replace(
                 "descriptor-revalidated-after-rename"
             )
         _verify_installed_directory_path(binding, destination)
-    except (OSError, StoreSafetyError) as exc:
+    except Exception as exc:
         terminal_source_observation = _observe_bound_name(
             parent_fd,
             source.name,
@@ -1216,7 +1278,7 @@ def _publish_directory_no_replace(
                         terminal_error=str(exc),
                     )
                 )
-            except (OSError, StoreSafetyError):
+            except Exception:
                 descriptor_bound_destination = None
         elif (
             descriptor_bound_destination.get("tree_verification")
@@ -1874,6 +1936,7 @@ def _bind_directory_at(
         opened=child_opened,
         parent_opened=parent.opened,
         parent_fd=parent.fd,
+        before_write=parent.before_write,
     )
     try:
         yield binding
@@ -1950,6 +2013,7 @@ def _bind_regular_file_at(
             opened=opened,
             sha256=sha256,
             parent_opened=parent.opened,
+            before_write=parent.before_write,
         )
         _verify_bound_regular_file_at(
             bound,
@@ -2388,7 +2452,7 @@ def _create_bound_directory(
         _verify_bound_directory_at(
             parent_binding,
             parent_fd=parent_binding.parent_fd,
-            basename=parent_binding.path.name,
+            basename=_bound_directory_basename(parent_binding),
             display_path=parent_binding.path,
         )
         parent_fd = os.dup(parent_binding.fd)
@@ -2396,6 +2460,8 @@ def _create_bound_directory(
     fd: int | None = None
     created_and_bound = False
     try:
+        if parent_binding is not None and parent_binding.before_write is not None:
+            parent_binding.before_write()
         os.mkdir(path.name, mode=0o700, dir_fd=parent_fd)
         fd = os.open(path.name, flags, dir_fd=parent_fd)
         created_path = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
@@ -2425,6 +2491,9 @@ def _create_bound_directory(
         opened=os.fstat(fd),
         parent_opened=parent_opened,
         parent_fd=parent_fd,
+        before_write=(
+            parent_binding.before_write if parent_binding is not None else None
+        ),
     )
     try:
         try:
@@ -2627,11 +2696,48 @@ def _bind_artifact_root(
 ) -> Iterator[_BoundDirectory]:
     """Bind an artifact root while preserving its public error taxonomy."""
 
+    requested_path, canonical_path, alias_spec = _trusted_alias_paths(path)
     entered = False
     try:
-        with _bind_existing_directory(path) as binding:
+        with ExitStack() as stack:
+            trusted_alias: _TrustedDirectoryAlias | None = None
+            if alias_spec is not None:
+                trusted_alias = stack.enter_context(
+                    _bind_trusted_directory_alias(
+                        alias_spec[0],
+                        alias_spec[1],
+                        destination=requested_path,
+                    )
+                )
+                _verify_trusted_directory_alias(
+                    trusted_alias,
+                    destination=requested_path,
+                )
+            canonical_binding = stack.enter_context(
+                _bind_existing_directory(canonical_path)
+            )
+
+            def revalidate_alias() -> dict[str, Any] | None:
+                if trusted_alias is None:
+                    return None
+                return _verify_trusted_directory_alias(
+                    trusted_alias,
+                    destination=requested_path,
+                )
+
+            binding = _BoundDirectory(
+                path=requested_path,
+                fd=canonical_binding.fd,
+                opened=canonical_binding.opened,
+                parent_opened=canonical_binding.parent_opened,
+                parent_fd=canonical_binding.parent_fd,
+                before_write=revalidate_alias if trusted_alias is not None else None,
+                namespace_basename=canonical_binding.path.name,
+            )
+            revalidate_alias()
             entered = True
             yield binding
+            revalidate_alias()
     except StoreSafetyError as exc:
         if entered:
             raise
@@ -2644,8 +2750,7 @@ def _bind_artifact_root(
         else:
             code = "directory-scan-inconclusive"
         raise StoreSafetyError(
-            code,
-            f"Cannot bind artifact root {path}: {exc}",
+            code, f"Cannot bind artifact root {requested_path}: {exc}"
         ) from exc
 
 
@@ -2733,7 +2838,7 @@ def _verify_bound_directory_namespace(
     return _verify_bound_directory_at(
         binding,
         parent_fd=binding.parent_fd,
-        basename=binding.path.name,
+        basename=_bound_directory_basename(binding),
         display_path=binding.path,
     )
 
@@ -2930,7 +3035,7 @@ def _fsync_bound_directory_descriptor(
         _verify_bound_directory_at(
             binding,
             parent_fd=binding.parent_fd,
-            basename=binding.path.name,
+            basename=_bound_directory_basename(binding),
             display_path=target,
         )
 
@@ -3195,6 +3300,8 @@ def _copy_fd(
             f"{destination}",
         )
     _verify_bound_directory_namespace(destination_binding)
+    if destination_binding.before_write is not None:
+        destination_binding.before_write()
     flags = (
         os.O_RDWR
         | os.O_CREAT
@@ -3878,6 +3985,8 @@ def _write_json_atomic(
             f"Manifest target does not use the bound prepared directory: {path}",
         )
     _verify_bound_directory_namespace(parent_binding)
+    if parent_binding.before_write is not None:
+        parent_binding.before_write()
     temp_path = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
     flags = (
         os.O_RDWR
@@ -3926,6 +4035,8 @@ def _write_json_atomic(
                 f"Manifest temporary file was replaced while writing: {temp_path}",
             )
         verified_sha256 = sha256
+        if parent_binding.before_write is not None:
+            parent_binding.before_write()
         _rename_file_no_replace_at(
             parent_binding.fd,
             temp_path.name,
@@ -3938,6 +4049,7 @@ def _write_json_atomic(
             opened=opened,
             sha256=sha256,
             parent_opened=parent_binding.opened,
+            before_write=parent_binding.before_write,
         )
         return _verify_bound_regular_file_at(
             bound,
@@ -4581,6 +4693,259 @@ def _normalized_scope_parts(path: Path) -> tuple[str, ...]:
     )
 
 
+def _trusted_directory_alias_registry() -> tuple[tuple[Path, Path], ...]:
+    """Return exact platform-owned root aliases accepted for destinations."""
+
+    if sys.platform != "darwin":
+        return ()
+    return (
+        (Path("/etc"), Path("/private/etc")),
+        (Path("/tmp"), Path("/private/tmp")),
+        (Path("/var"), Path("/private/var")),
+    )
+
+
+def _trusted_alias_destination(
+    destination: Path,
+) -> tuple[Path, tuple[Path, Path] | None]:
+    destination_parts = destination.parts
+    for alias, target in _trusted_directory_alias_registry():
+        alias_parts = alias.parts
+        if destination_parts[: len(alias_parts)] != alias_parts:
+            continue
+        return destination, (alias, target)
+    return destination, None
+
+
+def _trusted_alias_paths(
+    path: Path,
+) -> tuple[Path, Path, tuple[Path, Path] | None]:
+    """Return display and canonical paths for one exact registered root alias."""
+
+    requested = Path(os.path.abspath(os.fspath(path)))
+    _, alias_spec = _trusted_alias_destination(requested)
+    if alias_spec is None:
+        return requested, requested, None
+    alias_parts = alias_spec[0].parts
+    canonical = alias_spec[1].joinpath(*requested.parts[len(alias_parts) :])
+    return requested, canonical, alias_spec
+
+
+def _alias_target_path(alias: Path, target_text: str) -> Path:
+    return Path(
+        os.path.abspath(
+            os.path.join(
+                os.fspath(alias.parent),
+                target_text,
+            )
+        )
+    )
+
+
+def _raise_destination_scope_inconclusive(
+    message: str,
+    *,
+    destination: Path,
+    cause: BaseException | None = None,
+) -> StoreSafetyError:
+    details: dict[str, Any] = {
+        "destination": str(destination),
+        "scope_evidence": "inconclusive",
+        "mutation_performed": False,
+    }
+    if cause is not None:
+        details["underlying_error_type"] = type(cause).__name__
+        details["underlying_errno"] = getattr(cause, "errno", None)
+    return StoreSafetyError(
+        "snapshot-destination-scope-inconclusive",
+        message,
+        details=details,
+    )
+
+
+@contextmanager
+def _bind_trusted_directory_alias(
+    alias: Path,
+    target: Path,
+    *,
+    destination: Path,
+) -> Iterator[_TrustedDirectoryAlias]:
+    """Bind one exact platform alias entry and its canonical target."""
+
+    try:
+        with ExitStack() as stack:
+            alias_parent_before = os.stat(alias.parent, follow_symlinks=False)
+            alias_parent_fd = os.open(alias.parent, _directory_open_flags())
+            stack.callback(os.close, alias_parent_fd)
+            alias_parent_opened = os.fstat(alias_parent_fd)
+            alias_entry_before = os.stat(
+                alias.name,
+                dir_fd=alias_parent_fd,
+                follow_symlinks=False,
+            )
+            alias_target_before = os.readlink(alias.name, dir_fd=alias_parent_fd)
+            alias_target_path = _alias_target_path(alias, alias_target_before)
+            if alias_target_path != target:
+                raise _raise_destination_scope_inconclusive(
+                    "A platform-trusted destination alias no longer names its "
+                    f"registered canonical target: alias={alias}, target={target}",
+                    destination=destination,
+                )
+            target_binding = stack.enter_context(_bind_existing_directory(target))
+            alias_followed_before = os.stat(alias)
+            alias_entry_after = os.stat(
+                alias.name,
+                dir_fd=alias_parent_fd,
+                follow_symlinks=False,
+            )
+            alias_target_after = os.readlink(alias.name, dir_fd=alias_parent_fd)
+            alias_parent_after = os.stat(alias.parent, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(alias_parent_before.st_mode)
+                or not stat.S_ISDIR(alias_parent_opened.st_mode)
+                or not stat.S_ISDIR(alias_parent_after.st_mode)
+                or not stat.S_ISLNK(alias_entry_before.st_mode)
+                or not stat.S_ISLNK(alias_entry_after.st_mode)
+                or not _same_identity(alias_parent_before, alias_parent_opened)
+                or not _same_identity(alias_parent_opened, alias_parent_after)
+                or not _same_identity(alias_entry_before, alias_entry_after)
+                or alias_target_before != alias_target_after
+                or not _same_identity(alias_followed_before, target_binding.opened)
+            ):
+                raise _raise_destination_scope_inconclusive(
+                    "A platform-trusted destination alias, its parent, or its "
+                    f"canonical target changed identity while binding: {alias}",
+                    destination=destination,
+                )
+            if (
+                _access_policy(alias_parent_before)
+                != _access_policy(alias_parent_opened)
+                or _access_policy(alias_parent_opened)
+                != _access_policy(alias_parent_after)
+                or _access_policy(alias_entry_before)
+                != _access_policy(alias_entry_after)
+                or _access_policy(alias_followed_before)
+                != _access_policy(target_binding.opened)
+            ):
+                raise _raise_destination_scope_inconclusive(
+                    "A platform-trusted destination alias, its parent, or its "
+                    f"canonical target changed access policy while binding: {alias}",
+                    destination=destination,
+                )
+            yield _TrustedDirectoryAlias(
+                alias=alias,
+                target=target,
+                alias_parent_fd=alias_parent_fd,
+                alias_parent_opened=alias_parent_opened,
+                alias_entry_opened=alias_entry_before,
+                alias_target_text=alias_target_before,
+                target_binding=target_binding,
+            )
+    except StoreSafetyError:
+        raise
+    except Exception as exc:
+        raise _raise_destination_scope_inconclusive(
+            "Cannot bind a platform-trusted destination alias and canonical "
+            f"target: alias={alias}, target={target}: {exc}",
+            destination=destination,
+            cause=exc,
+        ) from exc
+
+
+def _verify_trusted_directory_alias(
+    binding: _TrustedDirectoryAlias,
+    *,
+    destination: Path,
+) -> dict[str, Any]:
+    try:
+        parent_descriptor_before = os.fstat(binding.alias_parent_fd)
+        parent_path_before = os.stat(binding.alias.parent, follow_symlinks=False)
+        entry_before = os.stat(
+            binding.alias.name,
+            dir_fd=binding.alias_parent_fd,
+            follow_symlinks=False,
+        )
+        target_text_before = os.readlink(
+            binding.alias.name,
+            dir_fd=binding.alias_parent_fd,
+        )
+        followed_before = os.stat(binding.alias)
+        target_receipt = _verify_bound_directory_namespace(binding.target_binding)
+        followed_after = os.stat(binding.alias)
+        target_text_after = os.readlink(
+            binding.alias.name,
+            dir_fd=binding.alias_parent_fd,
+        )
+        entry_after = os.stat(
+            binding.alias.name,
+            dir_fd=binding.alias_parent_fd,
+            follow_symlinks=False,
+        )
+        parent_path_after = os.stat(binding.alias.parent, follow_symlinks=False)
+        parent_descriptor_after = os.fstat(binding.alias_parent_fd)
+    except Exception as exc:
+        raise _raise_destination_scope_inconclusive(
+            "Cannot revalidate a platform-trusted destination alias and its "
+            f"canonical target: {binding.alias}: {exc}",
+            destination=destination,
+            cause=exc,
+        ) from exc
+    if (
+        not stat.S_ISLNK(entry_before.st_mode)
+        or not stat.S_ISLNK(entry_after.st_mode)
+        or not _same_identity(
+            binding.alias_parent_opened,
+            parent_descriptor_before,
+        )
+        or not _same_identity(parent_descriptor_before, parent_path_before)
+        or not _same_identity(parent_path_before, parent_path_after)
+        or not _same_identity(parent_path_after, parent_descriptor_after)
+        or not _same_identity(binding.alias_entry_opened, entry_before)
+        or not _same_identity(entry_before, entry_after)
+        or target_text_before != binding.alias_target_text
+        or target_text_after != binding.alias_target_text
+        or _alias_target_path(binding.alias, target_text_before) != binding.target
+        or not _same_identity(followed_before, binding.target_binding.opened)
+        or not _same_identity(followed_before, followed_after)
+        or target_receipt["identity"] != _identity(binding.target_binding.opened)
+    ):
+        raise _raise_destination_scope_inconclusive(
+            "A platform-trusted destination alias, its parent, or canonical "
+            f"target changed identity or retargeted: {binding.alias}",
+            destination=destination,
+        )
+    if (
+        _access_policy(binding.alias_parent_opened)
+        != _access_policy(parent_descriptor_before)
+        or _access_policy(parent_descriptor_before)
+        != _access_policy(parent_path_before)
+        or _access_policy(parent_path_before) != _access_policy(parent_path_after)
+        or _access_policy(parent_path_after) != _access_policy(parent_descriptor_after)
+        or _access_policy(binding.alias_entry_opened) != _access_policy(entry_before)
+        or _access_policy(entry_before) != _access_policy(entry_after)
+        or _access_policy(followed_before)
+        != _access_policy(binding.target_binding.opened)
+        or _access_policy(followed_before) != _access_policy(followed_after)
+        or target_receipt["access_policy"]
+        != _access_policy(binding.target_binding.opened)
+    ):
+        raise _raise_destination_scope_inconclusive(
+            "A platform-trusted destination alias, its parent, or canonical "
+            f"target changed access policy: {binding.alias}",
+            destination=destination,
+        )
+    return {
+        "alias": str(binding.alias),
+        "canonical_target": str(binding.target),
+        "alias_parent_identity": _identity(parent_descriptor_after),
+        "alias_parent_access_policy": _access_policy(parent_descriptor_after),
+        "alias_entry_identity": _identity(entry_after),
+        "alias_entry_access_policy": _access_policy(entry_after),
+        "alias_target_text": target_text_after,
+        "canonical_target_receipt": target_receipt,
+    }
+
+
 def _assert_snapshot_destination_lexically_outside_live_containers(
     destination: Path,
     live_containers: tuple[Path, ...],
@@ -4590,38 +4955,44 @@ def _assert_snapshot_destination_lexically_outside_live_containers(
         unicodedata.normalize("NFD", basename).casefold()
         for basename in NOTE_STORE_DISCOVERY_BASENAMES
     }
-    for live_container in live_containers:
-        live_parts = _normalized_scope_parts(live_container)
-        if destination_parts[: len(live_parts)] != live_parts:
-            continue
-        suffix = destination_parts[len(live_parts) :]
-        reserved_component = next(
-            (component for component in suffix if component in reserved),
-            None,
-        )
-        if reserved_component is not None:
-            raise StoreSafetyError(
-                "snapshot-destination-reserved-store-path",
-                "Snapshot destination would use a live or reserved SQLite store "
-                "name as a directory, including through a case-insensitive or "
-                f"Unicode-normalized alias: {destination}",
-                details={
-                    "destination": str(destination),
-                    "live_container": str(live_container),
-                    "reserved_component_normalized": reserved_component,
-                    "overlap_detection": "normalized-lexical-scope",
-                    "mutation_performed": False,
-                },
-            )
+    reserved_component = next(
+        (component for component in destination_parts if component in reserved),
+        None,
+    )
+    if reserved_component is not None:
         raise StoreSafetyError(
-            "snapshot-destination-inside-live-container",
-            "Snapshot destination is inside an Apple Notes live container, "
+            "snapshot-destination-reserved-store-path",
+            "Destination would use a live or reserved SQLite store name, "
             "including through a case-insensitive or Unicode-normalized alias: "
             f"{destination}",
             details={
                 "destination": str(destination),
-                "live_container": str(live_container),
+                "reserved_component_normalized": reserved_component,
                 "overlap_detection": "normalized-lexical-scope",
+                "mutation_performed": False,
+            },
+        )
+    for live_container in live_containers:
+        live_parts = _normalized_scope_parts(live_container)
+        destination_inside_live = destination_parts[: len(live_parts)] == live_parts
+        destination_contains_live = (
+            live_parts[: len(destination_parts)] == destination_parts
+        )
+        if not destination_inside_live and not destination_contains_live:
+            continue
+        raise StoreSafetyError(
+            "snapshot-destination-inside-live-container",
+            "Destination overlaps an Apple Notes live container as an ancestor "
+            "or descendant, including through a case-insensitive or "
+            f"Unicode-normalized alias: {destination}",
+            details={
+                "destination": str(destination),
+                "live_container": str(live_container),
+                "overlap_detection": (
+                    "normalized-lexical-descendant"
+                    if destination_inside_live
+                    else "normalized-lexical-ancestor"
+                ),
                 "mutation_performed": False,
             },
         )
@@ -4633,17 +5004,10 @@ def _raise_snapshot_destination_scope_inconclusive(
     destination: Path,
     cause: BaseException | None = None,
 ) -> StoreSafetyError:
-    details: dict[str, Any] = {
-        "destination": str(destination),
-        "scope_evidence": "inconclusive",
-    }
-    if cause is not None:
-        details["underlying_error_type"] = type(cause).__name__
-        details["underlying_errno"] = getattr(cause, "errno", None)
-    return StoreSafetyError(
-        "snapshot-destination-scope-inconclusive",
+    return _raise_destination_scope_inconclusive(
         message,
-        details=details,
+        destination=destination,
+        cause=cause,
     )
 
 
@@ -4818,6 +5182,7 @@ def _create_bound_snapshot_destination_parent_components(
     components: tuple[str, ...],
     *,
     live_bindings: list[dict[str, Any]],
+    trusted_alias: _TrustedDirectoryAlias | None,
     destination: Path,
     display_path: Path,
 ) -> None:
@@ -4843,6 +5208,11 @@ def _create_bound_snapshot_destination_parent_components(
                 live_bindings,
                 destination=destination,
             )
+            if trusted_alias is not None:
+                _verify_trusted_directory_alias(
+                    trusted_alias,
+                    destination=destination,
+                )
             _assert_snapshot_destination_ancestors_exclude_live_containers(
                 current_fd,
                 live_bindings,
@@ -4939,56 +5309,114 @@ def _create_bound_snapshot_destination_parent_components(
 
 
 @contextmanager
-def _bind_snapshot_destination_parent_outside_live_containers(
+def _bind_live_safe_destination_parent(
     paths: NoteStorePaths,
     destination: Path,
-) -> Iterator[_SnapshotDestinationScope]:
-    """Bind a snapshot parent only after a zero-write live-scope proof."""
+) -> Iterator[_LiveDestinationScope]:
+    """Bind one destination parent after a zero-write live-container proof."""
 
+    requested_destination, canonical_destination, alias_spec = _trusted_alias_paths(
+        destination
+    )
+    alias_canonical_destination = (
+        canonical_destination if alias_spec is not None else None
+    )
     live_containers = (paths.group_container, paths.app_container)
     _assert_snapshot_destination_lexically_outside_live_containers(
-        destination,
+        requested_destination,
         live_containers,
     )
+    if alias_canonical_destination is not None:
+        _assert_snapshot_destination_lexically_outside_live_containers(
+            alias_canonical_destination,
+            live_containers,
+        )
     with ExitStack() as stack:
+        trusted_alias: _TrustedDirectoryAlias | None = None
+        if alias_spec is not None:
+            trusted_alias = stack.enter_context(
+                _bind_trusted_directory_alias(
+                    alias_spec[0],
+                    alias_spec[1],
+                    destination=requested_destination,
+                )
+            )
+            _verify_trusted_directory_alias(
+                trusted_alias,
+                destination=requested_destination,
+            )
         live_bindings = _bind_snapshot_live_containers(
             stack,
             live_containers,
-            destination=destination,
+            destination=requested_destination,
         )
         try:
             nearest_path, missing_components = _nearest_existing_output_ancestor(
-                destination.parent
+                canonical_destination.parent
             )
         except StoreSafetyError as exc:
-            raise _raise_snapshot_destination_scope_inconclusive(
-                "Cannot locate a stable existing ancestor for the snapshot "
-                f"destination: {destination.parent}: {exc}",
-                destination=destination,
-                cause=exc,
-            ) from exc
+            try:
+                alias_nearest, _ = _nearest_existing_output_ancestor_following_aliases(
+                    canonical_destination.parent
+                )
+                with _bind_existing_directory_following_aliases(alias_nearest) as (
+                    alias_ancestor_fd,
+                    _,
+                ):
+                    _assert_snapshot_destination_ancestors_exclude_live_containers(
+                        alias_ancestor_fd,
+                        live_bindings,
+                        destination=requested_destination,
+                        display_path=alias_nearest,
+                    )
+            except StoreSafetyError as alias_probe_exc:
+                if alias_probe_exc.code == "snapshot-destination-inside-live-container":
+                    raise
+            if alias_canonical_destination is None:
+                raise _raise_snapshot_destination_scope_inconclusive(
+                    "Cannot locate a stable existing ancestor for the destination: "
+                    f"{canonical_destination.parent}: {exc}",
+                    destination=requested_destination,
+                    cause=exc,
+                ) from exc
+            canonical_destination = alias_canonical_destination
+            try:
+                nearest_path, missing_components = _nearest_existing_output_ancestor(
+                    canonical_destination.parent
+                )
+            except StoreSafetyError as canonical_exc:
+                raise _raise_snapshot_destination_scope_inconclusive(
+                    "Cannot locate a stable existing ancestor through the exact "
+                    "platform-trusted destination alias: "
+                    f"{canonical_destination.parent}: {canonical_exc}",
+                    destination=requested_destination,
+                    cause=canonical_exc,
+                ) from canonical_exc
         try:
-            with _bind_existing_directory_following_aliases(nearest_path) as (
-                ancestor_fd,
-                ancestor,
-            ):
+            with _bind_existing_directory(nearest_path) as ancestor_binding:
+                if trusted_alias is not None:
+                    _verify_trusted_directory_alias(
+                        trusted_alias,
+                        destination=requested_destination,
+                    )
                 _verify_snapshot_live_container_bindings(
                     live_bindings,
-                    destination=destination,
+                    destination=requested_destination,
                 )
                 _assert_snapshot_destination_ancestors_exclude_live_containers(
-                    ancestor_fd,
+                    ancestor_binding.fd,
                     live_bindings,
-                    destination=destination,
+                    destination=requested_destination,
                     display_path=nearest_path,
                 )
                 _create_bound_snapshot_destination_parent_components(
-                    ancestor_fd,
-                    ancestor,
+                    ancestor_binding.fd,
+                    ancestor_binding.opened,
                     missing_components,
                     live_bindings=live_bindings,
-                    destination=destination,
-                    display_path=destination.parent,
+                    trusted_alias=trusted_alias,
+                    destination=requested_destination,
+                    display_path=canonical_destination.parent,
                 )
         except StoreSafetyError as exc:
             if exc.code in {
@@ -4998,69 +5426,100 @@ def _bind_snapshot_destination_parent_outside_live_containers(
             }:
                 raise
             raise _raise_snapshot_destination_scope_inconclusive(
-                "Cannot bind or create a safe snapshot destination parent: "
-                f"{destination.parent}: {exc}",
-                destination=destination,
+                "Cannot bind or create a safe destination parent: "
+                f"{canonical_destination.parent}: {exc}",
+                destination=requested_destination,
                 cause=exc,
             ) from exc
         try:
-            output_parent = stack.enter_context(
-                _bind_existing_directory(destination.parent)
+            canonical_output_parent = stack.enter_context(
+                _bind_existing_directory(canonical_destination.parent)
             )
         except StoreSafetyError as exc:
             raise _raise_snapshot_destination_scope_inconclusive(
-                "Cannot bind the snapshot destination parent after descriptor-"
-                f"relative creation: {destination.parent}: {exc}",
-                destination=destination,
+                "Cannot bind the destination parent after descriptor-relative "
+                f"creation: {canonical_destination.parent}: {exc}",
+                destination=requested_destination,
                 cause=exc,
             ) from exc
+        output_parent = _BoundDirectory(
+            path=requested_destination.parent,
+            fd=canonical_output_parent.fd,
+            opened=canonical_output_parent.opened,
+            parent_opened=canonical_output_parent.parent_opened,
+            parent_fd=canonical_output_parent.parent_fd,
+            namespace_basename=canonical_output_parent.path.name,
+        )
 
         def revalidate() -> dict[str, Any]:
             _assert_snapshot_destination_lexically_outside_live_containers(
-                destination,
+                requested_destination,
                 live_containers,
+            )
+            _assert_snapshot_destination_lexically_outside_live_containers(
+                canonical_destination,
+                live_containers,
+            )
+            alias_receipt = (
+                _verify_trusted_directory_alias(
+                    trusted_alias,
+                    destination=requested_destination,
+                )
+                if trusted_alias is not None
+                else None
             )
             live_receipts = _verify_snapshot_live_container_bindings(
                 live_bindings,
-                destination=destination,
+                destination=requested_destination,
             )
             try:
                 parent_receipt = _verify_bound_directory_namespace(output_parent)
             except StoreSafetyError as exc:
+                if exc.code in {
+                    "prepared-directory-identity-mismatch",
+                    "prepared-directory-access-policy-mismatch",
+                }:
+                    raise
                 raise _raise_snapshot_destination_scope_inconclusive(
-                    "Cannot revalidate the descriptor-bound snapshot destination "
-                    f"parent: {destination.parent}: {exc}",
-                    destination=destination,
+                    "Cannot revalidate the descriptor-bound destination parent: "
+                    f"{canonical_destination.parent}: {exc}",
+                    destination=requested_destination,
                     cause=exc,
                 ) from exc
             ancestor_chain = (
                 _assert_snapshot_destination_ancestors_exclude_live_containers(
                     output_parent.fd,
                     live_bindings,
-                    destination=destination,
-                    display_path=destination.parent,
+                    destination=requested_destination,
+                    display_path=canonical_destination.parent,
                 )
             )
             return {
-                "schema": "apple-notes-snapshot-destination-scope/v1",
-                "destination": str(destination),
+                "schema": "apple-notes-live-destination-scope/v2",
+                "requested_destination": str(requested_destination),
+                "canonical_destination": str(canonical_destination),
                 "parent": parent_receipt,
                 "live_containers": live_receipts,
+                "trusted_alias": alias_receipt,
                 "ancestor_chain": ancestor_chain,
                 "protected_properties": {
                     "object_identity": ["device", "inode", "file_type"],
                     "location_scope": (
-                        "normalized-lexical-and-descriptor-ancestor-exclusion"
+                        "normalized-lexical-bidirectional-and-descriptor-ancestor-"
+                        "exclusion"
                     ),
                     "access_policy": ["mode", "uid", "gid", "flags"],
-                    "directory_entry_churn": (
-                        "not-treated-as-content-mutation-outside-reserved-names"
+                    "trusted_alias": (
+                        "exact-registry-entry-parent-target-and-retarget-binding"
                     ),
                 },
             }
 
         revalidate()
-        yield _SnapshotDestinationScope(
+        output_parent.before_write = revalidate
+        yield _LiveDestinationScope(
+            requested_destination=requested_destination,
+            destination=requested_destination,
             parent=output_parent,
             revalidate=revalidate,
         )
@@ -5691,8 +6150,10 @@ def _publication_details(
         except FileNotFoundError:
             receipt["verification"] = "absent-or-parent-missing"
             locators["prepared_unverified"] = receipt
-        except OSError as exc:
+        except Exception as exc:
             receipt["verification"] = f"inconclusive: {exc}"
+            receipt["verification_error_type"] = type(exc).__name__
+            receipt["verification_errno"] = getattr(exc, "errno", None)
             locators["prepared_unverified"] = receipt
         else:
             parent_matches = (
@@ -5854,6 +6315,90 @@ def _descriptor_bound_destination_receipt(
     }
 
 
+def _descriptor_bound_file_recovery_evidence(
+    parent_fd: int,
+    prepared: _BoundRegularFile,
+    destination: Path,
+    *,
+    terminal_error: BaseException,
+) -> dict[str, Any]:
+    """Retain best-effort descriptor evidence without claiming terminal content."""
+
+    evidence: dict[str, Any] = {
+        "evidence_status": "checked",
+        "prepared_display_path": str(prepared.path),
+        "destination_display_path": str(destination),
+        "terminal_error_type": type(terminal_error).__name__,
+        "terminal_errno": getattr(terminal_error, "errno", None),
+        "terminal_error": str(terminal_error),
+        "namespace_note": (
+            "Display paths are advisory; the held parent and file descriptors "
+            "remain the recovery authority"
+        ),
+        "content": {
+            "sha256": prepared.sha256,
+            "size": prepared.opened.st_size,
+            "verification": "creation-receipt-last-verified-before-terminal-error",
+        },
+    }
+    observations: dict[str, Any] = {}
+    for label, path in (
+        ("prepared_name", prepared.path),
+        ("destination_name", destination),
+    ):
+        state, observed = _observe_bound_sibling(parent_fd, prepared, path)
+        row: dict[str, Any] = {"status": state}
+        if state == "present" and observed is not None:
+            row["identity"] = _identity(observed)
+            row["access_policy"] = _access_policy(observed)
+        elif state == "unavailable":
+            evidence["evidence_status"] = "inconclusive"
+            row["evidence_status"] = "inconclusive"
+        observations[label] = row
+    evidence["namespace_observations"] = observations
+
+    try:
+        parent = os.fstat(parent_fd)
+    except Exception as exc:
+        evidence["evidence_status"] = "inconclusive"
+        evidence["parent_descriptor_error"] = str(exc)
+        evidence["parent_descriptor_error_type"] = type(exc).__name__
+        evidence["parent_descriptor_errno"] = getattr(exc, "errno", None)
+    else:
+        parent_matches = (
+            prepared.parent_opened is not None
+            and _same_identity(prepared.parent_opened, parent)
+            and _access_policy(prepared.parent_opened) == _access_policy(parent)
+        )
+        evidence["parent"] = {
+            "identity": _identity(parent),
+            "access_policy": _access_policy(parent),
+            "matches_creation_receipt": parent_matches,
+        }
+        if not parent_matches:
+            evidence["evidence_status"] = "inconclusive"
+
+    try:
+        leaf = os.fstat(prepared.fd)
+    except Exception as exc:
+        evidence["evidence_status"] = "inconclusive"
+        evidence["file_descriptor_error"] = str(exc)
+        evidence["file_descriptor_error_type"] = type(exc).__name__
+        evidence["file_descriptor_errno"] = getattr(exc, "errno", None)
+    else:
+        leaf_matches = _same_identity(prepared.opened, leaf) and _access_policy(
+            prepared.opened
+        ) == _access_policy(leaf)
+        evidence["file"] = {
+            "identity": _identity(leaf),
+            "access_policy": _access_policy(leaf),
+            "matches_creation_receipt": leaf_matches,
+        }
+        if not leaf_matches:
+            evidence["evidence_status"] = "inconclusive"
+    return evidence
+
+
 def _verify_installed_file_path(
     prepared: _BoundRegularFile,
     destination: Path,
@@ -5865,31 +6410,13 @@ def _verify_installed_file_path(
             "prepared-file-revalidation-inconclusive",
             f"Prepared file has no parent receipt: {prepared.path}",
         )
-    path_parent_fd: int | None = None
-    try:
-        parent_before = os.stat(destination.parent, follow_symlinks=False)
-        path_parent_fd = os.open(destination.parent, _directory_open_flags())
-        parent_descriptor = os.fstat(path_parent_fd)
-        leaf = os.stat(
-            destination.name,
-            dir_fd=path_parent_fd,
-            follow_symlinks=False,
+    parent_before, parent_descriptor, parent_after, leaf = (
+        _terminal_installed_path_stats(
+            destination,
+            missing_code="prepared-file-identity-mismatch",
+            inconclusive_code="prepared-file-revalidation-inconclusive",
         )
-        parent_after = os.stat(destination.parent, follow_symlinks=False)
-    except FileNotFoundError as exc:
-        raise StoreSafetyError(
-            "prepared-file-identity-mismatch",
-            f"The installed destination path is missing: {destination}",
-        ) from exc
-    except OSError as exc:
-        raise StoreSafetyError(
-            "prepared-file-revalidation-inconclusive",
-            f"Cannot terminally bind the installed destination path: "
-            f"{destination}: {exc}",
-        ) from exc
-    finally:
-        if path_parent_fd is not None:
-            os.close(path_parent_fd)
+    )
     if (
         not stat.S_ISDIR(parent_before.st_mode)
         or not stat.S_ISDIR(parent_descriptor.st_mode)
@@ -6007,7 +6534,7 @@ def _observe_bound_sibling(
         )
     except FileNotFoundError:
         return "absent", None
-    except OSError:
+    except Exception:
         return "unavailable", None
     return "present", value
 
@@ -6067,6 +6594,8 @@ def _publish_file_no_replace_from_parent(
     before_rename = os.fstat(prepared.fd)
     descriptor_bound_destination: dict[str, Any] | None = None
     try:
+        if prepared.before_write is not None:
+            prepared.before_write()
         _rename_file_no_replace_at(
             parent_fd,
             prepared.path.name,
@@ -6095,13 +6624,19 @@ def _publish_file_no_replace_from_parent(
             and _same_identity(prepared.opened, source_after)
         )
         if committed:
+            descriptor_bound_prepared_file = _descriptor_bound_file_recovery_evidence(
+                parent_fd,
+                prepared,
+                destination,
+                terminal_error=exc,
+            )
             try:
                 descriptor_bound_destination = _descriptor_bound_destination_receipt(
                     parent_fd,
                     prepared,
                     destination,
                 )
-            except (OSError, StoreSafetyError):
+            except Exception:
                 descriptor_bound_destination = None
             raise StoreSafetyError(
                 "destination-install-uncertain",
@@ -6113,6 +6648,7 @@ def _publish_file_no_replace_from_parent(
                     destination=destination,
                     retry_safe=False,
                     descriptor_bound_destination=descriptor_bound_destination,
+                    descriptor_bound_prepared_file=(descriptor_bound_prepared_file),
                 ),
             ) from exc
         if (
@@ -6287,7 +6823,13 @@ def _publish_file_no_replace_from_parent(
             destination,
         )
         _verify_installed_file_path(prepared, destination)
-    except (OSError, StoreSafetyError) as exc:
+    except Exception as exc:
+        descriptor_bound_prepared_file = _descriptor_bound_file_recovery_evidence(
+            parent_fd,
+            prepared,
+            destination,
+            terminal_error=exc,
+        )
         if descriptor_bound_destination is None:
             try:
                 descriptor_bound_destination = _descriptor_bound_destination_receipt(
@@ -6295,7 +6837,7 @@ def _publish_file_no_replace_from_parent(
                     prepared,
                     destination,
                 )
-            except (OSError, StoreSafetyError):
+            except Exception:
                 descriptor_bound_destination = None
         raise StoreSafetyError(
             "destination-install-uncertain",
@@ -6307,6 +6849,7 @@ def _publish_file_no_replace_from_parent(
                 destination=destination,
                 retry_safe=False,
                 descriptor_bound_destination=descriptor_bound_destination,
+                descriptor_bound_prepared_file=descriptor_bound_prepared_file,
             ),
         ) from exc
     return fingerprint
@@ -7065,6 +7608,8 @@ def _write_standalone_backup_payload(
             f"Standalone output does not use the bound destination directory: {output}",
         )
     _verify_bound_directory_namespace(destination_binding)
+    if destination_binding.before_write is not None:
+        destination_binding.before_write()
     expected_sha256 = hashlib.sha256(payload).hexdigest()
     expected_size = len(payload)
     expected_mode = 0o600
@@ -7348,7 +7893,15 @@ def _recover_validated_clone_to_standalone(
                     prepared,
                     out,
                 )
-            except StoreSafetyError as exc:
+            except Exception as exc:
+                descriptor_bound_prepared_file = (
+                    _descriptor_bound_file_recovery_evidence(
+                        output_parent_binding.fd,
+                        prepared,
+                        out,
+                        terminal_error=exc,
+                    )
+                )
                 descriptor_bound_destination: dict[str, Any] | None = None
                 try:
                     descriptor_bound_destination = (
@@ -7358,7 +7911,7 @@ def _recover_validated_clone_to_standalone(
                             out,
                         )
                     )
-                except (OSError, StoreSafetyError):
+                except Exception:
                     descriptor_bound_destination = None
                 details = _publication_details(
                     "uncertain",
@@ -7366,11 +7919,16 @@ def _recover_validated_clone_to_standalone(
                     destination=out,
                     retry_safe=False,
                     descriptor_bound_destination=descriptor_bound_destination,
+                    descriptor_bound_prepared_file=(descriptor_bound_prepared_file),
                 )
-                details = _merge_recovery_details(details, exc.details)
-                details["terminal_output_error_code"] = exc.code
-                if "terminal_sidecar_revalidation" in exc.details:
-                    details["terminal_sidecar_error_code"] = exc.code
+                if isinstance(exc, StoreSafetyError):
+                    details = _merge_recovery_details(details, exc.details)
+                    details["terminal_output_error_code"] = exc.code
+                    if "terminal_sidecar_revalidation" in exc.details:
+                        details["terminal_sidecar_error_code"] = exc.code
+                else:
+                    details["terminal_output_error_type"] = type(exc).__name__
+                    details["terminal_output_errno"] = getattr(exc, "errno", None)
                 raise StoreSafetyError(
                     "destination-install-uncertain",
                     "The standalone database was published and its main-file "
@@ -7447,27 +8005,35 @@ def copy_db(
             "Notes.app is running; quit it before using --require-notes-quit",
         )
 
-    destination = Path(
+    requested_destination = Path(
         os.path.abspath(os.fspath(dest or _timestamped_tmp_dir("apple-notes-probe")))
     )
-    if _lexists(destination):
+    if _lexists(requested_destination):
         raise StoreSafetyError(
-            "destination-exists", f"Destination already exists: {destination}"
+            "destination-exists",
+            f"Destination already exists: {requested_destination}",
         )
-    partial = destination.parent / f".{destination.name}.partial-{uuid.uuid4().hex}"
     try:
         with (
-            _bind_snapshot_destination_parent_outside_live_containers(
+            _bind_live_safe_destination_parent(
                 paths,
-                destination,
+                requested_destination,
             ) as destination_scope,
             _create_bound_directory(
-                partial,
+                destination_scope.destination.parent
+                / (f".{destination_scope.destination.name}.partial-{uuid.uuid4().hex}"),
                 retain_failure_receipt=True,
                 parent_binding=destination_scope.parent,
             ) as bound_root,
             ExitStack() as snapshot_stack,
         ):
+            destination = destination_scope.destination
+            partial = bound_root.path
+            if _lexists(destination):
+                raise StoreSafetyError(
+                    "destination-exists",
+                    f"Destination already exists: {requested_destination}",
+                )
             store_dir = partial / "group.com.apple.notes"
             bound_store = snapshot_stack.enter_context(
                 _create_bound_directory(
@@ -7775,8 +8341,8 @@ def copy_db(
         raise
 
     return {
-        "dest": destination,
-        "manifest": destination / SNAPSHOT_MANIFEST,
+        "dest": requested_destination,
+        "manifest": requested_destination / SNAPSHOT_MANIFEST,
         "manifest_creation_receipt": manifest_creation_receipt,
         "notes_running": notes_running,
         "notes_quit_required": require_notes_quit,
@@ -7784,7 +8350,7 @@ def copy_db(
         "copied_files": [
             {
                 "source": row["source"]["path"],
-                "dest": destination / row["relative_path"],
+                "dest": requested_destination / row["relative_path"],
                 "size": row["size"],
                 "sha256": row["sha256"],
             }
@@ -8172,12 +8738,52 @@ def validate_snapshot(
         return artifact.public_result
 
 
-def merge_db(src: Path, out: Path | None) -> dict[str, Any]:
-    output = out or src.with_name("NoteStore-merged-for-analysis.sqlite")
-    result = _recover_to_standalone(src, output)
+def merge_db(
+    src: Path,
+    out: Path | None,
+    *,
+    paths: NoteStorePaths | None = None,
+) -> dict[str, Any]:
+    requested_output = Path(
+        os.path.abspath(
+            os.fspath(out or src.with_name("NoteStore-merged-for-analysis.sqlite"))
+        )
+    )
+    with _bind_live_safe_destination_parent(
+        paths or NoteStorePaths(),
+        requested_output,
+    ) as destination_scope:
+        result = _recover_to_standalone(
+            src,
+            destination_scope.destination,
+            output_parent_binding=destination_scope.parent,
+        )
+        try:
+            destination_scope.revalidate()
+        except Exception as exc:
+            details = _publication_details(
+                "uncertain",
+                prepared=None,
+                destination=requested_output,
+                retry_safe=False,
+                descriptor_bound_destination=result.get("descriptor_bound_destination"),
+            )
+            details["post_publication_error_type"] = type(exc).__name__
+            details["post_publication_errno"] = getattr(exc, "errno", None)
+            if isinstance(exc, StoreSafetyError):
+                details = _merge_recovery_details(details, exc.details)
+                details["post_publication_error_code"] = exc.code
+            raise StoreSafetyError(
+                "destination-install-uncertain",
+                "The standalone database was published, but its live-container "
+                f"destination scope could not be revalidated: {requested_output}: "
+                f"{exc}",
+                details=details,
+            ) from exc
+    result["standalone_db"] = requested_output
     return {
         **result,
-        "merged_db": result["standalone_db"],
+        "merged_db": requested_output,
     }
 
 
@@ -8240,7 +8846,7 @@ def _nearest_existing_output_ancestor(
     missing_components: list[str] = []
     while True:
         try:
-            observed = os.stat(candidate)
+            observed = os.stat(candidate, follow_symlinks=False)
         except FileNotFoundError:
             parent = candidate.parent
             if parent == candidate:
@@ -8258,11 +8864,54 @@ def _nearest_existing_output_ancestor(
                 "Cannot inspect a candidate recovery-output ancestor: "
                 f"{candidate}: {exc}",
             ) from exc
+        if stat.S_ISLNK(observed.st_mode):
+            raise StoreSafetyError(
+                "recovery-output-scope-inconclusive",
+                "Destination ancestry contains an untrusted symlink; only an "
+                "exact platform-trusted root alias may be followed: "
+                f"{candidate}",
+            )
         if not stat.S_ISDIR(observed.st_mode):
             raise StoreSafetyError(
                 "recovery-output-scope-inconclusive",
                 "The nearest existing recovery-output ancestor is not a "
                 f"directory: {candidate}",
+            )
+        return candidate, tuple(reversed(missing_components))
+
+
+def _nearest_existing_output_ancestor_following_aliases(
+    output_parent: Path,
+) -> tuple[Path, tuple[str, ...]]:
+    """Locate an ancestor for read-only overlap probes; never use it to mutate."""
+
+    candidate = Path(os.path.abspath(os.fspath(output_parent)))
+    missing_components: list[str] = []
+    while True:
+        try:
+            observed = os.stat(candidate)
+        except FileNotFoundError:
+            parent = candidate.parent
+            if parent == candidate:
+                raise StoreSafetyError(
+                    "recovery-output-scope-inconclusive",
+                    "Cannot locate an existing destination ancestor for a "
+                    f"read-only alias probe: {output_parent}",
+                )
+            missing_components.append(candidate.name)
+            candidate = parent
+            continue
+        except OSError as exc:
+            raise StoreSafetyError(
+                "recovery-output-scope-inconclusive",
+                "Cannot inspect a candidate destination ancestor during the "
+                f"read-only alias probe: {candidate}: {exc}",
+            ) from exc
+        if not stat.S_ISDIR(observed.st_mode):
+            raise StoreSafetyError(
+                "recovery-output-scope-inconclusive",
+                "The nearest existing destination ancestor is not a directory "
+                f"during the read-only alias probe: {candidate}",
             )
         return candidate, tuple(reversed(missing_components))
 
@@ -8667,10 +9316,75 @@ def _create_bound_output_parent_components(
             os.close(current_fd)
 
 
+def _preflight_recovery_output_outside_snapshot(
+    snapshot_binding: _BoundDirectory,
+    out: Path,
+) -> None:
+    """Prove output scope without creating any output-parent component."""
+
+    snapshot_receipt = _verify_bound_artifact_directory(
+        snapshot_binding,
+        missing_code="snapshot-missing",
+        identity_code="snapshot-directory-identity-mismatch",
+        access_policy_code="snapshot-directory-access-policy-mismatch",
+        inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+        mismatch_code="snapshot-file-set-mismatch",
+    )
+    snapshot = os.fstat(snapshot_binding.fd)
+    if (
+        _identity(snapshot) != snapshot_receipt["identity"]
+        or _access_policy(snapshot) != snapshot_receipt["access_policy"]
+    ):
+        raise StoreSafetyError(
+            "snapshot-directory-identity-mismatch",
+            "Held snapshot root differs from its transaction receipt before "
+            f"recovery-output scope validation: {snapshot_binding.path}",
+        )
+    try:
+        output_existing = os.stat(out)
+    except FileNotFoundError:
+        output_existing = None
+    except OSError as exc:
+        raise StoreSafetyError(
+            "recovery-output-scope-inconclusive",
+            f"Cannot inspect the recovery output before parent creation: {out}: {exc}",
+        ) from exc
+    if (
+        output_existing is not None
+        and stat.S_ISDIR(output_existing.st_mode)
+        and _directory_identity_key(output_existing)
+        == _directory_identity_key(snapshot)
+    ):
+        raise StoreSafetyError(
+            "recovery-output-inside-snapshot",
+            f"Recovery output resolves to the immutable snapshot root: {out}",
+        )
+    nearest_path, _ = _nearest_existing_output_ancestor_following_aliases(out.parent)
+    with _bind_existing_directory_following_aliases(nearest_path) as (
+        ancestor_fd,
+        _,
+    ):
+        _assert_output_ancestors_exclude_snapshot(
+            ancestor_fd,
+            snapshot,
+            display_path=nearest_path,
+        )
+    _verify_bound_artifact_directory(
+        snapshot_binding,
+        missing_code="snapshot-missing",
+        identity_code="snapshot-directory-identity-mismatch",
+        access_policy_code="snapshot-directory-access-policy-mismatch",
+        inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+        mismatch_code="snapshot-file-set-mismatch",
+    )
+
+
 @contextmanager
 def _bind_recovery_output_parent_outside_snapshot(
     snapshot_binding: _BoundDirectory,
     out: Path,
+    *,
+    output_parent_binding: _BoundDirectory | None = None,
 ) -> Iterator[_BoundDirectory]:
     """Create and bind an output parent whose descriptor ancestry excludes snapshot."""
 
@@ -8695,6 +9409,35 @@ def _bind_recovery_output_parent_outside_snapshot(
             "Held snapshot root access policy differs from its transaction "
             f"receipt: {snapshot_dir}",
         )
+    if output_parent_binding is not None:
+        if output_parent_binding.path != out.parent:
+            raise StoreSafetyError(
+                "recovery-output-scope-inconclusive",
+                "Recovery output does not use the live-safe bound parent: "
+                f"output={out}, parent={output_parent_binding.path}",
+            )
+        _verify_bound_directory_namespace(output_parent_binding)
+        _assert_output_ancestors_exclude_snapshot(
+            output_parent_binding.fd,
+            snapshot,
+            display_path=out.parent,
+        )
+        yield output_parent_binding
+        _verify_bound_directory_namespace(output_parent_binding)
+        _assert_output_ancestors_exclude_snapshot(
+            output_parent_binding.fd,
+            snapshot,
+            display_path=out.parent,
+        )
+        _verify_bound_artifact_directory(
+            snapshot_binding,
+            missing_code="snapshot-missing",
+            identity_code="snapshot-directory-identity-mismatch",
+            access_policy_code="snapshot-directory-access-policy-mismatch",
+            inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+            mismatch_code="snapshot-file-set-mismatch",
+        )
+        return
     try:
         output_existing = os.stat(out)
     except FileNotFoundError:
@@ -8770,8 +9513,10 @@ def recover_snapshot(
     manifest_creation_receipt: dict[str, Any] | None = None,
     *,
     manifest_creation_receipt_file: Path | None = None,
+    paths: NoteStorePaths | None = None,
 ) -> dict[str, Any]:
     source = snapshot_dir / "group.com.apple.notes" / NOTE_STORE_MAIN
+    requested_out = Path(os.path.abspath(os.fspath(out)))
     recovered: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
     try:
@@ -8781,20 +9526,31 @@ def recover_snapshot(
             manifest_creation_receipt_file=manifest_creation_receipt_file,
         ) as artifact:
             validation = artifact.public_result
-            with _bind_recovery_output_parent_outside_snapshot(
+            _preflight_recovery_output_outside_snapshot(
                 artifact.artifact_root,
-                out,
-            ) as output_parent:
-                recovered = _recover_validated_clone_to_standalone(
-                    artifact.recovered_main,
-                    out,
-                    source_db=source,
-                    recovery_evidence=artifact.recovery_evidence,
-                    source_integrity=artifact.source_integrity,
-                    source_revalidate=artifact.revalidate_recovery_clone,
-                    source_backup=artifact.backup_recovery_clone,
-                    output_parent_binding=output_parent,
-                )
+                requested_out,
+            )
+            with _bind_live_safe_destination_parent(
+                paths or NoteStorePaths(),
+                requested_out,
+            ) as destination_scope:
+                with _bind_recovery_output_parent_outside_snapshot(
+                    artifact.artifact_root,
+                    destination_scope.destination,
+                    output_parent_binding=destination_scope.parent,
+                ) as output_parent:
+                    recovered = _recover_validated_clone_to_standalone(
+                        artifact.recovered_main,
+                        destination_scope.destination,
+                        source_db=source,
+                        recovery_evidence=artifact.recovery_evidence,
+                        source_integrity=artifact.source_integrity,
+                        source_revalidate=artifact.revalidate_recovery_clone,
+                        source_backup=artifact.backup_recovery_clone,
+                        output_parent_binding=output_parent,
+                    )
+                    destination_scope.revalidate()
+                recovered["standalone_db"] = requested_out
             result = {
                 "snapshot_dir": snapshot_dir,
                 "snapshot_validation": {
@@ -8814,7 +9570,7 @@ def recover_snapshot(
         details = _publication_details(
             "uncertain",
             prepared=None,
-            destination=out,
+            destination=requested_out,
             retry_safe=False,
             descriptor_bound_destination=(
                 descriptor_bound_destination
@@ -8838,25 +9594,44 @@ def recover_snapshot(
             "destination-install-uncertain",
             "The standalone database was published and its public main-file "
             "receipt completed, but a later transaction-scoped parent, ancestor, "
-            f"or snapshot revalidation failed: {out}: {exc}",
+            f"or snapshot revalidation failed: {requested_out}: {exc}",
             details=details,
         ) from exc
     assert result is not None
     return result
 
 
-def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
-    dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if _lexists(dest):
+def stage_patch(
+    src: Path,
+    dest: Path,
+    *,
+    paths: NoteStorePaths | None = None,
+) -> dict[str, Any]:
+    requested_dest = Path(os.path.abspath(os.fspath(dest)))
+    if _lexists(requested_dest):
         raise StoreSafetyError(
-            "destination-exists", f"Patch stage already exists: {dest}"
+            "destination-exists", f"Patch stage already exists: {requested_dest}"
         )
-    partial = dest.parent / f".{dest.name}.partial-{uuid.uuid4().hex}"
     try:
-        with _create_bound_directory(
-            partial,
-            retain_failure_receipt=True,
-        ) as bound_root:
+        with (
+            _bind_live_safe_destination_parent(
+                paths or NoteStorePaths(),
+                requested_dest,
+            ) as destination_scope,
+            _create_bound_directory(
+                destination_scope.destination.parent
+                / (f".{destination_scope.destination.name}.partial-{uuid.uuid4().hex}"),
+                retain_failure_receipt=True,
+                parent_binding=destination_scope.parent,
+            ) as bound_root,
+        ):
+            dest = destination_scope.destination
+            partial = bound_root.path
+            if _lexists(dest):
+                raise StoreSafetyError(
+                    "destination-exists",
+                    f"Patch stage already exists: {requested_dest}",
+                )
             staged_db = partial / NOTE_STORE_MAIN
             recovery = _recover_to_standalone(
                 src,
@@ -8942,6 +9717,7 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
             ) as prepared_files:
 
                 def verify_before_stage_rename() -> None:
+                    destination_scope.revalidate()
                     _revalidate_published_regular_files(
                         partial,
                         prepared_files,
@@ -8961,6 +9737,7 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
                         bound_identity=root_receipt["identity"],
                         bound_access_policy=root_receipt["access_policy"],
                     )
+                    destination_scope.revalidate()
 
                 def build_descriptor_stage_tree_receipt(
                     published_basename: str,
@@ -8989,6 +9766,7 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
                     ),
                 )
                 try:
+                    destination_scope.revalidate()
                     _scan_exact_directory_entries(
                         dest,
                         {
@@ -9008,6 +9786,7 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
                         manifest_receipt=manifest_receipt,
                         file_receipts=file_receipts,
                     )
+                    destination_scope.revalidate()
                 except Exception as exc:
                     raise StoreSafetyError(
                         "destination-install-uncertain",
@@ -9024,10 +9803,10 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
     except StoreSafetyError:
         raise
     return {
-        "stage_dir": dest,
-        "manifest": dest / PATCH_MANIFEST,
+        "stage_dir": requested_dest,
+        "manifest": requested_dest / PATCH_MANIFEST,
         "manifest_creation_receipt": manifest_creation_receipt,
-        "database": dest / NOTE_STORE_MAIN,
+        "database": requested_dest / NOTE_STORE_MAIN,
         "sha256": manifest["database"]["sha256"],
         "size": manifest["database"]["size"],
         "sqlite_validation": manifest["sqlite_validation"],
@@ -9551,6 +10330,7 @@ def build_parser() -> argparse.ArgumentParser:
         "merge-db",
         help="Recover a copied store into a standalone analysis DB.",
     )
+    _add_container_options(merge_parser)
     merge_parser.add_argument(
         "--src", type=Path, required=True, help="Copied NoteStore.sqlite."
     )
@@ -9572,6 +10352,7 @@ def build_parser() -> argparse.ArgumentParser:
         "recover-snapshot",
         help="Recover a validated snapshot to a standalone SQLite DB.",
     )
+    _add_container_options(recover_parser)
     recover_parser.add_argument("--snapshot-dir", type=Path, required=True)
     recover_parser.add_argument("--out", type=Path, required=True)
     recover_parser.add_argument(
@@ -9585,6 +10366,7 @@ def build_parser() -> argparse.ArgumentParser:
         "stage-patch",
         help="Normalize an edited DB into a validated, sidecar-free patch stage.",
     )
+    _add_container_options(stage_parser)
     stage_parser.add_argument("--src", type=Path, required=True)
     stage_parser.add_argument("--dest", type=Path, required=True)
 
@@ -9671,7 +10453,13 @@ def main(argv: Iterable[str] | None = None) -> int:
                 )
             )
         elif args.command == "merge-db":
-            emit_json(merge_db(args.src, args.out))
+            emit_json(
+                merge_db(
+                    args.src,
+                    args.out,
+                    paths=_paths_from_args(args),
+                )
+            )
         elif args.command == "validate-snapshot":
             emit_json(
                 validate_snapshot(
@@ -9689,10 +10477,17 @@ def main(argv: Iterable[str] | None = None) -> int:
                     manifest_creation_receipt_file=(
                         args.manifest_creation_receipt_file
                     ),
+                    paths=_paths_from_args(args),
                 )
             )
         elif args.command == "stage-patch":
-            emit_json(stage_patch(args.src, args.dest))
+            emit_json(
+                stage_patch(
+                    args.src,
+                    args.dest,
+                    paths=_paths_from_args(args),
+                )
+            )
         elif args.command == "validate-patch-stage":
             emit_json(
                 validate_patch_stage(

@@ -54,14 +54,24 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" copy-db \
   > /tmp/<task-snapshot>.creation-result.json
 ```
 
-Before creating even the destination parent, `copy-db` normalizes the requested path with
-case-folded NFD components and binds the nearest existing ancestor plus both Apple Notes live
-containers. It rejects a normalized lexical overlap or descriptor-ancestor identity match, and it
-never creates a directory at `NoteStore.sqlite`, `-wal`, `-shm`, or `-journal` under a live
-container—even when that sidecar is currently absent. Live-container and destination-ancestor
-identity and access policy remain bound through publication; unrelated child-entry churn is not a
-content mutation. Treat `snapshot-destination-scope-inconclusive` as fail-closed, distinct from a
-proved `snapshot-destination-inside-live-container` overlap.
+Before creating even the destination parent, every write-producing command (`copy-db`, `merge-db`,
+`recover-snapshot`, and `stage-patch`) enters the same live-container guard. It normalizes the
+requested path with case-folded NFD components and binds the nearest existing ancestor plus both
+Apple Notes live containers. It rejects normalized lexical overlap, either direction of
+ancestor/descendant overlap, or a descriptor-ancestor identity match. It also rejects
+`NoteStore.sqlite`, `-wal`, `-shm`, and `-journal` as path components anywhere in a destination,
+even when that sidecar is currently absent. The guard runs before the first mkdir, file creation,
+rename, partial, backup, receipt, or helper output.
+
+On macOS, only the exact registry entries `/tmp -> /private/tmp`, `/var -> /private/var`, and
+`/etc -> /private/etc` may bridge a root symlink. The helper binds the alias parent, alias entry and
+target text, plus the canonical target and its parent, then performs writes through canonical held
+descriptors while revalidating both namespaces. An arbitrary symlink, a case-folded spelling, an
+NFC/NFD variant, a retarget, or an alias replacement fails closed before mutation. Live-container,
+trusted-alias, and destination-ancestor identity and access policy remain bound through
+publication; unrelated child-entry churn is not a content mutation. Treat
+`snapshot-destination-scope-inconclusive` as fail-closed, distinct from a proved
+`snapshot-destination-inside-live-container` overlap.
 
 Treat a snapshot captured while Notes is running as tentative.
 Do not use it for absence claims, exact counts, patch planning, or writeback.
@@ -228,6 +238,12 @@ ancestor, manifest, or snapshot-file identity/content/access-policy failure is s
 `destination-install-uncertain` with `publication_state: uncertain`, `retry_safe: false`, and the
 descriptor-bound destination receipt; it must not escape as a pre-publication prepared/snapshot
 error.
+After any no-replace publication has committed, every later ordinary exception from descriptor
+stat/read, parent fsync, receipt construction, sidecar checks, public-path validation, or terminal
+revalidation—including `ENOENT`, `EACCES`, `EIO`, and an unexpected runtime exception—has that
+same uncertain, non-retryable result. Recovery evidence remains descriptor-bound and records an
+inconclusive sub-check when a terminal receipt cannot be completed. Process-control exceptions
+such as `KeyboardInterrupt` and `SystemExit` are not translated.
 
 The packaged helper remains compatible with Python 3.9. Do not use newer runtime-only call
 arguments, such as `zip(..., strict=True)`, without adding a consistent minimum-version gate.
