@@ -6454,6 +6454,559 @@ raise SystemExit(2)
                 value = conn.execute("SELECT value FROM sample").fetchone()[0]
             self.assertEqual(value, "validated")
 
+    def test_second_source_revalidation_failure_reports_bound_retained_temp(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            destination = root / "merged.sqlite"
+            self._create_db(source, value="validated")
+            revalidation_calls = 0
+            prepared_path: Path | None = None
+
+            with MODULE._bind_source_store(source) as source_store:
+
+                def revalidate_source() -> None:
+                    nonlocal revalidation_calls, prepared_path
+                    revalidation_calls += 1
+                    if revalidation_calls != 2:
+                        return
+                    prepared_path = next(root.glob(".merged.sqlite.tmp-*"))
+                    raise MODULE.StoreSafetyError(
+                        "source-revalidation-inconclusive",
+                        "simulated second source revalidation failure",
+                    )
+
+                def backup_source(
+                    output: Path,
+                    destination_binding: MODULE._BoundDirectory | None,
+                ) -> dict[str, object]:
+                    return MODULE._backup_sqlite_to_standalone(
+                        source_store,
+                        output,
+                        destination_binding=destination_binding,
+                    )
+
+                with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                    MODULE._recover_validated_clone_to_standalone(
+                        source,
+                        destination,
+                        source_db=source,
+                        recovery_evidence={},
+                        source_integrity={"result": "ok"},
+                        source_revalidate=revalidate_source,
+                        source_backup=backup_source,
+                    )
+
+            self._assert_safety_code(
+                "source-revalidation-inconclusive",
+                raised,
+            )
+            self.assertEqual(revalidation_calls, 2)
+            self.assertIsNotNone(prepared_path)
+            assert prepared_path is not None
+            self.assertTrue(prepared_path.is_file())
+            self.assertFalse(destination.exists())
+            details = raised.exception.details
+            self.assertEqual(details["cleanup_state"], "retained")
+            self.assertFalse(details["retry_safe"])
+            self.assertNotIn("publication_state", details)
+            locator = details["recovery_locators"]["descriptor_bound_prepared_file"]
+            self.assertEqual(locator["evidence_status"], "checked")
+            self.assertEqual(
+                locator["file_descriptor"]["identity"],
+                MODULE._identity(prepared_path.stat()),
+            )
+            namespace = locator["namespace_observations"][prepared_path.name]
+            self.assertEqual(namespace["status"], "present")
+            self.assertTrue(namespace["identity_matches_creation_receipt"])
+
+    def test_second_source_revalidation_runtime_failure_retains_swapped_objects(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            destination = root / "merged.sqlite"
+            self._create_db(source, value="validated")
+            revalidation_calls = 0
+            moved_prepared: Path | None = None
+            replacement: Path | None = None
+
+            with MODULE._bind_source_store(source) as source_store:
+
+                def revalidate_source() -> None:
+                    nonlocal revalidation_calls, moved_prepared, replacement
+                    revalidation_calls += 1
+                    if revalidation_calls != 2:
+                        return
+                    prepared = next(root.glob(".merged.sqlite.tmp-*"))
+                    moved_prepared = prepared.with_name(f"{prepared.name}.owned")
+                    prepared.rename(moved_prepared)
+                    prepared.write_text("replacement", encoding="utf-8")
+                    replacement = prepared
+                    raise OSError(
+                        MODULE.errno.EIO,
+                        "simulated second source revalidation failure",
+                    )
+
+                def backup_source(
+                    output: Path,
+                    destination_binding: MODULE._BoundDirectory | None,
+                ) -> dict[str, object]:
+                    return MODULE._backup_sqlite_to_standalone(
+                        source_store,
+                        output,
+                        destination_binding=destination_binding,
+                    )
+
+                with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                    MODULE._recover_validated_clone_to_standalone(
+                        source,
+                        destination,
+                        source_db=source,
+                        recovery_evidence={},
+                        source_integrity={"result": "ok"},
+                        source_revalidate=revalidate_source,
+                        source_backup=backup_source,
+                    )
+
+            self._assert_safety_code("prepared-operation-failed", raised)
+            self.assertIsInstance(raised.exception.__cause__, OSError)
+            self.assertEqual(
+                raised.exception.details["underlying_errno"],
+                MODULE.errno.EIO,
+            )
+            self.assertEqual(revalidation_calls, 2)
+            self.assertIsNotNone(moved_prepared)
+            self.assertIsNotNone(replacement)
+            assert moved_prepared is not None
+            assert replacement is not None
+            self.assertTrue(moved_prepared.is_file())
+            self.assertEqual(
+                replacement.read_text(encoding="utf-8"),
+                "replacement",
+            )
+            self.assertFalse(destination.exists())
+            details = raised.exception.details
+            self.assertEqual(details["cleanup_state"], "retained")
+            self.assertFalse(details["retry_safe"])
+            locator = details["recovery_locators"]["descriptor_bound_prepared_file"]
+            self.assertEqual(
+                locator["file_descriptor"]["identity"],
+                MODULE._identity(moved_prepared.stat()),
+            )
+            namespace = locator["namespace_observations"][replacement.name]
+            self.assertEqual(namespace["status"], "present")
+            self.assertFalse(namespace["identity_matches_creation_receipt"])
+            self.assertEqual(
+                namespace["identity"],
+                MODULE._identity(replacement.stat()),
+            )
+            with closing(sqlite3.connect(moved_prepared)) as conn:
+                value = conn.execute("SELECT value FROM sample").fetchone()[0]
+            self.assertEqual(value, "validated")
+
+    def test_prepublication_receipt_mismatch_does_not_sign_attacker_state(
+        self,
+    ) -> None:
+        cases = (
+            ("identity", "prepared-file-identity-mismatch"),
+            ("content", "prepared-file-content-mismatch"),
+            ("access-policy", "prepared-file-access-policy-mismatch"),
+        )
+        for attack, expected_code in cases:
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                source = root / MODULE.NOTE_STORE_MAIN
+                destination = root / "merged.sqlite"
+                self._create_db(source, value="validated")
+                creation_receipt: dict[str, object] | None = None
+                prepared_path: Path | None = None
+                moved_created: Path | None = None
+
+                with MODULE._bind_source_store(source) as source_store:
+
+                    def backup_source(
+                        output: Path,
+                        destination_binding: MODULE._BoundDirectory | None,
+                    ) -> dict[str, object]:
+                        nonlocal creation_receipt, prepared_path, moved_created
+                        result = MODULE._backup_sqlite_to_standalone(
+                            source_store,
+                            output,
+                            destination_binding=destination_binding,
+                        )
+                        creation_receipt = result
+                        prepared_path = output
+                        if attack == "identity":
+                            moved_created = output.with_name(f"{output.name}.created")
+                            output.rename(moved_created)
+                            shutil.copyfile(moved_created, output)
+                            output.chmod(stat.S_IMODE(moved_created.stat().st_mode))
+                        elif attack == "content":
+                            with output.open("ab") as handle:
+                                handle.write(b"tampered-after-creation-receipt")
+                                handle.flush()
+                                os.fsync(handle.fileno())
+                        else:
+                            output.chmod(0o640)
+                        return result
+
+                    with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                        MODULE._recover_validated_clone_to_standalone(
+                            source,
+                            destination,
+                            source_db=source,
+                            recovery_evidence={},
+                            source_integrity={"result": "ok"},
+                            source_revalidate=lambda: None,
+                            source_backup=backup_source,
+                        )
+
+                self._assert_safety_code(expected_code, raised)
+                self.assertIsNotNone(creation_receipt)
+                self.assertIsNotNone(prepared_path)
+                assert creation_receipt is not None
+                assert prepared_path is not None
+                self.assertTrue(prepared_path.is_file())
+                self.assertFalse(destination.exists())
+                details = raised.exception.details
+                self.assertEqual(details["cleanup_state"], "retained")
+                self.assertFalse(details["retry_safe"])
+                locator = details["recovery_locators"]["descriptor_bound_prepared_file"]
+                self.assertEqual(
+                    locator["creation_receipt"]["identity"],
+                    creation_receipt["identity"],
+                )
+                initial = locator["initial_bound_descriptor"]
+                self.assertEqual(
+                    initial["identity_matches_creation_receipt"],
+                    attack != "identity",
+                )
+                self.assertEqual(
+                    initial["content_matches_creation_receipt"],
+                    attack != "content",
+                )
+                self.assertEqual(
+                    initial["access_policy_matches_creation_receipt"],
+                    attack != "access-policy",
+                )
+                self.assertEqual(
+                    locator["content_evidence"]["matches_creation_receipt"],
+                    attack != "content",
+                )
+                namespace = locator["namespace_observations"][prepared_path.name]
+                self.assertEqual(namespace["status"], "present")
+                self.assertEqual(
+                    namespace["identity_matches_creation_receipt"],
+                    attack != "identity",
+                )
+                self.assertEqual(
+                    namespace["access_policy_matches_creation_receipt"],
+                    attack != "access-policy",
+                )
+                if attack == "identity":
+                    self.assertIsNotNone(moved_created)
+                    assert moved_created is not None
+                    self.assertEqual(
+                        MODULE._identity(moved_created.stat()),
+                        creation_receipt["identity"],
+                    )
+
+    def test_prepublication_receipt_allows_mtime_only_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            destination = root / "merged.sqlite"
+            self._create_db(source, value="validated")
+
+            with MODULE._bind_source_store(source) as source_store:
+
+                def backup_then_touch_mtime(
+                    output: Path,
+                    destination_binding: MODULE._BoundDirectory | None,
+                ) -> dict[str, object]:
+                    result = MODULE._backup_sqlite_to_standalone(
+                        source_store,
+                        output,
+                        destination_binding=destination_binding,
+                    )
+                    observed = output.stat()
+                    os.utime(
+                        output,
+                        ns=(
+                            observed.st_atime_ns,
+                            observed.st_mtime_ns + 1_000_000_000,
+                        ),
+                    )
+                    return result
+
+                result = MODULE._recover_validated_clone_to_standalone(
+                    source,
+                    destination,
+                    source_db=source,
+                    recovery_evidence={},
+                    source_integrity={"result": "ok"},
+                    source_revalidate=lambda: None,
+                    source_backup=backup_then_touch_mtime,
+                )
+
+            self.assertEqual(Path(result["standalone_db"]), destination)
+            with closing(sqlite3.connect(destination)) as conn:
+                value = conn.execute("SELECT value FROM sample").fetchone()[0]
+            self.assertEqual(value, "validated")
+
+    def test_snapshot_post_backup_revalidation_reports_retained_temp(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            source = paths.group_container / MODULE.NOTE_STORE_MAIN
+            self._create_db(source, value="validated")
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+            snapshot_main = (
+                snapshot_dir / "group.com.apple.notes" / MODULE.NOTE_STORE_MAIN
+            )
+            destination = root / "recovered.sqlite"
+            original_backup = MODULE._backup_bound_store_to_standalone
+            prepared_path: Path | None = None
+
+            def backup_then_change_snapshot_access(
+                source_store: MODULE._BoundRecoveryStore,
+                output: Path,
+                *,
+                destination_binding: MODULE._BoundDirectory | None = None,
+            ) -> dict[str, object]:
+                nonlocal prepared_path
+                result = original_backup(
+                    source_store,
+                    output,
+                    destination_binding=destination_binding,
+                )
+                prepared_path = output
+                snapshot_main.chmod(0o640)
+                return result
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_backup_bound_store_to_standalone",
+                    side_effect=backup_then_change_snapshot_access,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                self._recover_snapshot(snapshot_dir, destination)
+
+            self._assert_safety_code(
+                "snapshot-file-access-policy-mismatch",
+                raised,
+            )
+            self.assertIsNotNone(prepared_path)
+            assert prepared_path is not None
+            self.assertTrue(prepared_path.is_file())
+            self.assertFalse(destination.exists())
+            details = raised.exception.details
+            self.assertEqual(details["cleanup_state"], "retained")
+            self.assertFalse(details["retry_safe"])
+            locator = details["recovery_locators"]["descriptor_bound_prepared_file"]
+            self.assertTrue(
+                locator["initial_bound_descriptor"]["identity_matches_creation_receipt"]
+            )
+            self.assertTrue(
+                locator["initial_bound_descriptor"]["content_matches_creation_receipt"]
+            )
+            self.assertTrue(
+                locator["initial_bound_descriptor"][
+                    "access_policy_matches_creation_receipt"
+                ]
+            )
+
+    def test_temp_bind_failure_reports_unbound_creation_receipt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            destination = root / "merged.sqlite"
+            self._create_db(source, value="validated")
+            backup_finished = False
+            creation_receipt: dict[str, object] | None = None
+            prepared_path: Path | None = None
+            original_hash = MODULE._hash_fd
+
+            with MODULE._bind_source_store(source) as source_store:
+
+                def backup_source(
+                    output: Path,
+                    destination_binding: MODULE._BoundDirectory | None,
+                ) -> dict[str, object]:
+                    nonlocal backup_finished, creation_receipt, prepared_path
+                    result = MODULE._backup_sqlite_to_standalone(
+                        source_store,
+                        output,
+                        destination_binding=destination_binding,
+                    )
+                    creation_receipt = result
+                    prepared_path = output
+                    backup_finished = True
+                    return result
+
+                def fail_rebind_hash(fd: int) -> str:
+                    if (
+                        backup_finished
+                        and creation_receipt is not None
+                        and MODULE._identity(os.fstat(fd))
+                        == creation_receipt["identity"]
+                    ):
+                        raise OSError(
+                            MODULE.errno.EIO,
+                            "simulated descriptor rebind hash failure",
+                        )
+                    return original_hash(fd)
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_hash_fd",
+                        side_effect=fail_rebind_hash,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE._recover_validated_clone_to_standalone(
+                        source,
+                        destination,
+                        source_db=source,
+                        recovery_evidence={},
+                        source_integrity={"result": "ok"},
+                        source_revalidate=lambda: None,
+                        source_backup=backup_source,
+                    )
+
+            self._assert_safety_code(
+                "prepared-file-revalidation-inconclusive",
+                raised,
+            )
+            self.assertIsNotNone(creation_receipt)
+            self.assertIsNotNone(prepared_path)
+            assert creation_receipt is not None
+            assert prepared_path is not None
+            self.assertTrue(prepared_path.is_file())
+            self.assertFalse(destination.exists())
+            details = raised.exception.details
+            self.assertEqual(
+                details["cleanup_state"],
+                "preserved-or-incomplete",
+            )
+            self.assertFalse(details["retry_safe"])
+            self.assertNotIn(
+                "descriptor_bound_prepared_file",
+                details["recovery_locators"],
+            )
+            locator = details["recovery_locators"]["creation_receipt_prepared_file"]
+            self.assertEqual(locator["binding_status"], "inconclusive")
+            self.assertEqual(
+                locator["creation_receipt"]["identity"],
+                creation_receipt["identity"],
+            )
+            namespace = locator["namespace_observations"][prepared_path.name]
+            self.assertEqual(namespace["status"], "present")
+            self.assertTrue(namespace["identity_matches_creation_receipt"])
+
+    def test_retention_evidence_failure_preserves_source_error_and_temp(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            destination = root / "merged.sqlite"
+            self._create_db(source, value="validated")
+            revalidation_calls = 0
+            prepared_path: Path | None = None
+
+            with MODULE._bind_source_store(source) as source_store:
+
+                def revalidate_source() -> None:
+                    nonlocal revalidation_calls, prepared_path
+                    revalidation_calls += 1
+                    if revalidation_calls != 2:
+                        return
+                    prepared_path = next(root.glob(".merged.sqlite.tmp-*"))
+                    raise MODULE.StoreSafetyError(
+                        "source-content-mismatch",
+                        "simulated second source revalidation failure",
+                    )
+
+                def backup_source(
+                    output: Path,
+                    destination_binding: MODULE._BoundDirectory | None,
+                ) -> dict[str, object]:
+                    return MODULE._backup_sqlite_to_standalone(
+                        source_store,
+                        output,
+                        destination_binding=destination_binding,
+                    )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_retained_rebound_regular_file_details",
+                        side_effect=OSError(
+                            MODULE.errno.EIO,
+                            "simulated retention evidence failure",
+                        ),
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "unlink",
+                        wraps=MODULE.os.unlink,
+                    ) as unlink,
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE._recover_validated_clone_to_standalone(
+                        source,
+                        destination,
+                        source_db=source,
+                        recovery_evidence={},
+                        source_integrity={"result": "ok"},
+                        source_revalidate=revalidate_source,
+                        source_backup=backup_source,
+                    )
+                self.assertFalse(
+                    any(
+                        ".merged.sqlite.tmp-" in os.fspath(call.args[0])
+                        for call in unlink.call_args_list
+                    )
+                )
+
+            self._assert_safety_code("source-content-mismatch", raised)
+            self.assertIsNotNone(prepared_path)
+            assert prepared_path is not None
+            self.assertTrue(prepared_path.is_file())
+            self.assertFalse(destination.exists())
+            details = raised.exception.details
+            self.assertEqual(details["cleanup_state"], "inconclusive")
+            self.assertFalse(details["retry_safe"])
+            self.assertEqual(details["cleanup_error_type"], "OSError")
+            locator = details["recovery_locators"]["descriptor_bound_prepared_file"]
+            self.assertEqual(locator["evidence_status"], "inconclusive")
+            self.assertEqual(
+                locator["retention_evidence_error_type"],
+                "OSError",
+            )
+            self.assertEqual(
+                locator["initial_bound_descriptor"]["identity"],
+                MODULE._identity(prepared_path.stat()),
+            )
+
     def test_merge_db_rejects_corrupt_sqlite(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             src = Path(temp_dir) / MODULE.NOTE_STORE_MAIN

@@ -5405,6 +5405,421 @@ def _retained_created_regular_file_details(
     }
 
 
+def _retained_rebound_regular_file_details(
+    parent: _BoundDirectory,
+    prepared: _BoundRegularFile,
+    creation_receipt: dict[str, Any],
+    *,
+    display_path: Path,
+    candidate_basenames: Iterable[str],
+) -> dict[str, Any]:
+    """Describe a rebound retained file without signing it as the created object."""
+
+    expected_identity = creation_receipt.get("identity")
+    expected_access_policy = creation_receipt.get("access_policy")
+    expected_sha256 = creation_receipt.get("sha256")
+    expected_size = creation_receipt.get("size")
+    receipt: dict[str, Any] = {
+        "schema": "apple-notes-retained-rebound-prepared-file/v1",
+        "evidence_status": "checked",
+        "display_path": str(display_path),
+        "cleanup_policy": "retain-never-stat-then-unlink",
+        "protected_properties": [
+            "object-identity",
+            "content-stability",
+            "access-policy",
+        ],
+        "namespace_authority": "point-in-time-observation-only",
+        "namespace_note": (
+            "A namespace leaf can be replaced after observation. Recovery must "
+            "match the creation receipt and descriptor evidence before any later "
+            "destructive action."
+        ),
+        "creation_receipt": {
+            "identity": expected_identity,
+            "access_policy": expected_access_policy,
+            "sha256": expected_sha256,
+            "size": expected_size,
+        },
+        "initial_bound_descriptor": {
+            "identity": _identity(prepared.opened),
+            "access_policy": _access_policy(prepared.opened),
+            "sha256": prepared.sha256,
+            "size": prepared.opened.st_size,
+            "identity_matches_creation_receipt": (
+                _identity(prepared.opened) == expected_identity
+            ),
+            "access_policy_matches_creation_receipt": (
+                _access_policy(prepared.opened) == expected_access_policy
+            ),
+            "content_matches_creation_receipt": (
+                prepared.sha256 == expected_sha256
+                and prepared.opened.st_size == expected_size
+            ),
+        },
+    }
+    try:
+        parent_current = os.fstat(parent.fd)
+    except OSError as exc:
+        receipt["evidence_status"] = "inconclusive"
+        receipt["parent_descriptor_error"] = str(exc)
+    else:
+        receipt["parent_descriptor"] = {
+            "identity": _identity(parent_current),
+            "access_policy": _access_policy(parent_current),
+            "matches_creation_receipt": (
+                _same_identity(parent.opened, parent_current)
+                and _access_policy(parent.opened) == _access_policy(parent_current)
+            ),
+        }
+        if not receipt["parent_descriptor"]["matches_creation_receipt"]:
+            receipt["evidence_status"] = "inconclusive"
+    try:
+        file_current = os.fstat(prepared.fd)
+    except OSError as exc:
+        receipt["evidence_status"] = "inconclusive"
+        receipt["file_descriptor_error"] = str(exc)
+    else:
+        receipt["file_descriptor"] = {
+            "identity": _identity(file_current),
+            "access_policy": _access_policy(file_current),
+            "size": file_current.st_size,
+            "identity_matches_creation_receipt": (
+                _identity(file_current) == expected_identity
+            ),
+            "access_policy_matches_creation_receipt": (
+                _access_policy(file_current) == expected_access_policy
+            ),
+            "size_matches_creation_receipt": file_current.st_size == expected_size,
+        }
+    receipt["content_evidence"] = {
+        "status": "last-verified-during-descriptor-bind",
+        "sha256": prepared.sha256,
+        "size": prepared.opened.st_size,
+        "matches_creation_receipt": (
+            prepared.sha256 == expected_sha256
+            and prepared.opened.st_size == expected_size
+        ),
+        "terminal": False,
+    }
+    observations: dict[str, Any] = {}
+    namespace_inconclusive = False
+    for basename in dict.fromkeys(candidate_basenames):
+        state, observed = _observe_bound_name(parent.fd, basename)
+        row: dict[str, Any] = {
+            "status": state,
+            "authority": "point-in-time-only",
+        }
+        if state == "present" and observed is not None:
+            row.update(
+                {
+                    "identity": _identity(observed),
+                    "access_policy": _access_policy(observed),
+                    "size": observed.st_size,
+                    "identity_matches_creation_receipt": (
+                        _identity(observed) == expected_identity
+                    ),
+                    "access_policy_matches_creation_receipt": (
+                        _access_policy(observed) == expected_access_policy
+                    ),
+                    "size_matches_creation_receipt": observed.st_size == expected_size,
+                }
+            )
+        elif state == "unavailable":
+            row["evidence_status"] = "inconclusive"
+            namespace_inconclusive = True
+        observations[basename] = row
+    receipt["namespace_observations"] = observations
+    receipt["namespace_evidence_status"] = (
+        "inconclusive" if namespace_inconclusive else "point-in-time-only"
+    )
+    return {
+        "cleanup_state": "retained",
+        "cleanup_policy": "retain-never-stat-then-unlink",
+        "retry_safe": False,
+        "recovery_locators": {
+            "descriptor_bound_prepared_file": receipt,
+        },
+    }
+
+
+def _inconclusive_rebound_regular_file_details(
+    parent: _BoundDirectory,
+    prepared: _BoundRegularFile,
+    creation_receipt: dict[str, Any],
+    *,
+    display_path: Path,
+    evidence_error: BaseException,
+) -> dict[str, Any]:
+    """Return fixed descriptor evidence when richer retention inspection fails."""
+
+    return {
+        "cleanup_state": "inconclusive",
+        "cleanup_policy": "retain-never-stat-then-unlink",
+        "retry_safe": False,
+        "cleanup_error_type": type(evidence_error).__name__,
+        "cleanup_error": str(evidence_error),
+        "recovery_locators": {
+            "descriptor_bound_prepared_file": {
+                "schema": "apple-notes-retained-rebound-prepared-file/v1",
+                "evidence_status": "inconclusive",
+                "display_path": str(display_path),
+                "cleanup_policy": "retain-never-stat-then-unlink",
+                "protected_properties": [
+                    "object-identity",
+                    "content-stability",
+                    "access-policy",
+                ],
+                "creation_receipt": {
+                    "identity": dict.get(creation_receipt, "identity"),
+                    "access_policy": dict.get(creation_receipt, "access_policy"),
+                    "sha256": dict.get(creation_receipt, "sha256"),
+                    "size": dict.get(creation_receipt, "size"),
+                },
+                "initial_bound_descriptor": {
+                    "identity": _identity(prepared.opened),
+                    "access_policy": _access_policy(prepared.opened),
+                    "sha256": prepared.sha256,
+                    "size": prepared.opened.st_size,
+                },
+                "parent_creation_receipt": {
+                    "identity": _identity(parent.opened),
+                    "access_policy": _access_policy(parent.opened),
+                },
+                "retention_evidence_error_type": type(evidence_error).__name__,
+                "retention_evidence_error": str(evidence_error),
+                "namespace_evidence_status": "inconclusive",
+            },
+        },
+    }
+
+
+def _retained_unbound_regular_file_details(
+    parent: _BoundDirectory,
+    creation_receipt: dict[str, Any],
+    *,
+    display_path: Path,
+    candidate_basenames: Iterable[str],
+) -> dict[str, Any]:
+    """Report a created file that could not be rebound after writer return."""
+
+    expected_identity = creation_receipt.get("identity")
+    expected_access_policy = creation_receipt.get("access_policy")
+    expected_size = creation_receipt.get("size")
+    locator: dict[str, Any] = {
+        "schema": "apple-notes-retained-unbound-prepared-file/v1",
+        "evidence_status": "checked",
+        "display_path": str(display_path),
+        "cleanup_policy": "retain-never-stat-then-unlink",
+        "protected_properties": [
+            "object-identity",
+            "content-stability",
+            "access-policy",
+        ],
+        "creation_receipt": {
+            "identity": expected_identity,
+            "access_policy": expected_access_policy,
+            "sha256": creation_receipt.get("sha256"),
+            "size": expected_size,
+        },
+        "binding_status": "inconclusive",
+        "namespace_authority": "point-in-time-observation-only",
+    }
+    try:
+        parent_current = os.fstat(parent.fd)
+    except OSError as exc:
+        locator["evidence_status"] = "inconclusive"
+        locator["parent_descriptor_error"] = str(exc)
+    else:
+        locator["parent_descriptor"] = {
+            "identity": _identity(parent_current),
+            "access_policy": _access_policy(parent_current),
+            "matches_creation_receipt": (
+                _same_identity(parent.opened, parent_current)
+                and _access_policy(parent.opened) == _access_policy(parent_current)
+            ),
+        }
+        if not locator["parent_descriptor"]["matches_creation_receipt"]:
+            locator["evidence_status"] = "inconclusive"
+    observations: dict[str, Any] = {}
+    namespace_inconclusive = False
+    for basename in dict.fromkeys(candidate_basenames):
+        state, observed = _observe_bound_name(parent.fd, basename)
+        row: dict[str, Any] = {
+            "status": state,
+            "authority": "point-in-time-only",
+        }
+        if state == "present" and observed is not None:
+            row.update(
+                {
+                    "identity": _identity(observed),
+                    "access_policy": _access_policy(observed),
+                    "size": observed.st_size,
+                    "identity_matches_creation_receipt": (
+                        _identity(observed) == expected_identity
+                    ),
+                    "access_policy_matches_creation_receipt": (
+                        _access_policy(observed) == expected_access_policy
+                    ),
+                    "size_matches_creation_receipt": observed.st_size == expected_size,
+                }
+            )
+        elif state == "unavailable":
+            row["evidence_status"] = "inconclusive"
+            namespace_inconclusive = True
+        observations[basename] = row
+    locator["namespace_observations"] = observations
+    locator["namespace_evidence_status"] = (
+        "inconclusive" if namespace_inconclusive else "point-in-time-only"
+    )
+    return {
+        "cleanup_state": "preserved-or-incomplete",
+        "cleanup_policy": "retain-never-stat-then-unlink",
+        "retry_safe": False,
+        "recovery_locators": {
+            "creation_receipt_prepared_file": locator,
+        },
+    }
+
+
+def _inconclusive_unbound_regular_file_details(
+    parent: _BoundDirectory,
+    creation_receipt: dict[str, Any],
+    *,
+    display_path: Path,
+    evidence_error: BaseException,
+) -> dict[str, Any]:
+    """Return fixed creation evidence when unbound retention inspection fails."""
+
+    return {
+        "cleanup_state": "inconclusive",
+        "cleanup_policy": "retain-never-stat-then-unlink",
+        "retry_safe": False,
+        "cleanup_error_type": type(evidence_error).__name__,
+        "cleanup_error": str(evidence_error),
+        "recovery_locators": {
+            "creation_receipt_prepared_file": {
+                "schema": "apple-notes-retained-unbound-prepared-file/v1",
+                "evidence_status": "inconclusive",
+                "display_path": str(display_path),
+                "cleanup_policy": "retain-never-stat-then-unlink",
+                "creation_receipt": {
+                    "identity": dict.get(creation_receipt, "identity"),
+                    "access_policy": dict.get(creation_receipt, "access_policy"),
+                    "sha256": dict.get(creation_receipt, "sha256"),
+                    "size": dict.get(creation_receipt, "size"),
+                },
+                "parent_creation_receipt": {
+                    "identity": _identity(parent.opened),
+                    "access_policy": _access_policy(parent.opened),
+                },
+                "binding_status": "inconclusive",
+                "retention_evidence_error_type": type(evidence_error).__name__,
+                "retention_evidence_error": str(evidence_error),
+                "namespace_evidence_status": "inconclusive",
+            },
+        },
+    }
+
+
+@contextmanager
+def _bind_prepared_regular_file_with_failure_receipt(
+    path: Path,
+    parent: _BoundDirectory,
+    creation_receipt: dict[str, Any],
+) -> Iterator[_BoundRegularFile]:
+    """Bind a writer-created file or report its unbound creation receipt."""
+
+    prepared: _BoundRegularFile | None = None
+    try:
+        with _bind_regular_file_at(path, parent, PREPARED_FILE_CODES) as prepared:
+            yield prepared
+    except Exception as exc:
+        if prepared is not None:
+            raise
+        try:
+            retained = _retained_unbound_regular_file_details(
+                parent,
+                creation_receipt,
+                display_path=path,
+                candidate_basenames=(path.name,),
+            )
+        except Exception as evidence_error:
+            retained = _inconclusive_unbound_regular_file_details(
+                parent,
+                creation_receipt,
+                display_path=path,
+                evidence_error=evidence_error,
+            )
+        if isinstance(exc, StoreSafetyError):
+            exc.details = _merge_recovery_details(exc.details, retained)
+            raise
+        details = dict(retained)
+        details.update(
+            {
+                "underlying_error_type": type(exc).__name__,
+                "underlying_errno": getattr(exc, "errno", None),
+            }
+        )
+        raise StoreSafetyError(
+            "prepared-operation-failed",
+            "A writer-created sensitive file could not be rebound before "
+            f"publication and was retained: {path}: {exc}",
+            details=details,
+        ) from exc
+
+
+@contextmanager
+def _pre_publication_regular_file_failure_guard(
+    parent: _BoundDirectory,
+    prepared: _BoundRegularFile,
+    creation_receipt: dict[str, Any],
+    *,
+    display_path: Path,
+    candidate_basenames: Iterable[str],
+) -> Iterator[None]:
+    """Retain and report a descriptor-bound sensitive file before publication."""
+
+    try:
+        yield
+    except Exception as exc:
+        try:
+            retained = _retained_rebound_regular_file_details(
+                parent,
+                prepared,
+                creation_receipt,
+                display_path=display_path,
+                candidate_basenames=candidate_basenames,
+            )
+        except Exception as evidence_error:
+            retained = _inconclusive_rebound_regular_file_details(
+                parent,
+                prepared,
+                creation_receipt,
+                display_path=display_path,
+                evidence_error=evidence_error,
+            )
+        if isinstance(exc, StoreSafetyError):
+            exc.details = _merge_recovery_details(
+                exc.details,
+                retained,
+            )
+            raise
+        details = dict(retained)
+        details.update(
+            {
+                "underlying_error_type": type(exc).__name__,
+                "underlying_errno": getattr(exc, "errno", None),
+            }
+        )
+        raise StoreSafetyError(
+            "prepared-operation-failed",
+            "A descriptor-bound prepared-file operation failed before "
+            f"publication; the sensitive file was retained: {display_path}: {exc}",
+            details=details,
+        ) from exc
+
+
 def _verify_bound_parent_descriptor(
     parent_fd: int,
     opened: os.stat_result,
@@ -10863,43 +11278,50 @@ def _recover_validated_clone_to_standalone(
         if source_revalidate is not None:
             source_revalidate()
         temp_receipt = source_backup(temp_out, output_parent_binding)
-        if source_revalidate is not None:
-            source_revalidate()
-        with _bind_regular_file_at(
+        with _bind_prepared_regular_file_with_failure_receipt(
             temp_out,
             output_parent_binding,
-            PREPARED_FILE_CODES,
+            temp_receipt,
         ) as prepared:
-            _assert_bound_matches_receipt(
+            with _pre_publication_regular_file_failure_guard(
+                output_parent_binding,
                 prepared,
                 temp_receipt,
-                dir_fd=output_parent_binding.fd,
-                basename=temp_out.name,
-            )
-            output_integrity = _sqlite_integrity(
-                prepared,
-                parent=output_parent_binding,
-            )
-            _verify_bound_regular_file_at(
-                prepared,
-                PREPARED_FILE_CODES,
-                dir_fd=output_parent_binding.fd,
-                basename=temp_out.name,
-            )
-            try:
-                os.fsync(prepared.fd)
-            except OSError as exc:
-                raise StoreSafetyError(
-                    "destination-install-failed",
-                    "The prepared recovered database could not be made durable "
-                    f"before publication: {temp_out}: {exc}",
-                    details=_publication_details(
-                        "uncommitted",
-                        prepared=prepared,
-                        destination=out,
-                        retry_safe=True,
-                    ),
-                ) from exc
+                display_path=temp_out,
+                candidate_basenames=(temp_out.name,),
+            ):
+                _assert_bound_matches_receipt(
+                    prepared,
+                    temp_receipt,
+                    dir_fd=output_parent_binding.fd,
+                    basename=temp_out.name,
+                )
+                if source_revalidate is not None:
+                    source_revalidate()
+                output_integrity = _sqlite_integrity(
+                    prepared,
+                    parent=output_parent_binding,
+                )
+                _verify_bound_regular_file_at(
+                    prepared,
+                    PREPARED_FILE_CODES,
+                    dir_fd=output_parent_binding.fd,
+                    basename=temp_out.name,
+                )
+                try:
+                    os.fsync(prepared.fd)
+                except OSError as exc:
+                    raise StoreSafetyError(
+                        "destination-install-failed",
+                        "The prepared recovered database could not be made durable "
+                        f"before publication: {temp_out}: {exc}",
+                        details=_publication_details(
+                            "uncommitted",
+                            prepared=prepared,
+                            destination=out,
+                            retry_safe=True,
+                        ),
+                    ) from exc
             fingerprint = _publish_file_no_replace_from_parent(
                 prepared,
                 out,
@@ -11681,14 +12103,11 @@ def _validated_snapshot_artifact(
             output: Path,
             destination_binding: _BoundDirectory | None = None,
         ) -> dict[str, Any]:
-            revalidate_recovery_clone()
-            result = _backup_bound_store_to_standalone(
+            return _backup_bound_store_to_standalone(
                 snapshot_store,
                 output,
                 destination_binding=destination_binding,
             )
-            revalidate_recovery_clone()
-            return result
 
         _scan_exact_bound_directory_entries(
             artifact_root,

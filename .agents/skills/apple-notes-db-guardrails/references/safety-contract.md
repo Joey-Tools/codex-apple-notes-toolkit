@@ -532,6 +532,23 @@ In-place byte, size, or access-policy drift retains the failed artifact but chan
 classify it as `destination-exists`, keep publication `uncommitted`, and set `retry_safe: false`;
 if terminal destination observation is unavailable, classify publication as `uncertain`.
 
+Immediately after `source_backup` creates a private standalone `.tmp-*` database, bind that leaf
+relative to the already-held output-parent descriptor and compare its identity, SHA-256, size, and
+access policy with the creation receipt. Keep the same bound descriptor open across the
+creation-receipt comparison, second source revalidation, SQLite integrity check, terminal
+prepared-file revalidation, and pre-publication durability step. A classified safety failure in
+that interval
+retains its original code; an ordinary runtime failure becomes `prepared-operation-failed` with
+the original exception as its cause. Both outcomes retain the sensitive object, set
+`retry_safe: false`, and attach a descriptor-bound prepared-file locator plus point-in-time
+namespace observations. Receipt-mismatch evidence must distinguish the creation receipt from the
+rebound descriptor and current namespace; never sign a replacement, in-place content mutation, or
+access-policy drift as the created object. If rebinding itself fails, retain an explicitly unbound
+creation-receipt locator with `cleanup_state: preserved-or-incomplete`. If retention evidence
+construction fails, keep the original failure primary and emit fixed inconclusive
+creation/descriptor/parent evidence. Do not delete by name when the leaf may have been replaced or
+moved.
+
 Pre-publication failure handling protects deletion target identity by deleting nothing through a
 mutable pathname. While the creation-time root and parent descriptors are still open, revalidate
 the exact root relative to the held parent and scan a bounded sensitive-file inventory twice

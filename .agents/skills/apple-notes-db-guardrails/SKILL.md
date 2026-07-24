@@ -181,6 +181,17 @@ An individual file writer also retains its failed output: it never follows a sep
 an `unlink`, because the namespace leaf could be replaced between those syscalls. The error carries
 the held parent/file descriptor receipt, point-in-time namespace observations, `cleanup_state:
 retained`, and `retry_safe: false`.
+For standalone recovery, bind the private `.tmp-*` database through the already-held output
+parent immediately after `source_backup` returns and match it to the creation receipt before the
+second source revalidation. Keep that descriptor open across creation-receipt comparison, the
+second source revalidation, SQLite integrity, terminal file revalidation, and pre-publication
+`fsync`. Any failure in that interval uses one pre-publication failure path: preserve the original
+safety code, wrap an otherwise unclassified runtime failure as `prepared-operation-failed`, retain
+the sensitive object without name-based deletion, and attach its descriptor-bound recovery
+locator plus point-in-time namespace observations. If the writer-created leaf cannot be rebound,
+retain its creation receipt and an explicitly unbound point-in-time namespace locator instead of
+claiming descriptor authority. If recovery-evidence construction itself fails, keep the original
+error primary and fall back to fixed inconclusive creation/descriptor/parent evidence.
 An otherwise unclassified runtime failure becomes `prepared-operation-failed`, retains the
 underlying exception as its cause, and carries the same recovery details.
 If publication reports `destination-install-uncertain`, preserve the reported paths, do not retry

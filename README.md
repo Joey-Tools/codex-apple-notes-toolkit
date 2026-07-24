@@ -52,7 +52,9 @@ cannot block before type and identity rejection. Snapshot recovery acquires
 its output/live-container guard before validation and then consumes the held
 snapshot store directly; recovery uses in-memory bytes and anonymous
 temporary file descriptors, not named temporary or recovery-clone
-directories.
+directories. Its private standalone `.tmp-*` database is descriptor-bound and
+matched to its creation receipt before the second source revalidation; every
+pre-publication failure retains structured cleanup and recovery evidence.
 Snapshot/stage API and CLI inputs use one absolute lexical path policy for the
 root and every derived member, so relative paths cannot split parent authority.
 Notes process-state checks use fixed `/usr/bin/pgrep`, a minimal environment,
