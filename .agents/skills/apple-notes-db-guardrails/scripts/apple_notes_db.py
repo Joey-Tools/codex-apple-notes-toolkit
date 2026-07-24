@@ -121,6 +121,7 @@ class _BoundDirectory:
     namespace_basename: str | None = None
     trusted_alias: _TrustedDirectoryAlias | None = None
     canonical_path: Path | None = None
+    creation_install_receipt: dict[str, Any] | None = None
 
 
 @dataclass
@@ -188,6 +189,14 @@ class _HeldDirectoryComponent:
     opened: os.stat_result
     parent_fd: int | None
     parent_opened: os.stat_result | None
+    creation_install_receipt: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _CreatedDirectoryInstallation:
+    fd: int
+    opened: os.stat_result
+    receipt: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -359,12 +368,12 @@ def _lexists(path: Path) -> bool:
     return os.path.lexists(os.fspath(path))
 
 
-def _rename_directory_no_replace_at(
+def _rename_directory_no_replace_syscall_at(
     parent_fd: int,
     source_name: str,
     destination_name: str,
 ) -> None:
-    """Atomically rename one directory within a bound parent."""
+    """Invoke the platform's atomic no-replace directory rename."""
 
     libc = ctypes.CDLL(None, use_errno=True)
     source_bytes = os.fsencode(source_name)
@@ -427,6 +436,34 @@ def _rename_directory_no_replace_at(
             source_name,
             destination_name,
         )
+
+
+def _rename_directory_no_replace_at(
+    parent_fd: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    """Atomically publish one prepared directory within a bound parent."""
+
+    _rename_directory_no_replace_syscall_at(
+        parent_fd,
+        source_name,
+        destination_name,
+    )
+
+
+def _install_created_directory_no_replace_at(
+    parent_fd: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    """Atomically install one already-bound newly created directory."""
+
+    _rename_directory_no_replace_syscall_at(
+        parent_fd,
+        source_name,
+        destination_name,
+    )
 
 
 def _rename_file_no_replace_at(
@@ -1610,13 +1647,14 @@ def _verify_held_directory_components(
                     "A held parent changed access policy while revalidating its "
                     f"child: {component.path}",
                 )
-        receipts.append(
-            {
-                "path": str(component.path),
-                "identity": _identity(descriptor_after),
-                "access_policy": _access_policy(descriptor_after),
-            }
-        )
+        receipt = {
+            "path": str(component.path),
+            "identity": _identity(descriptor_after),
+            "access_policy": _access_policy(descriptor_after),
+        }
+        if component.creation_install_receipt is not None:
+            receipt["creation_install_receipt"] = component.creation_install_receipt
+        receipts.append(receipt)
     return {
         "schema": "apple-notes-component-path-binding/v1",
         "components": receipts,
@@ -2860,6 +2898,448 @@ def _read_bound_file_bytes(
     return bytes(payload)
 
 
+def _verify_directory_creation_parent(
+    parent_fd: int,
+    parent_opened: os.stat_result,
+    *,
+    display_path: Path,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+) -> os.stat_result:
+    try:
+        current = os.fstat(parent_fd)
+    except OSError as exc:
+        raise StoreSafetyError(
+            inconclusive_code,
+            f"Cannot revalidate the held directory-creation parent {display_path}: "
+            f"{exc}",
+        ) from exc
+    if not stat.S_ISDIR(current.st_mode) or not _same_identity(parent_opened, current):
+        raise StoreSafetyError(
+            identity_code,
+            f"Directory-creation parent changed identity: {display_path}",
+        )
+    if _access_policy(parent_opened) != _access_policy(current):
+        raise StoreSafetyError(
+            access_policy_code,
+            f"Directory-creation parent changed access policy: {display_path}",
+        )
+    return current
+
+
+def _verify_created_directory_name_at(
+    parent_fd: int,
+    parent_opened: os.stat_result,
+    directory_fd: int,
+    created: os.stat_result,
+    *,
+    basename: str,
+    display_path: Path,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+) -> dict[str, Any]:
+    _verify_directory_creation_parent(
+        parent_fd,
+        parent_opened,
+        display_path=display_path.parent,
+        identity_code=identity_code,
+        access_policy_code=access_policy_code,
+        inconclusive_code=inconclusive_code,
+    )
+    try:
+        descriptor_before = os.fstat(directory_fd)
+        named = os.stat(
+            basename,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        descriptor_after = os.fstat(directory_fd)
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            identity_code,
+            f"Created directory name disappeared: {display_path}",
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            inconclusive_code,
+            f"Cannot revalidate created directory {display_path}: {exc}",
+        ) from exc
+    if (
+        not stat.S_ISDIR(descriptor_before.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or not stat.S_ISDIR(descriptor_after.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or _is_reparse_point(named)
+        or not _same_identity(created, descriptor_before)
+        or not _same_identity(descriptor_before, named)
+        or not _same_identity(named, descriptor_after)
+    ):
+        raise StoreSafetyError(
+            identity_code,
+            "Created directory name no longer resolves to the transaction's "
+            f"retained object: {display_path}",
+        )
+    baseline_access = _access_policy(created)
+    if (
+        _access_policy(descriptor_before) != baseline_access
+        or _access_policy(named) != baseline_access
+        or _access_policy(descriptor_after) != baseline_access
+    ):
+        raise StoreSafetyError(
+            access_policy_code,
+            f"Created directory access policy changed: {display_path}",
+        )
+    _verify_directory_creation_parent(
+        parent_fd,
+        parent_opened,
+        display_path=display_path.parent,
+        identity_code=identity_code,
+        access_policy_code=access_policy_code,
+        inconclusive_code=inconclusive_code,
+    )
+    return {
+        "identity": _identity(descriptor_after),
+        "access_policy": _access_policy(descriptor_after),
+        "metadata": _metadata(descriptor_after),
+    }
+
+
+def _created_directory_install_recovery_details(
+    *,
+    parent_fd: int,
+    parent_opened: os.stat_result,
+    directory_fd: int | None,
+    created: os.stat_result | None,
+    staging_name: str | None,
+    target_name: str,
+    display_path: Path,
+    install_state: str,
+    mutation_performed: bool,
+) -> dict[str, Any]:
+    """Describe a failed create/install without deleting through a mutable name."""
+
+    receipt: dict[str, Any] = {
+        "schema": "apple-notes-created-directory-install-recovery/v1",
+        "protected_property": "transaction-created-object-identity",
+        "display_path": str(display_path),
+        "target_basename": target_name,
+        "staging_basename": staging_name,
+        "install_state": install_state,
+        "mutation_performed": mutation_performed,
+        "cleanup_policy": (
+            "delete-only-through-an-atomic-identity-bound-directory-primitive"
+        ),
+        "automatic_cleanup_attempted": False,
+        "cleanup_reason": (
+            "No portable descriptor-bound directory unlink can atomically "
+            "reconfirm identity at removal; retain point-in-time evidence."
+        ),
+    }
+    try:
+        parent_current = os.fstat(parent_fd)
+    except OSError as exc:
+        receipt["evidence_status"] = "inconclusive"
+        receipt["parent_descriptor_error"] = str(exc)
+    else:
+        receipt["parent_descriptor"] = {
+            "identity": _identity(parent_current),
+            "access_policy": _access_policy(parent_current),
+            "matches_creation_receipt": (
+                _same_identity(parent_opened, parent_current)
+                and _access_policy(parent_opened) == _access_policy(parent_current)
+            ),
+        }
+        if not receipt["parent_descriptor"]["matches_creation_receipt"]:
+            receipt["evidence_status"] = "inconclusive"
+    if directory_fd is not None:
+        try:
+            descriptor = os.fstat(directory_fd)
+        except OSError as exc:
+            receipt["evidence_status"] = "inconclusive"
+            receipt["created_descriptor_error"] = str(exc)
+        else:
+            receipt["created_descriptor"] = {
+                "identity": _identity(descriptor),
+                "access_policy": _access_policy(descriptor),
+                "matches_creation_receipt": (
+                    created is not None and _same_identity(created, descriptor)
+                ),
+                "matches_creation_access_policy": (
+                    created is not None
+                    and _access_policy(created) == _access_policy(descriptor)
+                ),
+            }
+            if not receipt["created_descriptor"]["matches_creation_receipt"]:
+                receipt["evidence_status"] = "inconclusive"
+    observations: dict[str, Any] = {}
+    for label, basename in (
+        ("staging_name", staging_name),
+        ("target_name", target_name),
+    ):
+        if basename is None:
+            observations[label] = {"status": "not-created"}
+            continue
+        state, observed = _observe_bound_name(parent_fd, basename)
+        row: dict[str, Any] = {
+            "status": state,
+            "authority": "point-in-time-only",
+        }
+        if state == "present" and observed is not None:
+            row["identity"] = _identity(observed)
+            row["access_policy"] = _access_policy(observed)
+            row["matches_created_identity"] = created is not None and _same_identity(
+                created, observed
+            )
+        elif state == "unavailable":
+            row["evidence_status"] = "inconclusive"
+            receipt["evidence_status"] = "inconclusive"
+        observations[label] = row
+    receipt["namespace_observations"] = observations
+    receipt.setdefault("evidence_status", "checked")
+    return {
+        "mutation_performed": mutation_performed,
+        "cleanup_state": (
+            "preserved-no-identity-safe-directory-unlink"
+            if mutation_performed
+            else "not-needed"
+        ),
+        "retry_safe": False,
+        "recovery_locators": {
+            "created_directory_install": receipt,
+        },
+    }
+
+
+def _create_and_install_directory_at(
+    parent_fd: int,
+    parent_opened: os.stat_result,
+    target_name: str,
+    *,
+    display_path: Path,
+    revalidate_scope: Callable[[], dict[str, Any] | None] | None,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+    collision_code: str,
+) -> _CreatedDirectoryInstallation:
+    """Create privately, bind first, then atomically install without replacement."""
+
+    if target_name in {"", ".", ".."} or os.sep in target_name:
+        raise StoreSafetyError(
+            inconclusive_code,
+            f"Directory target basename is not canonical: {display_path}",
+        )
+
+    staging_name: str | None = None
+    directory_fd: int | None = None
+    created: os.stat_result | None = None
+    mutation_performed = False
+    install_state = "not-created"
+    try:
+        _verify_directory_creation_parent(
+            parent_fd,
+            parent_opened,
+            display_path=display_path.parent,
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+        )
+        if revalidate_scope is not None:
+            revalidate_scope()
+        _verify_directory_creation_parent(
+            parent_fd,
+            parent_opened,
+            display_path=display_path.parent,
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+        )
+
+        for _ in range(8):
+            candidate = f".apple-notes-create-{uuid.uuid4().hex}"
+            try:
+                os.mkdir(candidate, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            staging_name = candidate
+            mutation_performed = True
+            install_state = "staging-created-unbound"
+            break
+        if staging_name is None:
+            raise StoreSafetyError(
+                inconclusive_code,
+                "Cannot allocate a collision-free randomized private directory "
+                f"name under the held parent: {display_path.parent}",
+            )
+
+        directory_fd = os.open(
+            staging_name,
+            _directory_open_flags(),
+            dir_fd=parent_fd,
+        )
+        first_descriptor = os.fstat(directory_fd)
+        first_named = os.stat(
+            staging_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(first_descriptor.st_mode)
+            or not stat.S_ISDIR(first_named.st_mode)
+            or stat.S_ISLNK(first_named.st_mode)
+            or _is_reparse_point(first_named)
+            or not _same_identity(first_descriptor, first_named)
+        ):
+            raise StoreSafetyError(
+                identity_code,
+                "Randomized private staging name did not bind one stable "
+                f"directory object: {display_path}",
+            )
+
+        os.fchmod(directory_fd, 0o700)
+        created = os.fstat(directory_fd)
+        configured_named = os.stat(
+            staging_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        expected_uid = os.geteuid() if hasattr(os, "geteuid") else created.st_uid
+        if not _same_identity(first_descriptor, created) or not _same_identity(
+            created, configured_named
+        ):
+            raise StoreSafetyError(
+                identity_code,
+                "Randomized private staging directory changed identity during "
+                f"owner-private configuration: {display_path}",
+            )
+        if (
+            stat.S_IMODE(created.st_mode) != 0o700
+            or created.st_uid != expected_uid
+            or _access_policy(created) != _access_policy(configured_named)
+        ):
+            raise StoreSafetyError(
+                access_policy_code,
+                "Randomized private staging directory is not owner-private or "
+                f"changed access policy: {display_path}",
+            )
+        install_state = "staging-bound-owner-private"
+
+        _verify_created_directory_name_at(
+            parent_fd,
+            parent_opened,
+            directory_fd,
+            created,
+            basename=staging_name,
+            display_path=display_path.with_name(staging_name),
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+        )
+        if revalidate_scope is not None:
+            revalidate_scope()
+        _verify_created_directory_name_at(
+            parent_fd,
+            parent_opened,
+            directory_fd,
+            created,
+            basename=staging_name,
+            display_path=display_path.with_name(staging_name),
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+        )
+
+        install_state = "no-replace-install-started"
+        _install_created_directory_no_replace_at(
+            parent_fd,
+            staging_name,
+            target_name,
+        )
+        install_state = "no-replace-install-returned"
+        installed = _verify_created_directory_name_at(
+            parent_fd,
+            parent_opened,
+            directory_fd,
+            created,
+            basename=target_name,
+            display_path=display_path,
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+        )
+        staging_state, _ = _observe_bound_name(parent_fd, staging_name)
+        if staging_state != "absent":
+            raise StoreSafetyError(
+                (identity_code if staging_state == "present" else inconclusive_code),
+                "The randomized private staging name did not disappear after "
+                f"no-replace installation: {display_path.with_name(staging_name)}",
+            )
+        if revalidate_scope is not None:
+            revalidate_scope()
+        installed = _verify_created_directory_name_at(
+            parent_fd,
+            parent_opened,
+            directory_fd,
+            created,
+            basename=target_name,
+            display_path=display_path,
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+        )
+        install_state = "installed-and-revalidated"
+        return _CreatedDirectoryInstallation(
+            fd=directory_fd,
+            opened=created,
+            receipt={
+                "schema": "apple-notes-created-directory-install/v1",
+                "protected_property": "transaction-created-object-identity",
+                "creation_protocol": (
+                    "randomized-owner-private-staging-bind-before-no-replace-install"
+                ),
+                "display_path": str(display_path),
+                "target_basename": target_name,
+                "staging_basename": staging_name,
+                "parent_identity": _identity(parent_opened),
+                "parent_access_policy": _access_policy(parent_opened),
+                "directory_identity": installed["identity"],
+                "directory_access_policy": installed["access_policy"],
+                "cleanup_policy": (
+                    "delete-only-through-an-atomic-identity-bound-directory-primitive"
+                ),
+            },
+        )
+    except Exception as exc:
+        details = _created_directory_install_recovery_details(
+            parent_fd=parent_fd,
+            parent_opened=parent_opened,
+            directory_fd=directory_fd,
+            created=created,
+            staging_name=staging_name,
+            target_name=target_name,
+            display_path=display_path,
+            install_state=install_state,
+            mutation_performed=mutation_performed,
+        )
+        if isinstance(exc, StoreSafetyError):
+            exc.details = _merge_recovery_details(exc.details, details)
+            raise
+        details["underlying_error_type"] = type(exc).__name__
+        details["underlying_errno"] = getattr(exc, "errno", None)
+        code = collision_code if isinstance(exc, FileExistsError) else inconclusive_code
+        raise StoreSafetyError(
+            code,
+            "Cannot create, bind, and atomically install directory "
+            f"{display_path}: {exc}",
+            details=details,
+        ) from exc
+    finally:
+        if install_state != "installed-and-revalidated" and directory_fd is not None:
+            os.close(directory_fd)
+
+
 @contextmanager
 def _create_bound_directory(
     path: Path,
@@ -2867,178 +3347,190 @@ def _create_bound_directory(
     retain_failure_receipt: bool = False,
     parent_binding: _BoundDirectory | None = None,
 ) -> Iterator[_BoundDirectory]:
-    flags = _directory_open_flags()
-    if parent_binding is None:
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        parent_fd = os.open(path.parent, flags)
-    else:
-        if path.parent != parent_binding.path:
-            raise StoreSafetyError(
-                "prepared-directory-identity-mismatch",
-                "Descriptor-relative child creation requires the declared bound "
-                f"parent: child={path}, parent={parent_binding.path}",
+    path = _absolute_path(path)
+    with ExitStack() as resource_stack:
+        if parent_binding is None:
+            try:
+                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                parent_fd = os.open(path.parent, _directory_open_flags())
+            except OSError as exc:
+                raise StoreSafetyError(
+                    "prepared-directory-revalidation-inconclusive",
+                    "Cannot bind the parent before private directory "
+                    f"creation: {path.parent}: {exc}",
+                ) from exc
+            effective_parent = None
+        else:
+            effective_parent = parent_binding
+            if path.parent != effective_parent.path:
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "Descriptor-relative child creation requires the declared bound "
+                    f"parent: child={path}, parent={effective_parent.path}",
+                )
+            if effective_parent.parent_fd is None:
+                raise StoreSafetyError(
+                    "prepared-directory-revalidation-inconclusive",
+                    "Bound parent has no namespace descriptor: "
+                    f"{effective_parent.path}",
+                )
+            _verify_bound_directory_namespace(effective_parent)
+            parent_fd = os.dup(effective_parent.fd)
+        resource_stack.callback(os.close, parent_fd)
+        parent_opened = os.fstat(parent_fd)
+
+        def revalidate_creation_scope() -> dict[str, Any]:
+            if effective_parent is not None:
+                return _verify_bound_directory_namespace(effective_parent)
+            current = _verify_directory_creation_parent(
+                parent_fd,
+                parent_opened,
+                display_path=path.parent,
+                identity_code="prepared-directory-identity-mismatch",
+                access_policy_code="prepared-directory-access-policy-mismatch",
+                inconclusive_code="prepared-directory-revalidation-inconclusive",
             )
-        if parent_binding.parent_fd is None:
-            raise StoreSafetyError(
-                "prepared-directory-revalidation-inconclusive",
-                f"Bound parent has no namespace descriptor: {parent_binding.path}",
-            )
-        _verify_bound_directory_at(
-            parent_binding,
-            parent_fd=parent_binding.parent_fd,
-            basename=_bound_directory_basename(parent_binding),
-            display_path=parent_binding.path,
+            return {
+                "identity": _identity(current),
+                "access_policy": _access_policy(current),
+            }
+
+        installation = _create_and_install_directory_at(
+            parent_fd,
+            parent_opened,
+            path.name,
+            display_path=path,
+            revalidate_scope=revalidate_creation_scope,
+            identity_code="prepared-directory-identity-mismatch",
+            access_policy_code="prepared-directory-access-policy-mismatch",
+            inconclusive_code="prepared-directory-revalidation-inconclusive",
+            collision_code="prepared-directory-revalidation-inconclusive",
         )
-        parent_fd = os.dup(parent_binding.fd)
-    parent_opened = os.fstat(parent_fd)
-    fd: int | None = None
-    created_and_bound = False
-    try:
-        if parent_binding is not None and parent_binding.before_write is not None:
-            parent_binding.before_write()
-        os.mkdir(path.name, mode=0o700, dir_fd=parent_fd)
-        fd = os.open(path.name, flags, dir_fd=parent_fd)
-        created_path = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-        created_fd = os.fstat(fd)
-        if not _same_identity(created_path, created_fd):
-            raise StoreSafetyError(
-                "prepared-directory-identity-mismatch",
-                f"Prepared directory was replaced while being created: {path}",
-            )
-        created_and_bound = True
-    except StoreSafetyError:
-        raise
-    except OSError as exc:
-        raise StoreSafetyError(
-            "prepared-directory-revalidation-inconclusive",
-            f"Cannot create and bind private prepared directory {path}: {exc}",
-        ) from exc
-    finally:
-        if not created_and_bound:
-            if fd is not None:
-                os.close(fd)
-            os.close(parent_fd)
-    assert fd is not None
-    binding = _BoundDirectory(
-        path=path,
-        fd=fd,
-        opened=os.fstat(fd),
-        parent_opened=parent_opened,
-        parent_fd=parent_fd,
-        before_write=(
-            parent_binding.before_write if parent_binding is not None else None
-        ),
-        path_revalidate=(
-            parent_binding.path_revalidate if parent_binding is not None else None
-        ),
-        trusted_alias=(
-            parent_binding.trusted_alias if parent_binding is not None else None
-        ),
-        canonical_path=(
-            _bound_directory_canonical_path(parent_binding) / path.name
-            if parent_binding is not None
-            else _absolute_path(path)
-        ),
-    )
-    try:
+
+        fd = installation.fd
+        binding = _BoundDirectory(
+            path=path,
+            fd=fd,
+            opened=installation.opened,
+            parent_opened=parent_opened,
+            parent_fd=parent_fd,
+            before_write=(
+                effective_parent.before_write
+                if effective_parent is not None
+                else revalidate_creation_scope
+            ),
+            path_revalidate=(
+                effective_parent.path_revalidate
+                if effective_parent is not None
+                else revalidate_creation_scope
+            ),
+            trusted_alias=(
+                effective_parent.trusted_alias if effective_parent is not None else None
+            ),
+            canonical_path=(
+                _bound_directory_canonical_path(effective_parent) / path.name
+                if effective_parent is not None
+                else path
+            ),
+            creation_install_receipt=installation.receipt,
+        )
         try:
-            _verify_bound_directory_at(
-                binding,
-                parent_fd=parent_fd,
-                basename=path.name,
-                display_path=path,
-            )
-            yield binding
-        except Exception as exc:
-            safety_error = exc if isinstance(exc, StoreSafetyError) else None
-            existing_details = dict(safety_error.details) if safety_error else {}
-            publication_state = existing_details.get("publication_state")
-            if (
-                retain_failure_receipt
-                and safety_error is not None
-                and safety_error.code == "destination-install-uncertain"
-            ):
-                merged = dict(existing_details)
-                merged["publication_state"] = "uncertain"
-                merged["retry_safe"] = False
-                locators = dict(merged.get("recovery_locators", {}))
-                locators.setdefault(
-                    "descriptor_bound_prepared_root",
-                    _descriptor_bound_directory_recovery_evidence(
-                        binding,
-                        source=path,
-                        destination=path,
-                        source_observation=None,
-                        destination_observation=None,
-                        tree_receipt=None,
-                    ),
+            try:
+                _verify_bound_directory_at(
+                    binding,
+                    parent_fd=parent_fd,
+                    basename=path.name,
+                    display_path=path,
                 )
-                merged["recovery_locators"] = locators
-                existing_details = merged
-                publication_state = "uncertain"
-            if (
-                retain_failure_receipt
-                and (
-                    safety_error is None
-                    or safety_error.code != "destination-install-uncertain"
-                )
-                and publication_state not in {"committed", "uncertain"}
-            ):
-                try:
-                    retained = _retained_bound_directory_receipt(binding, path)
-                except Exception as receipt_error:
+                yield binding
+            except Exception as exc:
+                safety_error = exc if isinstance(exc, StoreSafetyError) else None
+                existing_details = dict(safety_error.details) if safety_error else {}
+                publication_state = existing_details.get("publication_state")
+                if (
+                    retain_failure_receipt
+                    and safety_error is not None
+                    and safety_error.code == "destination-install-uncertain"
+                ):
                     merged = dict(existing_details)
-                    if isinstance(receipt_error, StoreSafetyError):
-                        merged = _merge_recovery_details(
-                            merged,
-                            receipt_error.details,
-                        )
-                        cleanup_error_code = receipt_error.code
-                    else:
-                        merged = _merge_recovery_details(
-                            merged,
-                            {
-                                "cleanup_state": "preserved-or-incomplete",
-                                "recovery_locators": {
-                                    "prepared_namespace": str(path),
-                                    "prepared_parent": str(path.parent),
-                                },
-                                "cleanup_error_type": type(receipt_error).__name__,
-                            },
-                        )
-                        cleanup_error_code = (
-                            "prepared-directory-revalidation-inconclusive"
-                        )
-                    merged["cleanup_error_code"] = cleanup_error_code
-                    merged["cleanup_error"] = str(receipt_error)
+                    merged["publication_state"] = "uncertain"
+                    merged["retry_safe"] = False
+                    locators = dict(merged.get("recovery_locators", {}))
+                    locators.setdefault(
+                        "descriptor_bound_prepared_root",
+                        _descriptor_bound_directory_recovery_evidence(
+                            binding,
+                            source=path,
+                            destination=path,
+                            source_observation=None,
+                            destination_observation=None,
+                            tree_receipt=None,
+                        ),
+                    )
+                    merged["recovery_locators"] = locators
                     existing_details = merged
-                else:
-                    if retained is not None:
-                        merged = _merge_recovery_details(
-                            existing_details,
-                            retained,
-                        )
+                    publication_state = "uncertain"
+                if (
+                    retain_failure_receipt
+                    and (
+                        safety_error is None
+                        or safety_error.code != "destination-install-uncertain"
+                    )
+                    and publication_state not in {"committed", "uncertain"}
+                ):
+                    try:
+                        retained = _retained_bound_directory_receipt(binding, path)
+                    except Exception as receipt_error:
+                        merged = dict(existing_details)
+                        if isinstance(receipt_error, StoreSafetyError):
+                            merged = _merge_recovery_details(
+                                merged,
+                                receipt_error.details,
+                            )
+                            cleanup_error_code = receipt_error.code
+                        else:
+                            merged = _merge_recovery_details(
+                                merged,
+                                {
+                                    "cleanup_state": "preserved-or-incomplete",
+                                    "recovery_locators": {
+                                        "prepared_namespace": str(path),
+                                        "prepared_parent": str(path.parent),
+                                    },
+                                    "cleanup_error_type": type(receipt_error).__name__,
+                                },
+                            )
+                            cleanup_error_code = (
+                                "prepared-directory-revalidation-inconclusive"
+                            )
+                        merged["cleanup_error_code"] = cleanup_error_code
+                        merged["cleanup_error"] = str(receipt_error)
                         existing_details = merged
-            if safety_error is not None:
-                safety_error.details = existing_details
-                raise
-            if not retain_failure_receipt:
-                raise
-            existing_details.update(
-                {
-                    "underlying_error_type": type(exc).__name__,
-                    "underlying_errno": getattr(exc, "errno", None),
-                }
-            )
-            raise StoreSafetyError(
-                "prepared-operation-failed",
-                "A prepared-tree operation failed before a safe terminal "
-                f"publication state: {path}: {exc}",
-                details=existing_details,
-            ) from exc
-    finally:
-        os.close(fd)
-        os.close(parent_fd)
+                    else:
+                        if retained is not None:
+                            existing_details = _merge_recovery_details(
+                                existing_details,
+                                retained,
+                            )
+                if safety_error is not None:
+                    safety_error.details = existing_details
+                    raise
+                if not retain_failure_receipt:
+                    raise
+                existing_details.update(
+                    {
+                        "underlying_error_type": type(exc).__name__,
+                        "underlying_errno": getattr(exc, "errno", None),
+                    }
+                )
+                raise StoreSafetyError(
+                    "prepared-operation-failed",
+                    "A prepared-tree operation failed before a safe terminal "
+                    f"publication state: {path}: {exc}",
+                    details=existing_details,
+                ) from exc
+        finally:
+            os.close(fd)
 
 
 @contextmanager
@@ -3207,6 +3699,8 @@ def _verify_bound_directory_namespace(
         )
     if component_receipt is not None:
         result["component_path_binding"] = component_receipt
+    if binding.creation_install_receipt is not None:
+        result["creation_install_receipt"] = binding.creation_install_receipt
     return result
 
 
@@ -5720,12 +6214,24 @@ def _create_bound_snapshot_destination_parent_components(
         *,
         cause: BaseException | None = None,
     ) -> StoreSafetyError:
-        return _raise_snapshot_destination_scope_inconclusive(
+        cause_mutation = (
+            bool(cause.details.get("mutation_performed"))
+            if isinstance(cause, StoreSafetyError)
+            else False
+        )
+        error = _raise_snapshot_destination_scope_inconclusive(
             message,
             destination=destination,
             cause=cause,
-            mutation_performed=mutation_performed,
+            mutation_performed=mutation_performed or cause_mutation,
         )
+        if isinstance(cause, StoreSafetyError):
+            error.details = _merge_recovery_details(
+                error.details,
+                cause.details,
+            )
+            error.details["mutation_performed"] = mutation_performed or cause_mutation
+        return error
 
     def revalidate_chain() -> dict[str, Any]:
         ancestor_receipt = _verify_bound_directory_namespace(ancestor)
@@ -5767,7 +6273,7 @@ def _create_bound_snapshot_destination_parent_components(
                 "Bound snapshot-destination ancestor changed before parent "
                 f"creation: {display_path}"
             )
-        for component in components:
+        for component_index, component in enumerate(components):
             if component in {"", ".", ".."}:
                 raise fail(
                     "Snapshot destination contains a non-canonical parent "
@@ -5783,75 +6289,34 @@ def _create_bound_snapshot_destination_parent_components(
                     "Bound snapshot-destination ancestor changed before "
                     f"descriptor-relative parent creation: {display_path}"
                 )
-            try:
-                os.mkdir(component, mode=0o700, dir_fd=current_fd)
-                mutation_performed = True
-            except FileExistsError as exc:
-                raise fail(
-                    "A previously absent snapshot-destination component "
-                    f"appeared before creation: {display_path}",
-                    cause=exc,
-                ) from exc
-            except OSError as exc:
-                raise fail(
-                    "Cannot create the snapshot destination parent through its "
-                    f"bound ancestor: {display_path}: {exc}",
-                    cause=exc,
-                ) from exc
-            child_fd: int | None = None
-            try:
-                child_before = os.stat(
-                    component,
-                    dir_fd=current_fd,
-                    follow_symlinks=False,
-                )
-                child_fd = os.open(component, flags, dir_fd=current_fd)
-                child_opened = os.fstat(child_fd)
-                child_after = os.stat(
-                    component,
-                    dir_fd=current_fd,
-                    follow_symlinks=False,
-                )
-                parent_after = os.fstat(current_fd)
-            except OSError as exc:
-                if child_fd is not None:
-                    os.close(child_fd)
-                raise fail(
-                    "Cannot bind a descriptor-created snapshot destination "
-                    f"parent: {display_path}: {exc}",
-                    cause=exc,
-                ) from exc
-            if (
-                not stat.S_ISDIR(child_before.st_mode)
-                or not stat.S_ISDIR(child_opened.st_mode)
-                or not stat.S_ISDIR(child_after.st_mode)
-                or stat.S_ISLNK(child_before.st_mode)
-                or stat.S_ISLNK(child_after.st_mode)
-                or _is_reparse_point(child_before)
-                or _is_reparse_point(child_after)
-                or not _same_identity(child_before, child_opened)
-                or not _same_identity(child_opened, child_after)
-                or not _same_identity(current_opened, parent_after)
-            ):
-                os.close(child_fd)
-                raise fail(
-                    "A snapshot destination parent or its bound ancestor changed "
-                    f"identity during descriptor-relative creation: {display_path}"
-                )
-            if (
-                _access_policy(child_before) != _access_policy(child_opened)
-                or _access_policy(child_opened) != _access_policy(child_after)
-                or _access_policy(current_opened) != _access_policy(parent_after)
-            ):
-                os.close(child_fd)
-                raise fail(
-                    "A snapshot destination parent or its bound ancestor changed "
-                    f"access policy during descriptor-relative creation: {display_path}"
-                )
             child_path = _bound_directory_canonical_path(ancestor).joinpath(
-                *(row.basename for row in held_components if row.basename is not None),
-                component,
+                *components[: component_index + 1]
             )
+            child_display_path = ancestor.path.joinpath(
+                *components[: component_index + 1]
+            )
+            try:
+                installation = _create_and_install_directory_at(
+                    current_fd,
+                    current_opened,
+                    component,
+                    display_path=child_display_path,
+                    revalidate_scope=revalidate_chain,
+                    identity_code="prepared-directory-identity-mismatch",
+                    access_policy_code="prepared-directory-access-policy-mismatch",
+                    inconclusive_code=("prepared-directory-revalidation-inconclusive"),
+                    collision_code="prepared-directory-identity-mismatch",
+                )
+                mutation_performed = True
+            except Exception as exc:
+                raise fail(
+                    "Cannot create, bind, and no-replace install the snapshot "
+                    "destination parent through its held ancestor: "
+                    f"{child_display_path}: {exc}",
+                    cause=exc,
+                ) from exc
+            child_fd = installation.fd
+            child_opened = installation.opened
             held_components.append(
                 _HeldDirectoryComponent(
                     path=child_path,
@@ -5860,6 +6325,7 @@ def _create_bound_snapshot_destination_parent_components(
                     opened=child_opened,
                     parent_fd=current_fd,
                     parent_opened=current_opened,
+                    creation_install_receipt=installation.receipt,
                 )
             )
             owned_fds.append(child_fd)
@@ -5883,6 +6349,7 @@ def _create_bound_snapshot_destination_parent_components(
                 namespace_basename=final.basename,
                 trusted_alias=trusted_alias,
                 canonical_path=final.path,
+                creation_install_receipt=final.creation_install_receipt,
             )
         else:
             binding = _BoundDirectory(

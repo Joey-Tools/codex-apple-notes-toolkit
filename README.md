@@ -20,6 +20,11 @@ descriptor-resolved overlap with either live Notes container before its first
 write. Existing destination and live-container paths are bound one no-follow
 component at a time; initially absent live containers retain their nearest
 existing ancestor and missing suffix through creation and terminal checks.
+Missing destination components and private partials are first created at
+randomized owner-private staging names, descriptor-bound, and only then
+installed at target names with atomic no-replace rename. Identity and access
+policy are revalidated around carried scope checks; failed installs retain
+structured evidence instead of using a racy name-based directory cleanup.
 Exact Darwin root aliases such as `/tmp -> /private/tmp` are
 registry-bound and continuously revalidated through the same carried alias
 object across receipt loading, creator results, publication, and terminal

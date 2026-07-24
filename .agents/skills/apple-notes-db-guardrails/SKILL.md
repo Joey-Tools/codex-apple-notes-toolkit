@@ -67,6 +67,13 @@ It also rejects
 even when that sidecar is currently absent. The guard runs before the first mkdir, file creation,
 rename, partial, backup, receipt, or helper output.
 
+Missing destination-parent components and private partial directories are never created directly
+at their target names. The helper creates an unpredictable owner-private staging directory under
+the held parent, binds its descriptor/identity first, then installs that exact object with atomic
+no-replace rename and revalidates the target around the carried scope checks. Replacement or
+access-policy drift fails closed with a structured retained-object locator; metadata-only
+transitions remain benign. A platform without atomic directory no-replace support is unsupported.
+
 On macOS, only the exact registry entries `/tmp -> /private/tmp`, `/var -> /private/var`, and
 `/etc -> /private/etc` may bridge a root symlink. The helper binds the alias parent, alias entry and
 target text, plus the canonical target and its parent, then performs writes through canonical held

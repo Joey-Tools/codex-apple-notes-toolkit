@@ -284,6 +284,22 @@ parent creation, creator receipts, publication, and terminal revalidation; an un
 `FileExistsError` for a formerly missing component is a race, not permission to adopt it.
 Directory child-entry churn is not itself content mutation outside those reserved names.
 
+Never `mkdir` a missing destination component or private-partial target name directly. Under the
+already-held parent, allocate an unpredictable `.apple-notes-create-<random>` staging directory
+with mode `0700`, immediately open it no-follow, retain its descriptor and creation identity,
+reapply/check owner-private access, and revalidate the staging name against that descriptor. Install
+the retained object at the target basename only with the platform's atomic no-replace directory
+rename, then verify the target name against the retained descriptor before and after the carried
+scope revalidation. Metadata-only changes are evidence, not object or access-policy changes;
+replacement, disappearance, or mode/owner/group/flags drift fails closed. If atomic no-replace is
+unsupported, stop rather than reverting to direct `mkdir(target)` or check-then-rename.
+
+On creation collision or any post-creation failure, retain the created descriptor evidence plus
+point-in-time staging/target observations. Do not `stat(name)` and then `rmdir(name)`: there is no
+portable directory unlink that atomically binds removal to the observed identity. Automatic
+cleanup is therefore allowed only through a future identity-bound primitive; otherwise report
+`preserved-no-identity-safe-directory-unlink` and the exact structured recovery locator.
+
 Darwin root aliases are an explicit, exact registry rather than a general symlink exception:
 `/tmp -> /private/tmp`, `/var -> /private/var`, and `/etc -> /private/etc`. Bind the alias parent,
 the no-follow alias entry identity/access policy, the exact link text, the followed canonical
@@ -301,9 +317,10 @@ Successful snapshot/stage creator results expose
 `descriptor_bound_destination`; standalone merge/recovery results expose the terminal scope and
 descriptor/public-path receipts with the same alias evidence.
 
-Create the partial root through a parent directory descriptor, immediately bind the root and parent
-descriptors, then create and bind the nested `group.com.apple.notes` store relative to that held
-root. Hold all three descriptors, identities, and access policies through publication. Bind every
+Create and bind the partial root through the randomized staging/no-replace protocol above, then
+create and bind the nested `group.com.apple.notes` store with the same protocol relative to that
+held root. Hold the parent/root/nested descriptors, identities, access policies, and
+creation-install receipts through publication. Bind every
 prepared regular file and compare it with its creation receipt: exact identity, SHA-256, size, and
 access policy. Parse the installed manifest and require it to equal the in-memory payload. Verify
 the exact no-follow root and nested name/type sets plus every held file immediately before rename.

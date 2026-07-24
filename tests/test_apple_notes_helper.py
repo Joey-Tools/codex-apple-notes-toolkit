@@ -887,6 +887,407 @@ raise SystemExit(2)
                 if parked.exists():
                     parked.rename(safe_root)
 
+    def test_destination_component_replacement_between_install_and_target_binding(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            destination = root / "created-parent" / "snapshot"
+            parked = root / "transaction-created-parent"
+            original_install = MODULE._install_created_directory_no_replace_at
+            attacked = False
+
+            def replace_after_install(
+                parent_fd: int,
+                staging_name: str,
+                target_name: str,
+            ) -> None:
+                nonlocal attacked
+                self.assertTrue(staging_name.startswith(".apple-notes-create-"))
+                self.assertNotEqual(staging_name, target_name)
+                original_install(parent_fd, staging_name, target_name)
+                if target_name != "created-parent":
+                    return
+                attacked = True
+                os.rename(
+                    target_name,
+                    parked.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                os.mkdir(target_name, mode=0o700, dir_fd=parent_fd)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_install_created_directory_no_replace_at",
+                    side_effect=replace_after_install,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                with MODULE._bind_live_safe_destination_parent(
+                    paths,
+                    destination,
+                ):
+                    self.fail("replaced destination parent must not be yielded")
+
+            self._assert_safety_code(
+                "snapshot-destination-scope-inconclusive",
+                raised,
+            )
+            self.assertTrue(attacked)
+            self.assertTrue(parked.is_dir())
+            self.assertTrue(destination.parent.is_dir())
+            self.assertTrue(raised.exception.details["mutation_performed"])
+            self.assertEqual(
+                raised.exception.details["cleanup_state"],
+                "preserved-no-identity-safe-directory-unlink",
+            )
+            recovery = raised.exception.details["recovery_locators"][
+                "created_directory_install"
+            ]
+            self.assertEqual(
+                recovery["protected_property"],
+                "transaction-created-object-identity",
+            )
+            self.assertTrue(recovery["created_descriptor"]["matches_creation_receipt"])
+            self.assertFalse(
+                recovery["namespace_observations"]["target_name"][
+                    "matches_created_identity"
+                ]
+            )
+
+    def test_destination_component_install_accepts_metadata_only_transition(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            destination = root / "created-parent" / "snapshot"
+            original_install = MODULE._install_created_directory_no_replace_at
+            touched = False
+
+            def touch_after_install(
+                parent_fd: int,
+                staging_name: str,
+                target_name: str,
+            ) -> None:
+                nonlocal touched
+                original_install(parent_fd, staging_name, target_name)
+                if target_name == "created-parent":
+                    touched = True
+                    os.utime(
+                        target_name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+
+            with mock.patch.object(
+                MODULE,
+                "_install_created_directory_no_replace_at",
+                side_effect=touch_after_install,
+            ):
+                with MODULE._bind_live_safe_destination_parent(
+                    paths,
+                    destination,
+                ) as scope:
+                    receipt = scope.parent.creation_install_receipt
+                    self.assertIsNotNone(receipt)
+                    assert receipt is not None
+                    self.assertEqual(
+                        receipt["creation_protocol"],
+                        (
+                            "randomized-owner-private-staging-bind-before-"
+                            "no-replace-install"
+                        ),
+                    )
+            self.assertTrue(touched)
+            self.assertTrue(destination.parent.is_dir())
+
+    def test_destination_component_install_rejects_access_policy_transition(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            destination = root / "created-parent" / "snapshot"
+            original_install = MODULE._install_created_directory_no_replace_at
+            changed = False
+
+            def chmod_after_install(
+                parent_fd: int,
+                staging_name: str,
+                target_name: str,
+            ) -> None:
+                nonlocal changed
+                original_install(parent_fd, staging_name, target_name)
+                if target_name == "created-parent":
+                    changed = True
+                    os.chmod(
+                        target_name,
+                        0o750,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_install_created_directory_no_replace_at",
+                    side_effect=chmod_after_install,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                with MODULE._bind_live_safe_destination_parent(
+                    paths,
+                    destination,
+                ):
+                    self.fail("access-policy drift must not be yielded")
+
+            self._assert_safety_code(
+                "snapshot-destination-scope-inconclusive",
+                raised,
+            )
+            self.assertTrue(changed)
+            self.assertTrue(raised.exception.details["mutation_performed"])
+            self.assertEqual(
+                stat.S_IMODE(destination.parent.stat().st_mode),
+                0o750,
+            )
+            recovery = raised.exception.details["recovery_locators"][
+                "created_directory_install"
+            ]
+            self.assertFalse(
+                recovery["created_descriptor"]["matches_creation_access_policy"]
+            )
+
+    def test_private_partial_replacement_between_install_and_target_binding(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_root = root / "live"
+            live_root.mkdir()
+            paths = self._make_paths(live_root)
+            source = root / "edited.sqlite"
+            self._create_db(source)
+            destination = root / "stage"
+            parked = root / "transaction-created-partial"
+            original_install = MODULE._install_created_directory_no_replace_at
+            attacked = False
+
+            def replace_partial_after_install(
+                parent_fd: int,
+                staging_name: str,
+                target_name: str,
+            ) -> None:
+                nonlocal attacked
+                self.assertTrue(staging_name.startswith(".apple-notes-create-"))
+                self.assertNotEqual(staging_name, target_name)
+                original_install(parent_fd, staging_name, target_name)
+                if not target_name.startswith(".stage.partial-"):
+                    return
+                attacked = True
+                os.rename(
+                    target_name,
+                    parked.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                os.mkdir(target_name, mode=0o700, dir_fd=parent_fd)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_install_created_directory_no_replace_at",
+                    side_effect=replace_partial_after_install,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.stage_patch(source, destination, paths=paths)
+
+            self._assert_safety_code(
+                "prepared-directory-identity-mismatch",
+                raised,
+            )
+            self.assertTrue(attacked)
+            self.assertTrue(parked.is_dir())
+            self.assertFalse(destination.exists())
+            partials = list(root.glob(".stage.partial-*"))
+            self.assertEqual(len(partials), 1)
+            self.assertTrue(partials[0].is_dir())
+            recovery = raised.exception.details["recovery_locators"][
+                "created_directory_install"
+            ]
+            self.assertEqual(
+                recovery["install_state"],
+                "no-replace-install-returned",
+            )
+            self.assertFalse(
+                recovery["namespace_observations"]["target_name"][
+                    "matches_created_identity"
+                ]
+            )
+
+    def test_private_partial_install_accepts_metadata_only_transition(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_root = root / "live"
+            live_root.mkdir()
+            paths = self._make_paths(live_root)
+            source = root / "edited.sqlite"
+            self._create_db(source)
+            destination = root / "stage"
+            original_install = MODULE._install_created_directory_no_replace_at
+            touched = False
+
+            def touch_partial_after_install(
+                parent_fd: int,
+                staging_name: str,
+                target_name: str,
+            ) -> None:
+                nonlocal touched
+                original_install(parent_fd, staging_name, target_name)
+                if target_name.startswith(".stage.partial-"):
+                    touched = True
+                    os.utime(
+                        target_name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+
+            with mock.patch.object(
+                MODULE,
+                "_install_created_directory_no_replace_at",
+                side_effect=touch_partial_after_install,
+            ):
+                result = self._stage_patch(source, destination, paths=paths)
+
+            self.assertTrue(touched)
+            self.assertEqual(Path(result["stage_dir"]), destination)
+            self.assertTrue(destination.is_dir())
+
+    def test_private_partial_install_rejects_access_policy_transition(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_root = root / "live"
+            live_root.mkdir()
+            paths = self._make_paths(live_root)
+            source = root / "edited.sqlite"
+            self._create_db(source)
+            destination = root / "stage"
+            original_install = MODULE._install_created_directory_no_replace_at
+            changed = False
+
+            def chmod_partial_after_install(
+                parent_fd: int,
+                staging_name: str,
+                target_name: str,
+            ) -> None:
+                nonlocal changed
+                original_install(parent_fd, staging_name, target_name)
+                if target_name.startswith(".stage.partial-"):
+                    changed = True
+                    os.chmod(
+                        target_name,
+                        0o750,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_install_created_directory_no_replace_at",
+                    side_effect=chmod_partial_after_install,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.stage_patch(source, destination, paths=paths)
+
+            self._assert_safety_code(
+                "prepared-directory-access-policy-mismatch",
+                raised,
+            )
+            self.assertTrue(changed)
+            partial = self._assert_retained_partial(root, ".stage.partial-*")
+            self.assertEqual(stat.S_IMODE(partial.stat().st_mode), 0o750)
+            self.assertEqual(
+                raised.exception.details["cleanup_state"],
+                "preserved-no-identity-safe-directory-unlink",
+            )
+            recovery = raised.exception.details["recovery_locators"][
+                "created_directory_install"
+            ]
+            self.assertFalse(
+                recovery["created_descriptor"]["matches_creation_access_policy"]
+            )
+
+    def test_private_partial_install_collision_retains_exact_staging_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / ".stage.partial-fixed"
+            original_install = MODULE._install_created_directory_no_replace_at
+            collided = False
+
+            def collide_before_install(
+                parent_fd: int,
+                staging_name: str,
+                target_name: str,
+            ) -> None:
+                nonlocal collided
+                collided = True
+                os.mkdir(target_name, mode=0o700, dir_fd=parent_fd)
+                original_install(parent_fd, staging_name, target_name)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_install_created_directory_no_replace_at",
+                    side_effect=collide_before_install,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                with MODULE._create_bound_directory(target):
+                    self.fail("no-replace collision must not yield a binding")
+
+            self._assert_safety_code(
+                "prepared-directory-revalidation-inconclusive",
+                raised,
+            )
+            self.assertTrue(collided)
+            self.assertTrue(target.is_dir())
+            staged = list(root.glob(".apple-notes-create-*"))
+            self.assertEqual(len(staged), 1)
+            self.assertEqual(
+                raised.exception.details["underlying_errno"],
+                errno.EEXIST,
+            )
+            recovery = raised.exception.details["recovery_locators"][
+                "created_directory_install"
+            ]
+            self.assertEqual(
+                recovery["namespace_observations"]["staging_name"]["status"],
+                "present",
+            )
+            self.assertTrue(
+                recovery["namespace_observations"]["staging_name"][
+                    "matches_created_identity"
+                ]
+            )
+            self.assertFalse(
+                recovery["namespace_observations"]["target_name"][
+                    "matches_created_identity"
+                ]
+            )
+
     def test_copy_db_rejects_case_and_nfd_live_container_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
