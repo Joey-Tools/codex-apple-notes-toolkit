@@ -48,7 +48,10 @@ Record whether the authoritative source is the live container or a Joey-provided
 Use a unique task-scoped destination:
 
 ```bash
-python3 "$SKILL_DIR/scripts/apple_notes_db.py" copy-db --dest /tmp/<task-snapshot>
+umask 077
+python3 "$SKILL_DIR/scripts/apple_notes_db.py" copy-db \
+  --dest /tmp/<task-snapshot> \
+  > /tmp/<task-snapshot>.creation-result.json
 ```
 
 Treat a snapshot captured while Notes is running as tentative.
@@ -59,10 +62,15 @@ For critical analysis or a writeback baseline, quit Notes first and run:
 ```bash
 python3 "$SKILL_DIR/scripts/apple_notes_db.py" copy-db \
   --dest /tmp/<task-backup> \
-  --require-notes-quit
+  --require-notes-quit \
+  > /tmp/<task-backup>.creation-result.json
 ```
 
-Keep `snapshot-manifest.json` with the copied file set.
+Keep `snapshot-manifest.json` with the copied file set, and separately preserve the successful
+creation-result JSON outside the snapshot with mode `0600`. Its
+`manifest_creation_receipt` anchors the exact creation-time manifest SHA-256, size, identity, and
+access policy. Never regenerate that receipt from a current artifact. Only a successful creator
+result is admissible; a partial or error result is not.
 Snapshot publication is atomic and no-replace on supported macOS/Linux filesystems.
 The helper binds the private partial directory, its nested `group.com.apple.notes` store, and their
 parents at creation. It verifies every prepared file against its creation receipt, fsyncs copied
@@ -103,11 +111,15 @@ Use `validate-snapshot` before relying on an older snapshot:
 
 ```bash
 python3 "$SKILL_DIR/scripts/apple_notes_db.py" validate-snapshot \
-  --snapshot-dir /tmp/<task-backup>
+  --snapshot-dir /tmp/<task-backup> \
+  --manifest-creation-receipt-file \
+    /tmp/<task-backup>.creation-result.json
 ```
 
-Validation requires the v2 manifest's creation-time root/store/file identity and access-policy
-receipts, then holds the manifest and every declared database-file descriptor through
+Validation requires the caller-preserved artifact-external receipt before parsing the v3
+manifest. It first compares the held manifest's identity, SHA-256, size, and access policy with
+that external receipt, then consumes the manifest's creation-time root/store/file receipts and
+holds the manifest and every declared database-file descriptor through
 recovery-clone creation, SQLite integrity checking, and terminal revalidation. Object replacement,
 byte mutation, and access-policy change have distinct failure codes; timestamp-only changes do not
 fail when the protected properties remain stable.
@@ -119,7 +131,9 @@ Prefer `recover-snapshot` when a manifest is available:
 ```bash
 python3 "$SKILL_DIR/scripts/apple_notes_db.py" recover-snapshot \
   --snapshot-dir /tmp/<task-snapshot> \
-  --out /tmp/<task-snapshot>-analysis.sqlite
+  --out /tmp/<task-snapshot>-analysis.sqlite \
+  --manifest-creation-receipt-file \
+    /tmp/<task-snapshot>.creation-result.json
 ```
 
 `recover-snapshot` consumes the private clone produced by that exact validation pass. It never
@@ -151,6 +165,12 @@ the prepared standalone file through that same held descriptor. Before writing, 
 writer binds the serialized payload's expected SHA-256, byte length, and `0600` mode. It accepts a
 creation receipt only after two consecutive same-descriptor readbacks plus size, access-policy,
 and descriptor-relative pathname identity/access checks all match that pre-bound expectation.
+After the main file is published, fsynced, terminally rehashed, and path-verified, the helper keeps
+its parent directory descriptor open and observes the output's `-wal`, `-shm`, and `-journal`
+names twice without following links. Any present entry of any type, permission failure, or
+unverifiable observation makes the already-published result `destination-install-uncertain`.
+Preserve the main and observed names, do not retry or delete, quiesce the writer, and rebind for
+inspection.
 Once a sidecar-free standalone image has been validated and bound, later backup copies only that
 held image. A newly injected adjacent WAL is neither discovered nor trusted.
 An ephemeral namespace replace-and-restore during SQLite backup may not be reported, but it cannot
@@ -199,19 +219,32 @@ Normalize the edited database into a new patch stage:
 ```bash
 python3 "$SKILL_DIR/scripts/apple_notes_db.py" stage-patch \
   --src /tmp/<edited>/NoteStore-edited.sqlite \
-  --dest /tmp/<task-patch-stage>
+  --dest /tmp/<task-patch-stage> \
+  > /tmp/<task-patch-stage>.creation-result.json
 ```
 
 Require the stage to contain only `NoteStore.sqlite` and `patch-manifest.json`.
 Validation examines every no-follow directory entry and rejects extra directories, FIFOs, and
 symlinks as well as extra regular files.
+Validate a stage independently when needed:
+
+```bash
+python3 "$SKILL_DIR/scripts/apple_notes_db.py" validate-patch-stage \
+  --stage-dir /tmp/<task-patch-stage> \
+  --manifest-creation-receipt-file \
+    /tmp/<task-patch-stage>.creation-result.json
+```
 
 While Notes remains quit, bind the live store, fresh backup, and stage:
 
 ```bash
 python3 "$SKILL_DIR/scripts/apple_notes_db.py" preflight-writeback \
   --backup-dir /tmp/<task-backup> \
-  --stage-dir /tmp/<task-patch-stage>
+  --stage-dir /tmp/<task-patch-stage> \
+  --backup-manifest-creation-receipt-file \
+    /tmp/<task-backup>.creation-result.json \
+  --stage-manifest-creation-receipt-file \
+    /tmp/<task-patch-stage>.creation-result.json
 ```
 
 Do not treat `ready_for_explicit_writeback: true` as authorization or as proof that a multi-file
@@ -226,7 +259,11 @@ Keep Notes quit and run:
 ```bash
 python3 "$SKILL_DIR/scripts/apple_notes_db.py" verify-writeback \
   --backup-dir /tmp/<task-backup> \
-  --stage-dir /tmp/<task-patch-stage>
+  --stage-dir /tmp/<task-patch-stage> \
+  --backup-manifest-creation-receipt-file \
+    /tmp/<task-backup>.creation-result.json \
+  --stage-manifest-creation-receipt-file \
+    /tmp/<task-patch-stage>.creation-result.json
 ```
 
 Require the live main database to be a new object that matches the staged bytes, preserve the
@@ -244,4 +281,9 @@ State:
 - WAL/SHM recovery interpretation;
 - read-only findings separately from patch/writeback actions;
 - any missing, unreadable, mismatched, or inconclusive gate by its exact error code;
+- where the external snapshot/stage creation-result receipts were preserved;
 - that preflight and verification do not make multi-file writeback atomic.
+
+The external receipt is an anchor, not a signature or MAC. It detects artifact tampering only
+while the caller preserves that receipt independently. If the same actor can rewrite both the
+artifact and receipt file, the helper cannot establish creation-time authenticity.

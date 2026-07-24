@@ -39,8 +39,9 @@ NOTE_STORE_DISCOVERY_BASENAMES = (
 )
 SNAPSHOT_MANIFEST = "snapshot-manifest.json"
 PATCH_MANIFEST = "patch-manifest.json"
-SNAPSHOT_SCHEMA = "apple-notes-snapshot/v2"
-PATCH_SCHEMA = "apple-notes-patch/v2"
+SNAPSHOT_SCHEMA = "apple-notes-snapshot/v3"
+PATCH_SCHEMA = "apple-notes-patch/v3"
+MANIFEST_CREATION_RECEIPT_SCHEMA = "apple-notes-manifest-creation-receipt/v1"
 CHUNK_SIZE = 1024 * 1024
 MANIFEST_MAX_BYTES = 4 * 1024 * 1024
 WAL_MAGIC_NUMBERS = {0x377F0682, 0x377F0683}
@@ -165,6 +166,13 @@ PREPARED_FILE_CODES = _FileProtectionCodes(
     content="prepared-file-content-mismatch",
     access_policy="prepared-file-access-policy-mismatch",
     inconclusive="prepared-file-revalidation-inconclusive",
+)
+MANIFEST_RECEIPT_FILE_CODES = _FileProtectionCodes(
+    missing="manifest-creation-receipt-missing",
+    identity="manifest-creation-receipt-file-identity-mismatch",
+    content="manifest-creation-receipt-file-content-mismatch",
+    access_policy="manifest-creation-receipt-file-access-policy-mismatch",
+    inconclusive="manifest-creation-receipt-file-revalidation-inconclusive",
 )
 
 
@@ -3712,6 +3720,165 @@ def _normalized_json_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _manifest_creation_receipt_payload(
+    *,
+    artifact_kind: str,
+    artifact_schema: str,
+    manifest_name: str,
+    manifest_receipt: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema": MANIFEST_CREATION_RECEIPT_SCHEMA,
+        "artifact_kind": artifact_kind,
+        "artifact_schema": artifact_schema,
+        "manifest_name": manifest_name,
+        "manifest": {
+            "sha256": manifest_receipt["sha256"],
+            "size": manifest_receipt["size"],
+            "identity": manifest_receipt["identity"],
+            "access_policy": manifest_receipt["access_policy"],
+        },
+    }
+
+
+def _normalized_manifest_creation_receipt(
+    value: Any,
+    *,
+    artifact_kind: str,
+    artifact_schema: str,
+    manifest_name: str,
+) -> dict[str, Any]:
+    if value is None:
+        raise StoreSafetyError(
+            "manifest-creation-receipt-required",
+            "A caller-preserved artifact-external manifest creation receipt is "
+            f"required before consuming {manifest_name}",
+        )
+    if (
+        isinstance(value, dict)
+        and "manifest_creation_receipt" in value
+        and value.get("schema") != MANIFEST_CREATION_RECEIPT_SCHEMA
+    ):
+        value = value.get("manifest_creation_receipt")
+    if not isinstance(value, dict):
+        raise StoreSafetyError(
+            "manifest-creation-receipt-invalid",
+            "Manifest creation receipt must be a JSON object",
+        )
+    expected_outer_keys = {
+        "schema",
+        "artifact_kind",
+        "artifact_schema",
+        "manifest_name",
+        "manifest",
+    }
+    if (
+        set(value) != expected_outer_keys
+        or value.get("schema") != MANIFEST_CREATION_RECEIPT_SCHEMA
+        or value.get("artifact_kind") != artifact_kind
+        or value.get("artifact_schema") != artifact_schema
+        or value.get("manifest_name") != manifest_name
+    ):
+        raise StoreSafetyError(
+            "manifest-creation-receipt-invalid",
+            "Manifest creation receipt schema or artifact binding is invalid "
+            f"for {manifest_name}",
+        )
+    manifest = value.get("manifest")
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "sha256",
+        "size",
+        "identity",
+        "access_policy",
+    }:
+        raise StoreSafetyError(
+            "manifest-creation-receipt-invalid",
+            f"Manifest creation receipt fields are invalid for {manifest_name}",
+        )
+    sha256 = manifest.get("sha256")
+    size = manifest.get("size")
+    if (
+        not isinstance(sha256, str)
+        or len(sha256) != 64
+        or any(character not in "0123456789abcdef" for character in sha256)
+        or type(size) is not int
+        or size < 0
+    ):
+        raise StoreSafetyError(
+            "manifest-creation-receipt-invalid",
+            f"Manifest content receipt is malformed for {manifest_name}",
+        )
+    try:
+        protection = _manifest_protection_receipt(
+            manifest,
+            label=f"external receipt for {manifest_name}",
+        )
+    except StoreSafetyError as exc:
+        raise StoreSafetyError(
+            "manifest-creation-receipt-invalid",
+            f"Manifest protection receipt is malformed for {manifest_name}: {exc}",
+        ) from exc
+    return {
+        "schema": MANIFEST_CREATION_RECEIPT_SCHEMA,
+        "artifact_kind": artifact_kind,
+        "artifact_schema": artifact_schema,
+        "manifest_name": manifest_name,
+        "manifest": {
+            "sha256": sha256,
+            "size": size,
+            **protection,
+        },
+    }
+
+
+def _assert_bound_manifest_creation_receipt(
+    bound: _BoundRegularFile,
+    creation_receipt: dict[str, Any],
+    codes: _FileProtectionCodes,
+) -> dict[str, Any]:
+    current = _verify_bound_regular_file(bound, codes)
+    expected = creation_receipt["manifest"]
+    if current["identity"] != expected["identity"]:
+        raise StoreSafetyError(
+            "manifest-creation-receipt-identity-mismatch",
+            "Manifest identity differs from the caller-preserved creation "
+            f"receipt: {bound.path}",
+        )
+    if current["sha256"] != expected["sha256"] or current["size"] != expected["size"]:
+        raise StoreSafetyError(
+            "manifest-creation-receipt-content-mismatch",
+            "Manifest bytes differ from the caller-preserved creation receipt: "
+            f"{bound.path}",
+        )
+    if current["access_policy"] != expected["access_policy"]:
+        raise StoreSafetyError(
+            "manifest-creation-receipt-access-policy-mismatch",
+            "Manifest access policy differs from the caller-preserved creation "
+            f"receipt: {bound.path}",
+        )
+    return current
+
+
+def _assert_manifest_external_anchor_declaration(
+    manifest: dict[str, Any],
+    *,
+    artifact_kind: str,
+    manifest_name: str,
+) -> None:
+    expected = {
+        "schema": MANIFEST_CREATION_RECEIPT_SCHEMA,
+        "artifact_kind": artifact_kind,
+        "manifest_name": manifest_name,
+        "required_before_manifest_consumption": True,
+    }
+    if manifest.get("external_creation_receipt") != expected:
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "Manifest does not declare its required artifact-external creation "
+            f"receipt: {manifest_name}",
+        )
+
+
 def _manifest_protection_receipt(
     value: Any,
     *,
@@ -3729,10 +3896,10 @@ def _manifest_protection_receipt(
     if (
         not isinstance(identity, dict)
         or set(identity) != identity_keys
-        or any(not isinstance(identity[key], int) for key in identity_keys)
+        or any(type(identity[key]) is not int for key in identity_keys)
         or not isinstance(access_policy, dict)
         or set(access_policy) != access_keys
-        or any(not isinstance(access_policy[key], int) for key in access_keys)
+        or any(type(access_policy[key]) is not int for key in access_keys)
     ):
         raise StoreSafetyError(
             "manifest-invalid",
@@ -5864,6 +6031,122 @@ def _terminal_standalone_output_receipt(
     }
 
 
+def _terminal_standalone_sidecar_absence_receipt(
+    destination_binding: _BoundDirectory,
+    output: Path,
+) -> dict[str, Any]:
+    """Observe every standalone sidecar twice through the held parent fd."""
+
+    receipt: dict[str, Any] = {
+        "schema": "apple-notes-standalone-sidecar-absence-receipt/v1",
+        "main": output.name,
+        "verification": "two-pass-descriptor-relative-no-follow",
+        "namespace_authority": "point-in-time-observation-only",
+        "evidence_status": "checked",
+        "sidecars": {
+            f"{output.name}{suffix}": {"passes": []}
+            for suffix in ("-wal", "-shm", "-journal")
+        },
+    }
+
+    def verify_parent(phase: str) -> None:
+        try:
+            _verify_bound_parent_descriptor(
+                destination_binding.fd,
+                destination_binding.opened,
+                display_path=output.parent,
+                identity_code="prepared-directory-identity-mismatch",
+                access_policy_code="prepared-directory-access-policy-mismatch",
+                inconclusive_code="prepared-directory-revalidation-inconclusive",
+            )
+        except StoreSafetyError as exc:
+            receipt["evidence_status"] = "inconclusive"
+            receipt["parent_revalidation"] = {
+                "phase": phase,
+                "error_code": exc.code,
+                "error": str(exc),
+            }
+            receipt["reason_code"] = (
+                "standalone-output-sidecar-revalidation-inconclusive"
+            )
+            raise StoreSafetyError(
+                "standalone-output-sidecar-revalidation-inconclusive",
+                "Cannot terminally revalidate the standalone output parent "
+                f"during {phase}: {output.parent}: {exc}",
+                details={"terminal_sidecar_revalidation": receipt},
+            ) from exc
+
+    observed_statuses: set[str] = set()
+    for pass_index in range(2):
+        pass_number = pass_index + 1
+        verify_parent(f"before-sidecar-pass-{pass_number}")
+        for basename, sidecar in receipt["sidecars"].items():
+            row: dict[str, Any] = {
+                "pass": pass_number,
+                "follow_symlinks": False,
+            }
+            try:
+                observed = os.stat(
+                    basename,
+                    dir_fd=destination_binding.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                row["status"] = "absent"
+            except PermissionError as exc:
+                row.update(
+                    {
+                        "status": "unreadable",
+                        "errno": exc.errno,
+                        "evidence_status": "inconclusive",
+                    }
+                )
+            except OSError as exc:
+                row.update(
+                    {
+                        "status": "unverifiable",
+                        "errno": exc.errno,
+                        "evidence_status": "inconclusive",
+                    }
+                )
+            else:
+                row.update(
+                    {
+                        "status": "present",
+                        "identity": _identity(observed),
+                        "access_policy": _access_policy(observed),
+                        "size": observed.st_size,
+                    }
+                )
+            sidecar["passes"].append(row)
+            observed_statuses.add(str(row["status"]))
+        verify_parent(f"after-sidecar-pass-{pass_number}")
+
+    non_absent = observed_statuses - {"absent"}
+    if non_absent:
+        if "present" in non_absent:
+            code = "standalone-output-sidecar-present"
+            receipt["evidence_status"] = "present"
+        elif "unreadable" in non_absent:
+            code = "standalone-output-sidecar-unreadable"
+            receipt["evidence_status"] = "inconclusive"
+        else:
+            code = "standalone-output-sidecar-revalidation-inconclusive"
+            receipt["evidence_status"] = "inconclusive"
+        receipt["reason_code"] = code
+        receipt["safe_action"] = (
+            "preserve-main-and-observed-sidecars-do-not-retry-or-delete-"
+            "quiesce-writer-and-rebind"
+        )
+        raise StoreSafetyError(
+            code,
+            "Standalone output sidecar absence could not be terminally proved "
+            f"through the held parent descriptor: {output}",
+            details={"terminal_sidecar_revalidation": receipt},
+        )
+    return receipt
+
+
 def _write_standalone_backup_payload(
     payload: bytes,
     output: Path,
@@ -6148,6 +6431,39 @@ def _recover_validated_clone_to_standalone(
                 out,
                 output_parent_binding.fd,
             )
+            try:
+                terminal_sidecars = _terminal_standalone_sidecar_absence_receipt(
+                    output_parent_binding,
+                    out,
+                )
+            except StoreSafetyError as exc:
+                descriptor_bound_destination: dict[str, Any] | None = None
+                try:
+                    descriptor_bound_destination = (
+                        _descriptor_bound_destination_receipt(
+                            output_parent_binding.fd,
+                            prepared,
+                            out,
+                        )
+                    )
+                except (OSError, StoreSafetyError):
+                    descriptor_bound_destination = None
+                details = _publication_details(
+                    "uncertain",
+                    prepared=prepared,
+                    destination=out,
+                    retry_safe=False,
+                    descriptor_bound_destination=descriptor_bound_destination,
+                )
+                details = _merge_recovery_details(details, exc.details)
+                details["terminal_sidecar_error_code"] = exc.code
+                raise StoreSafetyError(
+                    "destination-install-uncertain",
+                    "The standalone database was published and its main-file "
+                    "receipt completed, but terminal sidecar absence is "
+                    f"unconfirmed: {out}: {exc}",
+                    details=details,
+                ) from exc
     return {
         "source_db": source_db,
         "standalone_db": out,
@@ -6158,6 +6474,7 @@ def _recover_validated_clone_to_standalone(
         "size": fingerprint["size"],
         "identity": fingerprint["identity"],
         "access_policy": fingerprint["access_policy"],
+        "terminal_sidecar_revalidation": terminal_sidecars,
     }
 
 
@@ -6316,6 +6633,12 @@ def copy_db(
                         "link_count",
                     ],
                 },
+                "external_creation_receipt": {
+                    "schema": MANIFEST_CREATION_RECEIPT_SCHEMA,
+                    "artifact_kind": "snapshot",
+                    "manifest_name": SNAPSHOT_MANIFEST,
+                    "required_before_manifest_consumption": True,
+                },
                 "creation_receipts": {
                     "snapshot_directory": {
                         "identity": _identity(bound_root.opened),
@@ -6340,6 +6663,12 @@ def copy_db(
                 partial / SNAPSHOT_MANIFEST,
                 manifest,
                 parent_binding=bound_root,
+            )
+            manifest_creation_receipt = _manifest_creation_receipt_payload(
+                artifact_kind="snapshot",
+                artifact_schema=SNAPSHOT_SCHEMA,
+                manifest_name=SNAPSHOT_MANIFEST,
+                manifest_receipt=manifest_receipt,
             )
             root_receipt = _scan_exact_directory_entries(
                 partial,
@@ -6522,6 +6851,7 @@ def copy_db(
     return {
         "dest": destination,
         "manifest": destination / SNAPSHOT_MANIFEST,
+        "manifest_creation_receipt": manifest_creation_receipt,
         "notes_running": notes_running,
         "notes_quit_required": require_notes_quit,
         "classification": manifest["classification"],
@@ -6542,9 +6872,16 @@ def copy_db(
 @contextmanager
 def _validated_snapshot_artifact(
     snapshot_dir: Path,
+    manifest_creation_receipt: dict[str, Any] | None,
 ) -> Iterator[_ValidatedSnapshotArtifact]:
     """Bind snapshot inputs and expose only a private validated recovery clone."""
 
+    external_receipt = _normalized_manifest_creation_receipt(
+        manifest_creation_receipt,
+        artifact_kind="snapshot",
+        artifact_schema=SNAPSHOT_SCHEMA,
+        manifest_name=SNAPSHOT_MANIFEST,
+    )
     manifest_path = snapshot_dir / SNAPSHOT_MANIFEST
     store_dir = snapshot_dir / "group.com.apple.notes"
     with (
@@ -6573,10 +6910,20 @@ def _validated_snapshot_artifact(
                     f"Manifest is missing: {manifest_path}",
                 ) from exc
             raise
+        _assert_bound_manifest_creation_receipt(
+            manifest_bound,
+            external_receipt,
+            SNAPSHOT_FILE_CODES,
+        )
         manifest = _load_bound_manifest(
             manifest_bound,
             SNAPSHOT_FILE_CODES,
             SNAPSHOT_SCHEMA,
+        )
+        _assert_manifest_external_anchor_declaration(
+            manifest,
+            artifact_kind="snapshot",
+            manifest_name=SNAPSHOT_MANIFEST,
         )
         creation_receipts = manifest.get("creation_receipts")
         if not isinstance(creation_receipts, dict):
@@ -6778,6 +7125,7 @@ def _validated_snapshot_artifact(
         public_result = {
             "snapshot_dir": snapshot_dir,
             "manifest": manifest,
+            "manifest_creation_receipt": external_receipt,
             "verified_files": verified,
             "sidecar_consistency": clone.evidence["sidecars"],
             "sqlite_validation": sqlite_integrity,
@@ -6794,8 +7142,14 @@ def _validated_snapshot_artifact(
         )
 
 
-def validate_snapshot(snapshot_dir: Path) -> dict[str, Any]:
-    with _validated_snapshot_artifact(snapshot_dir) as artifact:
+def validate_snapshot(
+    snapshot_dir: Path,
+    manifest_creation_receipt: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    with _validated_snapshot_artifact(
+        snapshot_dir,
+        manifest_creation_receipt,
+    ) as artifact:
         return artifact.public_result
 
 
@@ -6987,6 +7341,89 @@ def _assert_output_ancestors_exclude_snapshot(
             f"{display_path}",
         )
     return chain
+
+
+def _load_external_manifest_creation_receipt(
+    receipt_file: Path,
+    *,
+    artifact_root: Path,
+    artifact_kind: str,
+    artifact_schema: str,
+    manifest_name: str,
+) -> dict[str, Any]:
+    """Read one stable caller-preserved receipt from outside its artifact."""
+
+    with (
+        _bind_existing_directory(artifact_root) as bound_artifact,
+        _bind_existing_directory(receipt_file.parent) as bound_receipt_parent,
+    ):
+        try:
+            _assert_output_ancestors_exclude_snapshot(
+                bound_receipt_parent.fd,
+                bound_artifact.opened,
+                display_path=receipt_file.parent,
+            )
+        except StoreSafetyError as exc:
+            code = (
+                "manifest-creation-receipt-not-external"
+                if exc.code == "recovery-output-inside-snapshot"
+                else "manifest-creation-receipt-scope-inconclusive"
+            )
+            raise StoreSafetyError(
+                code,
+                "Manifest creation receipt must be preserved outside the "
+                f"artifact tree: receipt={receipt_file}, artifact={artifact_root}: "
+                f"{exc}",
+            ) from exc
+        receipt_bound = False
+        try:
+            with _bind_regular_file_at(
+                receipt_file,
+                bound_receipt_parent,
+                MANIFEST_RECEIPT_FILE_CODES,
+            ) as bound_receipt:
+                receipt_bound = True
+                payload_bytes = _read_bound_file_bytes(
+                    bound_receipt,
+                    MANIFEST_RECEIPT_FILE_CODES,
+                    max_bytes=MANIFEST_MAX_BYTES,
+                    too_large_code="manifest-creation-receipt-too-large",
+                    dir_fd=bound_receipt_parent.fd,
+                    basename=receipt_file.name,
+                )
+        except StoreSafetyError as exc:
+            cause: BaseException | None = exc
+            permission_failure = False
+            while cause is not None:
+                if isinstance(cause, PermissionError):
+                    permission_failure = True
+                    break
+                cause = cause.__cause__
+            if not permission_failure:
+                raise
+            code = (
+                "manifest-creation-receipt-revalidation-unreadable"
+                if receipt_bound
+                else "manifest-creation-receipt-unreadable"
+            )
+            raise StoreSafetyError(
+                code,
+                "Manifest creation receipt could not be read with stable "
+                f"descriptor evidence: {receipt_file}: {exc}",
+            ) from exc
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise StoreSafetyError(
+            "manifest-creation-receipt-invalid",
+            f"Cannot parse manifest creation receipt {receipt_file}: {exc}",
+        ) from exc
+    return _normalized_manifest_creation_receipt(
+        payload,
+        artifact_kind=artifact_kind,
+        artifact_schema=artifact_schema,
+        manifest_name=manifest_name,
+    )
 
 
 def _create_bound_output_parent_components(
@@ -7189,9 +7626,16 @@ def _bind_recovery_output_parent_outside_snapshot(
             _verify_bound_directory_namespace(snapshot_binding)
 
 
-def recover_snapshot(snapshot_dir: Path, out: Path) -> dict[str, Any]:
+def recover_snapshot(
+    snapshot_dir: Path,
+    out: Path,
+    manifest_creation_receipt: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     source = snapshot_dir / "group.com.apple.notes" / NOTE_STORE_MAIN
-    with _validated_snapshot_artifact(snapshot_dir) as artifact:
+    with _validated_snapshot_artifact(
+        snapshot_dir,
+        manifest_creation_receipt,
+    ) as artifact:
         with _bind_recovery_output_parent_outside_snapshot(
             snapshot_dir,
             out,
@@ -7219,6 +7663,7 @@ def recover_snapshot(snapshot_dir: Path, out: Path) -> dict[str, Any]:
                 "sqlite_validation": validation["sqlite_validation"],
                 "sidecar_consistency": validation["sidecar_consistency"],
                 "source_integrity": artifact.source_integrity,
+                "manifest_creation_receipt": validation["manifest_creation_receipt"],
             },
             "recovered": recovered,
         }
@@ -7268,6 +7713,12 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
                         "access_policy": _access_policy(bound_root.opened),
                     },
                 },
+                "external_creation_receipt": {
+                    "schema": MANIFEST_CREATION_RECEIPT_SCHEMA,
+                    "artifact_kind": "patch-stage",
+                    "manifest_name": PATCH_MANIFEST,
+                    "required_before_manifest_consumption": True,
+                },
                 "sqlite_validation": recovery["output_integrity"],
                 "sidecar_policy": {
                     "allowed": False,
@@ -7278,6 +7729,12 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
                 partial / PATCH_MANIFEST,
                 manifest,
                 parent_binding=bound_root,
+            )
+            manifest_creation_receipt = _manifest_creation_receipt_payload(
+                artifact_kind="patch-stage",
+                artifact_schema=PATCH_SCHEMA,
+                manifest_name=PATCH_MANIFEST,
+                manifest_receipt=manifest_receipt,
             )
             root_receipt = _scan_exact_directory_entries(
                 partial,
@@ -7393,6 +7850,7 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
     return {
         "stage_dir": dest,
         "manifest": dest / PATCH_MANIFEST,
+        "manifest_creation_receipt": manifest_creation_receipt,
         "database": dest / NOTE_STORE_MAIN,
         "sha256": manifest["database"]["sha256"],
         "size": manifest["database"]["size"],
@@ -7401,7 +7859,16 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
     }
 
 
-def validate_patch_stage(stage_dir: Path) -> dict[str, Any]:
+def validate_patch_stage(
+    stage_dir: Path,
+    manifest_creation_receipt: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    external_receipt = _normalized_manifest_creation_receipt(
+        manifest_creation_receipt,
+        artifact_kind="patch-stage",
+        artifact_schema=PATCH_SCHEMA,
+        manifest_name=PATCH_MANIFEST,
+    )
     expected_stage_types = {
         NOTE_STORE_MAIN: stat.S_IFREG,
         PATCH_MANIFEST: stat.S_IFREG,
@@ -7419,10 +7886,20 @@ def validate_patch_stage(stage_dir: Path) -> dict[str, Any]:
                 PATCH_FILE_CODES,
             )
         )
+        _assert_bound_manifest_creation_receipt(
+            manifest_bound,
+            external_receipt,
+            PATCH_FILE_CODES,
+        )
         manifest = _load_bound_manifest(
             manifest_bound,
             PATCH_FILE_CODES,
             PATCH_SCHEMA,
+        )
+        _assert_manifest_external_anchor_declaration(
+            manifest,
+            artifact_kind="patch-stage",
+            manifest_name=PATCH_MANIFEST,
         )
         creation_receipts = manifest.get("creation_receipts")
         if not isinstance(creation_receipts, dict):
@@ -7511,6 +7988,7 @@ def validate_patch_stage(stage_dir: Path) -> dict[str, Any]:
         return {
             "stage_dir": stage_dir,
             "manifest": manifest,
+            "manifest_creation_receipt": external_receipt,
             "fingerprint": fingerprint,
             "sqlite_validation": integrity,
             "source_integrity": {
@@ -7624,12 +8102,17 @@ def preflight_writeback(
     *,
     backup_dir: Path,
     stage_dir: Path,
+    backup_manifest_creation_receipt: dict[str, Any] | None = None,
+    stage_manifest_creation_receipt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if notes_is_running():
         raise StoreSafetyError(
             "notes-running", "Notes.app must stay quit for writeback preflight"
         )
-    backup = validate_snapshot(backup_dir)
+    backup = validate_snapshot(
+        backup_dir,
+        backup_manifest_creation_receipt,
+    )
     manifest = backup["manifest"]
     if (
         manifest.get("notes_running") is not False
@@ -7644,7 +8127,10 @@ def preflight_writeback(
             "backup-source-mismatch",
             "Backup source root does not match the selected live store",
         )
-    stage = validate_patch_stage(stage_dir)
+    stage = validate_patch_stage(
+        stage_dir,
+        stage_manifest_creation_receipt,
+    )
     live = fingerprint_note_store(paths)
     _compare_live_to_baseline(live, manifest)
     if notes_is_running():
@@ -7661,6 +8147,10 @@ def preflight_writeback(
         "live_source_root": paths.group_container,
         "live_files": current_names,
         "stage_sha256": stage["fingerprint"]["sha256"],
+        "manifest_creation_receipts": {
+            "backup": backup["manifest_creation_receipt"],
+            "stage": stage["manifest_creation_receipt"],
+        },
         "required_whole_store_boundary": {
             "install": [NOTE_STORE_MAIN],
             "remove_or_restore_as_one_boundary": [
@@ -7678,12 +8168,17 @@ def verify_writeback(
     *,
     backup_dir: Path,
     stage_dir: Path,
+    backup_manifest_creation_receipt: dict[str, Any] | None = None,
+    stage_manifest_creation_receipt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if notes_is_running():
         raise StoreSafetyError(
             "notes-running", "Notes.app must stay quit for writeback verification"
         )
-    backup = validate_snapshot(backup_dir)
+    backup = validate_snapshot(
+        backup_dir,
+        backup_manifest_creation_receipt,
+    )
     baseline_manifest = backup["manifest"]
     if (
         baseline_manifest.get("notes_running") is not False
@@ -7698,7 +8193,10 @@ def verify_writeback(
             "backup-source-mismatch",
             "Backup source root does not match the selected live store",
         )
-    stage = validate_patch_stage(stage_dir)
+    stage = validate_patch_stage(
+        stage_dir,
+        stage_manifest_creation_receipt,
+    )
     live = validate_database_recovery(paths.group_container / NOTE_STORE_MAIN)
     current = {record["basename"]: record["source"] for record in live["capture"]}
     if set(current) != {NOTE_STORE_MAIN}:
@@ -7740,6 +8238,10 @@ def verify_writeback(
         "sha256": staged_fingerprint["sha256"],
         "sqlite_validation": live["sqlite_integrity"],
         "sidecars_absent": True,
+        "manifest_creation_receipts": {
+            "backup": backup["manifest_creation_receipt"],
+            "stage": stage["manifest_creation_receipt"],
+        },
     }
 
 
@@ -7844,6 +8346,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Revalidate a snapshot manifest, sidecars, and SQLite integrity.",
     )
     validate_parser.add_argument("--snapshot-dir", type=Path, required=True)
+    validate_parser.add_argument(
+        "--manifest-creation-receipt-file",
+        type=Path,
+        required=True,
+        help="Caller-preserved copy-db JSON output stored outside the snapshot.",
+    )
 
     recover_parser = subparsers.add_parser(
         "recover-snapshot",
@@ -7851,6 +8359,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recover_parser.add_argument("--snapshot-dir", type=Path, required=True)
     recover_parser.add_argument("--out", type=Path, required=True)
+    recover_parser.add_argument(
+        "--manifest-creation-receipt-file",
+        type=Path,
+        required=True,
+        help="Caller-preserved copy-db JSON output stored outside the snapshot.",
+    )
 
     stage_parser = subparsers.add_parser(
         "stage-patch",
@@ -7859,6 +8373,18 @@ def build_parser() -> argparse.ArgumentParser:
     stage_parser.add_argument("--src", type=Path, required=True)
     stage_parser.add_argument("--dest", type=Path, required=True)
 
+    validate_stage_parser = subparsers.add_parser(
+        "validate-patch-stage",
+        help="Revalidate a patch stage against its external manifest receipt.",
+    )
+    validate_stage_parser.add_argument("--stage-dir", type=Path, required=True)
+    validate_stage_parser.add_argument(
+        "--manifest-creation-receipt-file",
+        type=Path,
+        required=True,
+        help="Caller-preserved stage-patch JSON output stored outside the stage.",
+    )
+
     preflight_parser = subparsers.add_parser(
         "preflight-writeback",
         help="Read-only gate for an explicit whole-store writeback.",
@@ -7866,6 +8392,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_container_options(preflight_parser)
     preflight_parser.add_argument("--backup-dir", type=Path, required=True)
     preflight_parser.add_argument("--stage-dir", type=Path, required=True)
+    preflight_parser.add_argument(
+        "--backup-manifest-creation-receipt-file",
+        type=Path,
+        required=True,
+        help="Caller-preserved copy-db JSON output outside the backup.",
+    )
+    preflight_parser.add_argument(
+        "--stage-manifest-creation-receipt-file",
+        type=Path,
+        required=True,
+        help="Caller-preserved stage-patch JSON output outside the stage.",
+    )
 
     verify_parser = subparsers.add_parser(
         "verify-writeback",
@@ -7874,6 +8412,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_container_options(verify_parser)
     verify_parser.add_argument("--backup-dir", type=Path, required=True)
     verify_parser.add_argument("--stage-dir", type=Path, required=True)
+    verify_parser.add_argument(
+        "--backup-manifest-creation-receipt-file",
+        type=Path,
+        required=True,
+        help="Caller-preserved copy-db JSON output outside the backup.",
+    )
+    verify_parser.add_argument(
+        "--stage-manifest-creation-receipt-file",
+        type=Path,
+        required=True,
+        help="Caller-preserved stage-patch JSON output outside the stage.",
+    )
 
     tags_parser = subparsers.add_parser(
         "note-tags",
@@ -7908,17 +8458,71 @@ def main(argv: Iterable[str] | None = None) -> int:
         elif args.command == "merge-db":
             emit_json(merge_db(args.src, args.out))
         elif args.command == "validate-snapshot":
-            emit_json(validate_snapshot(args.snapshot_dir))
+            emit_json(
+                validate_snapshot(
+                    args.snapshot_dir,
+                    _load_external_manifest_creation_receipt(
+                        args.manifest_creation_receipt_file,
+                        artifact_root=args.snapshot_dir,
+                        artifact_kind="snapshot",
+                        artifact_schema=SNAPSHOT_SCHEMA,
+                        manifest_name=SNAPSHOT_MANIFEST,
+                    ),
+                )
+            )
         elif args.command == "recover-snapshot":
-            emit_json(recover_snapshot(args.snapshot_dir, args.out))
+            emit_json(
+                recover_snapshot(
+                    args.snapshot_dir,
+                    args.out,
+                    _load_external_manifest_creation_receipt(
+                        args.manifest_creation_receipt_file,
+                        artifact_root=args.snapshot_dir,
+                        artifact_kind="snapshot",
+                        artifact_schema=SNAPSHOT_SCHEMA,
+                        manifest_name=SNAPSHOT_MANIFEST,
+                    ),
+                )
+            )
         elif args.command == "stage-patch":
             emit_json(stage_patch(args.src, args.dest))
+        elif args.command == "validate-patch-stage":
+            emit_json(
+                validate_patch_stage(
+                    args.stage_dir,
+                    _load_external_manifest_creation_receipt(
+                        args.manifest_creation_receipt_file,
+                        artifact_root=args.stage_dir,
+                        artifact_kind="patch-stage",
+                        artifact_schema=PATCH_SCHEMA,
+                        manifest_name=PATCH_MANIFEST,
+                    ),
+                )
+            )
         elif args.command == "preflight-writeback":
             emit_json(
                 preflight_writeback(
                     _paths_from_args(args),
                     backup_dir=args.backup_dir,
                     stage_dir=args.stage_dir,
+                    backup_manifest_creation_receipt=(
+                        _load_external_manifest_creation_receipt(
+                            args.backup_manifest_creation_receipt_file,
+                            artifact_root=args.backup_dir,
+                            artifact_kind="snapshot",
+                            artifact_schema=SNAPSHOT_SCHEMA,
+                            manifest_name=SNAPSHOT_MANIFEST,
+                        )
+                    ),
+                    stage_manifest_creation_receipt=(
+                        _load_external_manifest_creation_receipt(
+                            args.stage_manifest_creation_receipt_file,
+                            artifact_root=args.stage_dir,
+                            artifact_kind="patch-stage",
+                            artifact_schema=PATCH_SCHEMA,
+                            manifest_name=PATCH_MANIFEST,
+                        )
+                    ),
                 )
             )
         elif args.command == "verify-writeback":
@@ -7927,6 +8531,24 @@ def main(argv: Iterable[str] | None = None) -> int:
                     _paths_from_args(args),
                     backup_dir=args.backup_dir,
                     stage_dir=args.stage_dir,
+                    backup_manifest_creation_receipt=(
+                        _load_external_manifest_creation_receipt(
+                            args.backup_manifest_creation_receipt_file,
+                            artifact_root=args.backup_dir,
+                            artifact_kind="snapshot",
+                            artifact_schema=SNAPSHOT_SCHEMA,
+                            manifest_name=SNAPSHOT_MANIFEST,
+                        )
+                    ),
+                    stage_manifest_creation_receipt=(
+                        _load_external_manifest_creation_receipt(
+                            args.stage_manifest_creation_receipt_file,
+                            artifact_root=args.stage_dir,
+                            artifact_kind="patch-stage",
+                            artifact_schema=PATCH_SCHEMA,
+                            manifest_name=PATCH_MANIFEST,
+                        )
+                    ),
                 )
             )
         elif args.command == "note-tags":

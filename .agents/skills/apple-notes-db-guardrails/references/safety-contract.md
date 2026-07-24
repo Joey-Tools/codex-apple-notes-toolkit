@@ -45,10 +45,14 @@ directory revalidation, and the terminal protected-property check. A same-byte i
 is an identity mismatch; a mode/owner/group/flags change is an access-policy mismatch; an in-place
 byte change is a content mismatch. Do not accept a fresh pathname open as proof about the object
 that supplied earlier validation evidence.
-The v2 snapshot and patch manifests must persist creation-time identity and access-policy receipts
-for their root directories and database files; snapshots also persist the nested store-directory
-receipt. Validators compare all receipt fields before consuming SQLite bytes and reject v1
-manifests rather than silently applying the weaker contract.
+The v3 snapshot and patch manifests persist creation-time identity and access-policy receipts for
+their root directories and database files; snapshots also persist the nested store-directory
+receipt. Their successful creator results separately return an
+`apple-notes-manifest-creation-receipt/v1` object containing the manifest's exact SHA-256, size,
+identity, and access policy. The caller must preserve that result outside the artifact. Validators
+require the external receipt and compare it with the held manifest before parsing or trusting any
+manifest field. Reject v1/v2 manifests and missing receipts rather than silently deriving an
+anchor from current artifact bytes.
 
 Treat these outcomes separately:
 
@@ -186,6 +190,16 @@ another anonymous image from those exact bytes, and never scans its containing d
 new WAL, SHM, or rollback journal. An adjacent sidecar injected after standalone validation cannot
 be admitted into the final backup.
 
+After standalone main-file publication, parent fsync, terminal main-file rehash, and public-path
+proof, retain the output-parent descriptor and perform two complete no-follow namespace passes for
+the final output's `-wal`, `-shm`, and `-journal` names. `FileNotFoundError` is absent; any successful
+stat is present regardless of file type; `PermissionError` is unreadable; every other `OSError` is
+unverifiable. All three names must be absent in both passes. Because the main file is already
+published, any non-absent or inconclusive observation is
+`destination-install-uncertain`, never an uncommitted or successful result. Preserve the strong
+descriptor-bound main receipt and point-in-time sidecar observations, but do not call an unbound
+sidecar display path a verified recovery locator.
+
 The protected recovery property is that SQLite consumes exactly the image derived from the
 creation-receipt-bound main descriptor plus the last committed checksum-valid WAL prefix.
 Persistent missing, unreadable, replaced, content-mutated, access-policy-mutated, or
@@ -242,6 +256,14 @@ changes on the held parent fail separately.
 Create copied database files, standalone recovery files, and manifest temporary files exclusively
 relative to those held directory descriptors. Perform their name-based validation through the same
 descriptors; never reconstruct a full pathname for those operations.
+After the manifest is durably written, return its exact creation receipt in the successful
+`copy-db` or `stage-patch` result. The result file is a separate caller-owned authority and must be
+stored outside the published artifact, preferably as a sibling created under `umask 077`. A
+consumer may supply either that complete creator result or the nested
+`manifest_creation_receipt`; it may not self-bootstrap a receipt from the current manifest.
+Before loading a CLI receipt file, bind its parent and the artifact root and traverse descriptor
+ancestors to prove the receipt is outside the artifact. Bind the receipt as a no-follow regular
+file, enforce the manifest-size bound, and require stable descriptor reads.
 On writer failure, retain the created file and report the held parent/file descriptor identities,
 access policies, content status, and point-in-time namespace observations. Do not attempt automatic
 name-based cleanup: even descriptor-relative `stat(name)` followed by `unlink(name)` has a
@@ -336,6 +358,7 @@ Keep patch preparation separate from live replacement.
 A writeback-grade backup must:
 
 - be captured with `--require-notes-quit`;
+- retain its successful artifact-external manifest creation receipt;
 - record that Notes was not running;
 - still match its copied-file hashes;
 - recover successfully with full SQLite integrity;
@@ -345,6 +368,10 @@ A patch stage must contain only:
 
 - `NoteStore.sqlite`;
 - `patch-manifest.json`.
+
+It must also retain its successful artifact-external manifest creation receipt. Preflight and
+post-writeback verification require both the backup and stage receipts before consuming either
+manifest.
 
 Never install a staged main database beside an old live WAL or SHM.
 Treat replacement of the main name and removal of live sidecar names as one whole-store semantic
@@ -404,6 +431,22 @@ The helper emits stable error codes, including:
 - `prepared-file-access-policy-mismatch`, `prepared-file-revalidation-inconclusive`;
 - `prepared-file-missing`, `prepared-file-set-mismatch`;
 - `prepared-manifest-mismatch`;
+- `manifest-creation-receipt-required`, `manifest-creation-receipt-invalid`;
+- `manifest-creation-receipt-missing`, `manifest-creation-receipt-too-large`;
+- `manifest-creation-receipt-not-external`;
+- `manifest-creation-receipt-scope-inconclusive`;
+- `manifest-creation-receipt-unreadable`;
+- `manifest-creation-receipt-revalidation-unreadable`;
+- `manifest-creation-receipt-file-identity-mismatch`;
+- `manifest-creation-receipt-file-content-mismatch`;
+- `manifest-creation-receipt-file-access-policy-mismatch`;
+- `manifest-creation-receipt-file-revalidation-inconclusive`;
+- `manifest-creation-receipt-identity-mismatch`;
+- `manifest-creation-receipt-content-mismatch`;
+- `manifest-creation-receipt-access-policy-mismatch`;
+- `standalone-output-sidecar-present`;
+- `standalone-output-sidecar-unreadable`;
+- `standalone-output-sidecar-revalidation-inconclusive`;
 - `destination-exists`, `destination-install-failed`;
 - `destination-install-uncertain`;
 - `recovery-output-inside-snapshot`, `recovery-output-scope-inconclusive`;
@@ -425,6 +468,10 @@ The helper does not:
 - validate every macOS ACL, extended attribute, File Provider policy, or external process;
 - prevent a same-UID process from mutating an object immediately after the final descriptor/path
   comparison; the bounded revalidation window detects observed races but is not a filesystem lock;
+- prevent a same-UID process from creating or changing a standalone sidecar immediately after the
+  last terminal sidecar observation;
+- authenticate an unsigned external manifest receipt when the same actor can also rewrite that
+  receipt file; the anchor is trustworthy only while independently preserved by the caller;
 - bound peak memory independently of recovered database size; native backup and serialization keep
   a complete recovered image in memory;
 - replace a case-specific rollback plan and Joey's explicit writeback approval.

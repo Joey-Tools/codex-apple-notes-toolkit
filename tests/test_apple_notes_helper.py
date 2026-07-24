@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import builtins
+import errno
+import hashlib
 import importlib.util
 import json
 import os
@@ -32,6 +34,122 @@ HOT_JOURNAL_FIXTURE = REPO_ROOT / "tests/create_hot_rollback_journal.py"
 
 
 class AppleNotesHelperTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._snapshot_manifest_receipts: dict[Path, dict[str, object]] = {}
+        self._stage_manifest_receipts: dict[Path, dict[str, object]] = {}
+
+    def _copy_db(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        result = MODULE.copy_db(*args, **kwargs)
+        self._snapshot_manifest_receipts[Path(result["dest"])] = result[
+            "manifest_creation_receipt"
+        ]
+        return result
+
+    def _stage_patch(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        result = MODULE.stage_patch(*args, **kwargs)
+        self._stage_manifest_receipts[Path(result["stage_dir"])] = result[
+            "manifest_creation_receipt"
+        ]
+        return result
+
+    def _validate_snapshot(self, snapshot_dir: Path) -> dict[str, object]:
+        return MODULE.validate_snapshot(
+            snapshot_dir,
+            self._snapshot_manifest_receipts[snapshot_dir],
+        )
+
+    def _validate_patch_stage(self, stage_dir: Path) -> dict[str, object]:
+        return MODULE.validate_patch_stage(
+            stage_dir,
+            self._stage_manifest_receipts[stage_dir],
+        )
+
+    def _recover_snapshot(
+        self,
+        snapshot_dir: Path,
+        out: Path,
+    ) -> dict[str, object]:
+        return MODULE.recover_snapshot(
+            snapshot_dir,
+            out,
+            self._snapshot_manifest_receipts[snapshot_dir],
+        )
+
+    def _preflight_writeback(
+        self,
+        paths: MODULE.NoteStorePaths,
+        *,
+        backup_dir: Path,
+        stage_dir: Path,
+    ) -> dict[str, object]:
+        return MODULE.preflight_writeback(
+            paths,
+            backup_dir=backup_dir,
+            stage_dir=stage_dir,
+            backup_manifest_creation_receipt=(
+                self._snapshot_manifest_receipts[backup_dir]
+            ),
+            stage_manifest_creation_receipt=self._stage_manifest_receipts[stage_dir],
+        )
+
+    def _verify_writeback(
+        self,
+        paths: MODULE.NoteStorePaths,
+        *,
+        backup_dir: Path,
+        stage_dir: Path,
+    ) -> dict[str, object]:
+        return MODULE.verify_writeback(
+            paths,
+            backup_dir=backup_dir,
+            stage_dir=stage_dir,
+            backup_manifest_creation_receipt=(
+                self._snapshot_manifest_receipts[backup_dir]
+            ),
+            stage_manifest_creation_receipt=self._stage_manifest_receipts[stage_dir],
+        )
+
+    def _reanchor_manifest_for_test(
+        self,
+        artifact_dir: Path,
+        *,
+        artifact_kind: str,
+    ) -> dict[str, object]:
+        if artifact_kind == "snapshot":
+            manifest_name = MODULE.SNAPSHOT_MANIFEST
+            artifact_schema = MODULE.SNAPSHOT_SCHEMA
+            registry = self._snapshot_manifest_receipts
+        elif artifact_kind == "patch-stage":
+            manifest_name = MODULE.PATCH_MANIFEST
+            artifact_schema = MODULE.PATCH_SCHEMA
+            registry = self._stage_manifest_receipts
+        else:
+            self.fail(f"Unsupported artifact kind: {artifact_kind}")
+        manifest_path = artifact_dir / manifest_name
+        payload = manifest_path.read_bytes()
+        observed = os.stat(manifest_path, follow_symlinks=False)
+        receipt = MODULE._manifest_creation_receipt_payload(
+            artifact_kind=artifact_kind,
+            artifact_schema=artifact_schema,
+            manifest_name=manifest_name,
+            manifest_receipt={
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+                "identity": MODULE._identity(observed),
+                "access_policy": MODULE._access_policy(observed),
+            },
+        )
+        registry[artifact_dir] = receipt
+        return receipt
+
     def _write_fake_osascript(self, path: Path) -> None:
         path.write_text(
             """#!/usr/bin/env python3
@@ -125,22 +243,22 @@ raise SystemExit(2)
             edited = root / "edited.sqlite"
             self._create_db(edited)
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                snapshot = MODULE.copy_db(
+                snapshot = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
                 )
-            stage = Path(MODULE.stage_patch(edited, root / "stage")["stage_dir"])
+            stage = Path(self._stage_patch(edited, root / "stage")["stage_dir"])
             targets = (
                 (
                     Path(snapshot["dest"]) / "group.com.apple.notes",
-                    MODULE.validate_snapshot,
+                    self._validate_snapshot,
                     Path(snapshot["dest"]),
                     "snapshot-file-set-mismatch",
                 ),
                 (
                     stage,
-                    MODULE.validate_patch_stage,
+                    self._validate_patch_stage,
                     stage,
                     "patch-file-set-mismatch",
                 ),
@@ -375,7 +493,7 @@ raise SystemExit(2)
             conn = self._create_wal_db(db_path)
             try:
                 with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                    result = MODULE.copy_db(
+                    result = self._copy_db(
                         paths,
                         dest=root / "snapshot",
                         require_notes_quit=True,
@@ -733,7 +851,7 @@ raise SystemExit(2)
                     side_effect=AssertionError("path recovery helper used"),
                 ),
             ):
-                result = MODULE.copy_db(
+                result = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
@@ -818,7 +936,7 @@ raise SystemExit(2)
                     side_effect=copy_with_create_swap,
                 ),
             ):
-                result = MODULE.copy_db(
+                result = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
@@ -827,7 +945,7 @@ raise SystemExit(2)
             self.assertTrue(attacked)
             self.assertEqual(replacement_entries, [])
             self.assertEqual(
-                MODULE.validate_snapshot(Path(result["dest"]))["sqlite_validation"][
+                self._validate_snapshot(Path(result["dest"]))["sqlite_validation"][
                     "result"
                 ],
                 "ok",
@@ -1142,7 +1260,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.copy_db(
+                self._copy_db(
                     paths,
                     dest=destination,
                     require_notes_quit=True,
@@ -1203,7 +1321,7 @@ raise SystemExit(2)
                         ),
                         self.assertRaises(MODULE.StoreSafetyError) as raised,
                     ):
-                        MODULE.copy_db(
+                        self._copy_db(
                             paths,
                             dest=destination,
                             require_notes_quit=True,
@@ -1252,7 +1370,7 @@ raise SystemExit(2)
                     side_effect=record_rename,
                 ),
             ):
-                MODULE.copy_db(
+                self._copy_db(
                     paths,
                     dest=destination,
                     require_notes_quit=True,
@@ -1291,7 +1409,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.copy_db(
+                self._copy_db(
                     paths,
                     dest=destination,
                     require_notes_quit=True,
@@ -1342,7 +1460,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.copy_db(
+                self._copy_db(
                     paths,
                     dest=destination,
                     require_notes_quit=True,
@@ -1360,7 +1478,7 @@ raise SystemExit(2)
             self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
             with mock.patch.object(MODULE, "notes_is_running", return_value=True):
                 with self.assertRaises(MODULE.StoreSafetyError) as raised:
-                    MODULE.copy_db(
+                    self._copy_db(
                         paths, dest=root / "snapshot", require_notes_quit=True
                     )
         self._assert_safety_code("notes-running", raised)
@@ -1534,7 +1652,7 @@ raise SystemExit(2)
             sentinel.write_text("keep", encoding="utf-8")
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
                 with self.assertRaises(MODULE.StoreSafetyError) as copy_raised:
-                    MODULE.copy_db(
+                    self._copy_db(
                         paths,
                         dest=snapshot_dest,
                         require_notes_quit=False,
@@ -1576,7 +1694,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.copy_db(
+                self._copy_db(
                     paths,
                     dest=destination,
                     require_notes_quit=False,
@@ -1629,7 +1747,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.stage_patch(edited, destination)
+                self._stage_patch(edited, destination)
             self._assert_safety_code("destination-exists", raised)
             self.assertEqual(
                 raised.exception.details["publication_state"],
@@ -1675,7 +1793,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.stage_patch(edited, destination)
+                self._stage_patch(edited, destination)
 
             self._assert_safety_code("destination-install-failed", raised)
             self.assertEqual(
@@ -1742,7 +1860,7 @@ raise SystemExit(2)
                     ),
                     self.assertRaises(MODULE.StoreSafetyError) as raised,
                 ):
-                    MODULE.stage_patch(edited, destination)
+                    self._stage_patch(edited, destination)
 
                 self._assert_safety_code("destination-install-failed", raised)
                 self.assertEqual(
@@ -1810,7 +1928,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.stage_patch(edited, destination)
+                self._stage_patch(edited, destination)
 
             self.assertTrue(injected)
             self._assert_safety_code("destination-exists", raised)
@@ -1862,7 +1980,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.stage_patch(edited, destination)
+                self._stage_patch(edited, destination)
 
             self.assertTrue(moved)
             self._assert_safety_code("destination-install-uncertain", raised)
@@ -2007,7 +2125,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.stage_patch(edited, destination)
+                self._stage_patch(edited, destination)
 
             self.assertTrue(injected)
             self._assert_safety_code("prepared-file-set-mismatch", raised)
@@ -2048,7 +2166,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.copy_db(
+                self._copy_db(
                     paths,
                     dest=destination,
                     require_notes_quit=False,
@@ -2081,7 +2199,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.stage_patch(edited, destination)
+                self._stage_patch(edited, destination)
             self._assert_safety_code("destination-install-uncertain", raised)
             self.assertTrue((destination / MODULE.PATCH_MANIFEST).is_file())
             self.assertEqual(list(root.glob(".stage.partial-*")), [])
@@ -2130,7 +2248,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.stage_patch(edited, destination)
+                self._stage_patch(edited, destination)
 
             self._assert_safety_code("destination-install-uncertain", raised)
             self.assertEqual(
@@ -2203,7 +2321,7 @@ raise SystemExit(2)
                     side_effect=replace_parent_during_fsync,
                 ),
             ):
-                result = MODULE.copy_db(
+                result = self._copy_db(
                     paths,
                     dest=destination,
                     require_notes_quit=False,
@@ -2246,7 +2364,7 @@ raise SystemExit(2)
                     ),
                     self.assertRaises(MODULE.StoreSafetyError) as raised,
                 ):
-                    MODULE.copy_db(
+                    self._copy_db(
                         paths,
                         dest=destination,
                         require_notes_quit=True,
@@ -2336,7 +2454,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.copy_db(
+                self._copy_db(
                     paths,
                     dest=destination,
                     require_notes_quit=False,
@@ -2407,7 +2525,7 @@ raise SystemExit(2)
                     side_effect=replace_parent_during_terminal_revalidation,
                 ),
             ):
-                result = MODULE.copy_db(
+                result = self._copy_db(
                     paths,
                     dest=destination,
                     require_notes_quit=False,
@@ -2524,6 +2642,274 @@ raise SystemExit(2)
             self.assertEqual(Path(result["standalone_db"]), merged)
             self.assertFalse(merged.with_name(f"{merged.name}-wal").exists())
             self.assertFalse(merged.with_name(f"{merged.name}-shm").exists())
+            terminal = result["terminal_sidecar_revalidation"]
+            self.assertEqual(
+                terminal["verification"],
+                "two-pass-descriptor-relative-no-follow",
+            )
+            self.assertEqual(
+                set(terminal["sidecars"]),
+                {
+                    f"{merged.name}-wal",
+                    f"{merged.name}-shm",
+                    f"{merged.name}-journal",
+                },
+            )
+            for sidecar in terminal["sidecars"].values():
+                self.assertEqual(
+                    [row["status"] for row in sidecar["passes"]],
+                    ["absent", "absent"],
+                )
+
+    def test_standalone_publication_rejects_terminal_sidecar_races(
+        self,
+    ) -> None:
+        for suffix in ("-wal", "-shm", "-journal"):
+            with self.subTest(suffix=suffix):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    source = root / MODULE.NOTE_STORE_MAIN
+                    merged = root / "merged.sqlite"
+                    sidecar = merged.with_name(f"{merged.name}{suffix}")
+                    self._create_db(source)
+                    original_publish = MODULE._publish_file_no_replace_from_parent
+
+                    def publish_then_inject(
+                        prepared: MODULE._BoundRegularFile,
+                        destination: Path,
+                        parent_fd: int,
+                    ) -> dict[str, object]:
+                        result = original_publish(
+                            prepared,
+                            destination,
+                            parent_fd,
+                        )
+                        if destination == merged:
+                            sidecar.write_bytes(b"raced-sidecar")
+                        return result
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_publish_file_no_replace_from_parent",
+                            side_effect=publish_then_inject,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        MODULE.merge_db(source, merged)
+
+                    self._assert_safety_code(
+                        "destination-install-uncertain",
+                        raised,
+                    )
+                    self.assertTrue(merged.is_file())
+                    self.assertTrue(sidecar.is_file())
+                    details = raised.exception.details
+                    self.assertEqual(details["publication_state"], "uncertain")
+                    self.assertFalse(details["retry_safe"])
+                    self.assertIn(
+                        "descriptor_bound_destination",
+                        details["recovery_locators"],
+                    )
+                    terminal = details["terminal_sidecar_revalidation"]
+                    self.assertEqual(
+                        terminal["reason_code"],
+                        "standalone-output-sidecar-present",
+                    )
+                    self.assertEqual(
+                        [
+                            row["status"]
+                            for row in terminal["sidecars"][sidecar.name]["passes"]
+                        ],
+                        ["present", "present"],
+                    )
+
+    def test_terminal_sidecar_revalidation_does_not_follow_symlinks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            merged = root / "merged.sqlite"
+            sidecar = merged.with_name(f"{merged.name}-wal")
+            self._create_db(source)
+            original_publish = MODULE._publish_file_no_replace_from_parent
+
+            def publish_then_inject_symlink(
+                prepared: MODULE._BoundRegularFile,
+                destination: Path,
+                parent_fd: int,
+            ) -> dict[str, object]:
+                result = original_publish(prepared, destination, parent_fd)
+                if destination == merged:
+                    sidecar.symlink_to("missing-target")
+                return result
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_publish_file_no_replace_from_parent",
+                    side_effect=publish_then_inject_symlink,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.merge_db(source, merged)
+
+            self._assert_safety_code("destination-install-uncertain", raised)
+            row = raised.exception.details["terminal_sidecar_revalidation"]["sidecars"][
+                sidecar.name
+            ]["passes"][0]
+            self.assertEqual(row["status"], "present")
+            self.assertEqual(row["identity"]["file_type"], stat.S_IFLNK)
+            self.assertTrue(sidecar.is_symlink())
+
+    def test_terminal_sidecar_revalidation_distinguishes_unreadable_and_io(
+        self,
+    ) -> None:
+        cases = (
+            (
+                PermissionError(errno.EACCES, "simulated permission failure"),
+                "standalone-output-sidecar-unreadable",
+                "unreadable",
+            ),
+            (
+                OSError(errno.EIO, "simulated I/O failure"),
+                "standalone-output-sidecar-revalidation-inconclusive",
+                "unverifiable",
+            ),
+        )
+        for failure, reason_code, status_name in cases:
+            with self.subTest(reason_code=reason_code):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    source = root / MODULE.NOTE_STORE_MAIN
+                    merged = root / "merged.sqlite"
+                    self._create_db(source)
+                    original_publish = MODULE._publish_file_no_replace_from_parent
+                    original_stat = MODULE.os.stat
+                    published = False
+
+                    def publish_then_mark(
+                        prepared: MODULE._BoundRegularFile,
+                        destination: Path,
+                        parent_fd: int,
+                    ) -> dict[str, object]:
+                        nonlocal published
+                        result = original_publish(
+                            prepared,
+                            destination,
+                            parent_fd,
+                        )
+                        published = destination == merged
+                        return result
+
+                    def fail_terminal_wal_stat(
+                        path: object,
+                        *args: object,
+                        **kwargs: object,
+                    ) -> os.stat_result:
+                        if (
+                            published
+                            and path == f"{merged.name}-wal"
+                            and kwargs.get("dir_fd") is not None
+                            and kwargs.get("follow_symlinks") is False
+                        ):
+                            raise failure
+                        return original_stat(path, *args, **kwargs)
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_publish_file_no_replace_from_parent",
+                            side_effect=publish_then_mark,
+                        ),
+                        mock.patch.object(
+                            MODULE.os,
+                            "stat",
+                            side_effect=fail_terminal_wal_stat,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        MODULE.merge_db(source, merged)
+
+                    self._assert_safety_code(
+                        "destination-install-uncertain",
+                        raised,
+                    )
+                    terminal = raised.exception.details["terminal_sidecar_revalidation"]
+                    self.assertEqual(terminal["reason_code"], reason_code)
+                    self.assertEqual(
+                        [
+                            row["status"]
+                            for row in terminal["sidecars"][f"{merged.name}-wal"][
+                                "passes"
+                            ]
+                        ],
+                        [status_name, status_name],
+                    )
+
+    def test_terminal_sidecar_second_pass_catches_late_wal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            merged = root / "merged.sqlite"
+            wal = merged.with_name(f"{merged.name}-wal")
+            self._create_db(source)
+            original_publish = MODULE._publish_file_no_replace_from_parent
+            original_stat = MODULE.os.stat
+            published = False
+            injected = False
+
+            def publish_then_mark(
+                prepared: MODULE._BoundRegularFile,
+                destination: Path,
+                parent_fd: int,
+            ) -> dict[str, object]:
+                nonlocal published
+                result = original_publish(prepared, destination, parent_fd)
+                published = destination == merged
+                return result
+
+            def inject_after_first_wal_observation(
+                path: object,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal injected
+                if (
+                    published
+                    and not injected
+                    and path == f"{merged.name}-shm"
+                    and kwargs.get("dir_fd") is not None
+                    and kwargs.get("follow_symlinks") is False
+                ):
+                    wal.write_bytes(b"late-wal")
+                    injected = True
+                return original_stat(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_publish_file_no_replace_from_parent",
+                    side_effect=publish_then_mark,
+                ),
+                mock.patch.object(
+                    MODULE.os,
+                    "stat",
+                    side_effect=inject_after_first_wal_observation,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.merge_db(source, merged)
+
+            self._assert_safety_code("destination-install-uncertain", raised)
+            passes = raised.exception.details["terminal_sidecar_revalidation"][
+                "sidecars"
+            ][wal.name]["passes"]
+            self.assertEqual(
+                [row["status"] for row in passes],
+                ["absent", "present"],
+            )
 
     def test_merge_db_preserves_committed_wal_only_row_with_writer_open(
         self,
@@ -3402,7 +3788,7 @@ raise SystemExit(2)
             paths = self._make_paths(root)
             self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                snapshot = MODULE.copy_db(
+                snapshot = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
@@ -3415,8 +3801,445 @@ raise SystemExit(2)
             with copied_db.open("ab") as handle:
                 handle.write(b"tampered")
             with self.assertRaises(MODULE.StoreSafetyError) as raised:
-                MODULE.validate_snapshot(Path(snapshot["dest"]))
+                self._validate_snapshot(Path(snapshot["dest"]))
         self._assert_safety_code("snapshot-content-mismatch", raised)
+
+    def test_creators_return_exact_external_manifest_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            stage = self._stage_patch(edited, root / "stage")
+
+            for result, artifact_kind, artifact_schema, manifest_name in (
+                (
+                    snapshot,
+                    "snapshot",
+                    MODULE.SNAPSHOT_SCHEMA,
+                    MODULE.SNAPSHOT_MANIFEST,
+                ),
+                (
+                    stage,
+                    "patch-stage",
+                    MODULE.PATCH_SCHEMA,
+                    MODULE.PATCH_MANIFEST,
+                ),
+            ):
+                with self.subTest(artifact_kind=artifact_kind):
+                    receipt = result["manifest_creation_receipt"]
+                    self.assertEqual(
+                        set(receipt),
+                        {
+                            "schema",
+                            "artifact_kind",
+                            "artifact_schema",
+                            "manifest_name",
+                            "manifest",
+                        },
+                    )
+                    self.assertEqual(
+                        receipt["schema"],
+                        MODULE.MANIFEST_CREATION_RECEIPT_SCHEMA,
+                    )
+                    self.assertEqual(receipt["artifact_kind"], artifact_kind)
+                    self.assertEqual(receipt["artifact_schema"], artifact_schema)
+                    self.assertEqual(receipt["manifest_name"], manifest_name)
+                    self.assertEqual(
+                        set(receipt["manifest"]),
+                        {
+                            "sha256",
+                            "size",
+                            "identity",
+                            "access_policy",
+                        },
+                    )
+                    self.assertNotIn(
+                        ".partial-",
+                        json.dumps(receipt, sort_keys=True),
+                    )
+
+    def test_manifest_receipt_is_required_before_manifest_parsing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            stage = self._stage_patch(edited, root / "stage")
+            targets = (
+                (
+                    Path(snapshot["dest"]) / MODULE.SNAPSHOT_MANIFEST,
+                    lambda: MODULE.validate_snapshot(Path(snapshot["dest"])),
+                ),
+                (
+                    Path(stage["stage_dir"]) / MODULE.PATCH_MANIFEST,
+                    lambda: MODULE.validate_patch_stage(Path(stage["stage_dir"])),
+                ),
+            )
+            for manifest_path, validate in targets:
+                with self.subTest(manifest=manifest_path.name):
+                    manifest_path.write_bytes(b"not-json")
+                    with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                        validate()
+                    self._assert_safety_code(
+                        "manifest-creation-receipt-required",
+                        raised,
+                    )
+
+    def test_external_receipt_schema_and_file_failures_use_receipt_codes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+
+            malformed = json.loads(json.dumps(snapshot["manifest_creation_receipt"]))
+            malformed["manifest"]["identity"]["device"] = False
+            with self.assertRaises(MODULE.StoreSafetyError) as malformed_raised:
+                MODULE.validate_snapshot(snapshot_dir, malformed)
+            self._assert_safety_code(
+                "manifest-creation-receipt-invalid",
+                malformed_raised,
+            )
+
+            receipt_target = root / "receipt-target.json"
+            receipt_target.write_text(
+                json.dumps(snapshot, default=str),
+                encoding="utf-8",
+            )
+            receipt_link = root / "receipt-link.json"
+            receipt_link.symlink_to(receipt_target.name)
+            with self.assertRaises(MODULE.StoreSafetyError) as symlink_raised:
+                MODULE._load_external_manifest_creation_receipt(
+                    receipt_link,
+                    artifact_root=snapshot_dir,
+                    artifact_kind="snapshot",
+                    artifact_schema=MODULE.SNAPSHOT_SCHEMA,
+                    manifest_name=MODULE.SNAPSHOT_MANIFEST,
+                )
+            self._assert_safety_code(
+                "manifest-creation-receipt-file-identity-mismatch",
+                symlink_raised,
+            )
+
+            original_stat = MODULE.os.stat
+
+            def fail_receipt_stat(
+                path: object,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                if (
+                    path == receipt_target.name
+                    and kwargs.get("dir_fd") is not None
+                    and kwargs.get("follow_symlinks") is False
+                ):
+                    raise OSError(errno.EIO, "simulated receipt stat failure")
+                return original_stat(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    MODULE.os,
+                    "stat",
+                    side_effect=fail_receipt_stat,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as stat_raised,
+            ):
+                MODULE._load_external_manifest_creation_receipt(
+                    receipt_target,
+                    artifact_root=snapshot_dir,
+                    artifact_kind="snapshot",
+                    artifact_schema=MODULE.SNAPSHOT_SCHEMA,
+                    manifest_name=MODULE.SNAPSHOT_MANIFEST,
+                )
+            self._assert_safety_code(
+                "manifest-creation-receipt-file-revalidation-inconclusive",
+                stat_raised,
+            )
+
+    def test_external_receipt_rejects_joint_database_and_manifest_rewrite(
+        self,
+    ) -> None:
+        for artifact_kind in ("snapshot", "patch-stage"):
+            with self.subTest(artifact_kind=artifact_kind):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    replacement = root / "replacement.sqlite"
+                    self._create_db(replacement, value="attacker")
+                    if artifact_kind == "snapshot":
+                        paths = self._make_paths(root)
+                        self._create_db(
+                            paths.group_container / MODULE.NOTE_STORE_MAIN,
+                            value="original",
+                        )
+                        with mock.patch.object(
+                            MODULE,
+                            "notes_is_running",
+                            return_value=False,
+                        ):
+                            result = self._copy_db(
+                                paths,
+                                dest=root / "snapshot",
+                                require_notes_quit=True,
+                            )
+                        artifact_dir = Path(result["dest"])
+                        database = (
+                            artifact_dir
+                            / "group.com.apple.notes"
+                            / MODULE.NOTE_STORE_MAIN
+                        )
+                        manifest_path = artifact_dir / MODULE.SNAPSHOT_MANIFEST
+                    else:
+                        edited = root / "edited.sqlite"
+                        self._create_db(edited, value="original")
+                        result = self._stage_patch(edited, root / "stage")
+                        artifact_dir = Path(result["stage_dir"])
+                        database = artifact_dir / MODULE.NOTE_STORE_MAIN
+                        manifest_path = artifact_dir / MODULE.PATCH_MANIFEST
+
+                    os.replace(replacement, database)
+                    database_bytes = database.read_bytes()
+                    observed = os.stat(database, follow_symlinks=False)
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    if artifact_kind == "snapshot":
+                        row = next(
+                            item
+                            for item in manifest["files"]
+                            if item["basename"] == MODULE.NOTE_STORE_MAIN
+                        )
+                        row["sha256"] = hashlib.sha256(database_bytes).hexdigest()
+                        row["size"] = len(database_bytes)
+                        row["copy"] = {
+                            "identity": MODULE._identity(observed),
+                            "access_policy": MODULE._access_policy(observed),
+                        }
+                    else:
+                        manifest["database"].update(
+                            {
+                                "sha256": hashlib.sha256(database_bytes).hexdigest(),
+                                "size": len(database_bytes),
+                                "identity": MODULE._identity(observed),
+                                "access_policy": MODULE._access_policy(observed),
+                            }
+                        )
+                    manifest_path.write_text(
+                        json.dumps(manifest),
+                        encoding="utf-8",
+                    )
+
+                    with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                        if artifact_kind == "snapshot":
+                            self._validate_snapshot(artifact_dir)
+                        else:
+                            self._validate_patch_stage(artifact_dir)
+                    self._assert_safety_code(
+                        "manifest-creation-receipt-content-mismatch",
+                        raised,
+                    )
+
+    def test_external_receipt_protects_manifest_identity_and_access_policy(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "identity",
+                "manifest-creation-receipt-identity-mismatch",
+            ),
+            (
+                "access-policy",
+                "manifest-creation-receipt-access-policy-mismatch",
+            ),
+        )
+        for attack, expected_code in cases:
+            with self.subTest(attack=attack):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    edited = root / "edited.sqlite"
+                    self._create_db(edited)
+                    stage = self._stage_patch(edited, root / "stage")
+                    stage_dir = Path(stage["stage_dir"])
+                    manifest = stage_dir / MODULE.PATCH_MANIFEST
+                    if attack == "identity":
+                        replacement = root / "replacement-manifest.json"
+                        shutil.copy2(manifest, replacement)
+                        os.replace(replacement, manifest)
+                    else:
+                        current_mode = stat.S_IMODE(manifest.stat().st_mode)
+                        manifest.chmod(0o640 if current_mode != 0o640 else 0o600)
+                    with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                        self._validate_patch_stage(stage_dir)
+                    self._assert_safety_code(expected_code, raised)
+
+    def test_preflight_rejects_manifest_source_evidence_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            live = paths.group_container / MODULE.NOTE_STORE_MAIN
+            self._create_db(live, value="original")
+            edited = root / "edited.sqlite"
+            self._create_db(edited, value="edited")
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                backup = self._copy_db(
+                    paths,
+                    dest=root / "backup",
+                    require_notes_quit=True,
+                )
+                self._stage_patch(edited, root / "stage")
+                replacement = root / "new-live.sqlite"
+                self._create_db(replacement, value="changed-live")
+                os.replace(replacement, live)
+                current = MODULE.fingerprint_note_store(paths)["files"][0]
+                manifest_path = Path(backup["manifest"])
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                source = next(
+                    row["source"]
+                    for row in manifest["files"]
+                    if row["basename"] == MODULE.NOTE_STORE_MAIN
+                )
+                for field in (
+                    "sha256",
+                    "size",
+                    "identity",
+                    "access_policy",
+                ):
+                    source[field] = current[field]
+                manifest_path.write_text(
+                    json.dumps(manifest),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                    self._preflight_writeback(
+                        paths,
+                        backup_dir=root / "backup",
+                        stage_dir=root / "stage",
+                    )
+            self._assert_safety_code(
+                "manifest-creation-receipt-content-mismatch",
+                raised,
+            )
+
+    def test_cli_loads_full_creator_results_only_from_outside_artifact(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+            external_receipt = root / "snapshot-creation-result.json"
+            external_receipt.write_text(
+                json.dumps(snapshot, default=str),
+                encoding="utf-8",
+            )
+            success = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(SCRIPT_PATH),
+                    "validate-snapshot",
+                    "--snapshot-dir",
+                    str(snapshot_dir),
+                    "--manifest-creation-receipt-file",
+                    str(external_receipt),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(success.returncode, 0, success.stderr)
+            self.assertEqual(
+                json.loads(success.stdout)["sqlite_validation"]["result"],
+                "ok",
+            )
+
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            stage = self._stage_patch(edited, root / "stage")
+            stage_dir = Path(stage["stage_dir"])
+            stage_receipt = root / "stage-creation-result.json"
+            stage_receipt.write_text(
+                json.dumps(stage, default=str),
+                encoding="utf-8",
+            )
+            stage_success = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(SCRIPT_PATH),
+                    "validate-patch-stage",
+                    "--stage-dir",
+                    str(stage_dir),
+                    "--manifest-creation-receipt-file",
+                    str(stage_receipt),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                stage_success.returncode,
+                0,
+                stage_success.stderr,
+            )
+            self.assertEqual(
+                json.loads(stage_success.stdout)["sqlite_validation"]["result"],
+                "ok",
+            )
+
+            internal_receipt = snapshot_dir / "creation-result.json"
+            internal_receipt.write_text(
+                json.dumps(snapshot, default=str),
+                encoding="utf-8",
+            )
+            failure = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(SCRIPT_PATH),
+                    "validate-snapshot",
+                    "--snapshot-dir",
+                    str(snapshot_dir),
+                    "--manifest-creation-receipt-file",
+                    str(internal_receipt),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(failure.returncode, 1, failure.stderr)
+            self.assertEqual(
+                json.loads(failure.stdout)["error_code"],
+                "manifest-creation-receipt-not-external",
+            )
 
     def test_validate_snapshot_enforces_creation_identity_and_access_receipts(
         self,
@@ -3440,7 +4263,7 @@ raise SystemExit(2)
                         "notes_is_running",
                         return_value=False,
                     ):
-                        snapshot = MODULE.copy_db(
+                        snapshot = self._copy_db(
                             paths,
                             dest=root / "snapshot",
                             require_notes_quit=True,
@@ -3454,6 +4277,10 @@ raise SystemExit(2)
                         shutil.copytree(snapshot_dir, replacement)
                         snapshot_dir.rename(parked)
                         replacement.rename(snapshot_dir)
+                        self._reanchor_manifest_for_test(
+                            snapshot_dir,
+                            artifact_kind="snapshot",
+                        )
                     elif attack == "store-identity":
                         replacement = snapshot_dir / "replacement-store"
                         parked = root / "original-store"
@@ -3473,7 +4300,7 @@ raise SystemExit(2)
                         current_mode = MODULE.stat.S_IMODE(target.stat().st_mode)
                         target.chmod(0o750 if current_mode != 0o750 else 0o700)
                     with self.assertRaises(MODULE.StoreSafetyError) as raised:
-                        MODULE.validate_snapshot(snapshot_dir)
+                        self._validate_snapshot(snapshot_dir)
                     self._assert_safety_code(expected_code, raised)
 
     def test_validate_patch_stage_enforces_creation_identity_and_access_receipts(
@@ -3491,9 +4318,7 @@ raise SystemExit(2)
                     root = Path(temp_dir)
                     edited = root / "edited.sqlite"
                     self._create_db(edited)
-                    stage = Path(
-                        MODULE.stage_patch(edited, root / "stage")["stage_dir"]
-                    )
+                    stage = Path(self._stage_patch(edited, root / "stage")["stage_dir"])
                     database = stage / MODULE.NOTE_STORE_MAIN
                     if attack == "root-identity":
                         replacement = root / "replacement-stage"
@@ -3501,6 +4326,10 @@ raise SystemExit(2)
                         shutil.copytree(stage, replacement)
                         stage.rename(parked)
                         replacement.rename(stage)
+                        self._reanchor_manifest_for_test(
+                            stage,
+                            artifact_kind="patch-stage",
+                        )
                     elif attack == "file-identity":
                         replacement = stage / ".replacement.sqlite"
                         shutil.copy2(database, replacement)
@@ -3510,7 +4339,7 @@ raise SystemExit(2)
                         current_mode = MODULE.stat.S_IMODE(target.stat().st_mode)
                         target.chmod(0o750 if current_mode != 0o750 else 0o700)
                     with self.assertRaises(MODULE.StoreSafetyError) as raised:
-                        MODULE.validate_patch_stage(stage)
+                        self._validate_patch_stage(stage)
                     self._assert_safety_code(expected_code, raised)
 
     def test_patch_manifest_enforces_every_access_policy_field(self) -> None:
@@ -3522,7 +4351,7 @@ raise SystemExit(2)
                         edited = root / "edited.sqlite"
                         self._create_db(edited)
                         stage = Path(
-                            MODULE.stage_patch(edited, root / "stage")["stage_dir"]
+                            self._stage_patch(edited, root / "stage")["stage_dir"]
                         )
                         manifest_path = stage / MODULE.PATCH_MANIFEST
                         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -3537,11 +4366,19 @@ raise SystemExit(2)
                             json.dumps(manifest),
                             encoding="utf-8",
                         )
+                        # This test intentionally re-anchors a modified manifest
+                        # so it can exercise the nested receipt validation.
+                        self._reanchor_manifest_for_test(
+                            stage,
+                            artifact_kind="patch-stage",
+                        )
                         with self.assertRaises(MODULE.StoreSafetyError) as raised:
-                            MODULE.validate_patch_stage(stage)
+                            self._validate_patch_stage(stage)
                         self._assert_safety_code(expected_code, raised)
 
-    def test_v1_manifests_fail_closed_without_v2_creation_receipts(self) -> None:
+    def test_legacy_manifests_fail_closed_without_v3_external_receipts(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             paths = self._make_paths(root)
@@ -3549,24 +4386,36 @@ raise SystemExit(2)
             edited = root / "edited.sqlite"
             self._create_db(edited)
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                snapshot = MODULE.copy_db(
+                snapshot = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
                 )
-            stage = Path(MODULE.stage_patch(edited, root / "stage")["stage_dir"])
+            stage = Path(self._stage_patch(edited, root / "stage")["stage_dir"])
             targets = (
                 (
                     Path(snapshot["dest"]) / MODULE.SNAPSHOT_MANIFEST,
-                    MODULE.validate_snapshot,
+                    self._validate_snapshot,
                     Path(snapshot["dest"]),
                     "apple-notes-snapshot/v1",
                 ),
                 (
+                    Path(snapshot["dest"]) / MODULE.SNAPSHOT_MANIFEST,
+                    self._validate_snapshot,
+                    Path(snapshot["dest"]),
+                    "apple-notes-snapshot/v2",
+                ),
+                (
                     stage / MODULE.PATCH_MANIFEST,
-                    MODULE.validate_patch_stage,
+                    self._validate_patch_stage,
                     stage,
                     "apple-notes-patch/v1",
+                ),
+                (
+                    stage / MODULE.PATCH_MANIFEST,
+                    self._validate_patch_stage,
+                    stage,
+                    "apple-notes-patch/v2",
                 ),
             )
             for manifest_path, validator, argument, legacy_schema in targets:
@@ -3577,6 +4426,14 @@ raise SystemExit(2)
                     manifest_path.write_text(
                         json.dumps(manifest),
                         encoding="utf-8",
+                    )
+                    self._reanchor_manifest_for_test(
+                        argument,
+                        artifact_kind=(
+                            "snapshot"
+                            if manifest_path.name == MODULE.SNAPSHOT_MANIFEST
+                            else "patch-stage"
+                        ),
                     )
                     with self.assertRaises(MODULE.StoreSafetyError) as raised:
                         validator(argument)
@@ -3602,14 +4459,14 @@ raise SystemExit(2)
             edited = root / "edited.sqlite"
             self._create_db(edited)
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                snapshot = MODULE.copy_db(
+                snapshot = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
                 )
             snapshot_dir = Path(snapshot["dest"])
             snapshot_store = snapshot_dir / "group.com.apple.notes"
-            stage = Path(MODULE.stage_patch(edited, root / "stage")["stage_dir"])
+            stage = Path(self._stage_patch(edited, root / "stage")["stage_dir"])
             for directory in (snapshot_store, stage):
                 current = directory.stat()
                 os.utime(
@@ -3619,8 +4476,8 @@ raise SystemExit(2)
                         current.st_mtime_ns + 1_000_000_000,
                     ),
                 )
-            snapshot_validation = MODULE.validate_snapshot(snapshot_dir)
-            stage_validation = MODULE.validate_patch_stage(stage)
+            snapshot_validation = self._validate_snapshot(snapshot_dir)
+            stage_validation = self._validate_patch_stage(stage)
         self.assertEqual(snapshot_validation["sqlite_validation"]["result"], "ok")
         self.assertEqual(stage_validation["sqlite_validation"]["result"], "ok")
 
@@ -3629,7 +4486,7 @@ raise SystemExit(2)
             root = Path(temp_dir)
             edited = root / "edited.sqlite"
             self._create_db(edited)
-            stage = Path(MODULE.stage_patch(edited, root / "stage")["stage_dir"])
+            stage = Path(self._stage_patch(edited, root / "stage")["stage_dir"])
             original_integrity = MODULE._sqlite_integrity
 
             def replace_after_integrity(path: Path) -> dict[str, object]:
@@ -3648,7 +4505,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.validate_patch_stage(stage)
+                self._validate_patch_stage(stage)
         self._assert_safety_code("directory-identity-mismatch", raised)
 
     def test_patch_validation_detects_directory_access_policy_change(self) -> None:
@@ -3656,7 +4513,7 @@ raise SystemExit(2)
             root = Path(temp_dir)
             edited = root / "edited.sqlite"
             self._create_db(edited)
-            stage = Path(MODULE.stage_patch(edited, root / "stage")["stage_dir"])
+            stage = Path(self._stage_patch(edited, root / "stage")["stage_dir"])
             stage.chmod(0o700)
             original_integrity = MODULE._sqlite_integrity
 
@@ -3673,7 +4530,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.validate_patch_stage(stage)
+                self._validate_patch_stage(stage)
         self._assert_safety_code("directory-access-policy-mismatch", raised)
 
     def test_stage_patch_normalizes_and_validates_database(self) -> None:
@@ -3681,13 +4538,13 @@ raise SystemExit(2)
             root = Path(temp_dir)
             edited = root / "edited.sqlite"
             self._create_db(edited, value="patched")
-            result = MODULE.stage_patch(edited, root / "stage")
+            result = self._stage_patch(edited, root / "stage")
             stage_dir = Path(result["stage_dir"])
             self.assertEqual(
                 {path.name for path in stage_dir.iterdir()},
                 {MODULE.NOTE_STORE_MAIN, MODULE.PATCH_MANIFEST},
             )
-            validation = MODULE.validate_patch_stage(stage_dir)
+            validation = self._validate_patch_stage(stage_dir)
             self.assertEqual(validation["sqlite_validation"]["result"], "ok")
             self.assertFalse(result["live_mutation_performed"])
 
@@ -3775,12 +4632,12 @@ raise SystemExit(2)
                 "_write_standalone_backup_payload",
                 side_effect=write_with_create_swap,
             ):
-                result = MODULE.stage_patch(edited, root / "stage")
+                result = self._stage_patch(edited, root / "stage")
 
             self.assertTrue(attacked)
             self.assertEqual(replacement_entries, [])
             self.assertEqual(
-                MODULE.validate_patch_stage(Path(result["stage_dir"]))[
+                self._validate_patch_stage(Path(result["stage_dir"]))[
                     "sqlite_validation"
                 ]["result"],
                 "ok",
@@ -3792,10 +4649,10 @@ raise SystemExit(2)
             edited = root / "edited.sqlite"
             self._create_db(edited)
             stage = root / "stage"
-            MODULE.stage_patch(edited, stage)
+            self._stage_patch(edited, stage)
             (stage / f"{MODULE.NOTE_STORE_MAIN}-wal").write_bytes(b"")
             with self.assertRaises(MODULE.StoreSafetyError) as raised:
-                MODULE.validate_patch_stage(stage)
+                self._validate_patch_stage(stage)
         self._assert_safety_code("patch-file-set-mismatch", raised)
 
     def test_validators_detect_same_byte_file_replacement_during_integrity(
@@ -3808,23 +4665,23 @@ raise SystemExit(2)
             edited = root / "edited.sqlite"
             self._create_db(edited)
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                snapshot = MODULE.copy_db(
+                snapshot = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
                 )
             snapshot_dir = Path(snapshot["dest"])
-            stage_dir = Path(MODULE.stage_patch(edited, root / "stage")["stage_dir"])
+            stage_dir = Path(self._stage_patch(edited, root / "stage")["stage_dir"])
             targets = (
                 (
                     snapshot_dir / "group.com.apple.notes" / MODULE.NOTE_STORE_MAIN,
-                    MODULE.validate_snapshot,
+                    self._validate_snapshot,
                     snapshot_dir,
                     "snapshot-file-identity-mismatch",
                 ),
                 (
                     stage_dir / MODULE.NOTE_STORE_MAIN,
-                    MODULE.validate_patch_stage,
+                    self._validate_patch_stage,
                     stage_dir,
                     "patch-file-identity-mismatch",
                 ),
@@ -3865,23 +4722,23 @@ raise SystemExit(2)
             edited = root / "edited.sqlite"
             self._create_db(edited)
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                snapshot = MODULE.copy_db(
+                snapshot = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
                 )
             snapshot_dir = Path(snapshot["dest"])
-            stage_dir = Path(MODULE.stage_patch(edited, root / "stage")["stage_dir"])
+            stage_dir = Path(self._stage_patch(edited, root / "stage")["stage_dir"])
             targets = (
                 (
                     snapshot_dir / "group.com.apple.notes" / MODULE.NOTE_STORE_MAIN,
-                    MODULE.validate_snapshot,
+                    self._validate_snapshot,
                     snapshot_dir,
                     "snapshot-file-access-policy-mismatch",
                 ),
                 (
                     stage_dir / MODULE.NOTE_STORE_MAIN,
-                    MODULE.validate_patch_stage,
+                    self._validate_patch_stage,
                     stage_dir,
                     "patch-file-access-policy-mismatch",
                 ),
@@ -3919,23 +4776,23 @@ raise SystemExit(2)
             edited = root / "edited.sqlite"
             self._create_db(edited)
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                snapshot = MODULE.copy_db(
+                snapshot = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
                 )
             snapshot_dir = Path(snapshot["dest"])
-            stage_dir = Path(MODULE.stage_patch(edited, root / "stage")["stage_dir"])
+            stage_dir = Path(self._stage_patch(edited, root / "stage")["stage_dir"])
             targets = (
                 (
                     snapshot_dir / "group.com.apple.notes" / MODULE.NOTE_STORE_MAIN,
-                    MODULE.validate_snapshot,
+                    self._validate_snapshot,
                     snapshot_dir,
                     "snapshot-content-mismatch",
                 ),
                 (
                     stage_dir / MODULE.NOTE_STORE_MAIN,
-                    MODULE.validate_patch_stage,
+                    self._validate_patch_stage,
                     stage_dir,
                     "patch-content-mismatch",
                 ),
@@ -3972,7 +4829,7 @@ raise SystemExit(2)
             root = Path(temp_dir)
             edited = root / "edited.sqlite"
             self._create_db(edited)
-            stage_dir = Path(MODULE.stage_patch(edited, root / "stage")["stage_dir"])
+            stage_dir = Path(self._stage_patch(edited, root / "stage")["stage_dir"])
             staged_db = stage_dir / MODULE.NOTE_STORE_MAIN
             original_integrity = MODULE._sqlite_integrity
             touched = False
@@ -3997,7 +4854,7 @@ raise SystemExit(2)
                 "_sqlite_integrity",
                 side_effect=touch_after_integrity,
             ):
-                validation = MODULE.validate_patch_stage(stage_dir)
+                validation = self._validate_patch_stage(stage_dir)
         transitions = validation["source_integrity"]["database"]["metadata_transitions"]
         self.assertIn("mtime_ns", transitions)
 
@@ -4008,7 +4865,7 @@ raise SystemExit(2)
             live = paths.group_container / MODULE.NOTE_STORE_MAIN
             self._create_db(live, value="validated")
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                snapshot = MODULE.copy_db(
+                snapshot = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
@@ -4035,7 +4892,7 @@ raise SystemExit(2)
                 "_recover_validated_clone_to_standalone",
                 side_effect=swap_then_recover,
             ):
-                MODULE.recover_snapshot(snapshot_dir, recovered)
+                self._recover_snapshot(snapshot_dir, recovered)
             with closing(sqlite3.connect(recovered)) as conn:
                 recovered_value = conn.execute("SELECT value FROM sample").fetchone()[0]
             with closing(sqlite3.connect(snapshot_db)) as conn:
@@ -4051,14 +4908,14 @@ raise SystemExit(2)
             paths = self._make_paths(root)
             self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                snapshot = MODULE.copy_db(
+                snapshot = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
                 )
             snapshot_dir = Path(snapshot["dest"])
-            validation = MODULE.validate_snapshot(snapshot_dir)
-            result = MODULE.recover_snapshot(
+            validation = self._validate_snapshot(snapshot_dir)
+            result = self._recover_snapshot(
                 snapshot_dir,
                 root / "recovered.sqlite",
             )
@@ -4083,6 +4940,52 @@ raise SystemExit(2)
             self.assertIn("identity", receipt)
             self.assertIn("access_policy", receipt)
 
+    def test_recover_snapshot_rejects_terminal_output_wal_race(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+            recovered = root / "recovered.sqlite"
+            wal = recovered.with_name(f"{recovered.name}-wal")
+            original_publish = MODULE._publish_file_no_replace_from_parent
+
+            def publish_then_inject_wal(
+                prepared: MODULE._BoundRegularFile,
+                destination: Path,
+                parent_fd: int,
+            ) -> dict[str, object]:
+                result = original_publish(prepared, destination, parent_fd)
+                if destination == recovered:
+                    wal.write_bytes(b"raced-wal")
+                return result
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_publish_file_no_replace_from_parent",
+                    side_effect=publish_then_inject_wal,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                self._recover_snapshot(snapshot_dir, recovered)
+
+            self._assert_safety_code("destination-install-uncertain", raised)
+            self.assertTrue(recovered.is_file())
+            self.assertTrue(wal.is_file())
+            self.assertEqual(
+                raised.exception.details["terminal_sidecar_revalidation"][
+                    "reason_code"
+                ],
+                "standalone-output-sidecar-present",
+            )
+
     def test_recover_snapshot_rejects_nested_output_before_parent_creation(
         self,
     ) -> None:
@@ -4091,7 +4994,7 @@ raise SystemExit(2)
             paths = self._make_paths(root)
             self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                snapshot = MODULE.copy_db(
+                snapshot = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
@@ -4102,7 +5005,7 @@ raise SystemExit(2)
             recovered = nested_parent / "recovered.sqlite"
 
             with self.assertRaises(MODULE.StoreSafetyError) as raised:
-                MODULE.recover_snapshot(snapshot_dir, recovered)
+                self._recover_snapshot(snapshot_dir, recovered)
 
             self._assert_safety_code(
                 "recovery-output-inside-snapshot",
@@ -4114,7 +5017,7 @@ raise SystemExit(2)
                 initial_members,
             )
             self.assertEqual(
-                MODULE.validate_snapshot(snapshot_dir)["sqlite_validation"]["result"],
+                self._validate_snapshot(snapshot_dir)["sqlite_validation"]["result"],
                 "ok",
             )
 
@@ -4126,7 +5029,7 @@ raise SystemExit(2)
             paths = self._make_paths(root)
             self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                snapshot = MODULE.copy_db(
+                snapshot = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
@@ -4148,7 +5051,7 @@ raise SystemExit(2)
                     self.subTest(label=label),
                     self.assertRaises(MODULE.StoreSafetyError) as raised,
                 ):
-                    MODULE.recover_snapshot(
+                    self._recover_snapshot(
                         snapshot_dir,
                         output_parent / "recovered.sqlite",
                     )
@@ -4170,7 +5073,7 @@ raise SystemExit(2)
             paths = self._make_paths(root)
             self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                snapshot = MODULE.copy_db(
+                snapshot = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
@@ -4178,7 +5081,7 @@ raise SystemExit(2)
             snapshot_dir = Path(snapshot["dest"])
             recovered = root / "analysis" / "nested" / "recovered.sqlite"
 
-            result = MODULE.recover_snapshot(snapshot_dir, recovered)
+            result = self._recover_snapshot(snapshot_dir, recovered)
 
             self.assertEqual(Path(result["recovered"]["standalone_db"]), recovered)
             with closing(sqlite3.connect(recovered)) as conn:
@@ -4196,7 +5099,7 @@ raise SystemExit(2)
                 value="validated",
             )
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                snapshot = MODULE.copy_db(
+                snapshot = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
@@ -4280,7 +5183,7 @@ raise SystemExit(2)
                 "_write_standalone_backup_payload",
                 side_effect=write_with_create_swap,
             ):
-                MODULE.recover_snapshot(snapshot_dir, recovered)
+                self._recover_snapshot(snapshot_dir, recovered)
 
             self.assertTrue(attacked)
             self.assertEqual(replacement_entries, [])
@@ -4297,7 +5200,7 @@ raise SystemExit(2)
                 value="validated",
             )
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                snapshot = MODULE.copy_db(
+                snapshot = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
@@ -4324,7 +5227,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.recover_snapshot(snapshot_dir, recovered)
+                self._recover_snapshot(snapshot_dir, recovered)
             self._assert_safety_code(
                 "prepared-file-identity-mismatch",
                 raised,
@@ -4342,7 +5245,7 @@ raise SystemExit(2)
                 value="validated",
             )
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                snapshot = MODULE.copy_db(
+                snapshot = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
@@ -4384,7 +5287,7 @@ raise SystemExit(2)
                 "_recover_validated_clone_to_standalone",
                 side_effect=inject_wal_then_recover,
             ):
-                MODULE.recover_snapshot(snapshot_dir, recovered)
+                self._recover_snapshot(snapshot_dir, recovered)
             with closing(sqlite3.connect(recovered)) as conn:
                 recovered_value = conn.execute("SELECT value FROM sample").fetchone()[0]
         self.assertTrue(injected)
@@ -4399,7 +5302,7 @@ raise SystemExit(2)
                 value="validated",
             )
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                snapshot = MODULE.copy_db(
+                snapshot = self._copy_db(
                     paths,
                     dest=root / "snapshot",
                     require_notes_quit=True,
@@ -4459,7 +5362,7 @@ raise SystemExit(2)
                 "_recover_validated_clone_to_standalone",
                 side_effect=recover_with_connect_swap,
             ):
-                MODULE.recover_snapshot(snapshot_dir, recovered)
+                self._recover_snapshot(snapshot_dir, recovered)
             with closing(sqlite3.connect(recovered)) as conn:
                 recovered_value = conn.execute("SELECT value FROM sample").fetchone()[0]
         self.assertTrue(attacked)
@@ -4494,7 +5397,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.copy_db(
+                self._copy_db(
                     paths,
                     dest=destination,
                     require_notes_quit=False,
@@ -4559,7 +5462,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.stage_patch(edited, destination)
+                self._stage_patch(edited, destination)
             self._assert_safety_code("destination-exists", raised)
             self.assertTrue(attacked)
             self.assertIsNotNone(moved_root)
@@ -4604,7 +5507,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.stage_patch(edited, destination)
+                self._stage_patch(edited, destination)
             self._assert_safety_code("prepared-operation-failed", raised)
             self.assertIsInstance(raised.exception.__cause__, OSError)
             self.assertEqual(
@@ -4662,7 +5565,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.stage_patch(edited, destination)
+                self._stage_patch(edited, destination)
             self._assert_safety_code("destination-exists", raised)
             self.assertEqual(
                 raised.exception.details["cleanup_error_code"],
@@ -4729,7 +5632,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.stage_patch(edited, destination)
+                self._stage_patch(edited, destination)
             self._assert_safety_code("destination-exists", raised)
             self.assertTrue(attacked)
             self.assertIsNotNone(moved_prepared)
@@ -4778,7 +5681,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.stage_patch(edited, destination)
+                self._stage_patch(edited, destination)
             self._assert_safety_code(
                 "prepared-directory-identity-mismatch",
                 raised,
@@ -4815,7 +5718,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.stage_patch(edited, destination)
+                self._stage_patch(edited, destination)
             self._assert_safety_code("prepared-file-content-mismatch", raised)
             self.assertFalse(destination.exists())
             self._assert_retained_partial(root, ".stage.partial-*")
@@ -4849,7 +5752,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.copy_db(
+                self._copy_db(
                     paths,
                     dest=destination,
                     require_notes_quit=False,
@@ -4882,7 +5785,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.stage_patch(edited, destination)
+                self._stage_patch(edited, destination)
             self._assert_safety_code(
                 "prepared-directory-access-policy-mismatch",
                 raised,
@@ -5563,18 +6466,18 @@ raise SystemExit(2)
             edited = root / "edited.sqlite"
             self._create_db(edited, value="after")
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                MODULE.copy_db(
+                self._copy_db(
                     paths,
                     dest=root / "backup",
                     require_notes_quit=True,
                 )
-                MODULE.stage_patch(edited, root / "stage")
+                self._stage_patch(edited, root / "stage")
                 current = live.stat()
                 os.utime(
                     live,
                     ns=(current.st_atime_ns, current.st_mtime_ns + 1_000_000_000),
                 )
-                result = MODULE.preflight_writeback(
+                result = self._preflight_writeback(
                     paths,
                     backup_dir=root / "backup",
                     stage_dir=root / "stage",
@@ -5596,17 +6499,17 @@ raise SystemExit(2)
             edited = root / "edited.sqlite"
             self._create_db(edited, value="after")
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                MODULE.copy_db(
+                self._copy_db(
                     paths,
                     dest=root / "backup",
                     require_notes_quit=True,
                 )
-                MODULE.stage_patch(edited, root / "stage")
+                self._stage_patch(edited, root / "stage")
                 replacement = root / "replacement.sqlite"
                 shutil.copyfile(live, replacement)
                 os.replace(replacement, live)
                 with self.assertRaises(MODULE.StoreSafetyError) as raised:
-                    MODULE.preflight_writeback(
+                    self._preflight_writeback(
                         paths,
                         backup_dir=root / "backup",
                         stage_dir=root / "stage",
@@ -5623,15 +6526,15 @@ raise SystemExit(2)
             edited = root / "edited.sqlite"
             self._create_db(edited, value="after")
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                MODULE.copy_db(
+                self._copy_db(
                     paths,
                     dest=root / "backup",
                     require_notes_quit=True,
                 )
-                MODULE.stage_patch(edited, root / "stage")
+                self._stage_patch(edited, root / "stage")
                 live.chmod(0o640)
                 with self.assertRaises(MODULE.StoreSafetyError) as raised:
-                    MODULE.preflight_writeback(
+                    self._preflight_writeback(
                         paths,
                         backup_dir=root / "backup",
                         stage_dir=root / "stage",
@@ -5646,14 +6549,14 @@ raise SystemExit(2)
             edited = root / "edited.sqlite"
             self._create_db(edited, value="after")
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                MODULE.copy_db(
+                self._copy_db(
                     paths,
                     dest=root / "backup",
                     require_notes_quit=False,
                 )
-                MODULE.stage_patch(edited, root / "stage")
+                self._stage_patch(edited, root / "stage")
                 with self.assertRaises(MODULE.StoreSafetyError) as raised:
-                    MODULE.preflight_writeback(
+                    self._preflight_writeback(
                         paths,
                         backup_dir=root / "backup",
                         stage_dir=root / "stage",
@@ -5673,17 +6576,17 @@ raise SystemExit(2)
             self._create_db(edited, value="after")
             stage = root / "stage"
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                MODULE.copy_db(
+                self._copy_db(
                     paths,
                     dest=root / "backup",
                     require_notes_quit=True,
                 )
-                MODULE.stage_patch(edited, stage)
+                self._stage_patch(edited, stage)
                 replacement = root / "replacement.sqlite"
                 shutil.copyfile(stage / MODULE.NOTE_STORE_MAIN, replacement)
                 replacement.chmod(baseline_mode)
                 os.replace(replacement, live)
-                result = MODULE.verify_writeback(
+                result = self._verify_writeback(
                     paths,
                     backup_dir=root / "backup",
                     stage_dir=stage,
@@ -5693,7 +6596,7 @@ raise SystemExit(2)
                     b""
                 )
                 with self.assertRaises(MODULE.StoreSafetyError) as raised:
-                    MODULE.verify_writeback(
+                    self._verify_writeback(
                         paths,
                         backup_dir=root / "backup",
                         stage_dir=stage,
@@ -5709,12 +6612,12 @@ raise SystemExit(2)
             edited = root / "edited.sqlite"
             self._create_db(edited, value="after")
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                MODULE.copy_db(
+                self._copy_db(
                     paths,
                     dest=root / "backup",
                     require_notes_quit=True,
                 )
-                MODULE.stage_patch(edited, root / "stage")
+                self._stage_patch(edited, root / "stage")
                 with (
                     (root / "stage" / MODULE.NOTE_STORE_MAIN).open("rb") as source,
                     live.open("r+b") as destination,
@@ -5723,7 +6626,7 @@ raise SystemExit(2)
                     destination.write(source.read())
                     destination.truncate()
                 with self.assertRaises(MODULE.StoreSafetyError) as raised:
-                    MODULE.verify_writeback(
+                    self._verify_writeback(
                         paths,
                         backup_dir=root / "backup",
                         stage_dir=root / "stage",
@@ -5740,18 +6643,18 @@ raise SystemExit(2)
             edited = root / "edited.sqlite"
             self._create_db(edited, value="after")
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
-                MODULE.copy_db(
+                self._copy_db(
                     paths,
                     dest=root / "backup",
                     require_notes_quit=True,
                 )
-                MODULE.stage_patch(edited, root / "stage")
+                self._stage_patch(edited, root / "stage")
                 replacement = root / "replacement.sqlite"
                 shutil.copyfile(root / "stage" / MODULE.NOTE_STORE_MAIN, replacement)
                 replacement.chmod(0o640)
                 os.replace(replacement, live)
                 with self.assertRaises(MODULE.StoreSafetyError) as raised:
-                    MODULE.verify_writeback(
+                    self._verify_writeback(
                         paths,
                         backup_dir=root / "backup",
                         stage_dir=root / "stage",
