@@ -189,16 +189,34 @@ page-size mismatch, invalid commit boundary, or database growth that cannot be b
 database plus the committed frame count.
 The WAL header stores page size as an unsigned 32-bit value. Accept `65536` directly; reject `1`
 instead of applying the SQLite database-header 16-bit `1 => 65536` sentinel rule to WAL bytes.
-Write the recovered image to an anonymous temporary regular-file descriptor and open only that
-descriptor through a read-only, immutable SQLite URI. Revalidate the anonymous descriptor before
-and after the native backup. SQLite never receives or reopens the mutable main, WAL, or containing
-directory pathname, so a replace-then-restore namespace race during SQLite open cannot substitute
+Write the recovered image to an anonymous temporary regular-file descriptor, then reread only that
+same receipt-matched descriptor into a native SQLite allocation. Deserialize the allocation with
+`SQLITE_DESERIALIZE_READONLY`. Revalidate descriptor identity, two content hashes, size, and access
+policy plus the exact deserialized-buffer SHA-256 before and after every native integrity query or
+backup boundary. SQLite never receives or reopens the mutable main, WAL, containing directory,
+`/dev/fd`, or `/proc/self/fd` pathname, so a replace-then-restore namespace race cannot substitute
 different source bytes.
+On Linux, `tempfile.TemporaryFile` may use `O_TMPFILE`. A separate `open("/dev/fd/<fd>")` can
+succeed while SQLite VFS full-path processing of the anonymous inode still fails, so a descriptor
+reopen probe is neither a portability gate nor an input-binding proof. The native read-only
+deserialization path is required on Linux and macOS; a missing `sqlite3_deserialize`,
+`sqlite3_malloc64`, query, backup, or serialize interface fails closed under the calling SQLite
+error class.
+SQLite cannot deserialize a WAL-mode header directly. Only after checksum-valid committed WAL
+frames have been applied, set database-header read/write version bytes 18 and 19 to `1`, write
+those normalized bytes into the anonymous descriptor, and bind its receipt. The normalization
+therefore becomes the explicit descriptor content authority rather than an unverified
+post-capture mutation.
+Close the native SQLite connection before releasing its allocation. If connection close is not
+proved, retain the allocation instead of risking a use-after-free and report bounded
+`sqlite_input_cleanup` evidence. The anonymous file descriptor remains owned by its context and is
+closed without a pathname cleanup step.
 Run the native SQLite backup API into an in-memory destination, serialize that database, and write
 the bytes directly to the exclusively created output descriptor. Never ask SQLite to reopen the
-mutable output pathname. Bind the completed output and run `PRAGMA integrity_check` through its
-read-only descriptor URI; replacing and restoring the output pathname during either write or
-integrity validation must not redirect those operations.
+mutable output pathname. Bind the completed output, reread that exact descriptor into the same
+read-only deserialization path, and run `PRAGMA integrity_check` there; replacing and restoring
+the output pathname during either write or integrity validation must not redirect those
+operations.
 Bind the serialized payload's expected SHA-256, exact length, and `0600` mode before creating or
 writing the output. After `fchmod` and `fsync`, require two consecutive same-descriptor hashes to
 match that pre-bound digest; around each hash compare descriptor and descriptor-relative pathname

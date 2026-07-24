@@ -272,8 +272,21 @@ WAL/SHM descriptors, then revalidates object identity, content, access policy, m
 and exact name/type membership before and after each recovery boundary. A replacement or injected
 entry between validation, sidecar inspection, payload construction, SQLite integrity, and backup
 fails closed. Recovery applies the checksum-valid committed WAL prefix to the held main-database
-bytes and gives SQLite only an anonymous descriptor-backed recovered image. SQLite never reopens
-the mutable main, WAL, SHM, or directory pathname.
+bytes and gives SQLite only bytes reread from one anonymous descriptor-backed recovered image.
+SQLite never reopens the mutable main, WAL, SHM, directory pathname, `/dev/fd`, or
+`/proc/self/fd`. The helper copies the receipt-matched descriptor bytes into a native
+SQLite-owned buffer, deserializes it read-only, and revalidates descriptor identity, content, and
+access policy plus the buffer digest before and after integrity queries and backup.
+Linux `TemporaryFile` may use `O_TMPFILE`, whose anonymous object is not required to survive
+SQLite VFS full-path processing. The helper therefore never treats a successful Python
+descriptor reopen probe as proof that SQLite can or should reopen that pseudo-path. For a
+recovered WAL-mode image, bytes 18 and 19 are normalized to rollback mode only after the committed
+WAL prefix has been applied; those normalized bytes are written to and receipted from the
+anonymous descriptor before deserialization.
+Connection teardown precedes buffer release. If native close cannot be proved, the helper retains
+the buffer instead of freeing memory SQLite may still reference and reports incomplete
+`sqlite_input_cleanup`; ordinary descriptor cleanup remains anchored to the still-held temporary
+file object.
 Initial discovery also detects `NoteStore.sqlite-journal` without following links. Any present
 rollback journal is descriptor-bound and then rejected as `rollback-journal-present`; if it cannot
 be bound as one stable regular file, the same reason code is returned as inconclusive. Recovery

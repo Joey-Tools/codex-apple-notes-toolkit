@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import array
 import builtins
+import ctypes
 import errno
 import hashlib
 import importlib.util
@@ -6158,14 +6159,14 @@ raise SystemExit(2)
             attacked = False
 
             def replace_wal_during_backup(
-                source_uri: str,
+                source_image: MODULE._DeserializedSQLiteImage,
                 source_path: Path,
             ) -> bytes:
                 nonlocal attacked
                 attacked = True
                 os.replace(wal, parked)
                 os.replace(replacement, wal)
-                return original_backup(source_uri, source_path)
+                return original_backup(source_image, source_path)
 
             try:
                 with (
@@ -6214,7 +6215,7 @@ raise SystemExit(2)
             attacked = False
 
             def replace_directory_during_backup(
-                source_uri: str,
+                source_image: MODULE._DeserializedSQLiteImage,
                 source_path: Path,
             ) -> bytes:
                 nonlocal attacked
@@ -6222,7 +6223,7 @@ raise SystemExit(2)
                 os.replace(source_dir, parked_dir)
                 os.replace(replacement_dir, source_dir)
                 try:
-                    return original_backup(source_uri, source_path)
+                    return original_backup(source_image, source_path)
                 finally:
                     os.replace(source_dir, replacement_dir)
                     os.replace(parked_dir, source_dir)
@@ -6279,14 +6280,14 @@ raise SystemExit(2)
             attacked = False
 
             def replace_directory_during_backup(
-                source_uri: str,
+                source_image: MODULE._DeserializedSQLiteImage,
                 source_path: Path,
             ) -> bytes:
                 nonlocal attacked
                 attacked = True
                 os.replace(source_dir, parked_dir)
                 os.replace(replacement_dir, source_dir)
-                return original_backup(source_uri, source_path)
+                return original_backup(source_image, source_path)
 
             try:
                 with (
@@ -6356,7 +6357,9 @@ raise SystemExit(2)
             assert replacement is not None
             self.assertEqual(replacement.read_bytes(), b"replacement")
 
-    def test_bound_sqlite_integrity_ignores_path_swap_during_connect(self) -> None:
+    def test_bound_sqlite_integrity_ignores_path_swap_during_consumption(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             database = root / MODULE.NOTE_STORE_MAIN
@@ -6364,25 +6367,21 @@ raise SystemExit(2)
             replacement = root / "replacement.sqlite"
             replacement.write_bytes(b"not a sqlite database")
             parked = root / "validated.sqlite"
-            original_connect = MODULE.sqlite3.connect
+            original_exec = MODULE._native_sqlite_exec
             attacked = False
 
-            def connect_with_swap(
-                target: object,
+            def exec_with_swap(
                 *args: object,
                 **kwargs: object,
-            ) -> sqlite3.Connection:
+            ) -> int:
                 nonlocal attacked
-                descriptor_uri = isinstance(target, str) and target.startswith(
-                    "file:/dev/fd/"
-                )
-                if attacked or not descriptor_uri:
-                    return original_connect(target, *args, **kwargs)
+                if attacked:
+                    return original_exec(*args, **kwargs)
                 attacked = True
                 os.replace(database, parked)
                 os.replace(replacement, database)
                 try:
-                    return original_connect(target, *args, **kwargs)
+                    return original_exec(*args, **kwargs)
                 finally:
                     os.replace(database, replacement)
                     os.replace(parked, database)
@@ -6395,12 +6394,208 @@ raise SystemExit(2)
                 mock.patch.object(
                     MODULE.sqlite3,
                     "connect",
-                    side_effect=connect_with_swap,
+                    side_effect=AssertionError(
+                        "bound integrity must not reopen a pathname"
+                    ),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_native_sqlite_exec",
+                    side_effect=exec_with_swap,
                 ),
             ):
                 integrity = MODULE._sqlite_integrity(bound)
         self.assertTrue(attacked)
         self.assertEqual(integrity["result"], "ok")
+
+    def test_linux_otmpfile_reopen_failure_does_not_block_sqlite_consumption(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database = root / MODULE.NOTE_STORE_MAIN
+            self._create_db(database, value="validated")
+            payload = database.read_bytes()
+            original_open = MODULE.os.open
+            pseudo_path_attempts: list[str] = []
+
+            def reject_descriptor_reopen(
+                path: object,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                try:
+                    raw_path = os.fsdecode(os.fspath(path))
+                except TypeError:
+                    raw_path = ""
+                if raw_path.startswith(("/dev/fd/", "/proc/self/fd/")):
+                    pseudo_path_attempts.append(raw_path)
+                    raise FileNotFoundError(
+                        errno.ENOENT,
+                        "simulated Linux O_TMPFILE reopen failure",
+                        raw_path,
+                    )
+                return original_open(path, flags, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    MODULE.os,
+                    "open",
+                    side_effect=reject_descriptor_reopen,
+                ),
+                mock.patch.object(
+                    MODULE.sqlite3,
+                    "connect",
+                    side_effect=AssertionError(
+                        "payload SQLite must not reopen a filesystem path"
+                    ),
+                ),
+            ):
+                integrity = MODULE._sqlite_integrity_from_payload(
+                    payload,
+                    database,
+                )
+                backup = MODULE._sqlite_backup_bytes_from_payload(
+                    payload,
+                    database,
+                )
+            recovered = root / "recovered.sqlite"
+            recovered.write_bytes(backup)
+            with closing(sqlite3.connect(recovered)) as connection:
+                value = connection.execute("SELECT value FROM sample").fetchone()[0]
+        self.assertEqual(pseudo_path_attempts, [])
+        self.assertEqual(integrity["result"], "ok")
+        self.assertEqual(value, "validated")
+
+    def test_wal_header_normalization_does_not_mask_invalid_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / MODULE.NOTE_STORE_MAIN
+            self._create_db(database)
+            payload = bytearray(database.read_bytes())
+            payload[18] = 3
+            payload[19] = 2
+            with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                MODULE._sqlite_integrity_from_payload(bytes(payload), database)
+        self._assert_safety_code("sqlite-integrity-failed", raised)
+
+    def test_deserialized_sqlite_input_revalidates_adversarial_mutations(
+        self,
+    ) -> None:
+        for attack, expected_code in (
+            ("identity", "prepared-file-identity-mismatch"),
+            ("content", "prepared-file-content-mismatch"),
+            ("access-policy", "prepared-file-access-policy-mismatch"),
+            ("sqlite-buffer", "prepared-file-content-mismatch"),
+        ):
+            with self.subTest(attack=attack):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    database = root / MODULE.NOTE_STORE_MAIN
+                    self._create_db(database, value="validated")
+                    payload = database.read_bytes()
+                    original_query = MODULE._native_sqlite_query_rows
+                    attacked = False
+                    replacement_handles: list[object] = []
+
+                    def query_then_attack(
+                        image: MODULE._DeserializedSQLiteImage,
+                        sql: str,
+                        source_path: Path,
+                        **kwargs: object,
+                    ) -> list[list[str | None]]:
+                        nonlocal attacked
+                        rows = original_query(
+                            image,
+                            sql,
+                            source_path,
+                            **kwargs,
+                        )
+                        if attacked:
+                            return rows
+                        attacked = True
+                        if attack == "identity":
+                            replacement = tempfile.TemporaryFile()
+                            replacement.write(payload)
+                            replacement.flush()
+                            os.fchmod(replacement.fileno(), 0o600)
+                            replacement_handles.append(replacement)
+                            os.dup2(replacement.fileno(), image.bound.fd)
+                        elif attack == "content":
+                            os.lseek(image.bound.fd, 0, os.SEEK_SET)
+                            os.write(image.bound.fd, b"X")
+                        elif attack == "access-policy":
+                            os.fchmod(image.bound.fd, 0o400)
+                        else:
+                            ctypes.memset(image.buffer, ord("X"), 1)
+                        return rows
+
+                    try:
+                        with (
+                            mock.patch.object(
+                                MODULE,
+                                "_native_sqlite_query_rows",
+                                side_effect=query_then_attack,
+                            ),
+                            self.assertRaises(MODULE.StoreSafetyError) as raised,
+                        ):
+                            MODULE._sqlite_integrity_from_payload(
+                                payload,
+                                database,
+                            )
+                    finally:
+                        for handle in replacement_handles:
+                            handle.close()
+                self.assertTrue(attacked)
+                self._assert_safety_code(expected_code, raised)
+
+    def test_deserialize_failure_closes_descriptor_and_frees_buffer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / MODULE.NOTE_STORE_MAIN
+            self._create_db(database)
+            payload = database.read_bytes()
+            original_temporary_file = MODULE.tempfile.TemporaryFile
+            original_close = MODULE._native_sqlite_close
+            original_free = MODULE._native_sqlite_free
+            handles: list[object] = []
+
+            def tracking_temporary_file(
+                *args: object,
+                **kwargs: object,
+            ) -> object:
+                handle = original_temporary_file(*args, **kwargs)
+                handles.append(handle)
+                return handle
+
+            with (
+                mock.patch.object(
+                    MODULE.tempfile,
+                    "TemporaryFile",
+                    side_effect=tracking_temporary_file,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_native_sqlite_deserialize",
+                    return_value=14,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_native_sqlite_close",
+                    wraps=original_close,
+                ) as close_mock,
+                mock.patch.object(
+                    MODULE,
+                    "_native_sqlite_free",
+                    wraps=original_free,
+                ) as free_mock,
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._sqlite_integrity_from_payload(payload, database)
+        self._assert_safety_code("sqlite-integrity-failed", raised)
+        self.assertEqual(len(handles), 1)
+        self.assertTrue(handles[0].closed)
+        close_mock.assert_called_once()
+        free_mock.assert_called_once()
 
     def test_failed_recovery_preserves_temp_leaf_replaced_after_binding(
         self,
@@ -9727,7 +9922,7 @@ raise SystemExit(2)
         self._assert_safety_code("snapshot-file-set-mismatch", raised)
         self.assertFalse(recovered.exists())
 
-    def test_recover_snapshot_binds_clone_during_connect_path_swap(self) -> None:
+    def test_recover_snapshot_binds_clone_during_native_path_swap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             paths = self._make_paths(root)
@@ -9743,10 +9938,10 @@ raise SystemExit(2)
                 )
             snapshot_dir = Path(snapshot["dest"])
             original_recover = MODULE._recover_validated_clone_to_standalone
-            original_connect = MODULE.sqlite3.connect
+            original_image = MODULE._deserialized_sqlite_image
             attacked = False
 
-            def recover_with_connect_swap(
+            def recover_with_native_swap(
                 recovered_main: Path,
                 out: Path,
                 **kwargs: object,
@@ -9755,38 +9950,34 @@ raise SystemExit(2)
                 parked = root / "connect-validated.sqlite"
                 self._create_db(replacement, value="replacement")
 
-                def connect_with_swap(
-                    database: object,
-                    *args: object,
-                    **connect_kwargs: object,
-                ) -> sqlite3.Connection:
+                @contextmanager
+                def image_with_swap(
+                    bound: MODULE._BoundRegularFile,
+                    source_path: Path,
+                    **image_kwargs: object,
+                ) -> Iterator[MODULE._DeserializedSQLiteImage]:
                     nonlocal attacked
-                    descriptor_uri = isinstance(database, str) and database.startswith(
-                        "file:/dev/fd/"
-                    )
-                    if attacked or (database != recovered_main and not descriptor_uri):
-                        return original_connect(
-                            database,
-                            *args,
-                            **connect_kwargs,
-                        )
-                    attacked = True
-                    os.replace(recovered_main, parked)
-                    os.replace(replacement, recovered_main)
-                    try:
-                        return original_connect(
-                            database,
-                            *args,
-                            **connect_kwargs,
-                        )
-                    finally:
-                        os.replace(recovered_main, replacement)
-                        os.replace(parked, recovered_main)
+                    with original_image(
+                        bound,
+                        source_path,
+                        **image_kwargs,
+                    ) as image:
+                        if attacked or source_path != recovered_main:
+                            yield image
+                            return
+                        attacked = True
+                        os.replace(recovered_main, parked)
+                        os.replace(replacement, recovered_main)
+                        try:
+                            yield image
+                        finally:
+                            os.replace(recovered_main, replacement)
+                            os.replace(parked, recovered_main)
 
                 with mock.patch.object(
-                    MODULE.sqlite3,
-                    "connect",
-                    side_effect=connect_with_swap,
+                    MODULE,
+                    "_deserialized_sqlite_image",
+                    side_effect=image_with_swap,
                 ):
                     return original_recover(recovered_main, out, **kwargs)
 
@@ -9794,7 +9985,7 @@ raise SystemExit(2)
             with mock.patch.object(
                 MODULE,
                 "_recover_validated_clone_to_standalone",
-                side_effect=recover_with_connect_swap,
+                side_effect=recover_with_native_swap,
             ):
                 self._recover_snapshot(snapshot_dir, recovered)
             with closing(sqlite3.connect(recovered)) as conn:

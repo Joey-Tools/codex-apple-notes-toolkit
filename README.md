@@ -10,9 +10,12 @@ snapshot/stage directories without replacing existing paths, and verifies
 explicit writeback boundaries. SHM commit evidence requires checksum-valid,
 identical native-order duplicate headers bound to the exact physical WAL commit
 frame. Standalone recovery applies committed WAL frames
-from descriptor-bound inputs before SQLite consumes an anonymous
-descriptor-backed image. Snapshot files, the nested store, and the snapshot
-root are fsynced bottom-up before publication. Publication uses held parent
+from descriptor-bound inputs before SQLite consumes a native read-only
+deserialization buffer copied and revalidated from the same anonymous
+descriptor. It never reopens `/dev/fd`, `/proc/self/fd`, or a mutable database
+pathname, including when Linux `TemporaryFile` uses `O_TMPFILE`. Snapshot files,
+the nested store, and the snapshot root are fsynced bottom-up before
+publication. Publication uses held parent
 descriptors for rename, fsync, and terminal revalidation; retained sensitive
 partials and uncertain standalone destinations receive precise recovery
 locators. Every output command rejects case/NFD, ancestor/descendant, and
