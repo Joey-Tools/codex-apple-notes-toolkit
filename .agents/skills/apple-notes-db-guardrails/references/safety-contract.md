@@ -87,6 +87,12 @@ membership and protected-property revalidation only relative to the held group-c
 descriptor. No
 source operation may restart from a full pathname or bind a second parent authority. Hold all
 component and file descriptors through capture.
+Open every existing untrusted regular-file leaf with
+`O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK`, then require the opened descriptor to remain the
+same regular object observed before open. `O_NOFOLLOW` rejects a symlink substitution;
+`O_NONBLOCK` ensures that a FIFO or blocking-device substitution cannot prevent the post-open
+`fstat` from rejecting its file type. Directory opens and exclusive new-file creation have
+separate flag contracts and are not substitutes for this leaf rule.
 
 For each file:
 
@@ -299,6 +305,17 @@ must bind parent/directory identity and access policy. POSIX/Darwin `mkdir`, `mk
 and `mkdtempat_np` return no descriptor; `mkdir` followed by `open` therefore cannot establish
 created-object identity and is forbidden as a fallback. With no trusted creator, fail before
 mutation as `directory-creation-identity-inconclusive`.
+A creator that raises after entering its mutation boundary must use
+`_IdentityBoundDirectoryCreationFailure` and transfer the created staging basename, open
+descriptor, creation-time stat, provider proof, and provider recovery details. Descriptor
+ownership transfers to the helper. The helper treats the handoff proof as unvalidated, captures
+bounded point-in-time evidence through the transferred descriptor and held parent, closes the
+descriptor after evidence capture, preserves the created namespace, and reports
+`creation-identity-inconclusive`, `mutation_performed: true`, and `retry_safe: false`. Provider
+details merge conservatively: mutation is ORed, retry safety is ANDed, cleanup takes the worst
+state, and locator keys are preserved. An unstructured creator exception cannot prove that no
+directory was created; classify mutation and cleanup as conservative/inconclusive rather than
+claiming `mutation_performed: false`.
 
 Validate the creator-returned descriptor against its staging name before using it. Install that
 held object at the target basename only with the platform's atomic no-replace directory rename,
@@ -425,6 +442,13 @@ never downgrade `uncertain` publication or incomplete cleanup. This includes raw
 completed, retain last-verified descriptor-bound parent/prepared-root evidence and mark the
 sub-check inconclusive. Do not catch `BaseException`; `KeyboardInterrupt` and `SystemExit` retain
 process-control semantics.
+Set one monotonic commit latch as the first action after a successful no-replace rename returns.
+When the rename syscall reports an error but descriptor-relative namespace evidence proves that
+the exact prepared object occupies the destination, set the same latch before building any
+recovery receipt. The enclosing post-publication guard and low-level publisher share that latch.
+After the minimum namespace observations needed to prove a commit, no further terminal namespace
+observation, durability check, tree/file receipt, or fallback evidence builder runs before the
+latch. Later code may add descriptor evidence but must never clear the commit fact.
 
 Standalone database publication uses an atomic no-replace rename from a descriptor-bound private
 file. Bind the creation-time private parent and operate on the exact source and destination leaf

@@ -76,6 +76,13 @@ object, parent, access policy, and exclusive namespace handoff. POSIX/Darwin `mk
 proof and is never an implicit fallback. The packaged module installs no production creator by
 default; an operation that needs a new directory fails before mutation with
 `directory-creation-identity-inconclusive` until a trusted integration supplies that capability.
+If that creator fails after entering the creation boundary, it must raise the packaged structured
+create-then-fail exception and transfer the staging basename, already-open descriptor,
+creation-time stat, proof, and recovery details to the helper. The helper records the handoff as
+`creation-identity-inconclusive`, closes the transferred descriptor only after bounded evidence
+capture, retains the namespace, and never retries or deletes it by name. A creator exception
+without that structure is treated as possibly post-mutation with inconclusive cleanup, never as
+`mutation_performed: false`.
 After validating the returned descriptor/name pair, the helper installs that exact object with
 atomic no-replace rename and revalidates the target around the carried scope checks. Replacement
 or access-policy drift fails closed with a structured retained-object locator; unproved handoff
@@ -127,7 +134,10 @@ The live NoteStore is one descriptor transaction: bind the complete group-contai
 one no-follow component at a time, then perform main/WAL/SHM/rollback-journal discovery, every
 regular-file open, hashing/copying, membership checks, and final protected-property revalidation
 only through the held group-container `dir_fd`. Do not restart discovery or open a source from a
-full pathname.
+full pathname. Every existing untrusted regular-file leaf open combines `O_NOFOLLOW` with
+`O_NONBLOCK`; the same descriptor is then checked as regular and identity-bound. A regular-file
+name swapped to a FIFO or device between the pre-open stat and open therefore cannot block before
+the type mismatch is rejected.
 The helper binds the private partial directory, its nested `group.com.apple.notes` store, and their
 parents at creation. It verifies every prepared file against its creation receipt, fsyncs copied
 files, then fsyncs the held nested-store and snapshot-root descriptors bottom-up before the
@@ -297,6 +307,11 @@ descriptor-bound destination evidence when available, and the underlying machine
 Recovery evidence remains descriptor-bound and records an inconclusive sub-check when a terminal
 receipt cannot be completed. Process-control exceptions such as `KeyboardInterrupt` and
 `SystemExit` are not translated.
+The commit fact is latched monotonically as the first action after a no-replace rename returns
+success, and likewise before any recovery-evidence construction when an error path proves that the
+exact prepared object occupies the destination. Callers pass the same latch into the low-level
+file or directory publisher; descriptor receipts are added only afterward. Evidence construction
+cannot therefore fail through a still-uncommitted outer guard.
 
 The packaged helper remains compatible with Python 3.9. Do not use newer runtime-only call
 arguments, such as `zip(..., strict=True)`, without adding a consistent minimum-version gate.

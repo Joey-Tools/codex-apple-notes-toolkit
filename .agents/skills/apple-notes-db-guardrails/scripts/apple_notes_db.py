@@ -214,6 +214,27 @@ class _IdentityBoundDirectoryCreation:
     proof: dict[str, Any]
 
 
+class _IdentityBoundDirectoryCreationFailure(RuntimeError):
+    """Transfer create-then-fail evidence and descriptor ownership to the helper."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        staging_basename: str | None = None,
+        fd: int | None = None,
+        opened: os.stat_result | None = None,
+        proof: dict[str, Any] | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.staging_basename = staging_basename
+        self.fd = fd
+        self.opened = opened
+        self.proof = proof
+        self.details = dict(details) if isinstance(details, dict) else {}
+
+
 @dataclass
 class _BoundSourceStore:
     """One live/caller store held through its complete directory component chain."""
@@ -282,6 +303,10 @@ SOURCE_FILE_CODES = _FileProtectionCodes(
 # the already-open created object plus an attestation matching the contract
 # checked by _create_identity_bound_directory_at().  Tests install a synthetic
 # provider explicitly; production code never treats mkdir-then-open as proof.
+# A provider that raises after entering its creation boundary must use
+# _IdentityBoundDirectoryCreationFailure and transfer any created name, open
+# descriptor, creation stat, proof, and recovery details.  Unstructured
+# provider failures are conservatively treated as possibly post-mutation.
 _IDENTITY_BOUND_DIRECTORY_CREATOR: (
     Callable[[int, str], _IdentityBoundDirectoryCreation] | None
 ) = None
@@ -1103,6 +1128,7 @@ def _publish_directory_no_replace(
     before_rename: Callable[[], None] | None = None,
     prepared_tree_receipt: dict[str, Any] | None = None,
     descriptor_tree_receipt_builder: (Callable[[str], dict[str, Any]] | None) = None,
+    publication_guard: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if binding is None or binding.parent_fd is None:
         raise StoreSafetyError(
@@ -1228,6 +1254,14 @@ def _publish_directory_no_replace(
             parent_fd,
             destination.name,
         )
+        committed = (
+            source_state == "absent"
+            and destination_state == "present"
+            and destination_after is not None
+            and _identity(destination_after) == source_identity
+        )
+        if committed:
+            _latch_publication_commit(publication_guard)
         descriptor_bound_prepared_root = _descriptor_bound_directory_recovery_evidence(
             binding,
             source=source,
@@ -1238,12 +1272,6 @@ def _publish_directory_no_replace(
                 destination_after,
             ),
             tree_receipt=prepared_tree_receipt,
-        )
-        committed = (
-            source_state == "absent"
-            and destination_state == "present"
-            and destination_after is not None
-            and _identity(destination_after) == source_identity
         )
         if committed:
             descriptor_bound_destination: dict[str, Any] | None = None
@@ -1272,6 +1300,10 @@ def _publish_directory_no_replace(
                         )
             except Exception:
                 descriptor_bound_destination = None
+            if publication_guard is not None:
+                publication_guard["descriptor_bound_destination"] = (
+                    descriptor_bound_destination
+                )
             raise StoreSafetyError(
                 "destination-install-uncertain",
                 "The destination contains the prepared directory, but the "
@@ -1440,6 +1472,7 @@ def _publish_directory_no_replace(
             ),
         ) from exc
 
+    _latch_publication_commit(publication_guard)
     descriptor_bound_destination: dict[str, Any] | None = None
     try:
         source_state, _ = _observe_bound_name(parent_fd, source.name)
@@ -1511,6 +1544,10 @@ def _publish_directory_no_replace(
         )
         if terminal_alias_receipt is not None:
             descriptor_bound_destination["trusted_alias"] = terminal_alias_receipt
+        if publication_guard is not None:
+            publication_guard["descriptor_bound_destination"] = (
+                descriptor_bound_destination
+            )
         binding.path = destination
         binding.namespace_basename = destination.name
     except Exception as exc:
@@ -1550,6 +1587,10 @@ def _publish_directory_no_replace(
             != "descriptor-revalidated-after-rename"
         ):
             descriptor_bound_destination["tree_revalidation_error"] = str(exc)
+        if publication_guard is not None:
+            publication_guard["descriptor_bound_destination"] = (
+                descriptor_bound_destination
+            )
         raise StoreSafetyError(
             "destination-install-uncertain",
             "The directory was renamed into place, but descriptor-relative "
@@ -1588,6 +1629,17 @@ def _source_revalidation_os_error(
     )
 
 
+def _untrusted_regular_read_open_flags() -> int:
+    """Open an untrusted leaf without following links or blocking on a type swap."""
+
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+
+
 def _open_regular_readonly(path: Path) -> tuple[int, os.stat_result]:
     try:
         path_before = os.stat(path, follow_symlinks=False)
@@ -1609,7 +1661,7 @@ def _open_regular_readonly(path: Path) -> tuple[int, os.stat_result]:
             "source-not-regular", f"Source path is not a regular file: {path}"
         )
 
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = _untrusted_regular_read_open_flags()
     try:
         fd = os.open(path, flags)
     except FileNotFoundError as exc:
@@ -1688,7 +1740,7 @@ def _open_regular_readonly_at(
             "source-not-regular",
             f"Descriptor-relative source is not a regular file: {display_path}",
         )
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = _untrusted_regular_read_open_flags()
     try:
         fd = os.open(basename, flags, dir_fd=parent.fd)
     except FileNotFoundError as exc:
@@ -2640,7 +2692,7 @@ def _bind_regular_file_at(
             codes.identity,
             f"Descriptor-relative source is not a regular file: {path}",
         )
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = _untrusted_regular_read_open_flags()
     try:
         fd = os.open(path.name, flags, dir_fd=parent.fd)
     except FileNotFoundError as exc:
@@ -3224,6 +3276,109 @@ def _verify_directory_creation_parent(
     return current
 
 
+def _identity_bound_directory_creation_failure_details(
+    failure: _IdentityBoundDirectoryCreationFailure,
+    *,
+    parent_fd: int,
+    parent_opened: os.stat_result,
+    display_path: Path,
+) -> dict[str, Any]:
+    """Retain create-then-fail evidence without trusting the failed handoff."""
+
+    reported_basename = failure.staging_basename
+    staging_basename = (
+        reported_basename
+        if isinstance(reported_basename, str)
+        and reported_basename not in {"", ".", ".."}
+        and os.sep not in reported_basename
+        and reported_basename.startswith(".apple-notes-create-")
+        else None
+    )
+    directory_fd = (
+        failure.fd
+        if isinstance(failure.fd, int)
+        and not isinstance(failure.fd, bool)
+        and failure.fd >= 0
+        else None
+    )
+    opened = failure.opened if isinstance(failure.opened, os.stat_result) else None
+    provider_proof = failure.proof if isinstance(failure.proof, dict) else None
+    recovery = _created_directory_install_recovery_details(
+        parent_fd=parent_fd,
+        parent_opened=parent_opened,
+        directory_fd=directory_fd,
+        created=opened,
+        staging_name=staging_basename,
+        target_name=display_path.name,
+        display_path=display_path,
+        install_state="trusted-creator-create-then-fail",
+        mutation_performed=True,
+        # A failed provider handoff has not passed the helper's proof checks.
+        creation_proof=None,
+    )
+    generic_locator = recovery["recovery_locators"].pop("created_directory_install")
+    generic_locator.update(
+        {
+            "schema": ("apple-notes-identity-bound-directory-creation-failure/v1"),
+            "creation_state": "create-then-fail",
+            "provider_reported_staging_basename": reported_basename,
+            "provider_proof": provider_proof,
+            "provider_error_type": type(failure).__name__,
+            "provider_error": str(failure),
+            "descriptor_ownership_transferred": directory_fd is not None,
+        }
+    )
+    recovery["recovery_locators"]["identity_bound_directory_creation_failure"] = (
+        generic_locator
+    )
+    provider_authority = (
+        provider_proof.get("creation_authority") if provider_proof is not None else None
+    )
+    recovery.update(
+        {
+            "creation_authority": (
+                provider_authority
+                if isinstance(provider_authority, str) and provider_authority
+                else "provider-failure-unverified"
+            ),
+            "provider_install_state": "trusted-creator-create-then-fail",
+            "provider_proof": provider_proof,
+            "provider_staging_basename": staging_basename,
+        }
+    )
+    return _merge_recovery_details(failure.details, recovery)
+
+
+def _unstructured_directory_creation_failure_details(
+    failure: Exception,
+    *,
+    display_path: Path,
+) -> dict[str, Any]:
+    """Treat an unstructured provider exception as possibly post-mutation."""
+
+    return {
+        "mutation_performed": True,
+        "cleanup_state": "inconclusive",
+        "retry_safe": False,
+        "creation_authority": "provider-failure-unstructured",
+        "provider_install_state": "trusted-creator-state-unknown",
+        "provider_staging_basename": None,
+        "recovery_locators": {
+            "identity_bound_directory_creation_failure": {
+                "schema": ("apple-notes-identity-bound-directory-creation-failure/v1"),
+                "protected_property": "creation-identity-inconclusive",
+                "creation_state": "unknown-after-creator-entry",
+                "display_path": str(display_path),
+                "provider_error_type": type(failure).__name__,
+                "provider_errno": getattr(failure, "errno", None),
+                "provider_error": str(failure),
+                "automatic_cleanup_attempted": False,
+                "evidence_status": "inconclusive",
+            },
+        },
+    }
+
+
 def _create_identity_bound_directory_at(
     parent_fd: int,
     parent_opened: os.stat_result,
@@ -3263,7 +3418,68 @@ def _create_identity_bound_directory_at(
         access_policy_code=access_policy_code,
         inconclusive_code=inconclusive_code,
     )
-    creation = creator(parent_fd, ".apple-notes-create-")
+    try:
+        creation = creator(parent_fd, ".apple-notes-create-")
+    except _IdentityBoundDirectoryCreationFailure as exc:
+        try:
+            try:
+                details = _identity_bound_directory_creation_failure_details(
+                    exc,
+                    parent_fd=parent_fd,
+                    parent_opened=parent_opened,
+                    display_path=display_path,
+                )
+            except Exception as evidence_exc:
+                fallback = _unstructured_directory_creation_failure_details(
+                    evidence_exc,
+                    display_path=display_path,
+                )
+                fallback.update(
+                    {
+                        "creation_authority": (
+                            "provider-structured-failure-evidence-inconclusive"
+                        ),
+                        "provider_install_state": ("trusted-creator-create-then-fail"),
+                        "provider_staging_basename": (
+                            exc.staging_basename
+                            if isinstance(exc.staging_basename, str)
+                            else None
+                        ),
+                        "provider_failure_type": type(exc).__name__,
+                        "provider_failure": str(exc),
+                        "provider_evidence_error_type": (type(evidence_exc).__name__),
+                        "provider_evidence_errno": getattr(
+                            evidence_exc,
+                            "errno",
+                            None,
+                        ),
+                    }
+                )
+                details = _merge_recovery_details(exc.details, fallback)
+        finally:
+            if isinstance(exc.fd, int) and not isinstance(exc.fd, bool) and exc.fd >= 0:
+                try:
+                    os.close(exc.fd)
+                except OSError:
+                    pass
+        raise StoreSafetyError(
+            "directory-creation-identity-inconclusive",
+            "The trusted directory creator reported a failure after entering "
+            f"its creation boundary; preserve the returned evidence: "
+            f"{display_path}: {exc}",
+            details=details,
+        ) from exc
+    except Exception as exc:
+        raise StoreSafetyError(
+            "directory-creation-identity-inconclusive",
+            "The trusted directory creator raised without structured "
+            "create-then-fail evidence; mutation cannot be excluded: "
+            f"{display_path}: {exc}",
+            details=_unstructured_directory_creation_failure_details(
+                exc,
+                display_path=display_path,
+            ),
+        ) from exc
 
     def rejected_creation_details(
         *,
@@ -3776,6 +3992,13 @@ def _create_and_install_directory_at(
                 and provider_staging_basename
             ):
                 staging_name = provider_staging_basename
+            provider_install_state = exc.details.get("provider_install_state")
+            if (
+                install_state == "not-created"
+                and isinstance(provider_install_state, str)
+                and provider_install_state
+            ):
+                install_state = provider_install_state
         details = _created_directory_install_recovery_details(
             parent_fd=parent_fd,
             parent_opened=parent_opened,
@@ -7950,6 +8173,15 @@ def _post_publication_uncertain_error(
     )
 
 
+def _latch_publication_commit(state: dict[str, Any] | None) -> None:
+    """Record a monotonic commit fact before any post-rename evidence work."""
+
+    if state is None:
+        return
+    state["committed"] = True
+    state["commit_boundary"] = "no-replace-rename-returned-or-proved-committed"
+
+
 @contextmanager
 def _post_publication_failure_guard(
     state: dict[str, Any],
@@ -7977,6 +8209,12 @@ def _post_publication_failure_guard(
             message=message,
             additional_details=(additional if isinstance(additional, dict) else None),
         )
+        if (
+            isinstance(exc, StoreSafetyError)
+            and exc.code == "destination-install-uncertain"
+        ):
+            exc.details = error.details
+            raise
         raise error from exc
 
 
@@ -8343,6 +8581,8 @@ def _observe_bound_sibling(
 def _publish_file_no_replace(
     prepared: _BoundRegularFile,
     destination: Path,
+    *,
+    publication_guard: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Install one bound file and classify every publication failure."""
 
@@ -8366,6 +8606,7 @@ def _publish_file_no_replace(
                 prepared,
                 destination,
                 parent_fd,
+                publication_guard=publication_guard,
             )
     except StoreSafetyError as exc:
         if exc.details:
@@ -8386,6 +8627,8 @@ def _publish_file_no_replace_from_parent(
     prepared: _BoundRegularFile,
     destination: Path,
     parent_fd: int,
+    *,
+    publication_guard: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if prepared.parent_opened is None:
         raise StoreSafetyError(
@@ -8425,6 +8668,7 @@ def _publish_file_no_replace_from_parent(
             and _same_identity(prepared.opened, source_after)
         )
         if committed:
+            _latch_publication_commit(publication_guard)
             descriptor_bound_prepared_file = _descriptor_bound_file_recovery_evidence(
                 parent_fd,
                 prepared,
@@ -8439,6 +8683,10 @@ def _publish_file_no_replace_from_parent(
                 )
             except Exception:
                 descriptor_bound_destination = None
+            if publication_guard is not None:
+                publication_guard["descriptor_bound_destination"] = (
+                    descriptor_bound_destination
+                )
             raise StoreSafetyError(
                 "destination-install-uncertain",
                 "The destination contains the prepared database, but the "
@@ -8564,6 +8812,7 @@ def _publish_file_no_replace_from_parent(
             ),
         ) from exc
 
+    _latch_publication_commit(publication_guard)
     try:
         source_state, _ = _observe_bound_sibling(
             parent_fd,
@@ -8636,6 +8885,10 @@ def _publish_file_no_replace_from_parent(
         )
         if terminal_alias_receipt is not None:
             descriptor_bound_destination["trusted_alias"] = terminal_alias_receipt
+        if publication_guard is not None:
+            publication_guard["descriptor_bound_destination"] = (
+                descriptor_bound_destination
+            )
     except Exception as exc:
         descriptor_bound_prepared_file = _descriptor_bound_file_recovery_evidence(
             parent_fd,
@@ -8652,6 +8905,10 @@ def _publish_file_no_replace_from_parent(
                 )
             except Exception:
                 descriptor_bound_destination = None
+        if publication_guard is not None:
+            publication_guard["descriptor_bound_destination"] = (
+                descriptor_bound_destination
+            )
         raise StoreSafetyError(
             "destination-install-uncertain",
             "The recovered database was renamed into place, but final durability "
@@ -9708,6 +9965,7 @@ def _recover_validated_clone_to_standalone(
                 prepared,
                 out,
                 output_parent_binding.fd,
+                publication_guard=publication_guard,
             )
             publication_guard["committed"] = True
             try:
@@ -10155,6 +10413,7 @@ def copy_db(
                     descriptor_tree_receipt_builder=(
                         build_descriptor_snapshot_tree_receipt
                     ),
+                    publication_guard=publication_guard,
                 )
                 publication_guard["committed"] = True
                 publication_guard["descriptor_bound_destination"] = publication_receipt
@@ -11475,6 +11734,7 @@ def stage_patch(
                     descriptor_tree_receipt_builder=(
                         build_descriptor_stage_tree_receipt
                     ),
+                    publication_guard=publication_guard,
                 )
                 publication_guard["committed"] = True
                 publication_guard["descriptor_bound_destination"] = publication_receipt

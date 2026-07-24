@@ -37,6 +37,22 @@ COMPATIBILITY_SCRIPT = REPO_ROOT / "scripts/apple_notes_helper.py"
 HOT_JOURNAL_FIXTURE = REPO_ROOT / "tests/create_hot_rollback_journal.py"
 
 
+@contextmanager
+def _fail_if_deadline_exceeded(seconds: float) -> Iterator[None]:
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def raise_timeout(_signum: int, _frame: object) -> None:
+        raise TimeoutError(f"operation exceeded {seconds:.3f}s deadline")
+
+    signal.signal(signal.SIGALRM, raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
 class AppleNotesHelperTests(unittest.TestCase):
     def setUp(self) -> None:
         self._snapshot_manifest_receipts: dict[Path, dict[str, object]] = {}
@@ -1091,6 +1107,180 @@ raise SystemExit(2)
                 "creation-identity-inconclusive",
             )
             self.assertIsNone(recovery["creation_proof"])
+
+    def test_structured_creator_create_then_fail_retains_conservative_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            created_path = root / ".apple-notes-create-structured-failure"
+            transferred_fd: int | None = None
+
+            def create_then_fail(
+                parent_fd: int,
+                _prefix: str,
+            ) -> MODULE._IdentityBoundDirectoryCreation:
+                nonlocal transferred_fd
+                os.mkdir(created_path.name, mode=0o700, dir_fd=parent_fd)
+                transferred_fd = os.open(
+                    created_path.name,
+                    MODULE._directory_open_flags(),
+                    dir_fd=parent_fd,
+                )
+                opened = os.fstat(transferred_fd)
+                parent = os.fstat(parent_fd)
+                raise MODULE._IdentityBoundDirectoryCreationFailure(
+                    "simulated provider failure after creation",
+                    staging_basename=created_path.name,
+                    fd=transferred_fd,
+                    opened=opened,
+                    proof={
+                        "schema": ("apple-notes-identity-bound-directory-creation/v1"),
+                        "creation_authority": "test-create-then-fail-provider",
+                        "actual_created_object_descriptor_returned": True,
+                        "namespace_exclusive_during_handoff": True,
+                        "parent_identity": MODULE._identity(parent),
+                        "parent_access_policy": MODULE._access_policy(parent),
+                        "directory_identity": MODULE._identity(opened),
+                        "directory_access_policy": MODULE._access_policy(opened),
+                    },
+                    details={
+                        "mutation_performed": False,
+                        "cleanup_state": "complete",
+                        "retry_safe": True,
+                    },
+                )
+
+            parent_fd = os.open(root, MODULE._directory_open_flags())
+            try:
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_IDENTITY_BOUND_DIRECTORY_CREATOR",
+                        create_then_fail,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE._create_and_install_directory_at(
+                        parent_fd,
+                        os.fstat(parent_fd),
+                        "installed",
+                        display_path=root / "installed",
+                        revalidate_scope=None,
+                        identity_code="prepared-directory-identity-mismatch",
+                        access_policy_code=(
+                            "prepared-directory-access-policy-mismatch"
+                        ),
+                        inconclusive_code=(
+                            "prepared-directory-revalidation-inconclusive"
+                        ),
+                        collision_code="prepared-directory-identity-mismatch",
+                    )
+            finally:
+                os.close(parent_fd)
+
+            self._assert_safety_code(
+                "directory-creation-identity-inconclusive",
+                raised,
+            )
+            self.assertTrue(created_path.is_dir())
+            self.assertFalse((root / "installed").exists())
+            self.assertIsNotNone(transferred_fd)
+            assert transferred_fd is not None
+            with self.assertRaises(OSError) as closed:
+                os.fstat(transferred_fd)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+            details = raised.exception.details
+            self.assertTrue(details["mutation_performed"])
+            self.assertFalse(details["retry_safe"])
+            self.assertEqual(
+                details["cleanup_state"],
+                "preserved-no-identity-safe-directory-unlink",
+            )
+            provider_recovery = details["recovery_locators"][
+                "identity_bound_directory_creation_failure"
+            ]
+            self.assertEqual(
+                provider_recovery["protected_property"],
+                "creation-identity-inconclusive",
+            )
+            self.assertEqual(
+                provider_recovery["creation_state"],
+                "create-then-fail",
+            )
+            self.assertTrue(
+                provider_recovery["created_descriptor"]["matches_creation_receipt"]
+            )
+            self.assertTrue(
+                provider_recovery["namespace_observations"]["staging_name"][
+                    "matches_created_identity"
+                ]
+            )
+            self.assertIn(
+                "created_directory_install",
+                details["recovery_locators"],
+            )
+
+    def test_unstructured_creator_failure_never_claims_no_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            created_path = root / ".apple-notes-create-unstructured-failure"
+
+            def create_then_raise_unstructured(
+                parent_fd: int,
+                _prefix: str,
+            ) -> MODULE._IdentityBoundDirectoryCreation:
+                os.mkdir(created_path.name, mode=0o700, dir_fd=parent_fd)
+                raise RuntimeError("simulated unstructured provider failure")
+
+            parent_fd = os.open(root, MODULE._directory_open_flags())
+            try:
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_IDENTITY_BOUND_DIRECTORY_CREATOR",
+                        create_then_raise_unstructured,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE._create_and_install_directory_at(
+                        parent_fd,
+                        os.fstat(parent_fd),
+                        "installed",
+                        display_path=root / "installed",
+                        revalidate_scope=None,
+                        identity_code="prepared-directory-identity-mismatch",
+                        access_policy_code=(
+                            "prepared-directory-access-policy-mismatch"
+                        ),
+                        inconclusive_code=(
+                            "prepared-directory-revalidation-inconclusive"
+                        ),
+                        collision_code="prepared-directory-identity-mismatch",
+                    )
+            finally:
+                os.close(parent_fd)
+
+            self._assert_safety_code(
+                "directory-creation-identity-inconclusive",
+                raised,
+            )
+            self.assertTrue(created_path.is_dir())
+            details = raised.exception.details
+            self.assertTrue(details["mutation_performed"])
+            self.assertFalse(details["retry_safe"])
+            self.assertEqual(details["cleanup_state"], "inconclusive")
+            provider_recovery = details["recovery_locators"][
+                "identity_bound_directory_creation_failure"
+            ]
+            self.assertEqual(
+                provider_recovery["creation_state"],
+                "unknown-after-creator-entry",
+            )
+            self.assertEqual(
+                provider_recovery["evidence_status"],
+                "inconclusive",
+            )
 
     def test_creator_handoff_replacement_is_retained_without_created_object_claim(
         self,
@@ -2455,6 +2645,7 @@ raise SystemExit(2)
                     source_opens += 1
                     self.assertIsNotNone(dir_fd)
                     self.assertTrue(flags & getattr(os, "O_NOFOLLOW", 0))
+                    self.assertTrue(flags & getattr(os, "O_NONBLOCK", 0))
                 if dir_fd is None:
                     return original_open(path, flags, mode)
                 return original_open(path, flags, mode, dir_fd=dir_fd)
@@ -2486,6 +2677,142 @@ raise SystemExit(2)
         self.assertEqual(group_binds, 1)
         self.assertEqual(source_opens, 1)
         self.assertEqual(result["files"][0]["basename"], MODULE.NOTE_STORE_MAIN)
+
+    def test_untrusted_regular_openers_reject_fifo_swaps_before_deadline(
+        self,
+    ) -> None:
+        for opener in ("path", "descriptor-relative", "bound-file"):
+            with (
+                self.subTest(opener=opener),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                leaf = root / MODULE.NOTE_STORE_MAIN
+                leaf.write_bytes(b"regular-before-race")
+                original_stat = MODULE.os.stat
+                swapped = False
+
+                with MODULE._bind_existing_directory_with_trusted_alias(root) as parent:
+
+                    def swap_regular_for_fifo(
+                        selected: object,
+                        *args: object,
+                        **kwargs: object,
+                    ) -> os.stat_result:
+                        nonlocal swapped
+                        result = original_stat(selected, *args, **kwargs)
+                        selected_path = os.fspath(selected)
+                        is_target = (
+                            opener == "path"
+                            and kwargs.get("dir_fd") is None
+                            and selected_path == os.fspath(leaf)
+                        ) or (
+                            opener != "path"
+                            and kwargs.get("dir_fd") == parent.fd
+                            and selected_path == leaf.name
+                        )
+                        if is_target and not swapped:
+                            leaf.unlink()
+                            os.mkfifo(leaf, mode=0o600)
+                            swapped = True
+                        return result
+
+                    with (
+                        mock.patch.object(
+                            MODULE.os,
+                            "stat",
+                            side_effect=swap_regular_for_fifo,
+                        ),
+                        _fail_if_deadline_exceeded(1.0),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        if opener == "path":
+                            MODULE._open_regular_readonly(leaf)
+                        elif opener == "descriptor-relative":
+                            MODULE._open_regular_readonly_at(
+                                parent,
+                                leaf.name,
+                                display_path=leaf,
+                            )
+                        else:
+                            with MODULE._bind_regular_file_at(
+                                leaf,
+                                parent,
+                                MODULE.SOURCE_FILE_CODES,
+                            ):
+                                self.fail("FIFO replacement was accepted")
+
+                self.assertTrue(swapped)
+                self.assertIn(
+                    raised.exception.code,
+                    {"source-not-regular", "source-identity-mismatch"},
+                )
+
+    def test_untrusted_device_race_uses_nonblocking_open_before_deadline(
+        self,
+    ) -> None:
+        device = Path("/dev/null")
+        if not device.exists():
+            self.skipTest("/dev/null is unavailable")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            regular = Path(temp_dir) / "regular"
+            regular.write_bytes(b"regular-before-device-race")
+            regular_stat = regular.stat()
+            original_stat = MODULE.os.stat
+            original_open = MODULE.os.open
+            substituted = False
+            opened_device = False
+
+            def substitute_regular_preopen_stat(
+                selected: object,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal substituted
+                if (
+                    not substituted
+                    and kwargs.get("dir_fd") is None
+                    and os.fspath(selected) == os.fspath(device)
+                ):
+                    substituted = True
+                    return regular_stat
+                return original_stat(selected, *args, **kwargs)
+
+            def require_nonblocking_device_open(
+                selected: object,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal opened_device
+                if dir_fd is None and os.fspath(selected) == os.fspath(device):
+                    opened_device = True
+                    self.assertTrue(flags & getattr(os, "O_NOFOLLOW", 0))
+                    self.assertTrue(flags & getattr(os, "O_NONBLOCK", 0))
+                if dir_fd is None:
+                    return original_open(selected, flags, mode)
+                return original_open(selected, flags, mode, dir_fd=dir_fd)
+
+            with (
+                mock.patch.object(
+                    MODULE.os,
+                    "stat",
+                    side_effect=substitute_regular_preopen_stat,
+                ),
+                mock.patch.object(
+                    MODULE.os,
+                    "open",
+                    side_effect=require_nonblocking_device_open,
+                ),
+                _fail_if_deadline_exceeded(1.0),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._open_regular_readonly(device)
+
+        self.assertTrue(substituted)
+        self.assertTrue(opened_device)
+        self._assert_safety_code("source-not-regular", raised)
 
     def test_fingerprint_rejects_complete_source_chain_component_replacement(
         self,
@@ -4370,11 +4697,14 @@ raise SystemExit(2)
                         prepared: MODULE._BoundRegularFile,
                         destination: Path,
                         parent_fd: int,
+                        *,
+                        publication_guard: dict[str, object] | None = None,
                     ) -> dict[str, object]:
                         result = original_publish(
                             prepared,
                             destination,
                             parent_fd,
+                            publication_guard=publication_guard,
                         )
                         if destination == merged:
                             sidecar.write_bytes(b"raced-sidecar")
@@ -4431,8 +4761,15 @@ raise SystemExit(2)
                 prepared: MODULE._BoundRegularFile,
                 destination: Path,
                 parent_fd: int,
+                *,
+                publication_guard: dict[str, object] | None = None,
             ) -> dict[str, object]:
-                result = original_publish(prepared, destination, parent_fd)
+                result = original_publish(
+                    prepared,
+                    destination,
+                    parent_fd,
+                    publication_guard=publication_guard,
+                )
                 if destination == merged:
                     sidecar.symlink_to("missing-target")
                 return result
@@ -4485,12 +4822,15 @@ raise SystemExit(2)
                         prepared: MODULE._BoundRegularFile,
                         destination: Path,
                         parent_fd: int,
+                        *,
+                        publication_guard: dict[str, object] | None = None,
                     ) -> dict[str, object]:
                         nonlocal published
                         result = original_publish(
                             prepared,
                             destination,
                             parent_fd,
+                            publication_guard=publication_guard,
                         )
                         published = destination == merged
                         return result
@@ -4556,9 +4896,16 @@ raise SystemExit(2)
                 prepared: MODULE._BoundRegularFile,
                 destination: Path,
                 parent_fd: int,
+                *,
+                publication_guard: dict[str, object] | None = None,
             ) -> dict[str, object]:
                 nonlocal published
-                result = original_publish(prepared, destination, parent_fd)
+                result = original_publish(
+                    prepared,
+                    destination,
+                    parent_fd,
+                    publication_guard=publication_guard,
+                )
                 published = destination == merged
                 return result
 
@@ -4623,9 +4970,16 @@ raise SystemExit(2)
                 prepared: MODULE._BoundRegularFile,
                 destination: Path,
                 parent_fd: int,
+                *,
+                publication_guard: dict[str, object] | None = None,
             ) -> dict[str, object]:
                 nonlocal published
-                result = original_publish(prepared, destination, parent_fd)
+                result = original_publish(
+                    prepared,
+                    destination,
+                    parent_fd,
+                    publication_guard=publication_guard,
+                )
                 published = destination == merged
                 return result
 
@@ -4698,9 +5052,16 @@ raise SystemExit(2)
                 prepared: MODULE._BoundRegularFile,
                 destination: Path,
                 parent_fd: int,
+                *,
+                publication_guard: dict[str, object] | None = None,
             ) -> dict[str, object]:
                 nonlocal published
-                result = original_publish(prepared, destination, parent_fd)
+                result = original_publish(
+                    prepared,
+                    destination,
+                    parent_fd,
+                    publication_guard=publication_guard,
+                )
                 published = destination == merged
                 return result
 
@@ -7602,8 +7963,15 @@ raise SystemExit(2)
                 prepared: MODULE._BoundRegularFile,
                 destination: Path,
                 parent_fd: int,
+                *,
+                publication_guard: dict[str, object] | None = None,
             ) -> dict[str, object]:
-                result = original_publish(prepared, destination, parent_fd)
+                result = original_publish(
+                    prepared,
+                    destination,
+                    parent_fd,
+                    publication_guard=publication_guard,
+                )
                 if destination == recovered:
                     wal.write_bytes(b"raced-wal")
                 return result
@@ -9285,6 +9653,260 @@ raise SystemExit(2)
                         "descriptor_bound_prepared_root",
                         details["recovery_locators"],
                     )
+
+    def test_standalone_commit_latch_precedes_recovery_evidence_failures(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            source = paths.group_container / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            destination = root / "recovered.sqlite"
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_descriptor_bound_destination_receipt",
+                    side_effect=RuntimeError(
+                        "simulated terminal destination receipt failure"
+                    ),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_descriptor_bound_file_recovery_evidence",
+                    side_effect=RuntimeError("simulated fallback evidence failure"),
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.merge_db(
+                    source,
+                    destination,
+                    paths=paths,
+                )
+
+            self._assert_safety_code("destination-install-uncertain", raised)
+            self.assertTrue(destination.is_file())
+            details = raised.exception.details
+            self.assertTrue(details["mutation_performed"])
+            self.assertEqual(details["publication_state"], "uncertain")
+            self.assertFalse(details["retry_safe"])
+            self.assertEqual(details["cleanup_state"], "retained")
+            self.assertEqual(
+                details["post_publication_phase"],
+                "standalone-output-transaction-teardown",
+            )
+            self.assertIn(
+                "post_publication_failure",
+                details["recovery_locators"],
+            )
+            self.assertEqual(
+                details["post_publication_error_type"],
+                "RuntimeError",
+            )
+            receipt = details["recovery_locators"]["post_publication_failure"]
+            self.assertTrue(receipt["mutation_performed"])
+            self.assertFalse(receipt["retry_safe"])
+
+    def test_standalone_proved_commit_latches_before_fallback_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            destination = root / "recovered.sqlite"
+            original_rename = MODULE._rename_file_no_replace_at
+
+            def commit_then_report_error(
+                parent_fd: int,
+                source_name: str,
+                destination_name: str,
+            ) -> None:
+                original_rename(parent_fd, source_name, destination_name)
+                raise OSError(
+                    errno.EIO,
+                    "simulated commit-then-error file rename",
+                )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_rename_file_no_replace_at",
+                    side_effect=commit_then_report_error,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_descriptor_bound_file_recovery_evidence",
+                    side_effect=RuntimeError(
+                        "simulated proved-commit evidence failure"
+                    ),
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.merge_db(source, destination)
+
+            self._assert_safety_code("destination-install-uncertain", raised)
+            self.assertTrue(destination.is_file())
+            details = raised.exception.details
+            self.assertTrue(details["mutation_performed"])
+            self.assertEqual(details["publication_state"], "uncertain")
+            self.assertFalse(details["retry_safe"])
+            self.assertEqual(
+                details["post_publication_phase"],
+                "standalone-output-transaction-teardown",
+            )
+            self.assertIn(
+                "post_publication_failure",
+                details["recovery_locators"],
+            )
+
+    def test_directory_proved_commit_latches_before_fallback_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            destination = root / "stage"
+            original_rename = MODULE._rename_directory_no_replace_at
+
+            def commit_then_report_error(
+                parent_fd: int,
+                source_name: str,
+                destination_name: str,
+            ) -> None:
+                original_rename(parent_fd, source_name, destination_name)
+                raise OSError(
+                    errno.EIO,
+                    "simulated commit-then-error directory rename",
+                )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_rename_directory_no_replace_at",
+                    side_effect=commit_then_report_error,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_descriptor_bound_directory_recovery_evidence",
+                    side_effect=RuntimeError(
+                        "simulated proved-commit directory evidence failure"
+                    ),
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.stage_patch(
+                    edited,
+                    destination,
+                    paths=paths,
+                )
+
+            self._assert_safety_code("destination-install-uncertain", raised)
+            self.assertTrue(destination.is_dir())
+            details = raised.exception.details
+            self.assertTrue(details["mutation_performed"])
+            self.assertEqual(details["publication_state"], "uncertain")
+            self.assertFalse(details["retry_safe"])
+            self.assertEqual(
+                details["post_publication_phase"],
+                "patch-stage-transaction-teardown",
+            )
+            self.assertIn(
+                "post_publication_failure",
+                details["recovery_locators"],
+            )
+
+    def test_directory_commit_latch_precedes_recovery_evidence_failures(
+        self,
+    ) -> None:
+        for artifact_kind in ("snapshot", "patch-stage"):
+            with (
+                self.subTest(artifact_kind=artifact_kind),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                source = paths.group_container / MODULE.NOTE_STORE_MAIN
+                self._create_db(source)
+                edited = root / "edited.sqlite"
+                self._create_db(edited, value="edited")
+                destination = root / artifact_kind
+                expected_phase = (
+                    "snapshot-transaction-teardown"
+                    if artifact_kind == "snapshot"
+                    else "patch-stage-transaction-teardown"
+                )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_verify_installed_directory_path",
+                        side_effect=RuntimeError(
+                            "simulated terminal directory proof failure"
+                        ),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_descriptor_bound_directory_recovery_evidence",
+                        side_effect=RuntimeError(
+                            "simulated directory fallback evidence failure"
+                        ),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    if artifact_kind == "snapshot":
+                        MODULE.copy_db(
+                            paths,
+                            dest=destination,
+                            require_notes_quit=True,
+                        )
+                    else:
+                        MODULE.stage_patch(
+                            edited,
+                            destination,
+                            paths=paths,
+                        )
+
+                self._assert_safety_code(
+                    "destination-install-uncertain",
+                    raised,
+                )
+                self.assertTrue(destination.is_dir())
+                details = raised.exception.details
+                self.assertTrue(details["mutation_performed"])
+                self.assertEqual(details["publication_state"], "uncertain")
+                self.assertFalse(details["retry_safe"])
+                self.assertEqual(
+                    details["cleanup_state"],
+                    "preserved-or-incomplete",
+                )
+                self.assertEqual(
+                    details["post_publication_phase"],
+                    expected_phase,
+                )
+                self.assertEqual(
+                    details["post_publication_error_type"],
+                    "StoreSafetyError",
+                )
+                self.assertEqual(
+                    details["post_publication_error_code"],
+                    "prepared-operation-failed",
+                )
+                self.assertEqual(
+                    details["underlying_error_type"],
+                    "RuntimeError",
+                )
+                receipt = details["recovery_locators"]["post_publication_failure"]
+                self.assertTrue(receipt["mutation_performed"])
+                self.assertFalse(receipt["retry_safe"])
 
     def test_post_publication_base_exceptions_are_not_overcaught(self) -> None:
         for base_exception in (KeyboardInterrupt(), SystemExit(17)):
