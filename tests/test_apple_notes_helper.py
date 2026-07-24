@@ -41,6 +41,46 @@ class AppleNotesHelperTests(unittest.TestCase):
     def setUp(self) -> None:
         self._snapshot_manifest_receipts: dict[Path, dict[str, object]] = {}
         self._stage_manifest_receipts: dict[Path, dict[str, object]] = {}
+        self._directory_creator_patch = mock.patch.object(
+            MODULE,
+            "_IDENTITY_BOUND_DIRECTORY_CREATOR",
+            self._synthetic_identity_bound_directory_creator,
+        )
+        self._directory_creator_patch.start()
+        self.addCleanup(self._directory_creator_patch.stop)
+
+    def _synthetic_identity_bound_directory_creator(
+        self,
+        parent_fd: int,
+        prefix: str,
+    ) -> MODULE._IdentityBoundDirectoryCreation:
+        """Model the trusted platform boundary; production has no such fallback."""
+
+        for _ in range(8):
+            basename = f"{prefix}{MODULE.uuid.uuid4().hex}"
+            try:
+                os.mkdir(basename, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            fd = os.open(basename, MODULE._directory_open_flags(), dir_fd=parent_fd)
+            opened = os.fstat(fd)
+            parent = os.fstat(parent_fd)
+            return MODULE._IdentityBoundDirectoryCreation(
+                basename=basename,
+                fd=fd,
+                opened=opened,
+                proof={
+                    "schema": ("apple-notes-identity-bound-directory-creation/v1"),
+                    "creation_authority": "test-only-synthetic-platform-provider",
+                    "actual_created_object_descriptor_returned": True,
+                    "namespace_exclusive_during_handoff": True,
+                    "parent_identity": MODULE._identity(parent),
+                    "parent_access_policy": MODULE._access_policy(parent),
+                    "directory_identity": MODULE._identity(opened),
+                    "directory_access_policy": MODULE._access_policy(opened),
+                },
+            )
+        raise OSError(errno.EEXIST, "synthetic creator exhausted candidate names")
 
     def _copy_db(
         self,
@@ -997,13 +1037,172 @@ raise SystemExit(2)
                     assert receipt is not None
                     self.assertEqual(
                         receipt["creation_protocol"],
-                        (
-                            "randomized-owner-private-staging-bind-before-"
-                            "no-replace-install"
-                        ),
+                        "trusted-creator-returned-fd-before-no-replace-install",
                     )
             self.assertTrue(touched)
             self.assertTrue(destination.parent.is_dir())
+
+    def test_directory_creation_without_identity_bound_provider_fails_before_mkdir(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            parent_fd = os.open(root, MODULE._directory_open_flags())
+            try:
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_IDENTITY_BOUND_DIRECTORY_CREATOR",
+                        None,
+                    ),
+                    mock.patch.object(MODULE.os, "mkdir") as mkdir,
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE._create_and_install_directory_at(
+                        parent_fd,
+                        os.fstat(parent_fd),
+                        "created",
+                        display_path=root / "created",
+                        revalidate_scope=None,
+                        identity_code="prepared-directory-identity-mismatch",
+                        access_policy_code=(
+                            "prepared-directory-access-policy-mismatch"
+                        ),
+                        inconclusive_code=(
+                            "prepared-directory-revalidation-inconclusive"
+                        ),
+                        collision_code="prepared-directory-identity-mismatch",
+                    )
+            finally:
+                os.close(parent_fd)
+
+            self._assert_safety_code(
+                "directory-creation-identity-inconclusive",
+                raised,
+            )
+            mkdir.assert_not_called()
+            self.assertFalse((root / "created").exists())
+            details = raised.exception.details
+            self.assertFalse(details["mutation_performed"])
+            self.assertFalse(details["retry_safe"])
+            recovery = details["recovery_locators"]["created_directory_install"]
+            self.assertEqual(
+                recovery["protected_property"],
+                "creation-identity-inconclusive",
+            )
+            self.assertIsNone(recovery["creation_proof"])
+
+    def test_creator_handoff_replacement_is_retained_without_created_object_claim(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            parked = root / "provider-created-object"
+            replacement = root / "provider-name-replacement"
+            returned_fd: int | None = None
+
+            def replace_before_handoff(
+                parent_fd: int,
+                prefix: str,
+            ) -> MODULE._IdentityBoundDirectoryCreation:
+                nonlocal returned_fd
+                basename = f"{prefix}replacement-race"
+                os.mkdir(basename, mode=0o700, dir_fd=parent_fd)
+                returned_fd = os.open(
+                    basename,
+                    MODULE._directory_open_flags(),
+                    dir_fd=parent_fd,
+                )
+                opened = os.fstat(returned_fd)
+                parent = os.fstat(parent_fd)
+                os.rename(
+                    basename,
+                    parked.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                os.mkdir(basename, mode=0o700, dir_fd=parent_fd)
+                os.rename(
+                    basename,
+                    replacement.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                os.mkdir(basename, mode=0o700, dir_fd=parent_fd)
+                return MODULE._IdentityBoundDirectoryCreation(
+                    basename=basename,
+                    fd=returned_fd,
+                    opened=opened,
+                    proof={
+                        "schema": ("apple-notes-identity-bound-directory-creation/v1"),
+                        "creation_authority": "test-provider-race",
+                        "actual_created_object_descriptor_returned": True,
+                        "namespace_exclusive_during_handoff": True,
+                        "parent_identity": MODULE._identity(parent),
+                        "parent_access_policy": MODULE._access_policy(parent),
+                        "directory_identity": MODULE._identity(opened),
+                        "directory_access_policy": MODULE._access_policy(opened),
+                    },
+                )
+
+            parent_fd = os.open(root, MODULE._directory_open_flags())
+            try:
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_IDENTITY_BOUND_DIRECTORY_CREATOR",
+                        replace_before_handoff,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE._create_and_install_directory_at(
+                        parent_fd,
+                        os.fstat(parent_fd),
+                        "installed",
+                        display_path=root / "installed",
+                        revalidate_scope=None,
+                        identity_code="prepared-directory-identity-mismatch",
+                        access_policy_code=(
+                            "prepared-directory-access-policy-mismatch"
+                        ),
+                        inconclusive_code=(
+                            "prepared-directory-revalidation-inconclusive"
+                        ),
+                        collision_code="prepared-directory-identity-mismatch",
+                    )
+            finally:
+                os.close(parent_fd)
+
+            self._assert_safety_code(
+                "prepared-directory-identity-mismatch",
+                raised,
+            )
+            self.assertIsNotNone(returned_fd)
+            assert returned_fd is not None
+            with self.assertRaises(OSError) as closed:
+                os.fstat(returned_fd)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+            self.assertTrue(parked.is_dir())
+            self.assertTrue(replacement.is_dir())
+            self.assertTrue((root / ".apple-notes-create-replacement-race").is_dir())
+            self.assertFalse((root / "installed").exists())
+            details = raised.exception.details
+            self.assertTrue(details["mutation_performed"])
+            self.assertFalse(details["retry_safe"])
+            recovery = details["recovery_locators"]["created_directory_install"]
+            self.assertEqual(
+                recovery["protected_property"],
+                "creation-identity-inconclusive",
+            )
+            self.assertIsNone(recovery["creation_proof"])
+            self.assertEqual(
+                recovery["namespace_observations"]["staging_name"]["status"],
+                "present",
+            )
+            self.assertNotIn(
+                "transaction-created-object-identity",
+                json.dumps(recovery, sort_keys=True),
+            )
 
     def test_destination_component_install_rejects_access_policy_transition(
         self,
@@ -2018,7 +2217,8 @@ raise SystemExit(2)
                 if (
                     after_primary_revalidation
                     and not attacked
-                    and Path(os.fspath(target)) == source
+                    and Path(os.fspath(target)).name == source.name
+                    and kwargs.get("dir_fd") is not None
                 ):
                     attacked = True
                     source.chmod(0o640)
@@ -2156,7 +2356,10 @@ raise SystemExit(2)
                     **kwargs: object,
                 ) -> object:
                     if after_primary_revalidation:
-                        if syscall == "fstat" or Path(os.fspath(args[0])) == source:
+                        if syscall == "fstat" or (
+                            Path(os.fspath(args[0])).name == source.name
+                            and kwargs.get("dir_fd") is not None
+                        ):
                             raise OSError(
                                 MODULE.errno.EIO,
                                 "simulated final revalidation EIO",
@@ -2200,6 +2403,16 @@ raise SystemExit(2)
                     "validate_database_recovery",
                     side_effect=AssertionError("path recovery helper used"),
                 ),
+                mock.patch.object(
+                    MODULE,
+                    "_discover_database_files",
+                    side_effect=AssertionError("path discovery helper used"),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_open_regular_readonly",
+                    side_effect=AssertionError("path source opener used"),
+                ),
             ):
                 result = self._copy_db(
                     paths,
@@ -2208,6 +2421,122 @@ raise SystemExit(2)
                 )
 
         self.assertEqual(result["sqlite_validation"]["result"], "ok")
+
+    def test_fingerprint_binds_group_chain_once_and_opens_store_via_parent_fd(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            source = paths.group_container / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            original_bind = MODULE._bind_existing_directory_with_trusted_alias
+            original_open = MODULE.os.open
+            group_binds = 0
+            source_opens = 0
+
+            @contextmanager
+            def count_group_binding(path: Path) -> Iterator[MODULE._BoundDirectory]:
+                nonlocal group_binds
+                if MODULE._absolute_path(path) == paths.group_container:
+                    group_binds += 1
+                with original_bind(path) as binding:
+                    yield binding
+
+            def require_descriptor_relative_source_open(
+                path: object,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal source_opens
+                if os.fspath(path) in MODULE.NOTE_STORE_DISCOVERY_BASENAMES:
+                    source_opens += 1
+                    self.assertIsNotNone(dir_fd)
+                    self.assertTrue(flags & getattr(os, "O_NOFOLLOW", 0))
+                if dir_fd is None:
+                    return original_open(path, flags, mode)
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_bind_existing_directory_with_trusted_alias",
+                    side_effect=count_group_binding,
+                ),
+                mock.patch.object(
+                    MODULE.os,
+                    "open",
+                    side_effect=require_descriptor_relative_source_open,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_discover_database_files",
+                    side_effect=AssertionError("path discovery helper used"),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_open_regular_readonly",
+                    side_effect=AssertionError("path source opener used"),
+                ),
+            ):
+                result = MODULE.fingerprint_note_store(paths)
+
+        self.assertEqual(group_binds, 1)
+        self.assertEqual(source_opens, 1)
+        self.assertEqual(result["files"][0]["basename"], MODULE.NOTE_STORE_MAIN)
+
+    def test_fingerprint_rejects_complete_source_chain_component_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_root = root / "source-root"
+            source_root.mkdir()
+            paths = self._make_paths(source_root)
+            source = paths.group_container / MODULE.NOTE_STORE_MAIN
+            self._create_db(source, value="validated")
+            parked = root / "source-root-parked"
+            replacement = root / "source-root-replacement"
+            replacement.mkdir()
+            replacement_paths = self._make_paths(replacement)
+            self._create_db(
+                replacement_paths.group_container / MODULE.NOTE_STORE_MAIN,
+                value="replacement",
+            )
+            original_capture = MODULE._capture_bound_source_store
+            attacked = False
+
+            def replace_ancestor_after_binding(
+                store: MODULE._BoundSourceStore,
+                *args: object,
+                **kwargs: object,
+            ) -> list[dict[str, object]]:
+                nonlocal attacked
+                if not attacked:
+                    attacked = True
+                    source_root.rename(parked)
+                    replacement.rename(source_root)
+                return original_capture(store, *args, **kwargs)
+
+            try:
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_capture_bound_source_store",
+                        side_effect=replace_ancestor_after_binding,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE.fingerprint_note_store(paths)
+                self.assertTrue(attacked)
+                self._assert_safety_code("source-identity-mismatch", raised)
+            finally:
+                if parked.exists():
+                    if source_root.exists():
+                        source_root.rename(replacement)
+                    parked.rename(source_root)
 
     def test_copy_db_creates_copy_through_bound_parent_during_swap_restore(
         self,
@@ -2963,20 +3292,23 @@ raise SystemExit(2)
             database = root / MODULE.NOTE_STORE_MAIN
             self._create_db(database)
             journal = database.with_name(f"{database.name}-journal")
-            original_discovery = MODULE._discover_database_files
+            original_discovery = MODULE._discover_database_files_at
             discovery_count = 0
 
-            def journal_appears(main_path: Path) -> list[Path]:
+            def journal_appears(
+                main_path: Path,
+                parent: MODULE._BoundDirectory,
+            ) -> list[Path]:
                 nonlocal discovery_count
                 discovery_count += 1
                 if discovery_count == 2:
                     journal.write_bytes(b"appeared-during-binding")
-                return original_discovery(main_path)
+                return original_discovery(main_path, parent)
 
             with (
                 mock.patch.object(
                     MODULE,
-                    "_discover_database_files",
+                    "_discover_database_files_at",
                     side_effect=journal_appears,
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
@@ -6748,15 +7080,20 @@ raise SystemExit(2)
             )
             for target, validator, argument, expected_code in targets:
                 with self.subTest(target=target):
-                    original_integrity = MODULE._sqlite_integrity
+                    integrity_boundary = (
+                        "_bound_recovery_integrity"
+                        if expected_code.startswith("snapshot-")
+                        else "_sqlite_integrity"
+                    )
+                    original_integrity = getattr(MODULE, integrity_boundary)
                     attacked = False
 
                     def replace_after_integrity(
-                        path: Path,
+                        database: object,
                         **kwargs: object,
                     ) -> dict[str, object]:
                         nonlocal attacked
-                        result = original_integrity(path, **kwargs)
+                        result = original_integrity(database, **kwargs)
                         if not attacked:
                             attacked = True
                             replacement = target.with_name(
@@ -6769,7 +7106,7 @@ raise SystemExit(2)
                     with (
                         mock.patch.object(
                             MODULE,
-                            "_sqlite_integrity",
+                            integrity_boundary,
                             side_effect=replace_after_integrity,
                         ),
                         self.assertRaises(MODULE.StoreSafetyError) as raised,
@@ -6809,15 +7146,20 @@ raise SystemExit(2)
             for target, validator, argument, expected_code in targets:
                 with self.subTest(target=target):
                     target.chmod(0o600)
-                    original_integrity = MODULE._sqlite_integrity
+                    integrity_boundary = (
+                        "_bound_recovery_integrity"
+                        if expected_code.startswith("snapshot-")
+                        else "_sqlite_integrity"
+                    )
+                    original_integrity = getattr(MODULE, integrity_boundary)
                     attacked = False
 
                     def chmod_after_integrity(
-                        path: Path,
+                        database: object,
                         **kwargs: object,
                     ) -> dict[str, object]:
                         nonlocal attacked
-                        result = original_integrity(path, **kwargs)
+                        result = original_integrity(database, **kwargs)
                         if not attacked:
                             attacked = True
                             target.chmod(0o640)
@@ -6826,7 +7168,7 @@ raise SystemExit(2)
                     with (
                         mock.patch.object(
                             MODULE,
-                            "_sqlite_integrity",
+                            integrity_boundary,
                             side_effect=chmod_after_integrity,
                         ),
                         self.assertRaises(MODULE.StoreSafetyError) as raised,
@@ -6865,15 +7207,20 @@ raise SystemExit(2)
             )
             for target, validator, argument, expected_code in targets:
                 with self.subTest(target=target):
-                    original_integrity = MODULE._sqlite_integrity
+                    integrity_boundary = (
+                        "_bound_recovery_integrity"
+                        if expected_code.startswith("snapshot-")
+                        else "_sqlite_integrity"
+                    )
+                    original_integrity = getattr(MODULE, integrity_boundary)
                     attacked = False
 
                     def mutate_after_integrity(
-                        path: Path,
+                        database: object,
                         **kwargs: object,
                     ) -> dict[str, object]:
                         nonlocal attacked
-                        result = original_integrity(path, **kwargs)
+                        result = original_integrity(database, **kwargs)
                         if not attacked:
                             attacked = True
                             with target.open("ab") as handle:
@@ -6885,7 +7232,7 @@ raise SystemExit(2)
                     with (
                         mock.patch.object(
                             MODULE,
-                            "_sqlite_integrity",
+                            integrity_boundary,
                             side_effect=mutate_after_integrity,
                         ),
                         self.assertRaises(MODULE.StoreSafetyError) as raised,
@@ -7600,12 +7947,12 @@ raise SystemExit(2)
             ):
                 self._recover_snapshot(snapshot_dir, recovered)
             self._assert_safety_code(
-                "prepared-file-identity-mismatch",
+                "snapshot-file-identity-mismatch",
                 raised,
             )
             self.assertFalse(recovered.exists())
 
-    def test_recover_snapshot_ignores_wal_injected_beside_validated_artifact(
+    def test_recover_snapshot_rejects_wal_injected_after_artifact_validation(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -7653,16 +8000,18 @@ raise SystemExit(2)
                     writer.close()
 
             recovered = root / "recovered.sqlite"
-            with mock.patch.object(
-                MODULE,
-                "_recover_validated_clone_to_standalone",
-                side_effect=inject_wal_then_recover,
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_recover_validated_clone_to_standalone",
+                    side_effect=inject_wal_then_recover,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
                 self._recover_snapshot(snapshot_dir, recovered)
-            with closing(sqlite3.connect(recovered)) as conn:
-                recovered_value = conn.execute("SELECT value FROM sample").fetchone()[0]
         self.assertTrue(injected)
-        self.assertEqual(recovered_value, "validated")
+        self._assert_safety_code("snapshot-file-set-mismatch", raised)
+        self.assertFalse(recovered.exists())
 
     def test_recover_snapshot_binds_clone_during_connect_path_swap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -7688,8 +8037,8 @@ raise SystemExit(2)
                 out: Path,
                 **kwargs: object,
             ) -> dict[str, object]:
-                replacement = recovered_main.with_name("connect-replacement.sqlite")
-                parked = recovered_main.with_name("connect-validated.sqlite")
+                replacement = root / "connect-replacement.sqlite"
+                parked = root / "connect-validated.sqlite"
                 self._create_db(replacement, value="replacement")
 
                 def connect_with_swap(
@@ -9166,6 +9515,247 @@ raise SystemExit(2)
                         stage_dir=root / "stage",
                     )
         self._assert_safety_code("post-writeback-access-policy-mismatch", raised)
+
+    def test_recovery_validation_and_publication_use_no_named_temp_directories(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            source = paths.group_container / MODULE.NOTE_STORE_MAIN
+            self._create_db(source, value="validated")
+            edited = root / "edited.sqlite"
+            self._create_db(edited, value="edited")
+            outputs = root / "outputs"
+            outputs.mkdir()
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            stage = self._stage_patch(edited, root / "stage", paths=paths)
+
+            with mock.patch.object(
+                MODULE.tempfile,
+                "TemporaryDirectory",
+                side_effect=AssertionError("named temporary root used"),
+            ):
+                recovery = MODULE.validate_database_recovery(source)
+                merged = MODULE.merge_db(
+                    source,
+                    outputs / "merged.sqlite",
+                    paths=paths,
+                )
+                stage_validation = MODULE.validate_patch_stage(
+                    Path(stage["stage_dir"]),
+                    stage["manifest_creation_receipt"],
+                )
+                restored = MODULE.recover_snapshot(
+                    Path(snapshot["dest"]),
+                    outputs / "restored.sqlite",
+                    snapshot["manifest_creation_receipt"],
+                    paths=paths,
+                )
+
+        self.assertEqual(recovery["sqlite_integrity"]["result"], "ok")
+        self.assertEqual(merged["output_integrity"]["result"], "ok")
+        self.assertEqual(stage_validation["sqlite_validation"]["result"], "ok")
+        self.assertEqual(
+            restored["recovered"]["output_integrity"]["result"],
+            "ok",
+        )
+
+    def test_source_context_teardown_after_publication_is_unified_uncertain(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            destination = root / "merged.sqlite"
+            self._create_db(source)
+            original_bind = MODULE._bind_source_store
+
+            @contextmanager
+            def fail_after_source_yield(
+                main_path: Path,
+            ) -> Iterator[MODULE._BoundSourceStore]:
+                with original_bind(main_path) as store:
+                    yield store
+                    raise MODULE.StoreSafetyError(
+                        "simulated-source-teardown",
+                        "simulated source context teardown failure",
+                    )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_bind_source_store",
+                    side_effect=fail_after_source_yield,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.merge_db(source, destination)
+
+            self._assert_safety_code("destination-install-uncertain", raised)
+            self.assertTrue(destination.is_file())
+            details = raised.exception.details
+            self.assertTrue(details["mutation_performed"])
+            self.assertEqual(details["publication_state"], "uncertain")
+            self.assertFalse(details["retry_safe"])
+            self.assertEqual(details["cleanup_state"], "retained")
+            self.assertEqual(
+                details["post_publication_error_code"],
+                "simulated-source-teardown",
+            )
+            receipt = details["recovery_locators"]["post_publication_failure"]
+            self.assertEqual(receipt["mutation_performed"], True)
+            self.assertEqual(receipt["publication_state"], "uncertain")
+            self.assertFalse(receipt["retry_safe"])
+            self.assertEqual(
+                receipt["phase"],
+                "source-store-transaction-teardown",
+            )
+
+    def test_directory_artifact_scope_teardown_after_publication_is_uncertain(
+        self,
+    ) -> None:
+        for artifact_kind in ("snapshot", "patch-stage"):
+            with (
+                self.subTest(artifact_kind=artifact_kind),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                source = paths.group_container / MODULE.NOTE_STORE_MAIN
+                self._create_db(source)
+                edited = root / "edited.sqlite"
+                self._create_db(edited)
+                destination = root / artifact_kind
+                original_scope = MODULE._bind_live_safe_destination_parent
+                expected_phase = (
+                    "snapshot-transaction-teardown"
+                    if artifact_kind == "snapshot"
+                    else "patch-stage-transaction-teardown"
+                )
+
+                @contextmanager
+                def fail_after_destination_scope_yield(
+                    selected_paths: MODULE.NoteStorePaths,
+                    selected_destination: Path,
+                ) -> Iterator[MODULE._LiveDestinationScope]:
+                    with original_scope(
+                        selected_paths,
+                        selected_destination,
+                    ) as scope:
+                        yield scope
+                        raise MODULE.StoreSafetyError(
+                            "simulated-destination-scope-teardown",
+                            "simulated destination context teardown failure",
+                        )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_bind_live_safe_destination_parent",
+                        side_effect=fail_after_destination_scope_yield,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    if artifact_kind == "snapshot":
+                        MODULE.copy_db(
+                            paths,
+                            dest=destination,
+                            require_notes_quit=True,
+                        )
+                    else:
+                        MODULE.stage_patch(
+                            edited,
+                            destination,
+                            paths=paths,
+                        )
+
+                self._assert_safety_code(
+                    "destination-install-uncertain",
+                    raised,
+                )
+                self.assertTrue(destination.is_dir())
+                details = raised.exception.details
+                self.assertTrue(details["mutation_performed"])
+                self.assertEqual(details["publication_state"], "uncertain")
+                self.assertFalse(details["retry_safe"])
+                self.assertEqual(details["cleanup_state"], "retained")
+                self.assertEqual(
+                    details["post_publication_error_code"],
+                    "simulated-destination-scope-teardown",
+                )
+                receipt = details["recovery_locators"]["post_publication_failure"]
+                self.assertEqual(receipt["phase"], expected_phase)
+
+    def test_snapshot_context_teardown_after_recovery_publication_is_uncertain(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            source = paths.group_container / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            destination = root / "recovered.sqlite"
+            original_validate = MODULE._validated_snapshot_artifact
+
+            @contextmanager
+            def fail_after_snapshot_yield(
+                *args: object,
+                **kwargs: object,
+            ) -> Iterator[MODULE._ValidatedSnapshotArtifact]:
+                with original_validate(*args, **kwargs) as artifact:
+                    yield artifact
+                    raise MODULE.StoreSafetyError(
+                        "simulated-snapshot-teardown",
+                        "simulated snapshot context teardown failure",
+                    )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_validated_snapshot_artifact",
+                    side_effect=fail_after_snapshot_yield,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.recover_snapshot(
+                    Path(snapshot["dest"]),
+                    destination,
+                    snapshot["manifest_creation_receipt"],
+                    paths=paths,
+                )
+
+            self._assert_safety_code("destination-install-uncertain", raised)
+            self.assertTrue(destination.is_file())
+            details = raised.exception.details
+            self.assertTrue(details["mutation_performed"])
+            self.assertEqual(details["publication_state"], "uncertain")
+            self.assertFalse(details["retry_safe"])
+            self.assertEqual(
+                details["post_publication_error_code"],
+                "simulated-snapshot-teardown",
+            )
+            receipt = details["recovery_locators"]["post_publication_failure"]
+            self.assertEqual(
+                receipt["phase"],
+                "snapshot-recovery-transaction-teardown",
+            )
 
     def test_query_note_tags_reads_expected_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

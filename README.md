@@ -21,16 +21,23 @@ write. Existing destination and live-container paths are bound one no-follow
 component at a time; initially absent live containers retain their nearest
 existing ancestor and missing suffix through creation and terminal checks.
 Missing destination components and private partials are first created at
-randomized owner-private staging names, descriptor-bound, and only then
-installed at target names with atomic no-replace rename. Identity and access
-policy are revalidated around carried scope checks; failed installs retain
-structured evidence instead of using a racy name-based directory cleanup.
+randomized owner-private staging names only through a trusted creator that
+returns the already-open object descriptor and an exclusive-handoff
+attestation. A later `open` after `mkdir` is never accepted as creation proof;
+without that capability, creation fails before mutation with
+`directory-creation-identity-inconclusive`. The held object is installed at
+the target name with atomic no-replace rename. Identity and access policy are
+revalidated around carried scope checks; failed installs retain structured
+evidence instead of using a racy name-based directory cleanup.
 Exact Darwin root aliases such as `/tmp -> /private/tmp` are
 registry-bound and continuously revalidated through the same carried alias
 object across receipt loading, creator results, publication, and terminal
-public-path checks; arbitrary symlinks fail closed. Snapshot recovery acquires
-its output/live-container guard before validation can allocate temporary
-storage, clone inputs, or invoke a writer.
+public-path checks; arbitrary symlinks fail closed. Live NoteStore discovery,
+open, hashing, membership checks, and terminal revalidation share one complete
+held no-follow group-container component chain. Snapshot recovery acquires its
+output/live-container guard before validation and then consumes the held
+snapshot store directly; recovery uses in-memory bytes and anonymous temporary
+file descriptors, not named temporary or recovery-clone directories.
 Snapshot/stage API and CLI inputs use one absolute lexical path policy for the
 root and every derived member, so relative paths cannot split parent authority.
 Notes process-state checks use fixed `/usr/bin/pgrep`, a minimal environment,

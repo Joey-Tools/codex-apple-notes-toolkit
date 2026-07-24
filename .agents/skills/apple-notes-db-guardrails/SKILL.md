@@ -68,11 +68,20 @@ even when that sidecar is currently absent. The guard runs before the first mkdi
 rename, partial, backup, receipt, or helper output.
 
 Missing destination-parent components and private partial directories are never created directly
-at their target names. The helper creates an unpredictable owner-private staging directory under
-the held parent, binds its descriptor/identity first, then installs that exact object with atomic
-no-replace rename and revalidates the target around the carried scope checks. Replacement or
-access-policy drift fails closed with a structured retained-object locator; metadata-only
-transitions remain benign. A platform without atomic directory no-replace support is unsupported.
+at their target names. A trusted platform or supervisor creator must allocate an unpredictable
+owner-private staging directory under the held parent and return the already-open descriptor plus
+an `apple-notes-identity-bound-directory-creation/v1` attestation that binds the actual created
+object, parent, access policy, and exclusive namespace handoff. POSIX/Darwin `mkdir`, `mkdirat`,
+`mkdtemp`, and `mkdtempat_np` return no descriptor, so a later no-follow `open` is not creation
+proof and is never an implicit fallback. The packaged module installs no production creator by
+default; an operation that needs a new directory fails before mutation with
+`directory-creation-identity-inconclusive` until a trusted integration supplies that capability.
+After validating the returned descriptor/name pair, the helper installs that exact object with
+atomic no-replace rename and revalidates the target around the carried scope checks. Replacement
+or access-policy drift fails closed with a structured retained-object locator; unproved handoff
+evidence is labeled `creation-identity-inconclusive`, never
+`transaction-created-object-identity`. Metadata-only transitions remain benign. A platform
+without atomic directory no-replace support is unsupported.
 
 On macOS, only the exact registry entries `/tmp -> /private/tmp`, `/var -> /private/var`, and
 `/etc -> /private/etc` may bridge a root symlink. The helper binds the alias parent, alias entry and
@@ -114,6 +123,11 @@ creation-result JSON outside the snapshot with mode `0600`. Its
 access policy. Never regenerate that receipt from a current artifact. Only a successful creator
 result is admissible; a partial or error result is not.
 Snapshot publication is atomic and no-replace on supported macOS/Linux filesystems.
+The live NoteStore is one descriptor transaction: bind the complete group-container path once,
+one no-follow component at a time, then perform main/WAL/SHM/rollback-journal discovery, every
+regular-file open, hashing/copying, membership checks, and final protected-property revalidation
+only through the held group-container `dir_fd`. Do not restart discovery or open a source from a
+full pathname.
 The helper binds the private partial directory, its nested `group.com.apple.notes` store, and their
 parents at creation. It verifies every prepared file against its creation receipt, fsyncs copied
 files, then fsyncs the held nested-store and snapshot-root descriptors bottom-up before the
@@ -166,14 +180,15 @@ root. Component-wise no-follow binding still rejects aliases, replacement, and s
 Validation requires the caller-preserved artifact-external receipt before parsing the v3
 manifest. The validator binds the artifact root once before loading that receipt. Receipt
 externality proof and loading, root membership scans, manifest binding, nested-store binding,
-database-file binding, recovery-clone creation, SQLite integrity checking, and terminal scans all
+database-file binding, recovery-payload construction, SQLite integrity checking, and terminal scans all
 reuse that exact root descriptor or child descriptors opened relative to it; no later artifact
 consumer reopens the root pathname. It first compares the held manifest's identity, SHA-256, size,
 and access policy with the external receipt, then consumes the manifest's creation-time
 root/store/file receipts and holds the manifest and every declared database-file descriptor
-through recovery-clone creation, SQLite integrity checking, and terminal revalidation. Object
-replacement, byte mutation, and access-policy change have distinct failure codes; timestamp-only
-changes do not fail when the protected properties remain stable.
+through recovery-payload construction, SQLite integrity checking, standalone backup, and terminal
+revalidation. No named recovery-clone directory is created. Object replacement, byte mutation,
+and access-policy change have distinct failure codes; timestamp-only changes do not fail when the
+protected properties remain stable.
 
 ## Recover For Analysis
 
@@ -187,16 +202,17 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" recover-snapshot \
     /tmp/<task-snapshot>.creation-result.json
 ```
 
-`recover-snapshot` consumes the private clone produced by that exact validation pass. It never
-reopens the mutable snapshot paths after validation. Its recovery result carries the snapshot
-manifest and database-file identity, SHA-256, size, and access-policy receipts from that validation
-context rather than replacing them with only the SQLite integrity result.
-Before the validator can create its `TemporaryDirectory`, recovery read-only binds the snapshot,
-proves output/snapshot separation, and acquires the live-safe destination guard. A direct
-group/app-container output, reserved store-name component, or symlink alias into a live container
-therefore fails before temporary-directory creation, recovery cloning, SQLite backup, or any
-standalone writer can run. The snapshot and destination guards remain held through publication
-and terminal validation.
+`recover-snapshot` consumes the manifest, store directory, main database, and declared sidecars
+held by that exact validation pass. It never reopens the mutable snapshot paths after validation,
+and it creates no named recovery-clone or `TemporaryDirectory`. Its recovery result carries the
+snapshot manifest and database-file identity, SHA-256, size, and access-policy receipts from that
+validation context rather than replacing them with only the SQLite integrity result.
+Before recovery can build an in-memory payload or anonymous recovered-image descriptor, it binds
+the snapshot, proves output/snapshot separation, and acquires the live-safe destination guard. A
+direct group/app-container output, reserved store-name component, or symlink alias into a live
+container therefore fails before recovery payload construction, SQLite backup, or any standalone
+writer can run. The snapshot and destination guards remain held through publication and terminal
+validation.
 The output must be a sibling of, never a member of, the snapshot tree. The helper rejects
 object-identity overlap before it can create an output parent: it binds the snapshot root and the
 output's nearest existing ancestor, then traverses `..` through held descriptors and compares
@@ -204,11 +220,10 @@ directory device/inode identity. This catches case-insensitive macOS spellings a
 without trusting path string case. Missing safe output-parent components are created and rebound
 relative to that proved ancestor, preserving the snapshot's exact root member set for later
 validation.
-The recovery step binds the clone directory, main database, and present WAL through held
-descriptors, then revalidates object identity, content, access policy, and directory membership
-against the clone's creation receipt before and after SQLite consumption. The receipt covers the
-created directory, every copied main/WAL/SHM object, and the exact name/type membership, so a
-replacement or injected entry between copying, sidecar inspection, and later recovery binding
+The recovery step retains the already-bound snapshot store directory, main database, and declared
+WAL/SHM descriptors, then revalidates object identity, content, access policy, manifest receipts,
+and exact name/type membership before and after each recovery boundary. A replacement or injected
+entry between validation, sidecar inspection, payload construction, SQLite integrity, and backup
 fails closed. Recovery applies the checksum-valid committed WAL prefix to the held main-database
 bytes and gives SQLite only an anonymous descriptor-backed recovered image. SQLite never reopens
 the mutable main, WAL, SHM, or directory pathname.
@@ -275,9 +290,13 @@ error.
 After any no-replace publication has committed, every later ordinary exception from descriptor
 stat/read, parent fsync, receipt construction, sidecar checks, public-path validation, or terminal
 revalidation—including `ENOENT`, `EACCES`, `EIO`, and an unexpected runtime exception—has that
-same uncertain, non-retryable result. Recovery evidence remains descriptor-bound and records an
-inconclusive sub-check when a terminal receipt cannot be completed. Process-control exceptions
-such as `KeyboardInterrupt` and `SystemExit` are not translated.
+same uncertain, non-retryable result. Context-manager teardown and post-yield revalidation are
+included. The unified `apple-notes-post-publication-failure/v1` recovery receipt records
+`mutation_performed: true`, `publication_state: uncertain`, `retry_safe: false`, the phase,
+descriptor-bound destination evidence when available, and the underlying machine code/type.
+Recovery evidence remains descriptor-bound and records an inconclusive sub-check when a terminal
+receipt cannot be completed. Process-control exceptions such as `KeyboardInterrupt` and
+`SystemExit` are not translated.
 
 The packaged helper remains compatible with Python 3.9. Do not use newer runtime-only call
 arguments, such as `zip(..., strict=True)`, without adding a consistent minimum-version gate.

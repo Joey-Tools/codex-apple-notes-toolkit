@@ -45,7 +45,7 @@ descriptor stays bound to the same object, both byte hashes match, size is stabl
 access-policy signals are unchanged.
 
 For `validate-snapshot` and patch-stage validation, hold the manifest and every declared regular
-file descriptor through recovery-clone creation, WAL/SHM inspection, SQLite integrity checking,
+file descriptor through recovery-payload construction, WAL/SHM inspection, SQLite integrity checking,
 directory revalidation, and the terminal protected-property check. A same-byte inode replacement
 is an identity mismatch; a mode/owner/group/flags change is an access-policy mismatch; an in-place
 byte change is a content mismatch. Do not accept a fresh pathname open as proof about the object
@@ -57,7 +57,7 @@ receipt. Their successful creator results separately return an
 identity, and access policy. The caller must preserve that result outside the artifact. Validators
 bind the artifact root once before loading the external receipt. The receipt externality proof and
 read, exact root scan, manifest open/read, nested-store binding, declared-file binding,
-recovery-clone capture, SQLite integrity check, and terminal scans must reuse that same held root
+recovery-payload construction, SQLite integrity check, and terminal scans must reuse that same held root
 object or child descriptors opened relative to it. No artifact consumer may reopen the root
 pathname after the receipt load. Compare the external receipt with the descriptor-relative held
 manifest before parsing or trusting any manifest field. Reject v1/v2 manifests and missing
@@ -80,8 +80,13 @@ identity, content, and access-policy comparison failures keep their dedicated co
 
 ## Stable Descriptor Capture
 
-Discover the main database and sidecar membership, open every present regular file without
-following symlinks, and hold all descriptors through capture.
+Bind the complete group-container path once, one no-follow component at a time, and retain that
+single component chain for the complete NoteStore transaction. Discover main/WAL/SHM/
+rollback-journal membership, open every present regular file, hash/copy bytes, and perform final
+membership and protected-property revalidation only relative to the held group-container
+descriptor. No
+source operation may restart from a full pathname or bind a second parent authority. Hold all
+component and file descriptors through capture.
 
 For each file:
 
@@ -129,25 +134,26 @@ of that proof is absent—including foreign-endian input, an out-of-range frame,
 or mismatched frame checksum/page count—report `derived-rebuild-required`; never upgrade
 unrelated or incomplete SHM evidence to `wal-shm-commit-mismatch`.
 Do not fail recovery solely because SHM is absent or stale.
-Instead, preserve the raw SHM in the evidence snapshot, omit it from the isolated recovery clone,
-and let SQLite rebuild the WAL index from the main database and valid WAL.
+Instead, preserve the raw SHM in the evidence snapshot, omit it from the authoritative anonymous
+recovery payload, and let SQLite rebuild the WAL index from the main database and valid WAL.
 
 Reject an invalid WAL even when the main database alone opens successfully.
 Ignoring a malformed or mismatched WAL can silently discard committed Notes changes.
 
 ## Integrity And Recovery
 
-Run recovery only in a task-scoped working copy.
-Never let SQLite checkpoint or rebuild sidecars against the live Notes container or the raw evidence
-snapshot.
+Run recovery only inside a task-scoped held-descriptor transaction.
+Never let SQLite checkpoint or rebuild sidecars against the live Notes container or the raw
+evidence snapshot.
 
-Run full `PRAGMA integrity_check` after opening the recovery clone.
+Run full `PRAGMA integrity_check` against the anonymous recovered image.
 When producing an analysis database or patch stage, use SQLite's backup API to create a standalone
 database, normalize it to non-WAL journal mode, close it, and run full `PRAGMA integrity_check`
 again.
-Bind the private recovery directory first, then open the main database and present WAL relative to
-that held directory descriptor. Keep the directory, main, and WAL descriptors open across byte
-capture and SQLite backup. Before and after SQLite consumption, require:
+Bind the live source or validated snapshot store once, then open the main database and present
+WAL/SHM only relative to that held directory descriptor. Keep the complete parent-component
+chain, store directory, main, WAL, and SHM descriptors open across byte capture, integrity, and
+SQLite backup. Before and after SQLite consumption, require:
 
 - the directory descriptor and pathname to identify the same directory object with the same mode,
   owner, group, and platform flags;
@@ -156,13 +162,13 @@ capture and SQLite backup. Before and after SQLite consumption, require:
   stable and to match their descriptor-relative names; and
 - any WAL classified as authoritative by the validated recovery evidence to remain present.
 
-Create and retain a recovery-clone receipt before releasing the creation-time directory
-descriptor. Bind that receipt to the created directory identity/access policy, every copied
-main/WAL/SHM identity/SHA-256/size/access policy, and the exact directory name/type map. Inspect
-WAL and derived SHM bytes only through the receipt-bound copied descriptors. Every later recovery
-binding must match this creation receipt before consuming bytes. Persistent directory or file
-replacement, byte or access-policy mutation, and entry addition/removal between copy, sidecar
-inspection, and later binding therefore fail closed.
+Retain the initial directory/file identity, SHA-256, size, access-policy, and exact name/type
+membership receipts on those same descriptors. Inspect WAL and derived SHM bytes only through the
+held files. Revalidate those receipts before and after payload construction, integrity checking,
+backup, and context teardown. Do not create a named recovery-clone directory or release the held
+source authority and later rebind it. Persistent directory or file replacement, byte or
+access-policy mutation, and entry addition/removal between binding, sidecar inspection, and later
+consumption therefore fail closed.
 
 The initial snapshot copy follows the same rule before writing its manifest: immediately bind the
 copied store relative to the already held nested-directory descriptor, compare every file with the
@@ -235,18 +241,18 @@ Use the following recovery boundary:
 
 Keep the original snapshot manifest and raw file set until the task is complete.
 
-`recover-snapshot` must consume the private recovery clone produced by its exact successful
-validation context. Do not reopen the original snapshot main/WAL/SHM paths between validation and
-recovery. The validation artifact exposes the clone and evidence, not the held source descriptors,
-and its private lifetime covers the complete standalone backup operation. Preserve that artifact's
-manifest and database-file identity, SHA-256, size, and access-policy receipts in the recovery
-result; SQLite integrity output supplements rather than replaces source-integrity evidence.
-Before that validation context can allocate a temporary directory or create a recovery clone, bind
-the snapshot root read-only, prove output/snapshot separation, and acquire the shared live-safe
-destination guard. Direct group/app outputs, reserved store components, and symlink aliases into a
-live container must fail before any temporary directory, clone, SQLite backup, or standalone
-writer is invoked. Retain the snapshot and destination bindings through final publication
-revalidation.
+`recover-snapshot` must consume the exact held snapshot store produced by its successful validation
+context. Do not reopen the original snapshot main/WAL/SHM paths between validation and recovery.
+The validation artifact exposes held store operations and evidence whose lifetime covers the
+complete standalone backup operation. Preserve its manifest and database-file identity, SHA-256,
+size, and access-policy receipts in the recovery result; SQLite integrity output supplements
+rather than replaces source-integrity evidence.
+Before that validation context can build recovery bytes, bind the snapshot root read-only, prove
+output/snapshot separation, and acquire the shared live-safe destination guard. Direct group/app
+outputs, reserved store components, and symlink aliases into a live container must fail before
+payload construction, SQLite backup, or a standalone writer. Do not allocate a named temporary or
+recovery-clone directory; use only in-memory payloads and anonymous temporary file descriptors.
+Retain the snapshot and destination bindings through final publication revalidation.
 Before creating any recovery-output parent, bind the snapshot root and the output path's nearest
 existing directory ancestor. Starting from the held output-ancestor descriptor, open only `..`
 relative to each descriptor and compare every directory `(st_dev, st_ino)` with the held snapshot
@@ -285,14 +291,24 @@ parent creation, creator receipts, publication, and terminal revalidation; an un
 Directory child-entry churn is not itself content mutation outside those reserved names.
 
 Never `mkdir` a missing destination component or private-partial target name directly. Under the
-already-held parent, allocate an unpredictable `.apple-notes-create-<random>` staging directory
-with mode `0700`, immediately open it no-follow, retain its descriptor and creation identity,
-reapply/check owner-private access, and revalidate the staging name against that descriptor. Install
-the retained object at the target basename only with the platform's atomic no-replace directory
-rename, then verify the target name against the retained descriptor before and after the carried
-scope revalidation. Metadata-only changes are evidence, not object or access-policy changes;
-replacement, disappearance, or mode/owner/group/flags drift fails closed. If atomic no-replace is
-unsupported, stop rather than reverting to direct `mkdir(target)` or check-then-rename.
+already-held parent, require a trusted platform or supervisor creator to allocate an unpredictable
+`.apple-notes-create-<random>` directory with mode `0700` and return the already-open descriptor
+plus an `apple-notes-identity-bound-directory-creation/v1` proof. The proof must attest that the
+descriptor is the actual created object, that the namespace was exclusive through handoff, and
+must bind parent/directory identity and access policy. POSIX/Darwin `mkdir`, `mkdirat`, `mkdtemp`,
+and `mkdtempat_np` return no descriptor; `mkdir` followed by `open` therefore cannot establish
+created-object identity and is forbidden as a fallback. With no trusted creator, fail before
+mutation as `directory-creation-identity-inconclusive`.
+
+Validate the creator-returned descriptor against its staging name before using it. Install that
+held object at the target basename only with the platform's atomic no-replace directory rename,
+then verify the target name against the retained descriptor before and after the carried scope
+revalidation. Metadata-only changes are evidence, not object or access-policy changes;
+replacement, disappearance, or mode/owner/group/flags drift fails closed. If the proof, name, or
+descriptor cannot be reconciled, retain point-in-time provider/name evidence but label the
+protected property `creation-identity-inconclusive`; never sign a replacement as
+`transaction-created-object-identity`. If atomic no-replace is unsupported, stop rather than
+reverting to direct `mkdir(target)` or check-then-rename.
 
 On creation collision or any post-creation failure, retain the created descriptor evidence plus
 point-in-time staging/target observations. Do not `stat(name)` and then `rmdir(name)`: there is no
@@ -397,12 +413,18 @@ If source or destination namespace observation is unavailable, still report
 last-verified target-tree evidence. Mark unavailable namespace evidence as inconclusive instead of
 omitting the recovery locator.
 Once the no-replace rename is known to have committed, catch every ordinary `Exception` from later
-descriptor stat/read, parent fsync, receipt construction, tree scan, or public-path revalidation
-and return `destination-install-uncertain`, `publication_state: uncertain`, and `retry_safe:
-false`. This includes raw `ENOENT`, `EACCES`, `EIO`, and unexpected runtime exceptions. If a
-terminal receipt itself cannot be completed, retain last-verified descriptor-bound
-parent/prepared-root evidence and mark the sub-check inconclusive. Do not catch `BaseException`;
-`KeyboardInterrupt` and `SystemExit` retain process-control semantics.
+descriptor stat/read, parent fsync, receipt construction, tree scan, public-path revalidation,
+post-yield validation, or context-manager teardown. Return
+`destination-install-uncertain`, `mutation_performed: true`,
+`publication_state: uncertain`, and `retry_safe: false`. Attach one
+`apple-notes-post-publication-failure/v1` locator containing the terminal phase, underlying machine
+code/type, destination, and descriptor-bound destination evidence when available. Conservative
+recovery-detail merging must OR `mutation_performed`, never turn false retry evidence true, and
+never downgrade `uncertain` publication or incomplete cleanup. This includes raw `ENOENT`,
+`EACCES`, `EIO`, and unexpected runtime exceptions. If a terminal receipt itself cannot be
+completed, retain last-verified descriptor-bound parent/prepared-root evidence and mark the
+sub-check inconclusive. Do not catch `BaseException`; `KeyboardInterrupt` and `SystemExit` retain
+process-control semantics.
 
 Standalone database publication uses an atomic no-replace rename from a descriptor-bound private
 file. Bind the creation-time private parent and operate on the exact source and destination leaf
@@ -507,7 +529,7 @@ After replacement, require:
 - live bytes equal the staged database;
 - live mode, owner, group, and file flags equal the baseline access policy;
 - live WAL and SHM names are absent before Notes restarts;
-- full SQLite integrity succeeds from an isolated verification clone.
+- full SQLite integrity succeeds from an anonymous descriptor-backed verification image.
 
 ## Failure Classes
 
@@ -519,6 +541,8 @@ The helper emits stable error codes, including:
 - `source-identity-mismatch`, `source-content-mismatch`;
 - `source-access-policy-mismatch`;
 - `store-file-set-mismatch`;
+- `rollback-journal-present`;
+- `directory-creation-identity-inconclusive`;
 - `directory-identity-mismatch`, `directory-access-policy-mismatch`;
 - `directory-scan-inconclusive`;
 - `wal-invalid`, `sqlite-recovery-failed`, `sqlite-integrity-failed`;
