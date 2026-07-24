@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import array
 import ctypes
 import ctypes.util
 import errno
@@ -11,6 +12,7 @@ import hashlib
 import json
 import os
 import signal
+import socket
 import sqlite3
 import stat
 import struct
@@ -19,6 +21,7 @@ import sys
 import tempfile
 import unicodedata
 import uuid
+from collections.abc import Mapping
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -53,6 +56,11 @@ RENAME_EXCL = 0x00000004
 NOTES_PGREP_PATH = "/usr/bin/pgrep"
 NOTES_STATE_TIMEOUT_SECONDS = 2.0
 NOTES_STATE_TERMINATION_GRACE_SECONDS = 0.25
+DIRECTORY_CREATOR_REQUEST_SCHEMA = "apple-notes-directory-creator-request/v1"
+DIRECTORY_CREATOR_RESPONSE_SCHEMA = "apple-notes-directory-creator-response/v1"
+DIRECTORY_CREATOR_MAX_MESSAGE_BYTES = 64 * 1024
+DIRECTORY_CREATOR_MAX_RECEIVED_FDS = 8
+DIRECTORY_CREATOR_TIMEOUT_SECONDS = 5.0
 
 
 class StoreSafetyError(RuntimeError):
@@ -235,6 +243,19 @@ class _IdentityBoundDirectoryCreationFailure(RuntimeError):
         self.details = dict(details) if isinstance(details, dict) else {}
 
 
+class _IdentityBoundDirectoryCreatorUnavailable(RuntimeError):
+    """Report that no trusted supervisor request could be started."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.details = dict(details) if isinstance(details, dict) else {}
+
+
 @dataclass
 class _BoundSourceStore:
     """One live/caller store held through its complete directory component chain."""
@@ -298,18 +319,20 @@ SOURCE_FILE_CODES = _FileProtectionCodes(
 
 # POSIX mkdir(2), mkdirat(2), and Darwin mkdtempat_np(3) return no directory
 # descriptor.  A later open cannot prove that it names the object created by
-# the earlier call.  The packaged helper therefore has no implicit fallback:
-# a trusted platform/supervisor integration must inject a creator that returns
-# the already-open created object plus an attestation matching the contract
-# checked by _create_identity_bound_directory_at().  Tests install a synthetic
-# provider explicitly; production code never treats mkdir-then-open as proof.
+# the earlier call.  The packaged production integration therefore uses only
+# an inherited, already-connected AF_UNIX/SOCK_DGRAM supervisor channel.  The
+# helper transfers the held parent FD with SCM_RIGHTS and accepts only the
+# directory FD that the trusted supervisor held continuously from its own
+# identity-preserving creation boundary.  It never reconnects by socket path
+# or treats a local mkdir-then-open sequence as proof.
 # A provider that raises after entering its creation boundary must use
 # _IdentityBoundDirectoryCreationFailure and transfer any created name, open
 # descriptor, creation stat, proof, and recovery details.  Unstructured
 # provider failures are conservatively treated as possibly post-mutation.
+_DIRECTORY_CREATOR_SUPERVISOR_FD: int | None = None
 _IDENTITY_BOUND_DIRECTORY_CREATOR: (
     Callable[[int, str], _IdentityBoundDirectoryCreation] | None
-) = None
+)
 
 
 def _json_default(value: Any) -> Any:
@@ -443,6 +466,318 @@ def _metadata(value: os.stat_result) -> dict[str, int]:
 
 def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
     return _identity(left) == _identity(right)
+
+
+@contextmanager
+def directory_creator_supervisor(supervisor_fd: int) -> Iterator[None]:
+    """Route identity-bound creation through one inherited supervisor channel."""
+
+    if (
+        not isinstance(supervisor_fd, int)
+        or isinstance(supervisor_fd, bool)
+        or supervisor_fd < 0
+    ):
+        raise ValueError("directory creator supervisor FD must be non-negative")
+    global _DIRECTORY_CREATOR_SUPERVISOR_FD
+    previous = _DIRECTORY_CREATOR_SUPERVISOR_FD
+    if previous is not None:
+        raise RuntimeError("a directory creator supervisor is already active")
+    owned_fd = os.dup(supervisor_fd)
+    try:
+        os.set_inheritable(owned_fd, False)
+    except BaseException:
+        os.close(owned_fd)
+        raise
+    _DIRECTORY_CREATOR_SUPERVISOR_FD = owned_fd
+    try:
+        yield
+    finally:
+        _DIRECTORY_CREATOR_SUPERVISOR_FD = previous
+        os.close(owned_fd)
+
+
+def _received_rights_descriptors(
+    ancillary: list[tuple[int, int, bytes]],
+) -> list[int]:
+    descriptors: list[int] = []
+    item_size = array.array("i").itemsize
+    for level, kind, payload in ancillary:
+        if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
+            continue
+        usable = len(payload) - (len(payload) % item_size)
+        if usable == 0:
+            continue
+        received = array.array("i")
+        received.frombytes(payload[:usable])
+        descriptors.extend(int(fd) for fd in received)
+    return descriptors
+
+
+def _close_descriptors(descriptors: Iterable[int]) -> None:
+    for descriptor in descriptors:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _supervisor_identity_bound_directory_creator(
+    parent_fd: int,
+    prefix: str,
+) -> _IdentityBoundDirectoryCreation:
+    """Request one continuously held created-directory FD from a supervisor."""
+
+    configured_fd = _DIRECTORY_CREATOR_SUPERVISOR_FD
+    if configured_fd is None:
+        raise _IdentityBoundDirectoryCreatorUnavailable(
+            "No inherited directory-creator supervisor channel is configured.",
+            details={
+                "creation_authority": "supervisor-channel-unavailable",
+                "supported_interface": (
+                    "inherited-connected-af-unix-sock-dgram-scm-rights"
+                ),
+                "request_started": False,
+            },
+        )
+
+    try:
+        configured = os.fstat(configured_fd)
+        if not stat.S_ISSOCK(configured.st_mode):
+            raise OSError(errno.ENOTSOCK, "configured descriptor is not a socket")
+        supervisor = socket.fromfd(
+            configured_fd,
+            socket.AF_UNIX,
+            socket.SOCK_DGRAM,
+        )
+    except (OSError, ValueError) as exc:
+        raise _IdentityBoundDirectoryCreatorUnavailable(
+            f"The inherited directory-creator supervisor channel is unusable: {exc}",
+            details={
+                "creation_authority": "supervisor-channel-invalid",
+                "supported_interface": (
+                    "inherited-connected-af-unix-sock-dgram-scm-rights"
+                ),
+                "request_started": False,
+                "error_type": type(exc).__name__,
+                "errno": getattr(exc, "errno", None),
+            },
+        ) from exc
+
+    request_started = False
+    received_descriptors: list[int] = []
+    response: dict[str, Any] | None = None
+    request_id = uuid.uuid4().hex
+
+    def after_request_failure(message: str, *, stage: str) -> None:
+        transferred_fd = received_descriptors.pop(0) if received_descriptors else None
+        reported_basename = (
+            response.get("basename")
+            if isinstance(response, dict) and isinstance(response.get("basename"), str)
+            else None
+        )
+        recoverable_basename = (
+            reported_basename
+            if reported_basename is not None and len(reported_basename) <= 255
+            else None
+        )
+        response_details = (
+            response.get("details")
+            if isinstance(response, dict) and isinstance(response.get("details"), dict)
+            else {}
+        )
+        details = _merge_recovery_details(
+            dict(response_details),
+            {
+                "mutation_performed": True,
+                "cleanup_state": "inconclusive",
+                "retry_safe": False,
+                "creation_authority": "inherited-supervisor-channel",
+                "provider_install_state": "supervisor-request-started",
+                "provider_staging_basename": recoverable_basename,
+                "recovery_locators": {
+                    "directory_creator_supervisor": {
+                        "schema": (
+                            "apple-notes-directory-creator-transport-failure/v1"
+                        ),
+                        "protected_property": "creation-identity-inconclusive",
+                        "request_schema": DIRECTORY_CREATOR_REQUEST_SCHEMA,
+                        "response_schema": (
+                            response.get("schema")
+                            if isinstance(response, dict)
+                            else None
+                        ),
+                        "request_id": request_id,
+                        "stage": stage,
+                        "request_started": True,
+                        "received_descriptor_count": (
+                            len(received_descriptors)
+                            + (1 if transferred_fd is not None else 0)
+                        ),
+                        "descriptor_ownership_transferred": (
+                            transferred_fd is not None
+                        ),
+                        "provider_reported_staging_basename": (
+                            reported_basename[:256]
+                            if reported_basename is not None
+                            else None
+                        ),
+                        "automatic_cleanup_attempted": False,
+                    },
+                },
+            },
+        )
+        raise _IdentityBoundDirectoryCreationFailure(
+            message,
+            staging_basename=recoverable_basename,
+            fd=transferred_fd,
+            proof=(
+                response.get("proof")
+                if isinstance(response, dict)
+                and isinstance(response.get("proof"), dict)
+                else None
+            ),
+            details=details,
+        )
+
+    try:
+        with supervisor:
+            socket_type = supervisor.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+            peer = supervisor.getpeername()
+            if socket_type != socket.SOCK_DGRAM or not isinstance(
+                peer,
+                (str, bytes),
+            ):
+                raise _IdentityBoundDirectoryCreatorUnavailable(
+                    "The inherited directory-creator channel is not a connected "
+                    "AF_UNIX/SOCK_DGRAM socket.",
+                    details={
+                        "creation_authority": "supervisor-channel-invalid",
+                        "supported_interface": (
+                            "inherited-connected-af-unix-sock-dgram-scm-rights"
+                        ),
+                        "request_started": False,
+                        "socket_type": socket_type,
+                    },
+                )
+            supervisor.settimeout(DIRECTORY_CREATOR_TIMEOUT_SECONDS)
+            parent_opened = os.fstat(parent_fd)
+            request = json.dumps(
+                {
+                    "schema": DIRECTORY_CREATOR_REQUEST_SCHEMA,
+                    "request_id": request_id,
+                    "operation": "create-owner-private-directory",
+                    "prefix": prefix,
+                    "mode": 0o700,
+                    "expected_uid": (
+                        os.geteuid() if hasattr(os, "geteuid") else parent_opened.st_uid
+                    ),
+                    "parent_identity": _identity(parent_opened),
+                    "parent_access_policy": _access_policy(parent_opened),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            request_started = True
+            sent = supervisor.sendmsg(
+                [request],
+                [
+                    (
+                        socket.SOL_SOCKET,
+                        socket.SCM_RIGHTS,
+                        array.array("i", [parent_fd]),
+                    ),
+                ],
+            )
+            if sent != len(request):
+                after_request_failure(
+                    "The directory-creator supervisor request was truncated.",
+                    stage="request-send",
+                )
+            payload, ancillary, flags, _ = supervisor.recvmsg(
+                DIRECTORY_CREATOR_MAX_MESSAGE_BYTES,
+                socket.CMSG_SPACE(
+                    array.array("i").itemsize * DIRECTORY_CREATOR_MAX_RECEIVED_FDS
+                ),
+            )
+            received_descriptors.extend(_received_rights_descriptors(ancillary))
+            if flags & (
+                getattr(socket, "MSG_TRUNC", 0) | getattr(socket, "MSG_CTRUNC", 0)
+            ):
+                after_request_failure(
+                    "The directory-creator supervisor response was truncated.",
+                    stage="response-receive",
+                )
+            try:
+                decoded = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                after_request_failure(
+                    f"The directory-creator supervisor returned malformed JSON: {exc}",
+                    stage="response-decode",
+                )
+            if not isinstance(decoded, dict):
+                after_request_failure(
+                    "The directory-creator supervisor response is not an object.",
+                    stage="response-validate",
+                )
+            response = decoded
+            if (
+                response.get("schema") != DIRECTORY_CREATOR_RESPONSE_SCHEMA
+                or response.get("request_id") != request_id
+            ):
+                after_request_failure(
+                    "The directory-creator supervisor response is not bound to "
+                    "the current request.",
+                    stage="response-validate",
+                )
+            if response.get("status") != "created":
+                after_request_failure(
+                    "The directory-creator supervisor did not return a created "
+                    "directory.",
+                    stage="supervisor-result",
+                )
+            if len(received_descriptors) != 1:
+                after_request_failure(
+                    "The directory-creator supervisor must return exactly one "
+                    "created-directory descriptor.",
+                    stage="response-rights",
+                )
+            directory_fd = received_descriptors[0]
+            os.set_inheritable(directory_fd, False)
+            opened = os.fstat(directory_fd)
+            creation = _IdentityBoundDirectoryCreation(
+                basename=response.get("basename"),
+                fd=directory_fd,
+                opened=opened,
+                proof=response.get("proof"),
+            )
+            received_descriptors.clear()
+            return creation
+    except _IdentityBoundDirectoryCreatorUnavailable:
+        raise
+    except _IdentityBoundDirectoryCreationFailure:
+        raise
+    except Exception as exc:
+        if not request_started:
+            raise _IdentityBoundDirectoryCreatorUnavailable(
+                f"The directory-creator supervisor request could not start: {exc}",
+                details={
+                    "creation_authority": "supervisor-channel-invalid",
+                    "request_started": False,
+                    "error_type": type(exc).__name__,
+                    "errno": getattr(exc, "errno", None),
+                },
+            ) from exc
+        after_request_failure(
+            "The directory-creator supervisor transaction failed after entering "
+            f"the request-send boundary: {exc}",
+            stage="supervisor-transaction",
+        )
+        raise AssertionError("unreachable")
+    finally:
+        _close_descriptors(received_descriptors)
+
+
+_IDENTITY_BOUND_DIRECTORY_CREATOR = _supervisor_identity_bound_directory_creator
 
 
 def _bound_directory_basename(binding: _BoundDirectory) -> str:
@@ -3303,6 +3638,19 @@ def _identity_bound_directory_creation_failure_details(
     )
     opened = failure.opened if isinstance(failure.opened, os.stat_result) else None
     provider_proof = failure.proof if isinstance(failure.proof, dict) else None
+    reported_install_state = failure.details.get("provider_install_state")
+    provider_install_state = (
+        reported_install_state
+        if isinstance(reported_install_state, str) and reported_install_state
+        else "trusted-creator-create-then-fail"
+    )
+    creation_state = (
+        "malformed-result"
+        if provider_install_state == "trusted-creator-malformed-result"
+        else "supervisor-transaction-failed"
+        if provider_install_state == "supervisor-request-started"
+        else "create-then-fail"
+    )
     recovery = _created_directory_install_recovery_details(
         parent_fd=parent_fd,
         parent_opened=parent_opened,
@@ -3311,7 +3659,7 @@ def _identity_bound_directory_creation_failure_details(
         staging_name=staging_basename,
         target_name=display_path.name,
         display_path=display_path,
-        install_state="trusted-creator-create-then-fail",
+        install_state=provider_install_state,
         mutation_performed=True,
         # A failed provider handoff has not passed the helper's proof checks.
         creation_proof=None,
@@ -3320,7 +3668,7 @@ def _identity_bound_directory_creation_failure_details(
     generic_locator.update(
         {
             "schema": ("apple-notes-identity-bound-directory-creation-failure/v1"),
-            "creation_state": "create-then-fail",
+            "creation_state": creation_state,
             "provider_reported_staging_basename": reported_basename,
             "provider_proof": provider_proof,
             "provider_error_type": type(failure).__name__,
@@ -3334,14 +3682,17 @@ def _identity_bound_directory_creation_failure_details(
     provider_authority = (
         provider_proof.get("creation_authority") if provider_proof is not None else None
     )
+    reported_authority = failure.details.get("creation_authority")
     recovery.update(
         {
             "creation_authority": (
                 provider_authority
                 if isinstance(provider_authority, str) and provider_authority
+                else reported_authority
+                if isinstance(reported_authority, str) and reported_authority
                 else "provider-failure-unverified"
             ),
-            "provider_install_state": "trusted-creator-create-then-fail",
+            "provider_install_state": provider_install_state,
             "provider_proof": provider_proof,
             "provider_staging_basename": staging_basename,
         }
@@ -3377,6 +3728,251 @@ def _unstructured_directory_creation_failure_details(
             },
         },
     }
+
+
+def _creator_result_field(
+    result: object,
+    name: str,
+) -> tuple[object | None, str | None]:
+    try:
+        if isinstance(result, Mapping):
+            if name not in result:
+                return None, "missing"
+            return result[name], None
+        return getattr(result, name), None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"[:512]
+
+
+def _normalize_identity_bound_directory_creation_result(
+    result: object,
+    *,
+    parent_fd: int,
+) -> _IdentityBoundDirectoryCreation:
+    """Conservatively take ownership from a malformed creator result."""
+
+    fields: dict[str, object | None] = {}
+    field_errors: dict[str, str] = {}
+    for field in ("basename", "fd", "opened", "proof"):
+        value, error = _creator_result_field(result, field)
+        fields[field] = value
+        if error is not None:
+            field_errors[field] = error
+
+    issues: list[str] = []
+    if not isinstance(result, _IdentityBoundDirectoryCreation):
+        issues.append("result-type")
+    basename = fields["basename"]
+    if not isinstance(basename, str):
+        issues.append("basename-type")
+    descriptor = fields["fd"]
+    recoverable_fd = (
+        descriptor
+        if isinstance(descriptor, int)
+        and not isinstance(descriptor, bool)
+        and descriptor >= 0
+        and descriptor != parent_fd
+        else None
+    )
+    fd_aliases_parent = (
+        isinstance(descriptor, int)
+        and not isinstance(descriptor, bool)
+        and descriptor == parent_fd
+    )
+    if (
+        not isinstance(descriptor, int)
+        or isinstance(descriptor, bool)
+        or descriptor < 0
+    ):
+        issues.append("fd-type")
+    elif fd_aliases_parent:
+        issues.append("fd-aliases-parent")
+    opened = fields["opened"]
+    if not isinstance(opened, os.stat_result):
+        issues.append("opened-type")
+    proof = fields["proof"]
+    if not isinstance(proof, dict):
+        issues.append("proof-type")
+
+    if issues or field_errors:
+        reported_basename = basename if isinstance(basename, str) else None
+        recoverable_basename = (
+            reported_basename
+            if reported_basename is not None and len(reported_basename) <= 255
+            else None
+        )
+        locator: dict[str, Any] = {
+            "schema": "apple-notes-directory-creator-malformed-result/v1",
+            "protected_property": "creation-identity-inconclusive",
+            "result_type": type(result).__name__,
+            "issues": sorted(set(issues)),
+            "field_errors": field_errors,
+            "field_types": {
+                field: type(value).__name__ if value is not None else None
+                for field, value in fields.items()
+            },
+            "provider_reported_staging_basename": (
+                reported_basename[:256] if reported_basename is not None else None
+            ),
+            "recoverable_descriptor_transferred": recoverable_fd is not None,
+            "fd_aliases_parent": fd_aliases_parent,
+            "automatic_cleanup_attempted": False,
+        }
+        raise _IdentityBoundDirectoryCreationFailure(
+            "The trusted directory creator returned a malformed result.",
+            staging_basename=recoverable_basename,
+            fd=recoverable_fd,
+            opened=(opened if isinstance(opened, os.stat_result) else None),
+            proof=(proof if isinstance(proof, dict) else None),
+            details={
+                "mutation_performed": True,
+                "cleanup_state": "inconclusive",
+                "retry_safe": False,
+                "creation_authority": "provider-malformed-result",
+                "provider_install_state": "trusted-creator-malformed-result",
+                "provider_staging_basename": recoverable_basename,
+                "recovery_locators": {
+                    "identity_bound_directory_creation_malformed_result": locator,
+                },
+            },
+        )
+
+    assert isinstance(result, _IdentityBoundDirectoryCreation)
+    return result
+
+
+def _rejected_identity_bound_creation_details(
+    creation: _IdentityBoundDirectoryCreation,
+    *,
+    authority: str,
+    proof: Any,
+) -> dict[str, Any]:
+    details: dict[str, Any] = {
+        "mutation_performed": True,
+        "cleanup_state": "inconclusive",
+        "creation_authority": authority,
+        "provider_proof": proof,
+        "provider_staging_basename": creation.basename,
+        "retry_safe": False,
+    }
+    try:
+        descriptor = os.fstat(creation.fd)
+    except OSError as exc:
+        details["provider_descriptor_receipt"] = {
+            "status": "inconclusive",
+            "error_type": type(exc).__name__,
+            "errno": getattr(exc, "errno", None),
+        }
+    else:
+        details["provider_descriptor_receipt"] = {
+            "status": "point-in-time-only",
+            "identity": _identity(descriptor),
+            "access_policy": _access_policy(descriptor),
+        }
+    return details
+
+
+def _validate_identity_bound_directory_creation_result(
+    creation: _IdentityBoundDirectoryCreation,
+    *,
+    parent_fd: int,
+    parent_opened: os.stat_result,
+    display_path: Path,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+) -> _IdentityBoundDirectoryCreation:
+    basename = creation.basename
+    if (
+        basename in {"", ".", ".."}
+        or os.sep in basename
+        or not basename.startswith(".apple-notes-create-")
+    ):
+        raise StoreSafetyError(
+            inconclusive_code,
+            "The identity-bound directory creator returned a non-canonical "
+            f"staging basename: {basename!r}",
+        )
+
+    proof = creation.proof
+    required_proof = {
+        "schema": "apple-notes-identity-bound-directory-creation/v1",
+        "actual_created_object_descriptor_returned": True,
+        "namespace_exclusive_during_handoff": True,
+    }
+    if (
+        any(proof.get(key) != value for key, value in required_proof.items())
+        or not isinstance(proof.get("creation_authority"), str)
+        or not proof["creation_authority"]
+    ):
+        raise StoreSafetyError(
+            "directory-creation-identity-inconclusive",
+            "The directory creator did not attest an actual-created-object FD "
+            f"and exclusive handoff namespace: {display_path}",
+        )
+
+    try:
+        descriptor_before = os.fstat(creation.fd)
+        named = os.stat(
+            basename,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        descriptor_after = os.fstat(creation.fd)
+    except OSError as exc:
+        raise StoreSafetyError(
+            "directory-creation-identity-inconclusive",
+            "Cannot validate the provider-returned created-directory FD and "
+            f"name: {display_path}: {exc}",
+        ) from exc
+    if (
+        not stat.S_ISDIR(creation.opened.st_mode)
+        or not stat.S_ISDIR(descriptor_before.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or not stat.S_ISDIR(descriptor_after.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or _is_reparse_point(named)
+        or not _same_identity(creation.opened, descriptor_before)
+        or not _same_identity(descriptor_before, named)
+        or not _same_identity(named, descriptor_after)
+        or proof.get("directory_identity") != _identity(descriptor_after)
+        or proof.get("parent_identity") != _identity(parent_opened)
+    ):
+        raise StoreSafetyError(
+            identity_code,
+            "The provider-returned name no longer identifies the exact object "
+            f"created and opened by the trusted creator: {display_path}",
+        )
+    expected_uid = os.geteuid() if hasattr(os, "geteuid") else descriptor_after.st_uid
+    expected_access = _access_policy(descriptor_after)
+    if (
+        stat.S_IMODE(descriptor_after.st_mode) != 0o700
+        or descriptor_after.st_uid != expected_uid
+        or _access_policy(creation.opened) != expected_access
+        or _access_policy(descriptor_before) != expected_access
+        or _access_policy(named) != expected_access
+        or proof.get("directory_access_policy") != expected_access
+        or proof.get("parent_access_policy") != _access_policy(parent_opened)
+    ):
+        raise StoreSafetyError(
+            access_policy_code,
+            "The provider-returned created directory is not owner-private or "
+            f"its access policy changed during handoff: {display_path}",
+        )
+    _verify_directory_creation_parent(
+        parent_fd,
+        parent_opened,
+        display_path=display_path.parent,
+        identity_code=identity_code,
+        access_policy_code=access_policy_code,
+        inconclusive_code=inconclusive_code,
+    )
+    return _IdentityBoundDirectoryCreation(
+        basename=basename,
+        fd=creation.fd,
+        opened=descriptor_after,
+        proof=dict(proof),
+    )
 
 
 def _create_identity_bound_directory_at(
@@ -3419,7 +4015,32 @@ def _create_identity_bound_directory_at(
         inconclusive_code=inconclusive_code,
     )
     try:
-        creation = creator(parent_fd, ".apple-notes-create-")
+        creation = _normalize_identity_bound_directory_creation_result(
+            creator(parent_fd, ".apple-notes-create-"),
+            parent_fd=parent_fd,
+        )
+    except _IdentityBoundDirectoryCreatorUnavailable as exc:
+        raise StoreSafetyError(
+            "directory-creation-identity-inconclusive",
+            "This runtime has no usable trusted directory-creator supervisor "
+            "channel; refusing mkdir-then-open: "
+            f"{display_path}: {exc}",
+            details=_merge_recovery_details(
+                exc.details,
+                {
+                    "mutation_performed": False,
+                    "cleanup_state": "not-needed",
+                    "retry_safe": False,
+                    "creation_authority": "supervisor-channel-unavailable",
+                    "unsupported_fallbacks": [
+                        "mkdir-then-open",
+                        "mkdirat-then-openat",
+                        "mkdtemp-then-open",
+                        "mkdtempat_np-then-openat",
+                    ],
+                },
+            ),
+        ) from exc
     except _IdentityBoundDirectoryCreationFailure as exc:
         try:
             try:
@@ -3481,166 +4102,41 @@ def _create_identity_bound_directory_at(
             ),
         ) from exc
 
-    def rejected_creation_details(
-        *,
-        authority: str,
-        proof: Any,
-    ) -> dict[str, Any]:
-        details: dict[str, Any] = {
-            "mutation_performed": True,
-            "creation_authority": authority,
-            "provider_proof": proof,
-            "provider_staging_basename": getattr(creation, "basename", None),
-            "retry_safe": False,
-        }
-        try:
-            descriptor = os.fstat(creation.fd)
-        except (AttributeError, OSError) as exc:
-            details["provider_descriptor_receipt"] = {
-                "status": "inconclusive",
-                "error_type": type(exc).__name__,
-                "errno": getattr(exc, "errno", None),
-            }
-        else:
-            details["provider_descriptor_receipt"] = {
-                "status": "point-in-time-only",
-                "identity": _identity(descriptor),
-                "access_policy": _access_policy(descriptor),
-            }
-        return details
-
-    def close_rejected_creation() -> None:
-        try:
-            os.close(creation.fd)
-        except (AttributeError, OSError):
-            pass
-
-    basename = creation.basename
-    if (
-        basename in {"", ".", ".."}
-        or os.sep in basename
-        or not basename.startswith(".apple-notes-create-")
-    ):
-        error = StoreSafetyError(
-            inconclusive_code,
-            "The identity-bound directory creator returned a non-canonical "
-            f"staging basename: {basename!r}",
-            details=rejected_creation_details(
-                authority="provider-returned-invalid-basename",
-                proof=getattr(creation, "proof", None),
-            ),
-        )
-        close_rejected_creation()
-        raise error
-
-    proof = creation.proof
-    required_proof = {
-        "schema": "apple-notes-identity-bound-directory-creation/v1",
-        "actual_created_object_descriptor_returned": True,
-        "namespace_exclusive_during_handoff": True,
-    }
-    if (
-        not isinstance(proof, dict)
-        or any(proof.get(key) != value for key, value in required_proof.items())
-        or not isinstance(proof.get("creation_authority"), str)
-        or not proof["creation_authority"]
-    ):
-        error = StoreSafetyError(
-            "directory-creation-identity-inconclusive",
-            "The directory creator did not attest an actual-created-object FD "
-            f"and exclusive handoff namespace: {display_path}",
-            details=rejected_creation_details(
-                authority="provider-attestation-rejected",
-                proof=proof,
-            ),
-        )
-        close_rejected_creation()
-        raise error
-
     try:
-        descriptor_before = os.fstat(creation.fd)
-        named = os.stat(
-            basename,
-            dir_fd=parent_fd,
-            follow_symlinks=False,
-        )
-        descriptor_after = os.fstat(creation.fd)
-    except OSError as exc:
-        error = StoreSafetyError(
-            "directory-creation-identity-inconclusive",
-            "Cannot validate the provider-returned created-directory FD and "
-            f"name: {display_path}: {exc}",
-            details=rejected_creation_details(
-                authority=str(proof.get("creation_authority")),
-                proof=proof,
-            ),
-        )
-        close_rejected_creation()
-        raise error from exc
-    if (
-        not stat.S_ISDIR(creation.opened.st_mode)
-        or not stat.S_ISDIR(descriptor_before.st_mode)
-        or not stat.S_ISDIR(named.st_mode)
-        or not stat.S_ISDIR(descriptor_after.st_mode)
-        or stat.S_ISLNK(named.st_mode)
-        or _is_reparse_point(named)
-        or not _same_identity(creation.opened, descriptor_before)
-        or not _same_identity(descriptor_before, named)
-        or not _same_identity(named, descriptor_after)
-        or proof.get("directory_identity") != _identity(descriptor_after)
-        or proof.get("parent_identity") != _identity(parent_opened)
-    ):
-        error = StoreSafetyError(
-            identity_code,
-            "The provider-returned name no longer identifies the exact object "
-            f"created and opened by the trusted creator: {display_path}",
-            details=rejected_creation_details(
-                authority=str(proof.get("creation_authority")),
-                proof=proof,
-            ),
-        )
-        close_rejected_creation()
-        raise error
-    expected_uid = os.geteuid() if hasattr(os, "geteuid") else descriptor_after.st_uid
-    expected_access = _access_policy(descriptor_after)
-    if (
-        stat.S_IMODE(descriptor_after.st_mode) != 0o700
-        or descriptor_after.st_uid != expected_uid
-        or _access_policy(creation.opened) != expected_access
-        or _access_policy(descriptor_before) != expected_access
-        or _access_policy(named) != expected_access
-        or proof.get("directory_access_policy") != expected_access
-        or proof.get("parent_access_policy") != _access_policy(parent_opened)
-    ):
-        error = StoreSafetyError(
-            access_policy_code,
-            "The provider-returned created directory is not owner-private or "
-            f"its access policy changed during handoff: {display_path}",
-            details=rejected_creation_details(
-                authority=str(proof.get("creation_authority")),
-                proof=proof,
-            ),
-        )
-        close_rejected_creation()
-        raise error
-    try:
-        _verify_directory_creation_parent(
-            parent_fd,
-            parent_opened,
-            display_path=display_path.parent,
+        return _validate_identity_bound_directory_creation_result(
+            creation,
+            parent_fd=parent_fd,
+            parent_opened=parent_opened,
+            display_path=display_path,
             identity_code=identity_code,
             access_policy_code=access_policy_code,
             inconclusive_code=inconclusive_code,
         )
-    except Exception:
-        close_rejected_creation()
-        raise
-    return _IdentityBoundDirectoryCreation(
-        basename=basename,
-        fd=creation.fd,
-        opened=descriptor_after,
-        proof=dict(proof),
-    )
+    except Exception as exc:
+        proof = creation.proof
+        authority = (
+            str(proof.get("creation_authority"))
+            if isinstance(proof, dict) and proof.get("creation_authority")
+            else "provider-result-validation-failed"
+        )
+        details = _rejected_identity_bound_creation_details(
+            creation,
+            authority=authority,
+            proof=proof,
+        )
+        try:
+            os.close(creation.fd)
+        except OSError:
+            pass
+        if isinstance(exc, StoreSafetyError):
+            exc.details = _merge_recovery_details(exc.details, details)
+            raise
+        raise StoreSafetyError(
+            "directory-creation-identity-inconclusive",
+            "The trusted directory creator result failed validation after "
+            f"possible creation: {display_path}: {exc}",
+            details=details,
+        ) from exc
 
 
 def _verify_created_directory_name_at(
@@ -12290,6 +12786,19 @@ def _add_container_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_directory_creator_supervisor_option(
+    parser: argparse.ArgumentParser,
+) -> None:
+    parser.add_argument(
+        "--directory-creator-fd",
+        type=int,
+        help=(
+            "Inherited connected AF_UNIX/SOCK_DGRAM supervisor FD used for "
+            "identity-bound directory creation via SCM_RIGHTS."
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -12304,6 +12813,7 @@ def build_parser() -> argparse.ArgumentParser:
         "copy-db", help="Copy and validate NoteStore files."
     )
     _add_container_options(copy_parser)
+    _add_directory_creator_supervisor_option(copy_parser)
     copy_parser.add_argument("--dest", type=Path, help="New snapshot directory.")
     copy_parser.add_argument(
         "--require-notes-quit",
@@ -12316,6 +12826,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Recover a copied store into a standalone analysis DB.",
     )
     _add_container_options(merge_parser)
+    _add_directory_creator_supervisor_option(merge_parser)
     merge_parser.add_argument(
         "--src", type=Path, required=True, help="Copied NoteStore.sqlite."
     )
@@ -12338,6 +12849,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Recover a validated snapshot to a standalone SQLite DB.",
     )
     _add_container_options(recover_parser)
+    _add_directory_creator_supervisor_option(recover_parser)
     recover_parser.add_argument("--snapshot-dir", type=Path, required=True)
     recover_parser.add_argument("--out", type=Path, required=True)
     recover_parser.add_argument(
@@ -12352,6 +12864,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Normalize an edited DB into a validated, sidecar-free patch stage.",
     )
     _add_container_options(stage_parser)
+    _add_directory_creator_supervisor_option(stage_parser)
     stage_parser.add_argument("--src", type=Path, required=True)
     stage_parser.add_argument("--dest", type=Path, required=True)
 
@@ -12426,7 +12939,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Iterable[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    command_stack = ExitStack()
     try:
+        supervisor_fd = getattr(args, "directory_creator_fd", None)
+        if supervisor_fd is not None:
+            command_stack.enter_context(directory_creator_supervisor(supervisor_fd))
         if args.command == "probe-db-access":
             emit_json(probe_db_access(_paths_from_args(args)))
         elif args.command == "copy-db":
@@ -12535,6 +13052,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             }
         )
         return 1
+    finally:
+        command_stack.close()
     return 0
 
 

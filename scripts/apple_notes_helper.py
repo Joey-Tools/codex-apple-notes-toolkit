@@ -37,6 +37,7 @@ _HELPER = _load_helper()
 NoteStorePaths = _HELPER.NoteStorePaths
 StoreSafetyError = _HELPER.StoreSafetyError
 copy_db = _HELPER.copy_db
+directory_creator_supervisor = _HELPER.directory_creator_supervisor
 fingerprint_note_store = _HELPER.fingerprint_note_store
 merge_db = _HELPER.merge_db
 probe_db_access = _HELPER.probe_db_access

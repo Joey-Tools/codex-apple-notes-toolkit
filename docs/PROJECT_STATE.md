@@ -4,7 +4,8 @@
 
 - Apple Notes database reads bind untrusted leaves with no-follow, nonblocking opens before regular-file and identity validation.
 - File and directory publication use a monotonic commit latch before post-rename evidence work.
-- Identity-bound directory creators have a structured, conservative create-then-fail recovery contract.
+- Write-producing CLI commands support an inherited supervisor FD protocol for identity-bound directory creation.
+- Structured, malformed, and unstructured creator failures all retain conservative recovery evidence and close transferred FDs.
 - Per-workstream implementation and validation records live under `docs/project_journal/`.
 
 ## Recovery Pointers

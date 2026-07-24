@@ -303,8 +303,26 @@ plus an `apple-notes-identity-bound-directory-creation/v1` proof. The proof must
 descriptor is the actual created object, that the namespace was exclusive through handoff, and
 must bind parent/directory identity and access policy. POSIX/Darwin `mkdir`, `mkdirat`, `mkdtemp`,
 and `mkdtempat_np` return no descriptor; `mkdir` followed by `open` therefore cannot establish
-created-object identity and is forbidden as a fallback. With no trusted creator, fail before
-mutation as `directory-creation-identity-inconclusive`.
+created-object identity and is forbidden as a fallback.
+
+The packaged production client uses only a caller-inherited, already-connected
+`AF_UNIX`/`SOCK_DGRAM` supervisor channel supplied as `--directory-creator-fd`; it never discovers
+or reconnects to a mutable socket pathname. For each creation, send one bounded
+`apple-notes-directory-creator-request/v1` datagram and the already-held parent descriptor with
+`SCM_RIGHTS`. Bind the request nonce, operation, prefix, mode, effective UID, parent identity, and
+parent access policy. Accept only one bounded `apple-notes-directory-creator-response/v1`
+datagram with the same nonce, status `created`, exactly one returned descriptor, canonical staging
+basename, and the normal creation attestation. The invoking macOS supervisor is the trusted
+creation authority: it must enforce a creation boundary that keeps the exact created directory
+descriptor continuously held through response and exclusive namespace handoff. A same-UID
+supervisor that merely calls `mkdir` and then reopens the name does not meet this contract.
+Validate the returned descriptor/name/proof again inside the helper. No configured channel or a
+non-socket/wrong socket type detected before the first send attempt is a proved no-mutation
+`directory-creation-identity-inconclusive`; after entering the request-send boundary, send or
+receive failure, timeout, truncation, malformed JSON, nonce/schema/status mismatch, or
+descriptor-count error is possibly post-mutation and must retain every received FD until
+conservative evidence is captured.
+
 A creator that raises after entering its mutation boundary must use
 `_IdentityBoundDirectoryCreationFailure` and transfer the created staging basename, open
 descriptor, creation-time stat, provider proof, and provider recovery details. Descriptor
@@ -316,6 +334,15 @@ details merge conservatively: mutation is ORed, retry safety is ANDed, cleanup t
 state, and locator keys are preserved. An unstructured creator exception cannot prove that no
 directory was created; classify mutation and cleanup as conservative/inconclusive rather than
 claiming `mutation_performed: false`.
+A creator call that returns normally has already crossed the same possible-mutation boundary.
+Normalize and validate the whole return value before reading fields as trusted: `None`, a mapping
+or unexpected object, missing attributes, wrong field types, an FD aliasing the held parent, and
+invalid semantic proof are failures after possible creation. Safely extract a bounded staging
+basename and any separately transferred integer FD without closing the held parent. Capture
+point-in-time descriptor/namespace evidence, close every recoverable transferred or ancillary FD,
+set `mutation_performed: true`, `retry_safe: false`, and worst-case cleanup, then preserve the
+union of malformed-result, creator-failure, and created-directory-install locators. Never let an
+attribute error escape into a `not-needed` cleanup result or leak a returned FD.
 
 Validate the creator-returned descriptor against its staging name before using it. Install that
 held object at the target basename only with the platform's atomic no-replace directory rename,

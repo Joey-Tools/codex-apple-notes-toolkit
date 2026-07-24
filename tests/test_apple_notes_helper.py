@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import array
 import builtins
 import errno
 import hashlib
@@ -9,6 +10,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import sqlite3
 import stat
 import struct
@@ -70,7 +72,7 @@ class AppleNotesHelperTests(unittest.TestCase):
         parent_fd: int,
         prefix: str,
     ) -> MODULE._IdentityBoundDirectoryCreation:
-        """Model the trusted platform boundary; production has no such fallback."""
+        """Model a trusted provider for focused in-process unit tests."""
 
         for _ in range(8):
             basename = f"{prefix}{MODULE.uuid.uuid4().hex}"
@@ -97,6 +99,111 @@ class AppleNotesHelperTests(unittest.TestCase):
                 },
             )
         raise OSError(errno.EEXIST, "synthetic creator exhausted candidate names")
+
+    @staticmethod
+    def _serve_directory_creator_supervisor(
+        server_fd: int,
+        *,
+        request_count: int,
+    ) -> int:
+        """Exercise the real inherited-FD transport from a separate test process.
+
+        This transport fixture runs in a test-owned namespace with no concurrent
+        mutator. It is not a production creation authority and does not make the
+        stronger same-UID mkdir-then-open claim forbidden by the safety contract.
+        """
+
+        handled = 0
+        with socket.socket(fileno=server_fd) as supervisor:
+            supervisor.settimeout(10.0)
+            for _ in range(request_count):
+                payload, ancillary, flags, _ = supervisor.recvmsg(
+                    MODULE.DIRECTORY_CREATOR_MAX_MESSAGE_BYTES,
+                    socket.CMSG_SPACE(
+                        array.array("i").itemsize
+                        * MODULE.DIRECTORY_CREATOR_MAX_RECEIVED_FDS
+                    ),
+                )
+                if flags & (
+                    getattr(socket, "MSG_TRUNC", 0) | getattr(socket, "MSG_CTRUNC", 0)
+                ):
+                    raise RuntimeError("test supervisor request was truncated")
+                parent_descriptors = MODULE._received_rights_descriptors(ancillary)
+                if len(parent_descriptors) != 1:
+                    MODULE._close_descriptors(parent_descriptors)
+                    raise RuntimeError(
+                        "test supervisor expected exactly one parent descriptor"
+                    )
+                parent_fd = parent_descriptors.pop()
+                directory_fd: int | None = None
+                try:
+                    request = json.loads(payload.decode("utf-8"))
+                    if (
+                        request.get("schema") != MODULE.DIRECTORY_CREATOR_REQUEST_SCHEMA
+                        or request.get("operation") != "create-owner-private-directory"
+                        or request.get("mode") != 0o700
+                        or request.get("expected_uid") != os.geteuid()
+                    ):
+                        raise RuntimeError("test supervisor rejected request")
+                    parent = os.fstat(parent_fd)
+                    if request.get("parent_identity") != MODULE._identity(
+                        parent
+                    ) or request.get("parent_access_policy") != MODULE._access_policy(
+                        parent
+                    ):
+                        raise RuntimeError("test supervisor parent proof mismatch")
+                    prefix = request.get("prefix")
+                    if prefix != ".apple-notes-create-":
+                        raise RuntimeError("test supervisor prefix mismatch")
+                    basename = f"{prefix}{MODULE.uuid.uuid4().hex}"
+                    os.mkdir(basename, mode=0o700, dir_fd=parent_fd)
+                    directory_fd = os.open(
+                        basename,
+                        MODULE._directory_open_flags(),
+                        dir_fd=parent_fd,
+                    )
+                    opened = os.fstat(directory_fd)
+                    response = json.dumps(
+                        {
+                            "schema": (MODULE.DIRECTORY_CREATOR_RESPONSE_SCHEMA),
+                            "request_id": request["request_id"],
+                            "status": "created",
+                            "basename": basename,
+                            "proof": {
+                                "schema": (
+                                    "apple-notes-identity-bound-directory-creation/v1"
+                                ),
+                                "creation_authority": (
+                                    "test-supervisor-inherited-fd-protocol"
+                                ),
+                                "actual_created_object_descriptor_returned": True,
+                                "namespace_exclusive_during_handoff": True,
+                                "parent_identity": MODULE._identity(parent),
+                                "parent_access_policy": (MODULE._access_policy(parent)),
+                                "directory_identity": MODULE._identity(opened),
+                                "directory_access_policy": (
+                                    MODULE._access_policy(opened)
+                                ),
+                            },
+                        },
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    supervisor.sendmsg(
+                        [response],
+                        [
+                            (
+                                socket.SOL_SOCKET,
+                                socket.SCM_RIGHTS,
+                                array.array("i", [directory_fd]),
+                            ),
+                        ],
+                    )
+                    handled += 1
+                finally:
+                    if directory_fd is not None:
+                        os.close(directory_fd)
+                    os.close(parent_fd)
+        return handled
 
     def _copy_db(
         self,
@@ -359,6 +466,81 @@ raise SystemExit(2)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn("preflight-writeback", result.stdout)
 
+    def test_copy_db_cli_uses_inherited_directory_creator_supervisor(
+        self,
+    ) -> None:
+        if not hasattr(os, "fork"):
+            self.skipTest("inherited-FD supervisor integration requires POSIX")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = root / "snapshot"
+            client, server = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_DGRAM,
+            )
+            child_pid = os.fork()
+            if child_pid == 0:
+                client.close()
+                try:
+                    handled = self._serve_directory_creator_supervisor(
+                        server.detach(),
+                        request_count=2,
+                    )
+                except BaseException as exc:
+                    os.write(
+                        2,
+                        f"test directory creator supervisor failed: {exc!r}\n".encode(
+                            "utf-8"
+                        ),
+                    )
+                    os._exit(71)
+                os._exit(0 if handled == 2 else 72)
+
+            server.close()
+            try:
+                result = subprocess.run(
+                    [
+                        "bash",
+                        str(WRAPPER_PATH),
+                        "copy-db",
+                        "--group-container",
+                        str(paths.group_container),
+                        "--app-container",
+                        str(paths.app_container),
+                        "--dest",
+                        str(destination),
+                        "--directory-creator-fd",
+                        str(client.fileno()),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    pass_fds=(client.fileno(),),
+                    timeout=20.0,
+                    env={
+                        **os.environ,
+                        "PYTHON_BIN": sys.executable,
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                )
+            finally:
+                client.close()
+                _, child_status = os.waitpid(child_pid, 0)
+            manifest_exists = (destination / MODULE.SNAPSHOT_MANIFEST).is_file()
+            database_exists = (
+                destination / "group.com.apple.notes" / MODULE.NOTE_STORE_MAIN
+            ).is_file()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        self.assertTrue(os.WIFEXITED(child_status))
+        self.assertEqual(os.WEXITSTATUS(child_status), 0)
+        payload = json.loads(result.stdout)
+        self.assertEqual(Path(payload["dest"]), destination)
+        self.assertTrue(manifest_exists)
+        self.assertTrue(database_exists)
+
     def test_notes_state_probe_ignores_malicious_path_shadow(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -510,6 +692,7 @@ raise SystemExit(2)
         spec.loader.exec_module(compatibility)
         self.assertEqual(compatibility.HELPER_PATH, SCRIPT_PATH)
         self.assertTrue(callable(compatibility.main))
+        self.assertTrue(callable(compatibility.directory_creator_supervisor))
         self.assertEqual(
             compatibility.NoteStorePaths().note_store_files(),
             MODULE.NoteStorePaths().note_store_files(),
@@ -1058,9 +1241,7 @@ raise SystemExit(2)
             self.assertTrue(touched)
             self.assertTrue(destination.parent.is_dir())
 
-    def test_directory_creation_without_identity_bound_provider_fails_before_mkdir(
-        self,
-    ) -> None:
+    def test_directory_creation_without_supervisor_fails_before_mkdir(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             parent_fd = os.open(root, MODULE._directory_open_flags())
@@ -1069,6 +1250,11 @@ raise SystemExit(2)
                     mock.patch.object(
                         MODULE,
                         "_IDENTITY_BOUND_DIRECTORY_CREATOR",
+                        MODULE._supervisor_identity_bound_directory_creator,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_DIRECTORY_CREATOR_SUPERVISOR_FD",
                         None,
                     ),
                     mock.patch.object(MODULE.os, "mkdir") as mkdir,
@@ -1281,6 +1467,110 @@ raise SystemExit(2)
                 provider_recovery["evidence_status"],
                 "inconclusive",
             )
+
+    def test_creator_create_then_malformed_return_is_conservative(self) -> None:
+        for malformed_kind in ("none", "missing-fields", "wrong-field-types"):
+            with (
+                self.subTest(malformed_kind=malformed_kind),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                created_path = root / f".apple-notes-create-{malformed_kind}"
+                returned_fd: int | None = None
+
+                def create_then_return_malformed(
+                    parent_fd: int,
+                    _prefix: str,
+                ) -> object:
+                    nonlocal returned_fd
+                    os.mkdir(created_path.name, mode=0o700, dir_fd=parent_fd)
+                    if malformed_kind == "none":
+                        return None
+                    returned_fd = os.open(
+                        created_path.name,
+                        MODULE._directory_open_flags(),
+                        dir_fd=parent_fd,
+                    )
+                    if malformed_kind == "missing-fields":
+                        return {
+                            "basename": created_path.name,
+                            "fd": returned_fd,
+                        }
+                    return MODULE._IdentityBoundDirectoryCreation(
+                        basename=created_path.name,
+                        fd=returned_fd,
+                        opened="not-a-stat-result",
+                        proof=["not", "a", "proof"],
+                    )
+
+                parent_fd = os.open(root, MODULE._directory_open_flags())
+                try:
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_IDENTITY_BOUND_DIRECTORY_CREATOR",
+                            create_then_return_malformed,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        MODULE._create_and_install_directory_at(
+                            parent_fd,
+                            os.fstat(parent_fd),
+                            "installed",
+                            display_path=root / "installed",
+                            revalidate_scope=None,
+                            identity_code=("prepared-directory-identity-mismatch"),
+                            access_policy_code=(
+                                "prepared-directory-access-policy-mismatch"
+                            ),
+                            inconclusive_code=(
+                                "prepared-directory-revalidation-inconclusive"
+                            ),
+                            collision_code=("prepared-directory-identity-mismatch"),
+                        )
+                finally:
+                    os.close(parent_fd)
+
+                self._assert_safety_code(
+                    "directory-creation-identity-inconclusive",
+                    raised,
+                )
+                self.assertTrue(created_path.is_dir())
+                self.assertFalse((root / "installed").exists())
+                if returned_fd is not None:
+                    with self.assertRaises(OSError) as closed:
+                        os.fstat(returned_fd)
+                    self.assertEqual(closed.exception.errno, errno.EBADF)
+                details = raised.exception.details
+                self.assertTrue(details["mutation_performed"])
+                self.assertFalse(details["retry_safe"])
+                self.assertEqual(details["cleanup_state"], "inconclusive")
+                self.assertEqual(
+                    details["provider_install_state"],
+                    "trusted-creator-malformed-result",
+                )
+                self.assertIn(
+                    "identity_bound_directory_creation_malformed_result",
+                    details["recovery_locators"],
+                )
+                self.assertIn(
+                    "identity_bound_directory_creation_failure",
+                    details["recovery_locators"],
+                )
+                self.assertIn(
+                    "created_directory_install",
+                    details["recovery_locators"],
+                )
+                malformed = details["recovery_locators"][
+                    "identity_bound_directory_creation_malformed_result"
+                ]
+                self.assertEqual(
+                    malformed["protected_property"],
+                    "creation-identity-inconclusive",
+                )
+                self.assertFalse(
+                    malformed["automatic_cleanup_attempted"],
+                )
 
     def test_creator_handoff_replacement_is_retained_without_created_object_claim(
         self,

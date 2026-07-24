@@ -24,15 +24,22 @@ Missing destination components and private partials are first created at
 randomized owner-private staging names only through a trusted creator that
 returns the already-open object descriptor and an exclusive-handoff
 attestation. A later `open` after `mkdir` is never accepted as creation proof;
-without that capability, creation fails before mutation with
-`directory-creation-identity-inconclusive`. The held object is installed at
-the target name with atomic no-replace rename. Identity and access policy are
-revalidated around carried scope checks; failed installs retain structured
-evidence instead of using a racy name-based directory cleanup. A trusted
-creator that fails after creation transfers the created name, descriptor,
-creation stat, proof, and recovery details through a structured exception;
-unstructured creator failures are treated as possibly post-mutation and never
-as retry-safe.
+the packaged production client instead accepts an inherited, already-connected
+`AF_UNIX`/`SOCK_DGRAM` supervisor channel through
+`--directory-creator-fd`. It transfers the held parent FD with `SCM_RIGHTS`
+and accepts only the supervisor's continuously held created-directory FD plus
+a request-bound attestation; it never reconnects by socket path or performs a
+local create-then-open fallback. Without that capability, creation fails
+before mutation with `directory-creation-identity-inconclusive`. The held
+object is installed at the target name with atomic no-replace rename. Identity
+and access policy are revalidated around carried scope checks; failed installs
+retain structured evidence instead of using a racy name-based directory
+cleanup. A trusted creator that fails after creation transfers the created
+name, descriptor, creation stat, proof, and recovery details through a
+structured exception. A normal return of `None`, missing fields, or wrong
+field types is also treated as possibly post-mutation: recoverable FDs are
+captured and closed, cleanup stays worst-case, and recovery locators are
+unioned. Unstructured creator failures are never treated as retry-safe.
 Exact Darwin root aliases such as `/tmp -> /private/tmp` are
 registry-bound and continuously revalidated through the same carried alias
 object across receipt loading, creator results, publication, and terminal
