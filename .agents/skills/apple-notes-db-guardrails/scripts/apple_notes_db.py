@@ -871,6 +871,27 @@ def _publish_directory_no_replace(
     return descriptor_bound_destination
 
 
+def _source_revalidation_os_error(
+    path: Path,
+    operation: str,
+    error: OSError,
+) -> StoreSafetyError:
+    if isinstance(error, FileNotFoundError):
+        code = "source-missing-after-read"
+        classification = "missing"
+    elif isinstance(error, PermissionError):
+        code = "source-revalidation-unreadable"
+        classification = "unreadable"
+    else:
+        code = "source-revalidation-inconclusive"
+        classification = "inconclusive"
+    return StoreSafetyError(
+        code,
+        f"Source revalidation is {classification} while attempting to "
+        f"{operation}: {path}: {error}",
+    )
+
+
 def _open_regular_readonly(path: Path) -> tuple[int, os.stat_result]:
     try:
         path_before = os.stat(path, follow_symlinks=False)
@@ -881,6 +902,11 @@ def _open_regular_readonly(path: Path) -> tuple[int, os.stat_result]:
     except PermissionError as exc:
         raise StoreSafetyError(
             "source-unreadable", f"Source file is unreadable: {path}"
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            "source-revalidation-inconclusive",
+            f"Cannot inspect source file before opening it: {path}: {exc}",
         ) from exc
     if not stat.S_ISREG(path_before.st_mode):
         raise StoreSafetyError(
@@ -904,7 +930,14 @@ def _open_regular_readonly(path: Path) -> tuple[int, os.stat_result]:
         ) from exc
 
     try:
-        opened = os.fstat(fd)
+        try:
+            opened = os.fstat(fd)
+        except OSError as exc:
+            raise _source_revalidation_os_error(
+                path,
+                "inspect the opened descriptor",
+                exc,
+            ) from exc
         if not stat.S_ISREG(opened.st_mode):
             raise StoreSafetyError(
                 "source-not-regular", f"Opened source is not a regular file: {path}"
@@ -2718,18 +2751,21 @@ def _reject_new_rollback_journal_membership(
 def _revalidate_open_source(
     opened: _OpenedSource, second_sha256: str
 ) -> dict[str, Any]:
-    after = os.fstat(opened.fd)
+    try:
+        after = os.fstat(opened.fd)
+    except OSError as exc:
+        raise _source_revalidation_os_error(
+            opened.path,
+            "inspect the opened descriptor after hashing",
+            exc,
+        ) from exc
     try:
         path_after = os.stat(opened.path, follow_symlinks=False)
-    except FileNotFoundError as exc:
-        raise StoreSafetyError(
-            "source-missing-after-read",
-            f"Source path disappeared during read: {opened.path}",
-        ) from exc
-    except PermissionError as exc:
-        raise StoreSafetyError(
-            "source-revalidation-unreadable",
-            f"Source path became unreadable during revalidation: {opened.path}",
+    except OSError as exc:
+        raise _source_revalidation_os_error(
+            opened.path,
+            "inspect the source path after hashing",
+            exc,
         ) from exc
 
     if not _same_identity(opened.before, after) or not _same_identity(
@@ -2833,7 +2869,14 @@ def _capture_database_files(
 
         for opened in opened_sources:
             if destination_dir is None:
-                opened.first_sha256 = _hash_fd(opened.fd)
+                try:
+                    opened.first_sha256 = _hash_fd(opened.fd)
+                except OSError as exc:
+                    raise _source_revalidation_os_error(
+                        opened.path,
+                        "compute the first descriptor hash",
+                        exc,
+                    ) from exc
             else:
                 assert destination_binding is not None
                 opened.copied = _copy_fd(
@@ -2845,7 +2888,14 @@ def _capture_database_files(
 
         records: list[dict[str, Any]] = []
         for opened in opened_sources:
-            second_sha256 = _hash_fd(opened.fd)
+            try:
+                second_sha256 = _hash_fd(opened.fd)
+            except OSError as exc:
+                raise _source_revalidation_os_error(
+                    opened.path,
+                    "repeat the descriptor hash",
+                    exc,
+                ) from exc
             source_record = _revalidate_open_source(opened, second_sha256)
             record: dict[str, Any] = {
                 "basename": opened.path.name,
@@ -2861,18 +2911,21 @@ def _capture_database_files(
                 "Internal capture records do not match the bound source set",
             )
         for opened, record in zip(opened_sources, records):
-            final_descriptor = os.fstat(opened.fd)
+            try:
+                final_descriptor = os.fstat(opened.fd)
+            except OSError as exc:
+                raise _source_revalidation_os_error(
+                    opened.path,
+                    "inspect the descriptor during final revalidation",
+                    exc,
+                ) from exc
             try:
                 final_path = os.stat(opened.path, follow_symlinks=False)
-            except FileNotFoundError as exc:
-                raise StoreSafetyError(
-                    "source-missing-after-read",
-                    f"Source path disappeared during final revalidation: {opened.path}",
-                ) from exc
-            except PermissionError as exc:
-                raise StoreSafetyError(
-                    "source-revalidation-unreadable",
-                    f"Source became unreadable during final revalidation: {opened.path}",
+            except OSError as exc:
+                raise _source_revalidation_os_error(
+                    opened.path,
+                    "inspect the source path during final revalidation",
+                    exc,
                 ) from exc
             if not _same_identity(
                 opened.before, final_descriptor
@@ -2925,8 +2978,15 @@ def _fingerprint_exact_file(path: Path) -> dict[str, Any]:
     fd, opened_stat = _open_regular_readonly(path)
     opened = _OpenedSource(path=path, fd=fd, before=opened_stat)
     try:
-        opened.first_sha256 = _hash_fd(fd)
-        second_sha256 = _hash_fd(fd)
+        try:
+            opened.first_sha256 = _hash_fd(fd)
+            second_sha256 = _hash_fd(fd)
+        except OSError as exc:
+            raise _source_revalidation_os_error(
+                path,
+                "hash the opened descriptor",
+                exc,
+            ) from exc
         return _revalidate_open_source(opened, second_sha256)
     finally:
         os.close(fd)
@@ -4207,11 +4267,14 @@ def _publication_details(
     destination: Path,
     retry_safe: bool,
     descriptor_bound_destination: dict[str, Any] | None = None,
+    descriptor_bound_prepared_file: dict[str, Any] | None = None,
     descriptor_bound_prepared_root: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     locators: dict[str, Any] = {"destination": str(destination)}
     if descriptor_bound_destination is not None:
         locators["descriptor_bound_destination"] = descriptor_bound_destination
+    if descriptor_bound_prepared_file is not None:
+        locators["descriptor_bound_prepared_file"] = descriptor_bound_prepared_file
     if descriptor_bound_prepared_root is not None:
         locators["descriptor_bound_prepared_root"] = descriptor_bound_prepared_root
     if prepared is not None:
@@ -4253,6 +4316,53 @@ def _publication_details(
         "publication_state": state,
         "retry_safe": retry_safe,
         "recovery_locators": locators,
+    }
+
+
+def _descriptor_bound_prepared_retry_receipt(
+    parent_fd: int,
+    prepared: _BoundRegularFile,
+) -> dict[str, Any]:
+    """Prove that a failed rename left the complete prepared object retryable."""
+
+    if prepared.parent_opened is None:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Prepared file has no parent receipt: {prepared.path}",
+        )
+    parent = _verify_bound_parent_descriptor(
+        parent_fd,
+        prepared.parent_opened,
+        display_path=prepared.path.parent,
+        identity_code="prepared-file-identity-mismatch",
+        access_policy_code="prepared-file-access-policy-mismatch",
+        inconclusive_code="prepared-file-revalidation-inconclusive",
+    )
+    fingerprint = _verify_bound_regular_file_at(
+        prepared,
+        PREPARED_FILE_CODES,
+        dir_fd=parent_fd,
+        basename=prepared.path.name,
+    )
+    parent = _verify_bound_parent_descriptor(
+        parent_fd,
+        prepared.parent_opened,
+        display_path=prepared.path.parent,
+        identity_code="prepared-file-identity-mismatch",
+        access_policy_code="prepared-file-access-policy-mismatch",
+        inconclusive_code="prepared-file-revalidation-inconclusive",
+    )
+    return {
+        "display_path": str(prepared.path),
+        "verification": (
+            "bound-parent-leaf-identity-content-size-and-access-match-creation-receipts"
+        ),
+        "parent_identity": _identity(parent),
+        "parent_access_policy": _access_policy(parent),
+        "leaf_identity": fingerprint["identity"],
+        "leaf_access_policy": fingerprint["access_policy"],
+        "sha256": fingerprint["sha256"],
+        "size": fingerprint["size"],
     }
 
 
@@ -4592,6 +4702,49 @@ def _publish_file_no_replace_from_parent(
                 ),
             ) from exc
         if source_is_prepared and destination_state == "absent":
+            try:
+                prepared_retry_receipt = _descriptor_bound_prepared_retry_receipt(
+                    parent_fd,
+                    prepared,
+                )
+            except (OSError, StoreSafetyError) as revalidation_exc:
+                details = _publication_details(
+                    "uncertain",
+                    prepared=prepared,
+                    destination=destination,
+                    retry_safe=False,
+                )
+                prepared_locator = details["recovery_locators"].pop(
+                    "prepared",
+                    None,
+                )
+                if prepared_locator is not None:
+                    details["recovery_locators"]["prepared_unverified"] = {
+                        "path": prepared_locator,
+                        "identity": _identity(prepared.opened),
+                        "parent_identity": _identity(prepared.parent_opened),
+                        "verification": "descriptor-revalidation-failed",
+                    }
+                details["retry_revalidation"] = {
+                    "status": "failed",
+                    "error_code": (
+                        revalidation_exc.code
+                        if isinstance(revalidation_exc, StoreSafetyError)
+                        else "prepared-file-revalidation-inconclusive"
+                    ),
+                    "error": str(revalidation_exc),
+                }
+                details["publication_error"] = {
+                    "errno": exc.errno,
+                    "error": str(exc),
+                }
+                raise StoreSafetyError(
+                    "destination-install-uncertain",
+                    "The rename reported an uncommitted failure, but the held "
+                    "prepared database no longer passes complete descriptor-bound "
+                    f"revalidation: {prepared.path}: {revalidation_exc}",
+                    details=details,
+                ) from revalidation_exc
             raise StoreSafetyError(
                 "destination-install-failed",
                 f"Cannot install recovered database at {destination}: {exc}",
@@ -4600,6 +4753,7 @@ def _publish_file_no_replace_from_parent(
                     prepared=prepared,
                     destination=destination,
                     retry_safe=True,
+                    descriptor_bound_prepared_file=prepared_retry_receipt,
                 ),
             ) from exc
         raise StoreSafetyError(
@@ -6105,7 +6259,44 @@ def merge_db(src: Path, out: Path | None) -> dict[str, Any]:
     }
 
 
+def _path_is_within(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _reject_recovery_output_inside_snapshot(
+    snapshot_dir: Path,
+    out: Path,
+) -> None:
+    """Reject output namespaces that could mutate the validated snapshot tree."""
+
+    lexical_snapshot = Path(os.path.abspath(os.fspath(snapshot_dir)))
+    lexical_out = Path(os.path.abspath(os.fspath(out)))
+    try:
+        resolved_snapshot = snapshot_dir.resolve(strict=False)
+        resolved_out = out.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise StoreSafetyError(
+            "recovery-output-scope-inconclusive",
+            "Cannot prove that the recovery output is outside the snapshot tree: "
+            f"snapshot={snapshot_dir}, out={out}: {exc}",
+        ) from exc
+    if _path_is_within(lexical_out, lexical_snapshot) or _path_is_within(
+        resolved_out,
+        resolved_snapshot,
+    ):
+        raise StoreSafetyError(
+            "recovery-output-inside-snapshot",
+            "Recovery output must be a sibling of, not a member of, the immutable "
+            f"snapshot tree: snapshot={snapshot_dir}, out={out}",
+        )
+
+
 def recover_snapshot(snapshot_dir: Path, out: Path) -> dict[str, Any]:
+    _reject_recovery_output_inside_snapshot(snapshot_dir, out)
     source = snapshot_dir / "group.com.apple.notes" / NOTE_STORE_MAIN
     with _validated_snapshot_artifact(snapshot_dir) as artifact:
         validation = artifact.public_result

@@ -392,6 +392,182 @@ raise SystemExit(2)
             manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
             self.assertEqual(manifest["schema"], MODULE.SNAPSHOT_SCHEMA)
 
+    def test_source_revalidation_maps_hash_eio_to_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            original_hash = MODULE._hash_fd
+            for fail_on_call in (1, 2):
+                hash_calls = 0
+
+                def fail_selected_hash(fd: int) -> str:
+                    nonlocal hash_calls
+                    hash_calls += 1
+                    if hash_calls == fail_on_call:
+                        raise OSError(
+                            MODULE.errno.EIO,
+                            "simulated revalidation EIO",
+                        )
+                    return original_hash(fd)
+
+                with (
+                    self.subTest(fail_on_call=fail_on_call),
+                    mock.patch.object(
+                        MODULE,
+                        "_hash_fd",
+                        side_effect=fail_selected_hash,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE.fingerprint_note_store(paths)
+
+                self._assert_safety_code(
+                    "source-revalidation-inconclusive",
+                    raised,
+                )
+
+    def test_source_descriptor_revalidation_maps_estale_to_inconclusive(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            fd, opened_stat = MODULE._open_regular_readonly(source)
+            opened = MODULE._OpenedSource(
+                path=source,
+                fd=fd,
+                before=opened_stat,
+                first_sha256=MODULE._hash_fd(fd),
+            )
+            second_sha256 = MODULE._hash_fd(fd)
+            try:
+                with (
+                    mock.patch.object(
+                        MODULE.os,
+                        "fstat",
+                        side_effect=OSError(
+                            getattr(MODULE.errno, "ESTALE", MODULE.errno.EIO),
+                            "simulated stale descriptor",
+                        ),
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE._revalidate_open_source(
+                        opened,
+                        second_sha256,
+                    )
+            finally:
+                os.close(fd)
+
+        self._assert_safety_code(
+            "source-revalidation-inconclusive",
+            raised,
+        )
+
+    def test_source_path_revalidation_preserves_error_classes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            fd, opened_stat = MODULE._open_regular_readonly(source)
+            opened = MODULE._OpenedSource(
+                path=source,
+                fd=fd,
+                before=opened_stat,
+                first_sha256=MODULE._hash_fd(fd),
+            )
+            second_sha256 = MODULE._hash_fd(fd)
+            cases = (
+                (
+                    FileNotFoundError(MODULE.errno.ENOENT, "simulated missing"),
+                    "source-missing-after-read",
+                ),
+                (
+                    PermissionError(MODULE.errno.EACCES, "simulated unreadable"),
+                    "source-revalidation-unreadable",
+                ),
+                (
+                    OSError(
+                        getattr(MODULE.errno, "ESTALE", MODULE.errno.EIO),
+                        "simulated stale handle",
+                    ),
+                    "source-revalidation-inconclusive",
+                ),
+            )
+            try:
+                for fault, expected_code in cases:
+                    with (
+                        self.subTest(expected_code=expected_code),
+                        mock.patch.object(
+                            MODULE.os,
+                            "stat",
+                            side_effect=fault,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        MODULE._revalidate_open_source(
+                            opened,
+                            second_sha256,
+                        )
+                    self._assert_safety_code(expected_code, raised)
+            finally:
+                os.close(fd)
+
+    def test_source_final_revalidation_maps_generic_os_errors(self) -> None:
+        for syscall in ("fstat", "stat"):
+            with (
+                self.subTest(syscall=syscall),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                source = paths.group_container / MODULE.NOTE_STORE_MAIN
+                self._create_db(source)
+                original_revalidate = MODULE._revalidate_open_source
+                original_syscall = getattr(MODULE.os, syscall)
+                after_primary_revalidation = False
+
+                def mark_primary_revalidation(
+                    opened: MODULE._OpenedSource,
+                    second_sha256: str,
+                ) -> dict[str, object]:
+                    nonlocal after_primary_revalidation
+                    result = original_revalidate(opened, second_sha256)
+                    after_primary_revalidation = True
+                    return result
+
+                def fail_final_revalidation(
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    if after_primary_revalidation:
+                        if syscall == "fstat" or Path(os.fspath(args[0])) == source:
+                            raise OSError(
+                                MODULE.errno.EIO,
+                                "simulated final revalidation EIO",
+                            )
+                    return original_syscall(*args, **kwargs)
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_revalidate_open_source",
+                        side_effect=mark_primary_revalidation,
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        syscall,
+                        side_effect=fail_final_revalidation,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE.fingerprint_note_store(paths)
+
+                self._assert_safety_code(
+                    "source-revalidation-inconclusive",
+                    raised,
+                )
+
     def test_copy_db_does_not_use_path_reopening_validation_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -3290,6 +3466,41 @@ raise SystemExit(2)
             self.assertIn("identity", receipt)
             self.assertIn("access_policy", receipt)
 
+    def test_recover_snapshot_rejects_nested_output_before_parent_creation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = MODULE.copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+            initial_members = sorted(child.name for child in snapshot_dir.iterdir())
+            nested_parent = snapshot_dir / "analysis" / "nested"
+            recovered = nested_parent / "recovered.sqlite"
+
+            with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                MODULE.recover_snapshot(snapshot_dir, recovered)
+
+            self._assert_safety_code(
+                "recovery-output-inside-snapshot",
+                raised,
+            )
+            self.assertFalse(nested_parent.exists())
+            self.assertEqual(
+                sorted(child.name for child in snapshot_dir.iterdir()),
+                initial_members,
+            )
+            self.assertEqual(
+                MODULE.validate_snapshot(snapshot_dir)["sqlite_validation"]["result"],
+                "ok",
+            )
+
     def test_recover_snapshot_creates_output_through_bound_parent_during_swap_restore(
         self,
     ) -> None:
@@ -4073,6 +4284,113 @@ raise SystemExit(2)
             self.assertTrue(raised.exception.details["retry_safe"])
             locators = raised.exception.details["recovery_locators"]
             self.assertTrue(Path(locators["prepared"]).is_file())
+            retry_receipt = locators["descriptor_bound_prepared_file"]
+            self.assertEqual(
+                retry_receipt["verification"],
+                "bound-parent-leaf-identity-content-size-and-access-match-"
+                "creation-receipts",
+            )
+            self.assertEqual(
+                retry_receipt["sha256"],
+                MODULE._fingerprint_exact_file(Path(locators["prepared"]))["sha256"],
+            )
+            self.assertFalse(destination.exists())
+
+    def test_single_file_rename_failure_with_in_place_content_drift_is_uncertain(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            destination = root / "recovered.sqlite"
+
+            def mutate_then_fail(
+                parent_fd: int,
+                prepared_name: str,
+                target_name: str,
+            ) -> None:
+                del target_name
+                attack_fd = os.open(
+                    prepared_name,
+                    os.O_WRONLY | os.O_TRUNC,
+                    dir_fd=parent_fd,
+                )
+                try:
+                    os.write(attack_fd, b"in-place replacement bytes")
+                    os.fsync(attack_fd)
+                finally:
+                    os.close(attack_fd)
+                raise OSError(MODULE.errno.EIO, "simulated rename failure")
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_rename_file_no_replace_at",
+                    side_effect=mutate_then_fail,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.merge_db(source, destination)
+
+            self._assert_safety_code("destination-install-uncertain", raised)
+            self.assertEqual(
+                raised.exception.details["publication_state"],
+                "uncertain",
+            )
+            self.assertFalse(raised.exception.details["retry_safe"])
+            self.assertEqual(
+                raised.exception.details["retry_revalidation"]["error_code"],
+                "prepared-file-content-mismatch",
+            )
+            self.assertFalse(destination.exists())
+
+    def test_single_file_rename_failure_with_in_place_mode_drift_is_uncertain(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            destination = root / "recovered.sqlite"
+
+            def chmod_then_fail(
+                parent_fd: int,
+                prepared_name: str,
+                target_name: str,
+            ) -> None:
+                del target_name
+                attack_fd = os.open(
+                    prepared_name,
+                    os.O_RDONLY,
+                    dir_fd=parent_fd,
+                )
+                try:
+                    os.fchmod(attack_fd, 0o640)
+                finally:
+                    os.close(attack_fd)
+                raise OSError(MODULE.errno.EIO, "simulated rename failure")
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_rename_file_no_replace_at",
+                    side_effect=chmod_then_fail,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.merge_db(source, destination)
+
+            self._assert_safety_code("destination-install-uncertain", raised)
+            self.assertEqual(
+                raised.exception.details["publication_state"],
+                "uncertain",
+            )
+            self.assertFalse(raised.exception.details["retry_safe"])
+            self.assertEqual(
+                raised.exception.details["retry_revalidation"]["error_code"],
+                "prepared-file-access-policy-mismatch",
+            )
             self.assertFalse(destination.exists())
 
     def test_replaced_prepared_leaf_is_not_reported_as_verified_locator(

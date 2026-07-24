@@ -106,13 +106,16 @@ Prefer `recover-snapshot` when a manifest is available:
 ```bash
 python3 "$SKILL_DIR/scripts/apple_notes_db.py" recover-snapshot \
   --snapshot-dir /tmp/<task-snapshot> \
-  --out /tmp/<task-snapshot>/NoteStore-analysis.sqlite
+  --out /tmp/<task-snapshot>-analysis.sqlite
 ```
 
 `recover-snapshot` consumes the private clone produced by that exact validation pass. It never
 reopens the mutable snapshot paths after validation. Its recovery result carries the snapshot
 manifest and database-file identity, SHA-256, size, and access-policy receipts from that validation
 context rather than replacing them with only the SQLite integrity result.
+The output must be a sibling of, never a member of, the snapshot tree. The helper rejects lexical
+or symlink-resolved overlap before it can create an output parent, preserving the snapshot's exact
+root member set for later validation.
 The recovery step binds the clone directory, main database, and present WAL through held
 descriptors, then revalidates object identity, content, access policy, and directory membership
 against the clone's creation receipt before and after SQLite consumption. The receipt covers the
@@ -158,6 +161,10 @@ checks, the helper also binds the public parent pathname and leaf one final time
 ancestor replacement is therefore `destination-install-uncertain`; its details include a
 descriptor-bound destination receipt with parent/leaf identity, SHA-256, size, and access policy
 even when the display path no longer resolves to that object.
+A rename failure is retry-safe only after the still-held parent and prepared-file descriptors
+revalidate parent/leaf identity, two SHA-256 reads, size, and access policy against the creation
+receipt. In-place byte or mode drift makes publication `uncertain` and `retry_safe: false`, even
+when the source inode remains named and the destination was observed absent.
 
 The packaged helper remains compatible with Python 3.9. Do not use newer runtime-only call
 arguments, such as `zip(..., strict=True)`, without adding a consistent minimum-version gate.

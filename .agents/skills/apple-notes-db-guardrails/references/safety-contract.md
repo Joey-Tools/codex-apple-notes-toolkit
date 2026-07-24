@@ -60,6 +60,10 @@ Treat these outcomes separately:
 - SQLite/WAL/SHM/rollback-journal file-set membership change.
 
 Do not collapse unreadable, failed revalidation, missing, and mismatched into one result.
+Map generic descriptor/path/hash revalidation failures such as `EIO` or `ESTALE` to
+`source-revalidation-inconclusive`; do not let them escape as `unexpected-error`. Continue to map
+`FileNotFoundError` to missing-after-read and `PermissionError` to revalidation-unreadable, while
+identity, content, and access-policy comparison failures keep their dedicated codes.
 
 ## Stable Descriptor Capture
 
@@ -193,6 +197,9 @@ recovery. The validation artifact exposes the clone and evidence, not the held s
 and its private lifetime covers the complete standalone backup operation. Preserve that artifact's
 manifest and database-file identity, SHA-256, size, and access-policy receipts in the recovery
 result; SQLite integrity output supplements rather than replaces source-integrity evidence.
+Reject a recovery output that is lexically within, or resolves through existing symlinks within,
+the snapshot directory before creating the output parent. Keep the standalone output as a snapshot
+sibling so recovery cannot add a member to the exact validated snapshot root.
 
 ## Snapshot And Stage Publication
 
@@ -253,7 +260,8 @@ result uncertain rather than successful.
 Every rename, parent fsync, and final fingerprint error must be classified:
 
 - `uncommitted`: publication is proved not to have committed; `retry_safe` is true only when the
-  destination is absent and the prepared object is still bound;
+  destination is absent and the held parent plus prepared-file descriptors revalidate identity,
+  two SHA-256 reads, size, and access policy against their creation receipts;
 - `uncertain`: the destination may be committed or its durability/final fingerprint is not proved.
 
 Return `publication_state`, `retry_safe`, and `recovery_locators` in error details. Never encourage
@@ -266,6 +274,9 @@ not provide durability. A persistent parent-path replacement is `destination-ins
 while the held parent is still open, attach a descriptor-bound recovery locator containing the
 actual parent/leaf identities, access policies, SHA-256, and size even if the display path now
 names another namespace.
+Source-name identity plus destination absence alone never makes a failed rename retry-safe.
+In-place byte, size, or access-policy drift retains the failed artifact but changes the result to
+`uncertain` with `retry_safe: false`.
 
 Pre-publication failure handling protects deletion target identity by deleting nothing through a
 mutable pathname. While the creation-time root and parent descriptors are still open, revalidate
@@ -361,6 +372,7 @@ The helper emits stable error codes, including:
 - `prepared-manifest-mismatch`;
 - `destination-exists`, `destination-install-failed`;
 - `destination-install-uncertain`;
+- `recovery-output-inside-snapshot`, `recovery-output-scope-inconclusive`;
 - `post-writeback-identity-mismatch`, `post-writeback-file-set-mismatch`;
 - `post-writeback-content-mismatch`, `post-writeback-access-policy-mismatch`.
 
