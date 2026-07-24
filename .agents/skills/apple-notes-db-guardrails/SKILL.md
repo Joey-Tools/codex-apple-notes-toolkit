@@ -95,6 +95,14 @@ extracts any recoverable basename/FD, captures conservative evidence, closes tra
 unions malformed-result, provider-failure, and install locators with worst-case cleanup.
 Supervisor `details` cross a closed, bounded schema before conservative merging; malformed nested
 locator containers are rejected and recorded rather than converted with generic `dict(...)`.
+Provider response schemas and basenames, proof keys/strings, documented details strings, unknown
+details field names, and recovery-locator keys/strings must contain only Unicode scalar values and
+encode with strict UTF-8; lone surrogates are rejected without entering recovery output. A
+provider `publication_state` remains only an unverified claim inside the provider-scoped
+normalization evidence and never merges into the top-level recovery state. Without local namespace
+proof, a post-request transport failure reports top-level `publication_state: uncertain`.
+CLI JSON uses ASCII escapes defensively so even an unexpected surrogate cannot make strict UTF-8
+stdout fail before structured recovery is emitted.
 Transport evidence is completed before the first received FD leaves the cleanup-owned list. If
 normalization, evidence construction, or merging fails, every received FD is closed first and the
 helper emits a fixed `mutation_performed: true`, `retry_safe: false`, inconclusive-cleanup

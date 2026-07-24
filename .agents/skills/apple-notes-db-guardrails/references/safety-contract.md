@@ -332,6 +332,15 @@ ordinary exception, close every received descriptor before returning a fixed tra
 with `mutation_performed: true`, `retry_safe: false`, inconclusive cleanup, no transferred FD, and
 the evidence-construction failure type. Never re-enter the same untrusted merge after removing an
 FD from cleanup ownership.
+Require every retained provider response schema/basename, proof key/string, documented details
+string, unknown details field name, and recovery-locator key/string to contain only Unicode scalar
+values and encode with strict UTF-8. Reject lone surrogates with fixed normalization reasons; never
+copy them into recovery details. Keep any provider `publication_state` only as an unverified claim
+inside the provider-scoped normalization locator. It is not local namespace evidence and must not
+participate in top-level recovery-detail merging. A post-request transport failure therefore sets
+top-level `publication_state: uncertain` unless a separate local namespace proof establishes
+another state. Serialize CLI JSON with ASCII escaping so an unexpected surrogate cannot suppress
+the structured error on strict UTF-8 stdout.
 
 A creator that raises after entering its mutation boundary must use
 `_IdentityBoundDirectoryCreationFailure` and transfer the created staging basename, open

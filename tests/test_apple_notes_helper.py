@@ -210,6 +210,7 @@ class AppleNotesHelperTests(unittest.TestCase):
         server_fd: int,
         *,
         details: object,
+        response_overrides: dict[str, object] | None = None,
     ) -> None:
         """Create one directory and return its FD with a provider failure."""
 
@@ -251,26 +252,28 @@ class AppleNotesHelperTests(unittest.TestCase):
                     dir_fd=parent_fd,
                 )
                 opened = os.fstat(directory_fd)
-                response = json.dumps(
-                    {
-                        "schema": MODULE.DIRECTORY_CREATOR_RESPONSE_SCHEMA,
-                        "request_id": request["request_id"],
-                        "status": "failed-after-create",
-                        "basename": basename,
-                        "proof": {
-                            "schema": (
-                                "apple-notes-identity-bound-directory-creation/v1"
-                            ),
-                            "creation_authority": ("test-supervisor-create-then-fail"),
-                            "actual_created_object_descriptor_returned": True,
-                            "namespace_exclusive_during_handoff": True,
-                            "parent_identity": MODULE._identity(parent),
-                            "parent_access_policy": MODULE._access_policy(parent),
-                            "directory_identity": MODULE._identity(opened),
-                            "directory_access_policy": MODULE._access_policy(opened),
-                        },
-                        "details": details,
+                response_payload: dict[str, object] = {
+                    "schema": MODULE.DIRECTORY_CREATOR_RESPONSE_SCHEMA,
+                    "request_id": request["request_id"],
+                    "status": "failed-after-create",
+                    "basename": basename,
+                    "proof": {
+                        "schema": ("apple-notes-identity-bound-directory-creation/v1"),
+                        "creation_authority": ("test-supervisor-create-then-fail"),
+                        "actual_created_object_descriptor_returned": True,
+                        "namespace_exclusive_during_handoff": True,
+                        "parent_identity": MODULE._identity(parent),
+                        "parent_access_policy": MODULE._access_policy(parent),
+                        "directory_identity": MODULE._identity(opened),
+                        "directory_access_policy": MODULE._access_policy(opened),
                     },
+                    "details": details,
+                }
+                if response_overrides is not None:
+                    response_payload.update(response_overrides)
+                response = json.dumps(
+                    response_payload,
+                    ensure_ascii=True,
                     separators=(",", ":"),
                 ).encode("utf-8")
                 supervisor.sendmsg(
@@ -797,6 +800,249 @@ raise SystemExit(2)
                     self.assertTrue(
                         transport["descriptor_ownership_transferred"],
                     )
+
+    def test_supervisor_surrogate_failure_is_utf8_safe_and_locally_uncertain(
+        self,
+    ) -> None:
+        if not hasattr(os, "fork"):
+            self.skipTest("inherited-FD supervisor integration requires POSIX")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            created_path = root / ".apple-notes-create-malformed-provider-details"
+            received_descriptors: list[int] = []
+            transport_merge_primary: list[dict[str, object]] = []
+            client, server = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_DGRAM,
+            )
+            child_pid = os.fork()
+            if child_pid == 0:
+                client.close()
+                try:
+                    self._serve_directory_creator_failure_response(
+                        server.detach(),
+                        details={
+                            "publication_state": "committed",
+                            "creation_authority": "provider\ud800",
+                            "provider_install_state": "created\ud800",
+                            "provider_staging_basename": "staging\ud800",
+                            "unknown\ud800": "ignored\ud800",
+                            "recovery_locators": {
+                                "locator\ud800": {"value": "safe"},
+                                "safe-locator": {"value": "unsafe\ud800"},
+                            },
+                        },
+                        response_overrides={
+                            "schema": (
+                                f"{MODULE.DIRECTORY_CREATOR_RESPONSE_SCHEMA}\ud800"
+                            ),
+                            "basename": ".apple-notes-create-\ud800",
+                            "proof": {
+                                "schema": (
+                                    "apple-notes-identity-bound-directory-creation/v1"
+                                ),
+                                "creation_authority": "provider\ud800",
+                            },
+                        },
+                    )
+                except BaseException as exc:
+                    os.write(
+                        2,
+                        (
+                            "test surrogate directory creator supervisor "
+                            f"failed: {exc!r}\n"
+                        ).encode("utf-8"),
+                    )
+                    os._exit(73)
+                os._exit(0)
+
+            server.close()
+            original_received_rights = MODULE._received_rights_descriptors
+            original_merge = MODULE._merge_recovery_details
+
+            def capture_received_rights(
+                ancillary: list[tuple[int, int, bytes]],
+            ) -> list[int]:
+                descriptors = original_received_rights(ancillary)
+                received_descriptors.extend(descriptors)
+                return descriptors
+
+            def capture_transport_merge(
+                primary: dict[str, object],
+                additional: dict[str, object],
+            ) -> dict[str, object]:
+                locators = additional.get("recovery_locators")
+                if (
+                    type(locators) is dict
+                    and "directory_creator_supervisor" in locators
+                ):
+                    transport_merge_primary.append(dict(primary))
+                return original_merge(primary, additional)
+
+            parent_fd = os.open(root, MODULE._directory_open_flags())
+            try:
+                with (
+                    MODULE.directory_creator_supervisor(client.fileno()),
+                    mock.patch.object(
+                        MODULE,
+                        "_IDENTITY_BOUND_DIRECTORY_CREATOR",
+                        MODULE._supervisor_identity_bound_directory_creator,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_received_rights_descriptors",
+                        side_effect=capture_received_rights,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_merge_recovery_details",
+                        side_effect=capture_transport_merge,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE._create_and_install_directory_at(
+                        parent_fd,
+                        os.fstat(parent_fd),
+                        "installed",
+                        display_path=root / "installed",
+                        revalidate_scope=None,
+                        identity_code="prepared-directory-identity-mismatch",
+                        access_policy_code=(
+                            "prepared-directory-access-policy-mismatch"
+                        ),
+                        inconclusive_code=(
+                            "prepared-directory-revalidation-inconclusive"
+                        ),
+                        collision_code="prepared-directory-identity-mismatch",
+                    )
+            finally:
+                os.close(parent_fd)
+                client.close()
+                _, child_status = os.waitpid(child_pid, 0)
+
+            self.assertTrue(os.WIFEXITED(child_status))
+            self.assertEqual(os.WEXITSTATUS(child_status), 0)
+            self.assertTrue(created_path.is_dir())
+            self.assertFalse((root / "installed").exists())
+            self.assertEqual(len(received_descriptors), 1)
+            with self.assertRaises(OSError) as closed:
+                os.fstat(received_descriptors[0])
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+
+            self._assert_safety_code(
+                "directory-creation-identity-inconclusive",
+                raised,
+            )
+            details = raised.exception.details
+            self.assertTrue(details["mutation_performed"])
+            self.assertFalse(details["retry_safe"])
+            self.assertEqual(details["publication_state"], "uncertain")
+            self.assertEqual(len(transport_merge_primary), 1)
+            self.assertNotIn(
+                "publication_state",
+                transport_merge_primary[0],
+            )
+            self.assertEqual(details["cleanup_state"], "inconclusive")
+            self.assertEqual(
+                details["creation_authority"],
+                "inherited-supervisor-channel",
+            )
+            self.assertEqual(
+                details["provider_install_state"],
+                "supervisor-request-started",
+            )
+            self.assertIsNone(details["provider_staging_basename"])
+
+            transport = details["recovery_locators"]["directory_creator_supervisor"]
+            self.assertIsNone(transport["provider_reported_staging_basename"])
+            response_normalization = transport["provider_response_normalization"]
+            self.assertEqual(
+                response_normalization["status"],
+                "normalized-with-rejections",
+            )
+            self.assertIn(
+                "schema:invalid-string",
+                response_normalization["rejected_fields"],
+            )
+            self.assertIn(
+                "basename:invalid-string",
+                response_normalization["rejected_fields"],
+            )
+            self.assertIn(
+                "proof:invalid-closed-json",
+                response_normalization["rejected_fields"],
+            )
+
+            provider_normalization = transport["provider_details_normalization"]
+            self.assertEqual(
+                provider_normalization["status"],
+                "normalized-with-rejections",
+            )
+            self.assertIn(
+                "publication_state",
+                provider_normalization["accepted_evidence_fields"],
+            )
+            publication_evidence = provider_normalization["provider_scoped_evidence"][
+                "publication_state"
+            ]
+            self.assertEqual(
+                publication_evidence["status"],
+                "accepted-unverified-claim",
+            )
+            self.assertEqual(publication_evidence["claim"], "committed")
+            self.assertEqual(
+                publication_evidence["top_level_merge"],
+                "forbidden",
+            )
+            self.assertIn(
+                "details:invalid-field-name",
+                provider_normalization["rejected_fields"],
+            )
+            self.assertIn(
+                "creation_authority:invalid-string",
+                provider_normalization["rejected_fields"],
+            )
+            self.assertIn(
+                "provider_install_state:invalid-string",
+                provider_normalization["rejected_fields"],
+            )
+            self.assertIn(
+                "provider_staging_basename:invalid-string",
+                provider_normalization["rejected_fields"],
+            )
+            self.assertEqual(
+                provider_normalization["rejected_locator_count"],
+                2,
+            )
+
+            encoded_details = json.dumps(
+                details,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8", errors="strict")
+            self.assertEqual(json.loads(encoded_details), details)
+
+    def test_emit_json_escapes_lone_surrogate_for_strict_utf8_stdout(self) -> None:
+        output = io.BytesIO()
+        stdout = io.TextIOWrapper(
+            output,
+            encoding="utf-8",
+            errors="strict",
+            write_through=True,
+        )
+        try:
+            with mock.patch.object(MODULE.sys, "stdout", stdout):
+                MODULE.emit_json({"provider_value": "\ud800"})
+            encoded = output.getvalue()
+        finally:
+            stdout.detach()
+
+        self.assertIn(b"\\ud800", encoded)
+        self.assertEqual(
+            json.loads(encoded.decode("utf-8")),
+            {"provider_value": "\ud800"},
+        )
 
     def test_notes_state_probe_ignores_malicious_path_shadow(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
