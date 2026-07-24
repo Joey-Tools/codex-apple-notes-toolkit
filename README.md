@@ -8,12 +8,14 @@ SQLite/WAL/SHM snapshots, rejects descriptor-bound rollback journals before
 capture, validates SQLite recovery, stages sidecar-free patches, publishes
 snapshot/stage directories without replacing existing paths, and verifies
 explicit writeback boundaries. SHM commit evidence requires checksum-valid,
-identical duplicate headers. Standalone recovery applies committed WAL frames
+identical native-order duplicate headers bound to the exact physical WAL commit
+frame. Standalone recovery applies committed WAL frames
 from descriptor-bound inputs before SQLite consumes an anonymous
-descriptor-backed image. Publication uses held parent descriptors for rename,
-fsync, and terminal revalidation; retained sensitive partials receive precise
-recovery locators and bounded inventories. It does not mutate the live Notes
-store.
+descriptor-backed image. Snapshot files, the nested store, and the snapshot
+root are fsynced bottom-up before publication. Publication uses held parent
+descriptors for rename, fsync, and terminal revalidation; retained sensitive
+partials and uncertain standalone destinations receive precise recovery
+locators. It does not mutate the live Notes store.
 
 `scripts/apple_notes_helper.sh` remains the top-level Notes/AppleScript wrapper
 and delegates database subcommands to the skill-packaged helper.

@@ -64,10 +64,12 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" copy-db \
 
 Keep `snapshot-manifest.json` with the copied file set.
 Snapshot publication is atomic and no-replace on supported macOS/Linux filesystems.
-The helper binds the private partial directory and its parent at creation, verifies every prepared
-file against its creation receipt immediately before a descriptor-relative rename, fsyncs the held
-parent descriptor, and performs terminal descriptor-relative revalidation. It never reopens the
-parent pathname for post-rename durability. On an ordinary pre-publication failure, the helper
+The helper binds the private partial directory, its nested `group.com.apple.notes` store, and their
+parents at creation. It verifies every prepared file against its creation receipt, fsyncs copied
+files, then fsyncs the held nested-store and snapshot-root descriptors bottom-up before the
+descriptor-relative rename. It fsyncs the held publication-parent descriptor and performs terminal
+descriptor-relative revalidation. It never reopens a parent pathname for durability. On an
+ordinary pre-publication failure, the helper
 preserves the partial tree and attaches a creation-receipt-matched namespace locator plus a bounded
 no-follow sensitive-file inventory to the original error. If the root is replaced or inventory is
 inconclusive, the original error remains primary and reports the separate receipt failure.
@@ -98,7 +100,9 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" recover-snapshot \
 ```
 
 `recover-snapshot` consumes the private clone produced by that exact validation pass. It never
-reopens the mutable snapshot paths after validation.
+reopens the mutable snapshot paths after validation. Its recovery result carries the snapshot
+manifest and database-file identity, SHA-256, size, and access-policy receipts from that validation
+context rather than replacing them with only the SQLite integrity result.
 The recovery step binds the clone directory, main database, and present WAL through held
 descriptors, then revalidates object identity, content, access policy, and directory membership
 against the clone's creation receipt before and after SQLite consumption. The receipt covers the
@@ -136,7 +140,11 @@ For single-file publication failures, inspect `details.publication_state`,
 within its bound private parent with no replacement; it does not create and later unlink a private
 hard link. A prepared pathname is reported as verified only while both its parent and leaf still
 match their creation receipts. Otherwise the locator is explicitly unverified and includes the
-creation-time object and parent identities.
+creation-time object and parent identities. After descriptor-relative durability and fingerprint
+checks, the helper also binds the public parent pathname and leaf one final time. A persistent
+ancestor replacement is therefore `destination-install-uncertain`; its details include a
+descriptor-bound destination receipt with parent/leaf identity, SHA-256, size, and access policy
+even when the display path no longer resolves to that object.
 
 The packaged helper remains compatible with Python 3.9. Do not use newer runtime-only call
 arguments, such as `zip(..., strict=True)`, without adding a consistent minimum-version gate.

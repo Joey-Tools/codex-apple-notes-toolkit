@@ -1341,10 +1341,31 @@ def _create_bound_directory(
     path: Path,
     *,
     retain_failure_receipt: bool = False,
+    parent_binding: _BoundDirectory | None = None,
 ) -> Iterator[_BoundDirectory]:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     flags = _directory_open_flags()
-    parent_fd = os.open(path.parent, flags)
+    if parent_binding is None:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        parent_fd = os.open(path.parent, flags)
+    else:
+        if path.parent != parent_binding.path:
+            raise StoreSafetyError(
+                "prepared-directory-identity-mismatch",
+                "Descriptor-relative child creation requires the declared bound "
+                f"parent: child={path}, parent={parent_binding.path}",
+            )
+        if parent_binding.parent_fd is None:
+            raise StoreSafetyError(
+                "prepared-directory-revalidation-inconclusive",
+                f"Bound parent has no namespace descriptor: {parent_binding.path}",
+            )
+        _verify_bound_directory_at(
+            parent_binding,
+            parent_fd=parent_binding.parent_fd,
+            basename=parent_binding.path.name,
+            display_path=parent_binding.path,
+        )
+        parent_fd = os.dup(parent_binding.fd)
     parent_opened = os.fstat(parent_fd)
     fd: int | None = None
     created_and_bound = False
@@ -1588,6 +1609,47 @@ def _fsync_bound_parent_descriptor(
         access_policy_code=access_policy_code,
         inconclusive_code=inconclusive_code,
     )
+
+
+def _fsync_bound_directory_descriptor(
+    binding: _BoundDirectory,
+    *,
+    display_path: Path | None = None,
+) -> None:
+    """Make one bound directory durable without reopening it by pathname."""
+
+    if binding.parent_fd is None:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Bound directory has no parent descriptor: {binding.path}",
+        )
+    target = display_path or binding.path
+
+    def verify() -> None:
+        _verify_bound_parent_descriptor(
+            binding.parent_fd,
+            binding.parent_opened,
+            display_path=target.parent,
+            identity_code="prepared-directory-identity-mismatch",
+            access_policy_code="prepared-directory-access-policy-mismatch",
+            inconclusive_code="prepared-directory-revalidation-inconclusive",
+        )
+        _verify_bound_directory_at(
+            binding,
+            parent_fd=binding.parent_fd,
+            basename=binding.path.name,
+            display_path=target,
+        )
+
+    verify()
+    try:
+        os.fsync(binding.fd)
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Cannot fsync bound prepared directory {target}: {exc}",
+        ) from exc
+    verify()
 
 
 def _inventory_file_type(mode: int) -> str:
@@ -2730,6 +2792,7 @@ def _inspect_wal_payload(payload: bytes, wal_path: Path) -> dict[str, Any]:
     valid_frame_count = 0
     commit_frame_count = 0
     last_valid_commit_frame = 0
+    last_valid_commit_evidence: dict[str, Any] | None = None
     first_invalid_frame: int | None = None
     for index in range(physical_frame_count):
         offset = 32 + index * frame_size
@@ -2754,6 +2817,11 @@ def _inspect_wal_payload(payload: bytes, wal_path: Path) -> dict[str, Any]:
         if database_pages:
             commit_frame_count += 1
             last_valid_commit_frame = index + 1
+            last_valid_commit_evidence = {
+                "frame": index + 1,
+                "database_page_count": database_pages,
+                "frame_checksum": list(expected_checksum),
+            }
     return {
         "present": True,
         "status": (
@@ -2767,6 +2835,7 @@ def _inspect_wal_payload(payload: bytes, wal_path: Path) -> dict[str, Any]:
         "valid_frame_count": valid_frame_count,
         "commit_frame_count": commit_frame_count,
         "last_valid_commit_frame": last_valid_commit_frame,
+        "last_valid_commit_evidence": last_valid_commit_evidence,
         "first_invalid_frame": first_invalid_frame,
         "trailing_bytes": trailing_bytes,
         "salt": [salt1, salt2],
@@ -2774,6 +2843,35 @@ def _inspect_wal_payload(payload: bytes, wal_path: Path) -> dict[str, Any]:
             "little" if checksum_byte_order == "<" else "big"
         ),
         "big_end_checksum": checksum_byte_order == ">",
+    }
+
+
+def _wal_physical_frame_header_evidence(
+    payload: bytes,
+    wal: dict[str, Any],
+    frame_number: int,
+) -> dict[str, Any] | None:
+    """Return bounded header evidence for one complete physical WAL frame."""
+
+    physical_frame_count = int(wal.get("physical_frame_count", 0))
+    if frame_number <= 0 or frame_number > physical_frame_count:
+        return None
+    page_size = int(wal["page_size"])
+    frame_size = 24 + page_size
+    offset = 32 + (frame_number - 1) * frame_size
+    if offset + frame_size > len(payload):
+        return None
+    frame_header = payload[offset : offset + 24]
+    page_number, database_pages, salt1, salt2, checksum0, checksum1 = struct.unpack(
+        ">6I",
+        frame_header,
+    )
+    return {
+        "frame": frame_number,
+        "page_number": page_number,
+        "database_page_count": database_pages,
+        "salt": [salt1, salt2],
+        "frame_checksum": [checksum0, checksum1],
     }
 
 
@@ -2791,61 +2889,60 @@ def _inspect_wal(wal_path: Path) -> dict[str, Any]:
 def _parse_shm_header_copy(payload: bytes, offset: int) -> dict[str, Any] | None:
     if len(payload) < offset + 48:
         return None
-    for byte_order in ("<", ">"):
-        version = struct.unpack_from(f"{byte_order}I", payload, offset)[0]
-        if version != WAL_VERSION:
-            continue
-        initialized = payload[offset + 12]
-        if initialized not in {0, 1}:
-            continue
-        big_end_checksum = payload[offset + 13]
-        if big_end_checksum not in {0, 1}:
-            continue
-        calculated_checksum = _wal_checksum(
-            payload[offset : offset + 40],
-            byte_order,
-        )
-        stored_checksum = struct.unpack_from(
-            f"{byte_order}2I",
+    byte_order = "<" if sys.byteorder == "little" else ">"
+    version = struct.unpack_from(f"{byte_order}I", payload, offset)[0]
+    if version != WAL_VERSION:
+        return None
+    initialized = payload[offset + 12]
+    if initialized not in {0, 1}:
+        return None
+    big_end_checksum = payload[offset + 13]
+    if big_end_checksum not in {0, 1}:
+        return None
+    calculated_checksum = _wal_checksum(
+        payload[offset : offset + 40],
+        byte_order,
+    )
+    stored_checksum = struct.unpack_from(
+        f"{byte_order}2I",
+        payload,
+        offset + 40,
+    )
+    if calculated_checksum != stored_checksum:
+        return None
+    raw_page_size = struct.unpack_from(f"{byte_order}H", payload, offset + 14)[0]
+    page_size = 65536 if raw_page_size == 1 else raw_page_size
+    max_frame = struct.unpack_from(f"{byte_order}I", payload, offset + 16)[0]
+    # WAL-index integers use native byte order, but aSalt is copied byte-for-byte
+    # from the big-endian WAL header.
+    salt = list(struct.unpack_from(">2I", payload, offset + 32))
+    return {
+        "byte_order": sys.byteorder,
+        "initialized": bool(initialized),
+        "change_counter": struct.unpack_from(
+            f"{byte_order}I",
             payload,
-            offset + 40,
-        )
-        if calculated_checksum != stored_checksum:
-            continue
-        raw_page_size = struct.unpack_from(f"{byte_order}H", payload, offset + 14)[0]
-        page_size = 65536 if raw_page_size == 1 else raw_page_size
-        max_frame = struct.unpack_from(f"{byte_order}I", payload, offset + 16)[0]
-        # WAL-index integers use native byte order, but aSalt is copied byte-for-byte
-        # from the big-endian WAL header.
-        salt = list(struct.unpack_from(">2I", payload, offset + 32))
-        return {
-            "byte_order": "little" if byte_order == "<" else "big",
-            "initialized": bool(initialized),
-            "change_counter": struct.unpack_from(
-                f"{byte_order}I",
+            offset + 8,
+        )[0],
+        "big_end_checksum": bool(big_end_checksum),
+        "raw_page_size": raw_page_size,
+        "page_size": page_size,
+        "max_frame": max_frame,
+        "database_page_count": struct.unpack_from(
+            f"{byte_order}I",
+            payload,
+            offset + 20,
+        )[0],
+        "frame_checksum": list(
+            struct.unpack_from(
+                f"{byte_order}2I",
                 payload,
-                offset + 8,
-            )[0],
-            "big_end_checksum": bool(big_end_checksum),
-            "raw_page_size": raw_page_size,
-            "page_size": page_size,
-            "max_frame": max_frame,
-            "database_page_count": struct.unpack_from(
-                f"{byte_order}I",
-                payload,
-                offset + 20,
-            )[0],
-            "frame_checksum": list(
-                struct.unpack_from(
-                    f"{byte_order}2I",
-                    payload,
-                    offset + 24,
-                )
-            ),
-            "salt": salt,
-            "header_checksum": list(stored_checksum),
-        }
-    return None
+                offset + 24,
+            )
+        ),
+        "salt": salt,
+        "header_checksum": list(stored_checksum),
+    }
 
 
 def _classify_sidecar_payloads(
@@ -2876,40 +2973,71 @@ def _classify_sidecar_payloads(
             and header[:48] == header[48:96]
         )
         trusted_header = parsed_copies[0] if duplicate_headers_consistent else None
-        same_generation = [
-            parsed
-            for parsed in ([trusted_header] if trusted_header is not None else [])
-            if wal.get("status") not in {"absent", "empty"}
-            and parsed["initialized"]
-            and parsed["salt"] == wal["salt"]
-            and parsed["page_size"] == wal["page_size"]
-            and parsed["big_end_checksum"] == wal["big_end_checksum"]
-        ]
-        matching_headers = sum(
-            1
-            for parsed in same_generation
-            if parsed["max_frame"] == wal["last_valid_commit_frame"]
+        same_generation_header = (
+            trusted_header
+            if trusted_header is not None
+            and wal.get("status") not in {"absent", "empty"}
+            and trusted_header["initialized"]
+            and trusted_header["salt"] == wal["salt"]
+            and trusted_header["page_size"] == wal["page_size"]
+            and trusted_header["big_end_checksum"] == wal["big_end_checksum"]
+            else None
         )
-        if any(
-            parsed["max_frame"] > wal["last_valid_commit_frame"]
-            for parsed in same_generation
-        ):
-            raise StoreSafetyError(
-                "wal-shm-commit-mismatch",
-                "SHM advertises a committed WAL frame whose checksum is invalid",
+        committed_frame_binding: dict[str, Any] | None = None
+        matching_wal_commit = False
+        if same_generation_header is not None:
+            committed_frame_binding = _wal_physical_frame_header_evidence(
+                wal_payload,
+                wal,
+                int(same_generation_header["max_frame"]),
             )
+            exact_physical_commit_binding = (
+                committed_frame_binding is not None
+                and committed_frame_binding["page_number"] > 0
+                and committed_frame_binding["database_page_count"] > 0
+                and committed_frame_binding["salt"] == wal["salt"]
+                and committed_frame_binding["frame_checksum"]
+                == same_generation_header["frame_checksum"]
+                and committed_frame_binding["database_page_count"]
+                == same_generation_header["database_page_count"]
+            )
+            last_valid_commit = wal.get("last_valid_commit_evidence")
+            matching_wal_commit = bool(
+                exact_physical_commit_binding
+                and last_valid_commit is not None
+                and committed_frame_binding["frame"] == wal["last_valid_commit_frame"]
+                and committed_frame_binding["frame"] == last_valid_commit["frame"]
+                and committed_frame_binding["frame_checksum"]
+                == last_valid_commit["frame_checksum"]
+                and committed_frame_binding["database_page_count"]
+                == last_valid_commit["database_page_count"]
+            )
+            if (
+                exact_physical_commit_binding
+                and committed_frame_binding["frame"] > wal["last_valid_commit_frame"]
+            ):
+                raise StoreSafetyError(
+                    "wal-shm-commit-mismatch",
+                    "The duplicate native-order SHM header binds mxFrame, "
+                    "aFrameCksum, and nPage to a later physical WAL commit frame "
+                    "whose checksum-valid prefix is incomplete",
+                )
         shm = {
             "present": True,
             "status": "derived-match"
-            if matching_headers
+            if matching_wal_commit
             else "derived-rebuild-required",
             "size": len(shm_payload),
             "valid_header_copies": len(copies),
             "duplicate_headers_consistent": duplicate_headers_consistent,
-            "same_generation_header_copies": 2 if same_generation else 0,
-            "matching_wal_header_copies": (
-                2 if matching_headers and duplicate_headers_consistent else 0
+            "native_byte_order": sys.byteorder,
+            "same_generation_header_copies": (
+                2 if same_generation_header is not None else 0
             ),
+            "matching_wal_header_copies": (
+                2 if matching_wal_commit and duplicate_headers_consistent else 0
+            ),
+            "committed_frame_binding": committed_frame_binding,
         }
 
     ignored = [shm_path.name] if shm_payload is not None else []
@@ -3131,8 +3259,11 @@ def _publication_details(
     prepared: _BoundRegularFile | None,
     destination: Path,
     retry_safe: bool,
+    descriptor_bound_destination: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     locators: dict[str, Any] = {"destination": str(destination)}
+    if descriptor_bound_destination is not None:
+        locators["descriptor_bound_destination"] = descriptor_bound_destination
     if prepared is not None:
         receipt: dict[str, Any] = {
             "path": str(prepared.path),
@@ -3173,6 +3304,128 @@ def _publication_details(
         "retry_safe": retry_safe,
         "recovery_locators": locators,
     }
+
+
+def _descriptor_bound_destination_receipt(
+    parent_fd: int,
+    prepared: _BoundRegularFile,
+    destination: Path,
+) -> dict[str, Any]:
+    """Bind the installed leaf to the still-open publication parent."""
+
+    if prepared.parent_opened is None:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Prepared file has no parent receipt: {prepared.path}",
+        )
+    parent = _verify_bound_parent_descriptor(
+        parent_fd,
+        prepared.parent_opened,
+        display_path=destination.parent,
+        identity_code="prepared-file-identity-mismatch",
+        access_policy_code="prepared-file-access-policy-mismatch",
+        inconclusive_code="prepared-file-revalidation-inconclusive",
+    )
+    leaf = os.stat(
+        destination.name,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+    )
+    if not stat.S_ISREG(leaf.st_mode) or not _same_identity(prepared.opened, leaf):
+        raise StoreSafetyError(
+            "prepared-file-identity-mismatch",
+            "The descriptor-bound destination no longer identifies the prepared "
+            f"regular file: {destination}",
+        )
+    if _access_policy(prepared.opened) != _access_policy(leaf):
+        raise StoreSafetyError(
+            "prepared-file-access-policy-mismatch",
+            f"The descriptor-bound destination changed access policy: {destination}",
+        )
+    fingerprint = _verify_bound_regular_file_at(
+        prepared,
+        PREPARED_FILE_CODES,
+        dir_fd=parent_fd,
+        basename=destination.name,
+    )
+    return {
+        "display_path": str(destination),
+        "verification": "bound-parent-and-leaf-match-creation-receipts",
+        "content_verification": "descriptor-rehashed-against-creation-receipt",
+        "namespace_note": (
+            "The display path may no longer resolve if its ancestor namespace "
+            "was replaced after descriptor-bound publication"
+        ),
+        "parent_identity": _identity(parent),
+        "parent_access_policy": _access_policy(parent),
+        "leaf_identity": _identity(leaf),
+        "leaf_access_policy": _access_policy(leaf),
+        "sha256": fingerprint["sha256"],
+        "size": fingerprint["size"],
+    }
+
+
+def _verify_installed_file_path(
+    prepared: _BoundRegularFile,
+    destination: Path,
+) -> None:
+    """Terminally prove that the public path names the descriptor-bound leaf."""
+
+    if prepared.parent_opened is None:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Prepared file has no parent receipt: {prepared.path}",
+        )
+    path_parent_fd: int | None = None
+    try:
+        parent_before = os.stat(destination.parent, follow_symlinks=False)
+        path_parent_fd = os.open(destination.parent, _directory_open_flags())
+        parent_descriptor = os.fstat(path_parent_fd)
+        leaf = os.stat(
+            destination.name,
+            dir_fd=path_parent_fd,
+            follow_symlinks=False,
+        )
+        parent_after = os.stat(destination.parent, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            "prepared-file-identity-mismatch",
+            f"The installed destination path is missing: {destination}",
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Cannot terminally bind the installed destination path: "
+            f"{destination}: {exc}",
+        ) from exc
+    finally:
+        if path_parent_fd is not None:
+            os.close(path_parent_fd)
+    if (
+        not stat.S_ISDIR(parent_before.st_mode)
+        or not stat.S_ISDIR(parent_descriptor.st_mode)
+        or not stat.S_ISDIR(parent_after.st_mode)
+        or not _same_identity(prepared.parent_opened, parent_before)
+        or not _same_identity(parent_before, parent_descriptor)
+        or not _same_identity(parent_descriptor, parent_after)
+        or not stat.S_ISREG(leaf.st_mode)
+        or not _same_identity(prepared.opened, leaf)
+    ):
+        raise StoreSafetyError(
+            "prepared-file-identity-mismatch",
+            "The installed path parent or leaf does not match the "
+            f"descriptor-bound publication receipts: {destination}",
+        )
+    if (
+        _access_policy(prepared.parent_opened) != _access_policy(parent_before)
+        or _access_policy(parent_before) != _access_policy(parent_descriptor)
+        or _access_policy(parent_descriptor) != _access_policy(parent_after)
+        or _access_policy(prepared.opened) != _access_policy(leaf)
+    ):
+        raise StoreSafetyError(
+            "prepared-file-access-policy-mismatch",
+            f"The installed path parent or leaf changed access policy: {destination}",
+        )
 
 
 @contextmanager
@@ -3324,6 +3577,7 @@ def _publish_file_no_replace_from_parent(
             f"{prepared.path}",
         )
     before_rename = os.fstat(prepared.fd)
+    descriptor_bound_destination: dict[str, Any] | None = None
     try:
         _rename_file_no_replace_at(
             parent_fd,
@@ -3353,6 +3607,14 @@ def _publish_file_no_replace_from_parent(
             and _same_identity(prepared.opened, source_after)
         )
         if committed:
+            try:
+                descriptor_bound_destination = _descriptor_bound_destination_receipt(
+                    parent_fd,
+                    prepared,
+                    destination,
+                )
+            except (OSError, StoreSafetyError):
+                descriptor_bound_destination = None
             raise StoreSafetyError(
                 "destination-install-uncertain",
                 "The destination contains the prepared database, but the "
@@ -3362,6 +3624,7 @@ def _publish_file_no_replace_from_parent(
                     prepared=prepared,
                     destination=destination,
                     retry_safe=False,
+                    descriptor_bound_destination=descriptor_bound_destination,
                 ),
             ) from exc
         if (
@@ -3457,7 +3720,22 @@ def _publish_file_no_replace_from_parent(
                 "The private source name reappeared after publication: "
                 f"{prepared.path}",
             )
+        descriptor_bound_destination = _descriptor_bound_destination_receipt(
+            parent_fd,
+            prepared,
+            destination,
+        )
+        _verify_installed_file_path(prepared, destination)
     except (OSError, StoreSafetyError) as exc:
+        if descriptor_bound_destination is None:
+            try:
+                descriptor_bound_destination = _descriptor_bound_destination_receipt(
+                    parent_fd,
+                    prepared,
+                    destination,
+                )
+            except (OSError, StoreSafetyError):
+                descriptor_bound_destination = None
         raise StoreSafetyError(
             "destination-install-uncertain",
             "The recovered database was renamed into place, but final durability "
@@ -3467,6 +3745,7 @@ def _publish_file_no_replace_from_parent(
                 prepared=prepared,
                 destination=destination,
                 retry_safe=False,
+                descriptor_bound_destination=descriptor_bound_destination,
             ),
         ) from exc
     return fingerprint
@@ -4170,14 +4449,24 @@ def copy_db(
         )
     partial = destination.parent / f".{destination.name}.partial-{uuid.uuid4().hex}"
     try:
-        with _create_bound_directory(
-            partial,
-            retain_failure_receipt=True,
-        ) as bound_root:
+        with (
+            _create_bound_directory(
+                partial,
+                retain_failure_receipt=True,
+            ) as bound_root,
+            ExitStack() as snapshot_stack,
+        ):
             store_dir = partial / "group.com.apple.notes"
+            bound_store = snapshot_stack.enter_context(
+                _create_bound_directory(
+                    store_dir,
+                    parent_binding=bound_root,
+                )
+            )
             captured = _capture_database_files(
                 paths.group_container / NOTE_STORE_MAIN,
                 store_dir,
+                destination_binding=bound_store,
             )
             _verify_bound_directory(bound_root)
             copied_main = store_dir / NOTE_STORE_MAIN
@@ -4287,6 +4576,54 @@ def copy_db(
                         manifest_payload=manifest,
                         manifest_receipt=manifest_receipt,
                         file_receipts=file_receipts,
+                    )
+                    # Copied files are individually fsynced by _copy_fd. Persist
+                    # the nested store directory, then its containing snapshot
+                    # root, before publishing the root name.
+                    _fsync_bound_directory_descriptor(bound_store)
+                    _scan_exact_directory_entries(
+                        store_dir,
+                        expected_names,
+                        missing_code="prepared-file-missing",
+                        mismatch_code="prepared-file-set-mismatch",
+                        bound_identity=store_receipt["identity"],
+                        bound_access_policy=store_receipt["access_policy"],
+                    )
+                    _revalidate_published_regular_files(
+                        partial,
+                        prepared_files,
+                        manifest_name=SNAPSHOT_MANIFEST,
+                        manifest_payload=manifest,
+                        manifest_receipt=manifest_receipt,
+                        file_receipts=file_receipts,
+                    )
+                    _fsync_bound_directory_descriptor(bound_root)
+                    _scan_exact_directory_entries(
+                        store_dir,
+                        expected_names,
+                        missing_code="prepared-file-missing",
+                        mismatch_code="prepared-file-set-mismatch",
+                        bound_identity=store_receipt["identity"],
+                        bound_access_policy=store_receipt["access_policy"],
+                    )
+                    _revalidate_published_regular_files(
+                        partial,
+                        prepared_files,
+                        manifest_name=SNAPSHOT_MANIFEST,
+                        manifest_payload=manifest,
+                        manifest_receipt=manifest_receipt,
+                        file_receipts=file_receipts,
+                    )
+                    _scan_exact_directory_entries(
+                        partial,
+                        {
+                            "group.com.apple.notes": stat.S_IFDIR,
+                            SNAPSHOT_MANIFEST: stat.S_IFREG,
+                        },
+                        missing_code="prepared-directory-identity-mismatch",
+                        mismatch_code="prepared-file-set-mismatch",
+                        bound_identity=root_receipt["identity"],
+                        bound_access_policy=root_receipt["access_policy"],
                     )
 
                 _verify_bound_directory(bound_root)
@@ -4573,7 +4910,7 @@ def recover_snapshot(snapshot_dir: Path, out: Path) -> dict[str, Any]:
             out,
             source_db=source,
             recovery_evidence=artifact.recovery_evidence,
-            source_integrity=validation["sqlite_validation"],
+            source_integrity=artifact.source_integrity,
             source_revalidate=artifact.revalidate_recovery_clone,
             source_backup=artifact.backup_recovery_clone,
         )
@@ -4582,6 +4919,7 @@ def recover_snapshot(snapshot_dir: Path, out: Path) -> dict[str, Any]:
             "snapshot_validation": {
                 "sqlite_validation": validation["sqlite_validation"],
                 "sidecar_consistency": validation["sidecar_consistency"],
+                "source_integrity": artifact.source_integrity,
             },
             "recovered": recovered,
         }

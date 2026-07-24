@@ -346,6 +346,141 @@ raise SystemExit(2)
             manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
             self.assertEqual(manifest["schema"], MODULE.SNAPSHOT_SCHEMA)
 
+    def test_snapshot_fsyncs_nested_store_then_root_before_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = root / "snapshot"
+            events: list[str] = []
+            original_fsync = MODULE._fsync_bound_directory_descriptor
+            original_rename = MODULE._rename_directory_no_replace_at
+
+            def record_fsync(binding: object, **kwargs: object) -> None:
+                events.append(f"fsync:{Path(binding.path).name}")
+                original_fsync(binding, **kwargs)
+
+            def record_rename(
+                parent_fd: int,
+                source_name: str,
+                target_name: str,
+            ) -> None:
+                events.append("publish")
+                original_rename(parent_fd, source_name, target_name)
+
+            with (
+                mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                mock.patch.object(
+                    MODULE,
+                    "_fsync_bound_directory_descriptor",
+                    side_effect=record_fsync,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_rename_directory_no_replace_at",
+                    side_effect=record_rename,
+                ),
+            ):
+                MODULE.copy_db(
+                    paths,
+                    dest=destination,
+                    require_notes_quit=True,
+                )
+
+        self.assertEqual(len(events), 3)
+        self.assertEqual(events[0], "fsync:group.com.apple.notes")
+        self.assertTrue(events[1].startswith("fsync:.snapshot.partial-"))
+        self.assertEqual(events[2], "publish")
+
+    def test_snapshot_nested_store_fsync_failure_retains_unpublished_tree(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = root / "snapshot"
+            original_fsync = MODULE._fsync_bound_directory_descriptor
+
+            def fail_store_fsync(binding: object, **kwargs: object) -> None:
+                if Path(binding.path).name == "group.com.apple.notes":
+                    raise MODULE.StoreSafetyError(
+                        "prepared-directory-revalidation-inconclusive",
+                        "simulated nested store fsync failure",
+                    )
+                original_fsync(binding, **kwargs)
+
+            with (
+                mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                mock.patch.object(
+                    MODULE,
+                    "_fsync_bound_directory_descriptor",
+                    side_effect=fail_store_fsync,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.copy_db(
+                    paths,
+                    dest=destination,
+                    require_notes_quit=True,
+                )
+
+            self._assert_safety_code(
+                "prepared-directory-revalidation-inconclusive",
+                raised,
+            )
+            self.assertFalse(destination.exists())
+            retained = self._assert_retained_partial(root, ".snapshot.partial-*")
+            self.assertTrue(
+                (retained / "group.com.apple.notes" / MODULE.NOTE_STORE_MAIN).is_file()
+            )
+
+    def test_snapshot_revalidates_store_after_root_fsync(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = root / "snapshot"
+            original_fsync = MODULE._fsync_bound_directory_descriptor
+            attacked = False
+
+            def mutate_after_root_fsync(binding: object, **kwargs: object) -> None:
+                nonlocal attacked
+                original_fsync(binding, **kwargs)
+                if not attacked and Path(binding.path).name.startswith(
+                    ".snapshot.partial-"
+                ):
+                    attacked = True
+                    copied = (
+                        Path(binding.path)
+                        / "group.com.apple.notes"
+                        / MODULE.NOTE_STORE_MAIN
+                    )
+                    with copied.open("ab") as handle:
+                        handle.write(b"tampered-after-root-fsync")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+
+            with (
+                mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                mock.patch.object(
+                    MODULE,
+                    "_fsync_bound_directory_descriptor",
+                    side_effect=mutate_after_root_fsync,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.copy_db(
+                    paths,
+                    dest=destination,
+                    require_notes_quit=True,
+                )
+
+            self.assertTrue(attacked)
+            self._assert_safety_code("prepared-file-content-mismatch", raised)
+            self.assertFalse(destination.exists())
+            self._assert_retained_partial(root, ".snapshot.partial-*")
+
     def test_copy_db_rejects_open_notes_for_writeback_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1583,6 +1718,159 @@ raise SystemExit(2)
         self.assertEqual(result["shm"]["valid_header_copies"], 2)
         self.assertTrue(result["shm"]["duplicate_headers_consistent"])
         self.assertEqual(result["shm"]["matching_wal_header_copies"], 2)
+        self.assertEqual(result["shm"]["native_byte_order"], sys.byteorder)
+        binding = result["shm"]["committed_frame_binding"]
+        commit = result["wal"]["last_valid_commit_evidence"]
+        self.assertEqual(binding["frame"], commit["frame"])
+        self.assertEqual(
+            binding["database_page_count"],
+            commit["database_page_count"],
+        )
+        self.assertEqual(binding["frame_checksum"], commit["frame_checksum"])
+
+    def test_foreign_endian_shm_headers_are_never_promoted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            connection = self._create_wal_db(source)
+            try:
+                wal_payload = source.with_name(f"{source.name}-wal").read_bytes()
+                native_shm = source.with_name(f"{source.name}-shm").read_bytes()
+            finally:
+                connection.close()
+            native = MODULE._parse_shm_header_copy(native_shm, 0)
+            self.assertIsNotNone(native)
+            assert native is not None
+            foreign_order = ">" if sys.byteorder == "little" else "<"
+            foreign = bytearray(48)
+            struct.pack_into(f"{foreign_order}I", foreign, 0, MODULE.WAL_VERSION)
+            struct.pack_into(
+                f"{foreign_order}I",
+                foreign,
+                8,
+                native["change_counter"],
+            )
+            foreign[12] = int(native["initialized"])
+            foreign[13] = int(native["big_end_checksum"])
+            struct.pack_into(
+                f"{foreign_order}H",
+                foreign,
+                14,
+                native["raw_page_size"],
+            )
+            struct.pack_into(
+                f"{foreign_order}2I",
+                foreign,
+                16,
+                native["max_frame"],
+                native["database_page_count"],
+            )
+            struct.pack_into(
+                f"{foreign_order}2I",
+                foreign,
+                24,
+                *native["frame_checksum"],
+            )
+            struct.pack_into(">2I", foreign, 32, *native["salt"])
+            checksum = MODULE._wal_checksum(bytes(foreign[:40]), foreign_order)
+            struct.pack_into(f"{foreign_order}2I", foreign, 40, *checksum)
+            result = MODULE._classify_sidecar_payloads(
+                source,
+                wal_payload=wal_payload,
+                shm_payload=bytes(foreign + foreign),
+            )
+
+        self.assertEqual(result["shm"]["status"], "derived-rebuild-required")
+        self.assertEqual(result["shm"]["valid_header_copies"], 0)
+
+    def test_unrelated_valid_shm_cannot_promote_wal_corruption(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            connection = self._create_wal_db(source)
+            try:
+                wal_payload = bytearray(
+                    source.with_name(f"{source.name}-wal").read_bytes()
+                )
+                shm_payload = bytearray(
+                    source.with_name(f"{source.name}-shm").read_bytes()
+                )
+            finally:
+                connection.close()
+            wal_payload[32 + 24] ^= 0xFF
+            parsed = MODULE._parse_shm_header_copy(shm_payload, 0)
+            self.assertIsNotNone(parsed)
+            assert parsed is not None
+            byte_order = "<" if sys.byteorder == "little" else ">"
+            unrelated_checksum = [
+                parsed["frame_checksum"][0] ^ 0xFFFFFFFF,
+                parsed["frame_checksum"][1],
+            ]
+            struct.pack_into(
+                f"{byte_order}2I",
+                shm_payload,
+                24,
+                *unrelated_checksum,
+            )
+            checksum = MODULE._wal_checksum(bytes(shm_payload[:40]), byte_order)
+            struct.pack_into(f"{byte_order}2I", shm_payload, 40, *checksum)
+            shm_payload[48:96] = shm_payload[:48]
+            result = MODULE._classify_sidecar_payloads(
+                source,
+                wal_payload=bytes(wal_payload),
+                shm_payload=bytes(shm_payload),
+            )
+
+        self.assertEqual(result["shm"]["status"], "derived-rebuild-required")
+        self.assertEqual(result["shm"]["valid_header_copies"], 2)
+        self.assertTrue(result["shm"]["duplicate_headers_consistent"])
+        self.assertEqual(result["shm"]["same_generation_header_copies"], 2)
+        self.assertEqual(result["shm"]["matching_wal_header_copies"], 0)
+
+    def test_shm_npage_must_match_its_physical_commit_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            connection = self._create_wal_db(source)
+            try:
+                wal_payload = source.with_name(f"{source.name}-wal").read_bytes()
+                shm_payload = bytearray(
+                    source.with_name(f"{source.name}-shm").read_bytes()
+                )
+            finally:
+                connection.close()
+            parsed = MODULE._parse_shm_header_copy(shm_payload, 0)
+            self.assertIsNotNone(parsed)
+            assert parsed is not None
+            byte_order = "<" if sys.byteorder == "little" else ">"
+            for offset in (0, 48):
+                struct.pack_into(
+                    f"{byte_order}I",
+                    shm_payload,
+                    offset + 20,
+                    parsed["database_page_count"] + 1,
+                )
+                checksum = MODULE._wal_checksum(
+                    bytes(shm_payload[offset : offset + 40]),
+                    byte_order,
+                )
+                struct.pack_into(
+                    f"{byte_order}2I",
+                    shm_payload,
+                    offset + 40,
+                    *checksum,
+                )
+            result = MODULE._classify_sidecar_payloads(
+                source,
+                wal_payload=wal_payload,
+                shm_payload=bytes(shm_payload),
+            )
+
+        self.assertEqual(result["shm"]["status"], "derived-rebuild-required")
+        self.assertEqual(result["shm"]["valid_header_copies"], 2)
+        self.assertTrue(result["shm"]["duplicate_headers_consistent"])
+        self.assertEqual(result["shm"]["same_generation_header_copies"], 2)
+        self.assertEqual(result["shm"]["matching_wal_header_copies"], 0)
 
     def test_corrupt_shm_checksums_cannot_prove_corrupt_wal_commit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2077,6 +2365,43 @@ raise SystemExit(2)
                 current_value = conn.execute("SELECT value FROM sample").fetchone()[0]
         self.assertEqual(recovered_value, "validated")
         self.assertEqual(current_value, "replacement")
+
+    def test_recover_snapshot_preserves_snapshot_source_integrity_receipts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = MODULE.copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+            validation = MODULE.validate_snapshot(snapshot_dir)
+            result = MODULE.recover_snapshot(
+                snapshot_dir,
+                root / "recovered.sqlite",
+            )
+
+        self.assertEqual(
+            result["recovered"]["source_integrity"],
+            validation["source_integrity"],
+        )
+        self.assertEqual(
+            result["snapshot_validation"]["source_integrity"],
+            validation["source_integrity"],
+        )
+        for receipt in [
+            validation["source_integrity"]["manifest"],
+            *validation["source_integrity"]["files"],
+        ]:
+            self.assertIn("identity", receipt)
+            self.assertIn("sha256", receipt)
+            self.assertIn("size", receipt)
+            self.assertIn("access_policy", receipt)
 
     def test_recover_snapshot_rejects_validated_artifact_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2952,6 +3277,75 @@ raise SystemExit(2)
             self.assertTrue(attacked)
             self.assertEqual(Path(result["standalone_db"]), destination)
             self.assertTrue(destination.is_file())
+
+    def test_single_file_permanent_parent_replacement_is_uncertain_with_locator(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            self._create_db(source, value="validated")
+            destination = root / "recovered.sqlite"
+            parked = root.with_name(f"{root.name}-parked")
+            original_fsync = MODULE._fsync_bound_parent_descriptor
+            attacked = False
+
+            def replace_parent_permanently(
+                parent_fd: int,
+                opened: os.stat_result,
+                **kwargs: object,
+            ) -> None:
+                nonlocal attacked
+                display_path = Path(str(kwargs["display_path"]))
+                if not attacked and display_path == root and destination.exists():
+                    attacked = True
+                    root.rename(parked)
+                    root.mkdir(mode=0o700)
+                    self.assertNotEqual(
+                        MODULE._identity(root.stat()),
+                        MODULE._identity(os.fstat(parent_fd)),
+                    )
+                original_fsync(parent_fd, opened, **kwargs)
+
+            try:
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_fsync_bound_parent_descriptor",
+                        side_effect=replace_parent_permanently,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE.merge_db(source, destination)
+                self._assert_safety_code("destination-install-uncertain", raised)
+                self.assertTrue(attacked)
+                self.assertFalse(destination.exists())
+                parked_destination = parked / destination.name
+                self.assertTrue(parked_destination.is_file())
+                locators = raised.exception.details["recovery_locators"]
+                locator = locators["descriptor_bound_destination"]
+                self.assertEqual(locator["display_path"], str(destination))
+                self.assertEqual(
+                    locator["verification"],
+                    "bound-parent-and-leaf-match-creation-receipts",
+                )
+                self.assertEqual(
+                    locator["leaf_identity"],
+                    MODULE._identity(parked_destination.stat()),
+                )
+                self.assertEqual(
+                    locator["size"],
+                    parked_destination.stat().st_size,
+                )
+                self.assertEqual(
+                    locator["sha256"],
+                    MODULE._fingerprint_exact_file(parked_destination)["sha256"],
+                )
+            finally:
+                if parked.exists():
+                    if root.exists():
+                        root.rmdir()
+                    parked.rename(root)
 
     def test_single_file_content_tamper_after_rename_is_uncertain(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

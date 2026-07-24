@@ -93,11 +93,13 @@ commit frame and reporting any ignored tail.
 Reject a copy when trusted same-generation SHM says an invalid WAL frame was already committed.
 
 Treat `NoteStore.sqlite-shm` as a derived WAL-index cache, not as authoritative durable content.
-Validate each WAL-index header checksum using its native byte order. A header may prove a committed
-frame only when both 48-byte copies are individually checksum-valid and byte-for-byte identical.
-If either checksum is invalid, one copy is torn, or the valid copies disagree, report
-`derived-rebuild-required`; never upgrade that ambiguous SHM state to
-`wal-shm-commit-mismatch`.
+Parse WAL-index integers only in the current host's native byte order and validate each header
+checksum in that order. A header may prove a committed frame only when both 48-byte copies are
+individually checksum-valid and byte-for-byte identical, match the WAL generation, and bind
+`mxFrame`, `aFrameCksum`, and `nPage` to that exact complete physical WAL commit frame. If any part
+of that proof is absent—including foreign-endian input, an out-of-range frame, a non-commit frame,
+or mismatched frame checksum/page count—report `derived-rebuild-required`; never upgrade
+unrelated or incomplete SHM evidence to `wal-shm-commit-mismatch`.
 Do not fail recovery solely because SHM is absent or stale.
 Instead, preserve the raw SHM in the evidence snapshot, omit it from the isolated recovery clone,
 and let SQLite rebuild the WAL index from the main database and valid WAL.
@@ -177,7 +179,9 @@ Keep the original snapshot manifest and raw file set until the task is complete.
 `recover-snapshot` must consume the private recovery clone produced by its exact successful
 validation context. Do not reopen the original snapshot main/WAL/SHM paths between validation and
 recovery. The validation artifact exposes the clone and evidence, not the held source descriptors,
-and its private lifetime covers the complete standalone backup operation.
+and its private lifetime covers the complete standalone backup operation. Preserve that artifact's
+manifest and database-file identity, SHA-256, size, and access-policy receipts in the recovery
+result; SQLite integrity output supplements rather than replaces source-integrity evidence.
 
 ## Snapshot And Stage Publication
 
@@ -188,14 +192,18 @@ instead of falling back to a check-then-rename sequence. An existing destination
 empty directory that appeared after an earlier check, must remain untouched.
 
 Create the partial root through a parent directory descriptor, immediately bind the root and parent
-descriptors, identities, and access policies, and hold both through publication. Bind every
+descriptors, then create and bind the nested `group.com.apple.notes` store relative to that held
+root. Hold all three descriptors, identities, and access policies through publication. Bind every
 prepared regular file and compare it with its creation receipt: exact identity, SHA-256, size, and
 access policy. Parse the installed manifest and require it to equal the in-memory payload. Verify
 the exact no-follow root and nested name/type sets plus every held file immediately before rename.
-Rename the source/destination names relative to the held parent, fsync that same parent descriptor,
-and terminally revalidate the installed root relative to it. Never reopen the parent pathname
-between rename and durability. A temporary parent-path replacement therefore cannot redirect
-publication evidence, while identity or access-policy changes on the held parent fail separately.
+After each copied file has been fsynced, fsync the held nested-store descriptor and then the held
+snapshot-root descriptor; revalidate their receipts and exact membership between those bottom-up
+durability steps. Rename the source/destination names relative to the held publication parent,
+fsync that same parent descriptor, and terminally revalidate the installed root relative to it.
+Never reopen the parent pathname between rename and durability. A temporary parent-path
+replacement therefore cannot redirect publication evidence, while identity or access-policy
+changes on the held parent fail separately.
 
 After any publication error, compare the private source and destination namespaces with the
 prepared directory's object identity. Report a proved pre-existing destination as
@@ -219,7 +227,13 @@ Every rename, parent fsync, and final fingerprint error must be classified:
 Return `publication_state`, `retry_safe`, and `recovery_locators` in error details. Never encourage
 a retry for `uncertain`. Include a verified prepared pathname only when its current parent and leaf
 match their creation receipts. Otherwise emit an explicitly unverified locator containing the
-recorded path, device/inode/file type, and parent identity.
+recorded path, device/inode/file type, and parent identity. After the descriptor-relative parent
+fsync and terminal leaf fingerprint, reopen the public parent pathname only for a final identity and
+access-policy proof, and require its leaf to identify the prepared object. This pathname check does
+not provide durability. A persistent parent-path replacement is `destination-install-uncertain`;
+while the held parent is still open, attach a descriptor-bound recovery locator containing the
+actual parent/leaf identities, access policies, SHA-256, and size even if the display path now
+names another namespace.
 
 Pre-publication failure handling protects deletion target identity by deleting nothing through a
 mutable pathname. While the creation-time root and parent descriptors are still open, revalidate
