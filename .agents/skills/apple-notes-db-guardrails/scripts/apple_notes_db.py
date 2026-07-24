@@ -39,8 +39,8 @@ NOTE_STORE_DISCOVERY_BASENAMES = (
 )
 SNAPSHOT_MANIFEST = "snapshot-manifest.json"
 PATCH_MANIFEST = "patch-manifest.json"
-SNAPSHOT_SCHEMA = "apple-notes-snapshot/v1"
-PATCH_SCHEMA = "apple-notes-patch/v1"
+SNAPSHOT_SCHEMA = "apple-notes-snapshot/v2"
+PATCH_SCHEMA = "apple-notes-patch/v2"
 CHUNK_SIZE = 1024 * 1024
 MANIFEST_MAX_BYTES = 4 * 1024 * 1024
 WAL_MAGIC_NUMBERS = {0x377F0682, 0x377F0683}
@@ -70,9 +70,7 @@ class NoteStorePaths:
     app_container: Path = APP_CONTAINER
 
     def note_store_files(self) -> list[Path]:
-        return [
-            self.group_container / name for name in NOTE_STORE_DISCOVERY_BASENAMES
-        ]
+        return [self.group_container / name for name in NOTE_STORE_DISCOVERY_BASENAMES]
 
 
 @dataclass
@@ -141,7 +139,10 @@ class _ValidatedSnapshotArtifact:
     recovery_evidence: dict[str, Any]
     source_integrity: dict[str, Any]
     revalidate_recovery_clone: Callable[[], None]
-    backup_recovery_clone: Callable[[Path], dict[str, Any]]
+    backup_recovery_clone: Callable[
+        [Path, _BoundDirectory | None],
+        dict[str, Any],
+    ]
 
 
 SNAPSHOT_FILE_CODES = _FileProtectionCodes(
@@ -176,6 +177,23 @@ def _json_default(value: Any) -> Any:
 def emit_json(payload: Any) -> None:
     json.dump(payload, sys.stdout, indent=2, ensure_ascii=False, default=_json_default)
     sys.stdout.write("\n")
+
+
+def _merge_recovery_details(
+    primary: dict[str, Any],
+    additional: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge nested recovery locators without discarding earlier evidence."""
+
+    merged = dict(primary)
+    merged.update(
+        {key: value for key, value in additional.items() if key != "recovery_locators"}
+    )
+    locators = dict(primary.get("recovery_locators", {}))
+    locators.update(additional.get("recovery_locators", {}))
+    if locators:
+        merged["recovery_locators"] = locators
+    return merged
 
 
 def _utc_now() -> str:
@@ -441,6 +459,87 @@ def _descriptor_bound_directory_destination_receipt(
     return receipt
 
 
+def _descriptor_bound_directory_recovery_evidence(
+    binding: _BoundDirectory,
+    *,
+    source: Path,
+    destination: Path,
+    source_observation: tuple[str, os.stat_result | None] | None,
+    destination_observation: tuple[str, os.stat_result | None] | None,
+    tree_receipt: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return descriptor-only recovery evidence without trusting either path."""
+
+    evidence: dict[str, Any] = {
+        "evidence_status": "checked",
+        "prepared_display_path": str(source),
+        "destination_display_path": str(destination),
+        "namespace_note": (
+            "Display paths are advisory; the parent and prepared root evidence "
+            "below comes from descriptors retained since creation"
+        ),
+        "target_tree": {
+            "verification": "creation-receipt-last-verified-before-publication",
+            "receipt": tree_receipt,
+        },
+    }
+    observations: dict[str, Any] = {}
+    unavailable = False
+    for label, observation in (
+        ("prepared_name", source_observation),
+        ("destination_name", destination_observation),
+    ):
+        if observation is None:
+            observations[label] = {
+                "status": "not-observed",
+                "evidence_status": "inconclusive",
+            }
+            unavailable = True
+            continue
+        state, value = observation
+        row: dict[str, Any] = {"status": state}
+        if state == "present" and value is not None:
+            row["identity"] = _identity(value)
+            row["access_policy"] = _access_policy(value)
+        elif state == "unavailable":
+            row["evidence_status"] = "inconclusive"
+            unavailable = True
+        observations[label] = row
+    evidence["namespace_observations"] = observations
+    try:
+        if binding.parent_fd is None:
+            raise OSError(errno.EBADF, "bound parent descriptor is unavailable")
+        parent = os.fstat(binding.parent_fd)
+        prepared_root = os.fstat(binding.fd)
+    except OSError as exc:
+        evidence["evidence_status"] = "inconclusive"
+        evidence["descriptor_error"] = str(exc)
+        return evidence
+    evidence["parent"] = {
+        "identity": _identity(parent),
+        "access_policy": _access_policy(parent),
+        "matches_creation_receipt": (
+            _same_identity(parent, binding.parent_opened)
+            and _access_policy(parent) == _access_policy(binding.parent_opened)
+        ),
+    }
+    evidence["prepared_root"] = {
+        "identity": _identity(prepared_root),
+        "access_policy": _access_policy(prepared_root),
+        "matches_creation_receipt": (
+            _same_identity(prepared_root, binding.opened)
+            and _access_policy(prepared_root) == _access_policy(binding.opened)
+        ),
+    }
+    if (
+        unavailable
+        or not evidence["parent"]["matches_creation_receipt"]
+        or not evidence["prepared_root"]["matches_creation_receipt"]
+    ):
+        evidence["evidence_status"] = "inconclusive"
+    return evidence
+
+
 def _verify_installed_directory_path(
     binding: _BoundDirectory,
     destination: Path,
@@ -568,6 +667,17 @@ def _publish_directory_no_replace(
             parent_fd,
             destination.name,
         )
+        descriptor_bound_prepared_root = _descriptor_bound_directory_recovery_evidence(
+            binding,
+            source=source,
+            destination=destination,
+            source_observation=(source_state, source_after),
+            destination_observation=(
+                destination_state,
+                destination_after,
+            ),
+            tree_receipt=prepared_tree_receipt,
+        )
         committed = (
             source_state == "absent"
             and destination_state == "present"
@@ -611,6 +721,7 @@ def _publish_directory_no_replace(
                     destination=destination,
                     retry_safe=False,
                     descriptor_bound_destination=descriptor_bound_destination,
+                    descriptor_bound_prepared_root=(descriptor_bound_prepared_root),
                 ),
             ) from exc
         if (
@@ -638,6 +749,13 @@ def _publish_directory_no_replace(
             "destination-install-uncertain",
             "Cannot prove whether directory publication committed; preserve both "
             f"paths for inspection: source={source}, destination={destination}: {exc}",
+            details=_publication_details(
+                "uncertain",
+                prepared=None,
+                destination=destination,
+                retry_safe=False,
+                descriptor_bound_prepared_root=descriptor_bound_prepared_root,
+            ),
         ) from exc
 
     descriptor_bound_destination: dict[str, Any] | None = None
@@ -683,16 +801,13 @@ def _publish_directory_no_replace(
         if terminal_source != "absent":
             raise StoreSafetyError(
                 "prepared-directory-identity-mismatch",
-                "The private source name reappeared after publication: "
-                f"{source}",
+                f"The private source name reappeared after publication: {source}",
             )
-        descriptor_bound_destination = (
-            _descriptor_bound_directory_destination_receipt(
-                binding,
-                destination,
-                tree_receipt=prepared_tree_receipt,
-                tree_verification="creation-receipt-last-verified-before-rename",
-            )
+        descriptor_bound_destination = _descriptor_bound_directory_destination_receipt(
+            binding,
+            destination,
+            tree_receipt=prepared_tree_receipt,
+            tree_verification="creation-receipt-last-verified-before-rename",
         )
         if descriptor_tree_receipt_builder is not None:
             descriptor_bound_destination["tree_receipt"] = (
@@ -703,6 +818,22 @@ def _publish_directory_no_replace(
             )
         _verify_installed_directory_path(binding, destination)
     except (OSError, StoreSafetyError) as exc:
+        terminal_source_observation = _observe_bound_name(
+            parent_fd,
+            source.name,
+        )
+        terminal_destination_observation = _observe_bound_name(
+            parent_fd,
+            destination.name,
+        )
+        descriptor_bound_prepared_root = _descriptor_bound_directory_recovery_evidence(
+            binding,
+            source=source,
+            destination=destination,
+            source_observation=terminal_source_observation,
+            destination_observation=terminal_destination_observation,
+            tree_receipt=prepared_tree_receipt,
+        )
         if descriptor_bound_destination is None:
             try:
                 descriptor_bound_destination = (
@@ -734,6 +865,7 @@ def _publish_directory_no_replace(
                 destination=destination,
                 retry_safe=False,
                 descriptor_bound_destination=descriptor_bound_destination,
+                descriptor_bound_prepared_root=(descriptor_bound_prepared_root),
             ),
         ) from exc
     return descriptor_bound_destination
@@ -1666,6 +1798,29 @@ def _create_bound_directory(
             publication_state = existing_details.get("publication_state")
             if (
                 retain_failure_receipt
+                and safety_error is not None
+                and safety_error.code == "destination-install-uncertain"
+            ):
+                merged = dict(existing_details)
+                merged["publication_state"] = "uncertain"
+                merged["retry_safe"] = False
+                locators = dict(merged.get("recovery_locators", {}))
+                locators.setdefault(
+                    "descriptor_bound_prepared_root",
+                    _descriptor_bound_directory_recovery_evidence(
+                        binding,
+                        source=path,
+                        destination=path,
+                        source_observation=None,
+                        destination_observation=None,
+                        tree_receipt=None,
+                    ),
+                )
+                merged["recovery_locators"] = locators
+                existing_details = merged
+                publication_state = "uncertain"
+            if (
+                retain_failure_receipt
                 and (
                     safety_error is None
                     or safety_error.code != "destination-install-uncertain"
@@ -1677,10 +1832,14 @@ def _create_bound_directory(
                 except Exception as receipt_error:
                     merged = dict(existing_details)
                     if isinstance(receipt_error, StoreSafetyError):
-                        merged.update(receipt_error.details)
+                        merged = _merge_recovery_details(
+                            merged,
+                            receipt_error.details,
+                        )
                         cleanup_error_code = receipt_error.code
                     else:
-                        merged.update(
+                        merged = _merge_recovery_details(
+                            merged,
                             {
                                 "cleanup_state": "preserved-or-incomplete",
                                 "recovery_locators": {
@@ -1688,7 +1847,7 @@ def _create_bound_directory(
                                     "prepared_parent": str(path.parent),
                                 },
                                 "cleanup_error_type": type(receipt_error).__name__,
-                            }
+                            },
                         )
                         cleanup_error_code = (
                             "prepared-directory-revalidation-inconclusive"
@@ -1698,8 +1857,10 @@ def _create_bound_directory(
                     existing_details = merged
                 else:
                     if retained is not None:
-                        merged = dict(existing_details)
-                        merged.update(retained)
+                        merged = _merge_recovery_details(
+                            existing_details,
+                            retained,
+                        )
                         existing_details = merged
             if safety_error is not None:
                 safety_error.details = existing_details
@@ -1720,6 +1881,98 @@ def _create_bound_directory(
             ) from exc
     finally:
         os.close(fd)
+        os.close(parent_fd)
+
+
+@contextmanager
+def _bind_existing_directory(path: Path) -> Iterator[_BoundDirectory]:
+    """Bind one existing directory and retain its parent namespace descriptor."""
+
+    parent_fd: int | None = None
+    directory_fd: int | None = None
+    flags = _directory_open_flags()
+    try:
+        parent_before = os.stat(path.parent, follow_symlinks=False)
+        parent_fd = os.open(path.parent, flags)
+        parent_opened = os.fstat(parent_fd)
+        directory_before = os.stat(
+            path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        directory_fd = os.open(path.name, flags, dir_fd=parent_fd)
+        directory_opened = os.fstat(directory_fd)
+        directory_after = os.stat(
+            path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        parent_after = os.stat(path.parent, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise StoreSafetyError(
+            "prepared-directory-missing",
+            f"Prepared output directory is missing: {path}",
+        ) from exc
+    except OSError as exc:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Cannot bind prepared output directory {path}: {exc}",
+        ) from exc
+    if (
+        not stat.S_ISDIR(parent_before.st_mode)
+        or not stat.S_ISDIR(parent_opened.st_mode)
+        or not stat.S_ISDIR(parent_after.st_mode)
+        or not _same_identity(parent_before, parent_opened)
+        or not _same_identity(parent_opened, parent_after)
+        or not stat.S_ISDIR(directory_before.st_mode)
+        or not stat.S_ISDIR(directory_opened.st_mode)
+        or not stat.S_ISDIR(directory_after.st_mode)
+        or not _same_identity(directory_before, directory_opened)
+        or not _same_identity(directory_opened, directory_after)
+    ):
+        os.close(directory_fd)
+        os.close(parent_fd)
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            f"Prepared output directory changed identity while binding: {path}",
+        )
+    if (
+        _access_policy(parent_before) != _access_policy(parent_opened)
+        or _access_policy(parent_opened) != _access_policy(parent_after)
+        or _access_policy(directory_before) != _access_policy(directory_opened)
+        or _access_policy(directory_opened) != _access_policy(directory_after)
+    ):
+        os.close(directory_fd)
+        os.close(parent_fd)
+        raise StoreSafetyError(
+            "prepared-directory-access-policy-mismatch",
+            f"Prepared output directory changed access policy while binding: {path}",
+        )
+    binding = _BoundDirectory(
+        path=path,
+        fd=directory_fd,
+        opened=directory_opened,
+        parent_opened=parent_opened,
+        parent_fd=parent_fd,
+    )
+    try:
+        _verify_bound_directory_at(
+            binding,
+            parent_fd=parent_fd,
+            basename=path.name,
+            display_path=path,
+        )
+        yield binding
+    finally:
+        os.close(directory_fd)
         os.close(parent_fd)
 
 
@@ -1797,6 +2050,122 @@ def _verify_bound_directory_at(
             follow_symlinks=False,
         ),
     )
+
+
+def _verify_bound_directory_namespace(
+    binding: _BoundDirectory,
+) -> dict[str, Any]:
+    if binding.parent_fd is None:
+        return _verify_bound_directory(binding)
+    return _verify_bound_directory_at(
+        binding,
+        parent_fd=binding.parent_fd,
+        basename=binding.path.name,
+        display_path=binding.path,
+    )
+
+
+def _retained_created_regular_file_details(
+    parent: _BoundDirectory,
+    file_fd: int,
+    created: os.stat_result,
+    *,
+    display_path: Path,
+    candidate_basenames: Iterable[str],
+    content_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Describe a retained failed output without deleting through its name."""
+
+    receipt: dict[str, Any] = {
+        "evidence_status": "checked",
+        "display_path": str(display_path),
+        "cleanup_policy": "retain-never-stat-then-unlink",
+        "protected_property": "object-identity",
+        "namespace_authority": "point-in-time-observation-only",
+        "namespace_note": (
+            "A namespace leaf can be replaced after observation. Recovery must "
+            "match the descriptor receipt before any later destructive action."
+        ),
+        "created_identity": _identity(created),
+        "created_access_policy": _access_policy(created),
+    }
+    try:
+        parent_current = os.fstat(parent.fd)
+    except OSError as exc:
+        receipt["evidence_status"] = "inconclusive"
+        receipt["parent_descriptor_error"] = str(exc)
+    else:
+        receipt["parent_descriptor"] = {
+            "identity": _identity(parent_current),
+            "access_policy": _access_policy(parent_current),
+            "matches_creation_receipt": (
+                _same_identity(parent.opened, parent_current)
+                and _access_policy(parent.opened) == _access_policy(parent_current)
+            ),
+        }
+        if not receipt["parent_descriptor"]["matches_creation_receipt"]:
+            receipt["evidence_status"] = "inconclusive"
+    try:
+        file_current = os.fstat(file_fd)
+    except OSError as exc:
+        receipt["evidence_status"] = "inconclusive"
+        receipt["file_descriptor_error"] = str(exc)
+    else:
+        receipt["file_descriptor"] = {
+            "identity": _identity(file_current),
+            "access_policy": _access_policy(file_current),
+            "size": file_current.st_size,
+            "matches_created_identity": _same_identity(created, file_current),
+        }
+        if not receipt["file_descriptor"]["matches_created_identity"]:
+            receipt["evidence_status"] = "inconclusive"
+    receipt["content_evidence"] = (
+        {
+            "status": "last-verified-before-failure",
+            "sha256": content_sha256,
+            "terminal": False,
+        }
+        if content_sha256 is not None
+        else {
+            "status": "inconclusive",
+            "reason": "operation-failed-before-complete-content-receipt",
+        }
+    )
+    observations: dict[str, Any] = {}
+    namespace_inconclusive = False
+    for basename in dict.fromkeys(candidate_basenames):
+        state, observed = _observe_bound_name(parent.fd, basename)
+        row: dict[str, Any] = {
+            "status": state,
+            "authority": "point-in-time-only",
+        }
+        if state == "present" and observed is not None:
+            row.update(
+                {
+                    "identity": _identity(observed),
+                    "access_policy": _access_policy(observed),
+                    "matches_created_identity": _same_identity(
+                        created,
+                        observed,
+                    ),
+                }
+            )
+        elif state == "unavailable":
+            row["evidence_status"] = "inconclusive"
+            namespace_inconclusive = True
+        observations[basename] = row
+    receipt["namespace_observations"] = observations
+    receipt["namespace_evidence_status"] = (
+        "inconclusive" if namespace_inconclusive else "point-in-time-only"
+    )
+    return {
+        "cleanup_state": "retained",
+        "cleanup_policy": "retain-never-stat-then-unlink",
+        "retry_safe": False,
+        "recovery_locators": {
+            "descriptor_bound_prepared_file": receipt,
+        },
+    }
 
 
 def _verify_bound_parent_descriptor(
@@ -1997,19 +2366,17 @@ def _scan_sensitive_partial_inventory(
                     dir_fd=directory_fd,
                     follow_symlinks=False,
                 )
-                if (
-                    not _same_identity(entry_stat, child_after)
-                    or not _same_identity(child_after, current_child)
+                if not _same_identity(entry_stat, child_after) or not _same_identity(
+                    child_after, current_child
                 ):
                     raise StoreSafetyError(
                         "prepared-directory-identity-mismatch",
                         "Retained partial child directory changed during inventory: "
                         f"{binding.path / relative_path}",
                     )
-                if (
-                    _access_policy(entry_stat) != _access_policy(child_after)
-                    or _access_policy(child_after) != _access_policy(current_child)
-                ):
+                if _access_policy(entry_stat) != _access_policy(
+                    child_after
+                ) or _access_policy(child_after) != _access_policy(current_child):
                     raise StoreSafetyError(
                         "prepared-directory-access-policy-mismatch",
                         "Retained partial child access policy changed during "
@@ -2142,7 +2509,19 @@ def _write_all(fd: int, payload: bytes) -> None:
         offset += written
 
 
-def _copy_fd(fd: int, destination: Path) -> dict[str, Any]:
+def _copy_fd(
+    fd: int,
+    destination: Path,
+    *,
+    destination_binding: _BoundDirectory,
+) -> dict[str, Any]:
+    if destination.parent != destination_binding.path:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            "Descriptor-relative copy target does not use the bound destination: "
+            f"{destination}",
+        )
+    _verify_bound_directory_namespace(destination_binding)
     flags = (
         os.O_RDWR
         | os.O_CREAT
@@ -2150,7 +2529,20 @@ def _copy_fd(fd: int, destination: Path) -> dict[str, Any]:
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    out_fd = os.open(destination, flags, 0o600)
+    try:
+        out_fd = os.open(
+            destination.name,
+            flags,
+            0o600,
+            dir_fd=destination_binding.fd,
+        )
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Cannot exclusively create descriptor-bound copy {destination}: {exc}",
+        ) from exc
+    created = os.fstat(out_fd)
+    verified_sha256: str | None = None
     digest = hashlib.sha256()
     try:
         os.lseek(fd, 0, os.SEEK_SET)
@@ -2168,20 +2560,47 @@ def _copy_fd(fd: int, destination: Path) -> dict[str, Any]:
                 "copy-content-mismatch",
                 f"Destination readback differs from bytes written: {destination}",
             )
+        verified_sha256 = written_sha256
         descriptor_stat = os.fstat(out_fd)
-        path_stat = os.stat(destination, follow_symlinks=False)
+        path_stat = os.stat(
+            destination.name,
+            dir_fd=destination_binding.fd,
+            follow_symlinks=False,
+        )
         if not _same_identity(descriptor_stat, path_stat):
             raise StoreSafetyError(
                 "copy-identity-mismatch",
                 f"Destination was replaced during copy: {destination}",
             )
-        return {
+        result = {
             "path": destination,
             "sha256": written_sha256,
             "size": descriptor_stat.st_size,
             "identity": _identity(descriptor_stat),
             "access_policy": _access_policy(descriptor_stat),
         }
+        return result
+    except Exception as exc:
+        retained = _retained_created_regular_file_details(
+            destination_binding,
+            out_fd,
+            created,
+            display_path=destination,
+            candidate_basenames=(destination.name,),
+            content_sha256=verified_sha256,
+        )
+        if isinstance(exc, StoreSafetyError):
+            exc.details = _merge_recovery_details(
+                exc.details,
+                retained,
+            )
+            raise
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Copy failed; the descriptor-bound partial file was retained: "
+            f"{destination}: {exc}",
+            details=retained,
+        ) from exc
     finally:
         os.close(out_fd)
 
@@ -2355,6 +2774,13 @@ def _capture_database_files(
     *,
     destination_binding: _BoundDirectory | None = None,
 ) -> list[dict[str, Any]]:
+    if destination_dir is not None and destination_binding is None:
+        with _create_bound_directory(destination_dir) as created_destination:
+            return _capture_database_files(
+                main_path,
+                destination_dir,
+                destination_binding=created_destination,
+            )
     before_paths = _discover_database_files(main_path)
     before_names = [path.name for path in before_paths]
     opened_sources: list[_OpenedSource] = []
@@ -2396,22 +2822,25 @@ def _capture_database_files(
         _reject_bound_rollback_journal(opened_sources, main_path)
 
         if destination_dir is not None:
-            if destination_binding is None:
-                destination_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
-            else:
-                if destination_binding.path != destination_dir:
-                    raise StoreSafetyError(
-                        "prepared-directory-identity-mismatch",
-                        "Recovery destination binding does not match the copy target: "
-                        f"{destination_dir}",
-                    )
-                _verify_bound_directory(destination_binding)
+            assert destination_binding is not None
+            if destination_binding.path != destination_dir:
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "Recovery destination binding does not match the copy target: "
+                    f"{destination_dir}",
+                )
+            _verify_bound_directory_namespace(destination_binding)
 
         for opened in opened_sources:
             if destination_dir is None:
                 opened.first_sha256 = _hash_fd(opened.fd)
             else:
-                opened.copied = _copy_fd(opened.fd, destination_dir / opened.path.name)
+                assert destination_binding is not None
+                opened.copied = _copy_fd(
+                    opened.fd,
+                    destination_dir / opened.path.name,
+                    destination_binding=destination_binding,
+                )
                 opened.first_sha256 = opened.copied["sha256"]
 
         records: list[dict[str, Any]] = []
@@ -2485,7 +2914,7 @@ def _capture_database_files(
                 "capture",
             )
         if destination_binding is not None:
-            _verify_bound_directory(destination_binding)
+            _verify_bound_directory_namespace(destination_binding)
         return records
     finally:
         for opened in opened_sources:
@@ -2663,10 +3092,48 @@ def _scan_exact_directory_entries(
     }
 
 
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+def _write_json_atomic(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    parent_binding: _BoundDirectory | None = None,
+) -> dict[str, Any]:
+    if parent_binding is None:
+        with _bind_existing_directory(path.parent) as bound_parent:
+            return _write_json_atomic(
+                path,
+                payload,
+                parent_binding=bound_parent,
+            )
+    if path.parent != parent_binding.path:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            f"Manifest target does not use the bound prepared directory: {path}",
+        )
+    _verify_bound_directory_namespace(parent_binding)
     temp_path = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
-    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(temp_path, flags, 0o600)
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        fd = os.open(
+            temp_path.name,
+            flags,
+            0o600,
+            dir_fd=parent_binding.fd,
+        )
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Cannot exclusively create bound manifest temporary file "
+            f"{temp_path}: {exc}",
+        ) from exc
+    created = os.fstat(fd)
+    verified_sha256: str | None = None
     try:
         with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
             json.dump(
@@ -2677,19 +3144,63 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
             os.fsync(handle.fileno())
         opened = os.fstat(fd)
         sha256 = _hash_fd(fd)
-        os.replace(temp_path, path)
-        _fsync_directory(path.parent)
+        temp_leaf = os.stat(
+            temp_path.name,
+            dir_fd=parent_binding.fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not _same_identity(created, opened)
+            or not _same_identity(opened, temp_leaf)
+        ):
+            raise StoreSafetyError(
+                "prepared-file-identity-mismatch",
+                f"Manifest temporary file was replaced while writing: {temp_path}",
+            )
+        verified_sha256 = sha256
+        _rename_file_no_replace_at(
+            parent_binding.fd,
+            temp_path.name,
+            path.name,
+        )
+        _fsync_bound_directory_descriptor(parent_binding)
         bound = _BoundRegularFile(
             path=path,
             fd=fd,
             opened=opened,
             sha256=sha256,
+            parent_opened=parent_binding.opened,
         )
-        return _verify_bound_regular_file(bound, PREPARED_FILE_CODES)
+        return _verify_bound_regular_file_at(
+            bound,
+            PREPARED_FILE_CODES,
+            dir_fd=parent_binding.fd,
+            basename=path.name,
+        )
+    except Exception as exc:
+        retained = _retained_created_regular_file_details(
+            parent_binding,
+            fd,
+            created,
+            display_path=path,
+            candidate_basenames=(temp_path.name, path.name),
+            content_sha256=verified_sha256,
+        )
+        if isinstance(exc, StoreSafetyError):
+            exc.details = _merge_recovery_details(
+                exc.details,
+                retained,
+            )
+            raise
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Manifest publication failed; the descriptor-bound file was "
+            f"retained: {path}: {exc}",
+            details=retained,
+        ) from exc
     finally:
         os.close(fd)
-        if _lexists(temp_path):
-            os.unlink(temp_path)
 
 
 def _parse_manifest_bytes(
@@ -2719,6 +3230,59 @@ def _normalized_json_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(normalized, dict):
         raise TypeError("Expected a JSON object")
     return normalized
+
+
+def _manifest_protection_receipt(
+    value: Any,
+    *,
+    label: str,
+) -> dict[str, dict[str, int]]:
+    if not isinstance(value, dict):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Manifest protection receipt is missing for {label}",
+        )
+    identity = value.get("identity")
+    access_policy = value.get("access_policy")
+    identity_keys = {"device", "inode", "file_type"}
+    access_keys = {"mode", "uid", "gid", "flags"}
+    if (
+        not isinstance(identity, dict)
+        or set(identity) != identity_keys
+        or any(not isinstance(identity[key], int) for key in identity_keys)
+        or not isinstance(access_policy, dict)
+        or set(access_policy) != access_keys
+        or any(not isinstance(access_policy[key], int) for key in access_keys)
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Manifest protection receipt is malformed for {label}",
+        )
+    return {
+        "identity": {key: int(identity[key]) for key in sorted(identity_keys)},
+        "access_policy": {key: int(access_policy[key]) for key in sorted(access_keys)},
+    }
+
+
+def _assert_manifest_protection_receipt(
+    current: dict[str, Any],
+    value: Any,
+    *,
+    label: str,
+    identity_code: str,
+    access_policy_code: str,
+) -> None:
+    receipt = _manifest_protection_receipt(value, label=label)
+    if current.get("identity") != receipt["identity"]:
+        raise StoreSafetyError(
+            identity_code,
+            f"Object identity differs from the creation manifest: {label}",
+        )
+    if current.get("access_policy") != receipt["access_policy"]:
+        raise StoreSafetyError(
+            access_policy_code,
+            f"Access policy differs from the creation manifest: {label}",
+        )
 
 
 def _load_bound_manifest(
@@ -2949,10 +3513,9 @@ def _descriptor_bound_prepared_tree_receipt(
         display_path=root_binding.path.parent / published_basename,
     )
     root_entries = _scan_bound_directory_entry_types(root_binding)
-    if (
-        root_current["identity"] != root_receipt.get("identity")
-        or root_current["access_policy"] != root_receipt.get("access_policy")
-    ):
+    if root_current["identity"] != root_receipt.get("identity") or root_current[
+        "access_policy"
+    ] != root_receipt.get("access_policy"):
         raise StoreSafetyError(
             "prepared-directory-identity-mismatch",
             "Installed prepared root differs from its creation receipt",
@@ -2981,10 +3544,9 @@ def _descriptor_bound_prepared_tree_receipt(
             display_path=root_binding.path / relative_path,
         )
         entries = _scan_bound_directory_entry_types(directory)
-        if (
-            current["identity"] != receipt.get("identity")
-            or current["access_policy"] != receipt.get("access_policy")
-        ):
+        if current["identity"] != receipt.get("identity") or current[
+            "access_policy"
+        ] != receipt.get("access_policy"):
             raise StoreSafetyError(
                 "prepared-directory-identity-mismatch",
                 f"Installed prepared directory differs from its creation receipt: "
@@ -3222,9 +3784,7 @@ def _inspect_wal_payload(payload: bytes, wal_path: Path) -> dict[str, Any]:
         "first_invalid_frame": first_invalid_frame,
         "trailing_bytes": trailing_bytes,
         "salt": [salt1, salt2],
-        "checksum_byte_order": (
-            "little" if checksum_byte_order == "<" else "big"
-        ),
+        "checksum_byte_order": ("little" if checksum_byte_order == "<" else "big"),
         "big_end_checksum": checksum_byte_order == ">",
     }
 
@@ -3575,7 +4135,11 @@ def _make_recovery_clone_from_bound(
             if bound is None:
                 continue
             source = _verify_bound_regular_file(bound, codes)
-            copied = _copy_fd(bound.fd, destination / basename)
+            copied = _copy_fd(
+                bound.fd,
+                destination / basename,
+                destination_binding=destination_binding,
+            )
             if (
                 copied["sha256"] != bound.sha256
                 or copied["size"] != bound.opened.st_size
@@ -3643,10 +4207,13 @@ def _publication_details(
     destination: Path,
     retry_safe: bool,
     descriptor_bound_destination: dict[str, Any] | None = None,
+    descriptor_bound_prepared_root: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     locators: dict[str, Any] = {"destination": str(destination)}
     if descriptor_bound_destination is not None:
         locators["descriptor_bound_destination"] = descriptor_bound_destination
+    if descriptor_bound_prepared_root is not None:
+        locators["descriptor_bound_prepared_root"] = descriptor_bound_prepared_root
     if prepared is not None:
         receipt: dict[str, Any] = {
             "path": str(prepared.path),
@@ -3956,8 +4523,7 @@ def _publish_file_no_replace_from_parent(
     if prepared.parent_opened is None:
         raise StoreSafetyError(
             "prepared-file-revalidation-inconclusive",
-            "Prepared file has no creation-time parent receipt: "
-            f"{prepared.path}",
+            f"Prepared file has no creation-time parent receipt: {prepared.path}",
         )
     before_rename = os.fstat(prepared.fd)
     descriptor_bound_destination: dict[str, Any] | None = None
@@ -4585,7 +5151,22 @@ def _sqlite_backup_bytes(source_uri: str, source_path: Path) -> bytes:
 def _write_standalone_backup_payload(
     payload: bytes,
     output: Path,
+    *,
+    destination_binding: _BoundDirectory | None = None,
 ) -> dict[str, Any]:
+    if destination_binding is None:
+        with _bind_existing_directory(output.parent) as bound_destination:
+            return _write_standalone_backup_payload(
+                payload,
+                output,
+                destination_binding=bound_destination,
+            )
+    if output.parent != destination_binding.path:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            f"Standalone output does not use the bound destination directory: {output}",
+        )
+    _verify_bound_directory_namespace(destination_binding)
     flags = (
         os.O_RDWR
         | os.O_CREAT
@@ -4594,15 +5175,25 @@ def _write_standalone_backup_payload(
         | getattr(os, "O_NOFOLLOW", 0)
     )
     try:
-        output_fd = os.open(output, flags, 0o600)
+        output_fd = os.open(
+            output.name,
+            flags,
+            0o600,
+            dir_fd=destination_binding.fd,
+        )
     except OSError as exc:
         raise StoreSafetyError(
             "prepared-file-revalidation-inconclusive",
             f"Cannot exclusively create standalone recovery output {output}: {exc}",
         ) from exc
     created = os.fstat(output_fd)
+    verified_sha256: str | None = None
     try:
-        path_before = os.stat(output, follow_symlinks=False)
+        path_before = os.stat(
+            output.name,
+            dir_fd=destination_binding.fd,
+            follow_symlinks=False,
+        )
         if not _same_identity(created, path_before):
             raise StoreSafetyError(
                 "prepared-file-identity-mismatch",
@@ -4614,7 +5205,11 @@ def _write_standalone_backup_payload(
         os.fsync(output_fd)
         os.fchmod(output_fd, 0o600)
         descriptor_after = os.fstat(output_fd)
-        path_after = os.stat(output, follow_symlinks=False)
+        path_after = os.stat(
+            output.name,
+            dir_fd=destination_binding.fd,
+            follow_symlinks=False,
+        )
         if (
             not stat.S_ISREG(descriptor_after.st_mode)
             or not _same_identity(created, descriptor_after)
@@ -4631,19 +5226,35 @@ def _write_standalone_backup_payload(
                 f"{output}",
             )
         sha256 = _hash_fd(output_fd)
-        return {
+        verified_sha256 = sha256
+        result = {
             "path": output,
             "sha256": sha256,
             "size": descriptor_after.st_size,
             "identity": _identity(descriptor_after),
             "access_policy": _access_policy(descriptor_after),
         }
-    except StoreSafetyError:
-        raise
-    except OSError as exc:
+        return result
+    except Exception as exc:
+        retained = _retained_created_regular_file_details(
+            destination_binding,
+            output_fd,
+            created,
+            display_path=output,
+            candidate_basenames=(output.name,),
+            content_sha256=verified_sha256,
+        )
+        if isinstance(exc, StoreSafetyError):
+            exc.details = _merge_recovery_details(
+                exc.details,
+                retained,
+            )
+            raise
         raise StoreSafetyError(
             "prepared-file-revalidation-inconclusive",
-            f"Cannot revalidate standalone recovery output {output}: {exc}",
+            f"Standalone recovery failed; the descriptor-bound partial file "
+            f"was retained: {output}: {exc}",
+            details=retained,
         ) from exc
     finally:
         os.close(output_fd)
@@ -4652,6 +5263,8 @@ def _write_standalone_backup_payload(
 def _backup_bound_store_to_standalone(
     source: _BoundRecoveryStore,
     output: Path,
+    *,
+    destination_binding: _BoundDirectory | None = None,
 ) -> dict[str, Any]:
     recovered_payload = _bound_recovery_payload(source)
     payload = _sqlite_backup_bytes_from_payload(
@@ -4659,12 +5272,18 @@ def _backup_bound_store_to_standalone(
         source.directory.path / source.main_name,
     )
     _verify_bound_recovery_store(source)
-    return _write_standalone_backup_payload(payload, output)
+    return _write_standalone_backup_payload(
+        payload,
+        output,
+        destination_binding=destination_binding,
+    )
 
 
 def _backup_bound_regular_to_standalone(
     source: _BoundRegularFile,
     output: Path,
+    *,
+    destination_binding: _BoundDirectory | None = None,
 ) -> dict[str, Any]:
     """Back up an already validated standalone file without sidecar discovery."""
 
@@ -4677,7 +5296,11 @@ def _backup_bound_regular_to_standalone(
     )
     payload = _sqlite_backup_bytes_from_payload(source_payload, source.path)
     _verify_bound_regular_file(source, PREPARED_FILE_CODES)
-    result = _write_standalone_backup_payload(payload, output)
+    result = _write_standalone_backup_payload(
+        payload,
+        output,
+        destination_binding=destination_binding,
+    )
     _verify_bound_regular_file(source, PREPARED_FILE_CODES)
     return result
 
@@ -4685,16 +5308,26 @@ def _backup_bound_regular_to_standalone(
 def _backup_sqlite_to_standalone(
     source: Union[_BoundRegularFile, _BoundRecoveryStore],
     output: Path,
+    *,
+    destination_binding: _BoundDirectory | None = None,
 ) -> dict[str, Any]:
     if isinstance(source, _BoundRecoveryStore):
-        return _backup_bound_store_to_standalone(source, output)
+        return _backup_bound_store_to_standalone(
+            source,
+            output,
+            destination_binding=destination_binding,
+        )
     source_receipt = _verify_bound_regular_file(source, PREPARED_FILE_CODES)
     with _bind_recovery_store(source.path) as store:
         _assert_bound_matches_receipt(
             store.files[store.main_name],
             source_receipt,
         )
-        result = _backup_bound_store_to_standalone(store, output)
+        result = _backup_bound_store_to_standalone(
+            store,
+            output,
+            destination_binding=destination_binding,
+        )
     _verify_bound_regular_file(source, PREPARED_FILE_CODES)
     return result
 
@@ -4707,7 +5340,12 @@ def _recover_validated_clone_to_standalone(
     recovery_evidence: dict[str, Any],
     source_integrity: dict[str, Any],
     source_revalidate: Callable[[], None] | None = None,
-    source_backup: Callable[[Path], dict[str, Any]] | None = None,
+    source_backup: Callable[
+        [Path, _BoundDirectory | None],
+        dict[str, Any],
+    ]
+    | None = None,
+    output_parent_binding: _BoundDirectory | None = None,
 ) -> dict[str, Any]:
     if source_backup is None:
         with _bind_recovery_store(recovered_main) as recovered_store:
@@ -4724,49 +5362,91 @@ def _recover_validated_clone_to_standalone(
                 recovery_evidence=recovery_evidence,
                 source_integrity=source_integrity,
                 source_revalidate=revalidate_bound_source,
-                source_backup=lambda output: _backup_sqlite_to_standalone(
-                    recovered_store,
-                    output,
+                source_backup=lambda output, destination_binding: (
+                    _backup_sqlite_to_standalone(
+                        recovered_store,
+                        output,
+                        destination_binding=destination_binding,
+                    )
                 ),
+                output_parent_binding=output_parent_binding,
             )
-    if any(
-        _lexists(candidate)
+    out.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with ExitStack() as output_stack:
+        if output_parent_binding is None:
+            output_parent_binding = output_stack.enter_context(
+                _bind_existing_directory(out.parent)
+            )
+        elif output_parent_binding.path != out.parent:
+            raise StoreSafetyError(
+                "prepared-directory-identity-mismatch",
+                f"Recovery output does not use the supplied bound parent: {out}",
+            )
+        _verify_bound_directory_namespace(output_parent_binding)
         for candidate in (
             out,
             out.with_name(f"{out.name}-wal"),
             out.with_name(f"{out.name}-shm"),
             out.with_name(f"{out.name}-journal"),
-        )
-    ):
-        raise StoreSafetyError(
-            "destination-exists", f"Recovery destination already exists: {out}"
-        )
-    out.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temp_out = out.parent / f".{out.name}.tmp-{uuid.uuid4().hex}"
-    if source_revalidate is not None:
-        source_revalidate()
-    temp_receipt = source_backup(temp_out)
-    if source_revalidate is not None:
-        source_revalidate()
-    with _bind_regular_file(temp_out, PREPARED_FILE_CODES) as prepared:
-        _assert_bound_matches_receipt(prepared, temp_receipt)
-        output_integrity = _sqlite_integrity(prepared)
-        _verify_bound_regular_file(prepared, PREPARED_FILE_CODES)
-        try:
-            os.fsync(prepared.fd)
-        except OSError as exc:
-            raise StoreSafetyError(
-                "destination-install-failed",
-                "The prepared recovered database could not be made durable "
-                f"before publication: {temp_out}: {exc}",
-                details=_publication_details(
-                    "uncommitted",
-                    prepared=prepared,
-                    destination=out,
-                    retry_safe=True,
-                ),
-            ) from exc
-        fingerprint = _publish_file_no_replace(prepared, out)
+        ):
+            state, _ = _observe_bound_name(
+                output_parent_binding.fd,
+                candidate.name,
+            )
+            if state == "present":
+                raise StoreSafetyError(
+                    "destination-exists",
+                    f"Recovery destination already exists: {candidate}",
+                )
+            if state == "unavailable":
+                raise StoreSafetyError(
+                    "prepared-directory-revalidation-inconclusive",
+                    "Cannot inspect descriptor-bound recovery destination: "
+                    f"{candidate}",
+                )
+        temp_out = out.parent / f".{out.name}.tmp-{uuid.uuid4().hex}"
+        if source_revalidate is not None:
+            source_revalidate()
+        temp_receipt = source_backup(temp_out, output_parent_binding)
+        if source_revalidate is not None:
+            source_revalidate()
+        with _bind_regular_file_at(
+            temp_out,
+            output_parent_binding,
+            PREPARED_FILE_CODES,
+        ) as prepared:
+            _assert_bound_matches_receipt(
+                prepared,
+                temp_receipt,
+                dir_fd=output_parent_binding.fd,
+                basename=temp_out.name,
+            )
+            output_integrity = _sqlite_integrity(prepared)
+            _verify_bound_regular_file_at(
+                prepared,
+                PREPARED_FILE_CODES,
+                dir_fd=output_parent_binding.fd,
+                basename=temp_out.name,
+            )
+            try:
+                os.fsync(prepared.fd)
+            except OSError as exc:
+                raise StoreSafetyError(
+                    "destination-install-failed",
+                    "The prepared recovered database could not be made durable "
+                    f"before publication: {temp_out}: {exc}",
+                    details=_publication_details(
+                        "uncommitted",
+                        prepared=prepared,
+                        destination=out,
+                        retry_safe=True,
+                    ),
+                ) from exc
+            fingerprint = _publish_file_no_replace_from_parent(
+                prepared,
+                out,
+                output_parent_binding.fd,
+            )
     return {
         "source_db": source_db,
         "standalone_db": out,
@@ -4780,7 +5460,12 @@ def _recover_validated_clone_to_standalone(
     }
 
 
-def _recover_to_standalone(src: Path, out: Path) -> dict[str, Any]:
+def _recover_to_standalone(
+    src: Path,
+    out: Path,
+    *,
+    output_parent_binding: _BoundDirectory | None = None,
+) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="apple-notes-merge-") as temp_dir:
         clone = _make_recovery_clone(src, Path(temp_dir) / "store")
         with _bind_recovery_store(
@@ -4804,10 +5489,14 @@ def _recover_to_standalone(src: Path, out: Path) -> dict[str, Any]:
                 recovery_evidence=clone.evidence,
                 source_integrity=source_integrity,
                 source_revalidate=revalidate_bound_source,
-                source_backup=lambda output: _backup_sqlite_to_standalone(
-                    recovered_store,
-                    output,
+                source_backup=lambda output, destination_binding: (
+                    _backup_sqlite_to_standalone(
+                        recovered_store,
+                        output,
+                        destination_binding=destination_binding,
+                    )
                 ),
+                output_parent_binding=output_parent_binding,
             )
 
 
@@ -4865,9 +5554,7 @@ def copy_db(
             )
             store_receipt = {
                 "identity": dict(recovery_store_receipt.directory_identity),
-                "access_policy": dict(
-                    recovery_store_receipt.directory_access_policy
-                ),
+                "access_policy": dict(recovery_store_receipt.directory_access_policy),
                 "entry_types": dict(recovery_store_receipt.entry_types),
             }
             with _bind_recovery_store_from_directory(
@@ -4928,6 +5615,16 @@ def copy_db(
                         "link_count",
                     ],
                 },
+                "creation_receipts": {
+                    "snapshot_directory": {
+                        "identity": _identity(bound_root.opened),
+                        "access_policy": _access_policy(bound_root.opened),
+                    },
+                    "store_directory": {
+                        "identity": store_receipt["identity"],
+                        "access_policy": store_receipt["access_policy"],
+                    },
+                },
                 "files": manifest_files,
                 "sidecar_consistency": sidecars,
                 "sqlite_validation": sqlite_integrity,
@@ -4941,6 +5638,7 @@ def copy_db(
             manifest_receipt = _write_json_atomic(
                 partial / SNAPSHOT_MANIFEST,
                 manifest,
+                parent_binding=bound_root,
             )
             root_receipt = _scan_exact_directory_entries(
                 partial,
@@ -5152,6 +5850,15 @@ def _validated_snapshot_artifact(
         ) as temp_dir,
         ExitStack() as stack,
     ):
+        snapshot_directory = _scan_exact_directory_entries(
+            snapshot_dir,
+            {
+                "group.com.apple.notes": stat.S_IFDIR,
+                SNAPSHOT_MANIFEST: stat.S_IFREG,
+            },
+            missing_code="snapshot-missing",
+            mismatch_code="snapshot-file-set-mismatch",
+        )
         try:
             manifest_bound = stack.enter_context(
                 _bind_regular_file(manifest_path, SNAPSHOT_FILE_CODES)
@@ -5167,6 +5874,19 @@ def _validated_snapshot_artifact(
             manifest_bound,
             SNAPSHOT_FILE_CODES,
             SNAPSHOT_SCHEMA,
+        )
+        creation_receipts = manifest.get("creation_receipts")
+        if not isinstance(creation_receipts, dict):
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Snapshot manifest has no creation receipts",
+            )
+        _assert_manifest_protection_receipt(
+            snapshot_directory,
+            creation_receipts.get("snapshot_directory"),
+            label="snapshot directory",
+            identity_code="snapshot-directory-identity-mismatch",
+            access_policy_code="snapshot-directory-access-policy-mismatch",
         )
         rows = manifest.get("files")
         if (
@@ -5196,6 +5916,13 @@ def _validated_snapshot_artifact(
             missing_code="snapshot-missing",
             mismatch_code="snapshot-file-set-mismatch",
         )
+        _assert_manifest_protection_receipt(
+            store_directory,
+            creation_receipts.get("store_directory"),
+            label="snapshot store directory",
+            identity_code="snapshot-directory-identity-mismatch",
+            access_policy_code="snapshot-directory-access-policy-mismatch",
+        )
         manifest_by_name = {row.get("basename"): row for row in rows}
         for basename, row in manifest_by_name.items():
             expected_relative = Path("group.com.apple.notes") / str(basename)
@@ -5217,6 +5944,18 @@ def _validated_snapshot_artifact(
                         store_dir / basename,
                         SNAPSHOT_FILE_CODES,
                     )
+                )
+                current_file = _verify_bound_regular_file(
+                    bound_files[basename],
+                    SNAPSHOT_FILE_CODES,
+                )
+                row = manifest_by_name[basename]
+                _assert_manifest_protection_receipt(
+                    current_file,
+                    row.get("copy"),
+                    label=f"snapshot file {basename}",
+                    identity_code=SNAPSHOT_FILE_CODES.identity,
+                    access_policy_code=SNAPSHOT_FILE_CODES.access_policy,
                 )
         clone = _make_recovery_clone_from_bound(
             bound_files,
@@ -5265,7 +6004,10 @@ def _validated_snapshot_artifact(
                 validated_recovery_receipt,
             )
 
-        def backup_recovery_clone(output: Path) -> dict[str, Any]:
+        def backup_recovery_clone(
+            output: Path,
+            destination_binding: _BoundDirectory | None = None,
+        ) -> dict[str, Any]:
             _assert_bound_matches_receipt(
                 validated_recovery_bound,
                 validated_recovery_receipt,
@@ -5273,6 +6015,7 @@ def _validated_snapshot_artifact(
             result = _backup_bound_regular_to_standalone(
                 validated_recovery_bound,
                 output,
+                destination_binding=destination_binding,
             )
             _assert_bound_matches_receipt(
                 validated_recovery_bound,
@@ -5280,6 +6023,17 @@ def _validated_snapshot_artifact(
             )
             return result
 
+        _scan_exact_directory_entries(
+            snapshot_dir,
+            {
+                "group.com.apple.notes": stat.S_IFDIR,
+                SNAPSHOT_MANIFEST: stat.S_IFREG,
+            },
+            missing_code="snapshot-missing",
+            mismatch_code="snapshot-file-set-mismatch",
+            bound_identity=snapshot_directory["identity"],
+            bound_access_policy=snapshot_directory["access_policy"],
+        )
         _scan_exact_directory_entries(
             store_dir,
             expected_store_types,
@@ -5310,6 +6064,10 @@ def _validated_snapshot_artifact(
                     "ctime_ns",
                     "link_count",
                 ],
+            },
+            "directories": {
+                "snapshot": snapshot_directory,
+                "store": store_directory,
             },
             "manifest": manifest_integrity,
             "files": verified,
@@ -5384,7 +6142,11 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
             retain_failure_receipt=True,
         ) as bound_root:
             staged_db = partial / NOTE_STORE_MAIN
-            recovery = _recover_to_standalone(src, staged_db)
+            recovery = _recover_to_standalone(
+                src,
+                staged_db,
+                output_parent_binding=bound_root,
+            )
             fingerprint = {
                 "path": staged_db,
                 "sha256": recovery["sha256"],
@@ -5402,6 +6164,14 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
                     "relative_path": NOTE_STORE_MAIN,
                     "sha256": fingerprint["sha256"],
                     "size": fingerprint["size"],
+                    "identity": fingerprint["identity"],
+                    "access_policy": fingerprint["access_policy"],
+                },
+                "creation_receipts": {
+                    "stage_directory": {
+                        "identity": _identity(bound_root.opened),
+                        "access_policy": _access_policy(bound_root.opened),
+                    },
                 },
                 "sqlite_validation": recovery["output_integrity"],
                 "sidecar_policy": {
@@ -5412,6 +6182,7 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
             manifest_receipt = _write_json_atomic(
                 partial / PATCH_MANIFEST,
                 manifest,
+                parent_binding=bound_root,
             )
             root_receipt = _scan_exact_directory_entries(
                 partial,
@@ -5545,6 +6316,19 @@ def validate_patch_stage(stage_dir: Path) -> dict[str, Any]:
             PATCH_FILE_CODES,
             PATCH_SCHEMA,
         )
+        creation_receipts = manifest.get("creation_receipts")
+        if not isinstance(creation_receipts, dict):
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Patch manifest has no creation receipts",
+            )
+        _assert_manifest_protection_receipt(
+            stage_directory,
+            creation_receipts.get("stage_directory"),
+            label="patch stage directory",
+            identity_code="stage-directory-identity-mismatch",
+            access_policy_code="stage-directory-access-policy-mismatch",
+        )
         database = manifest.get("database")
         if not isinstance(database, dict):
             raise StoreSafetyError(
@@ -5563,6 +6347,17 @@ def validate_patch_stage(stage_dir: Path) -> dict[str, Any]:
                 stage_dir / NOTE_STORE_MAIN,
                 PATCH_FILE_CODES,
             )
+        )
+        database_creation_receipt = {
+            "identity": database.get("identity"),
+            "access_policy": database.get("access_policy"),
+        }
+        _assert_manifest_protection_receipt(
+            _verify_bound_regular_file(database_bound, PATCH_FILE_CODES),
+            database_creation_receipt,
+            label="patch database",
+            identity_code=PATCH_FILE_CODES.identity,
+            access_policy_code=PATCH_FILE_CODES.access_policy,
         )
         with tempfile.TemporaryDirectory(
             prefix="apple-notes-stage-validation-"
@@ -5621,6 +6416,7 @@ def validate_patch_stage(stage_dir: Path) -> dict[str, Any]:
                         "link_count",
                     ],
                 },
+                "stage_directory": stage_directory,
                 "manifest": manifest_integrity,
                 "database": database_integrity,
             },

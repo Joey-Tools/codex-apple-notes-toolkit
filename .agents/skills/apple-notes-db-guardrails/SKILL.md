@@ -75,6 +75,10 @@ On an ordinary pre-publication failure, the helper
 preserves the partial tree and attaches a creation-receipt-matched namespace locator plus a bounded
 no-follow sensitive-file inventory to the original error. If the root is replaced or inventory is
 inconclusive, the original error remains primary and reports the separate receipt failure.
+An individual file writer also retains its failed output: it never follows a separate `stat` with
+an `unlink`, because the namespace leaf could be replaced between those syscalls. The error carries
+the held parent/file descriptor receipt, point-in-time namespace observations, `cleanup_state:
+retained`, and `retry_safe: false`.
 An otherwise unclassified runtime failure becomes `prepared-operation-failed`, retains the
 underlying exception as its cause, and carries the same recovery details.
 If publication reports `destination-install-uncertain`, preserve the reported paths, do not retry
@@ -89,10 +93,11 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" validate-snapshot \
   --snapshot-dir /tmp/<task-backup>
 ```
 
-Validation holds the manifest and every declared database-file descriptor through recovery-clone
-creation, SQLite integrity checking, and terminal revalidation. Object replacement, byte mutation,
-and access-policy change have distinct failure codes; timestamp-only changes do not fail when the
-protected properties remain stable.
+Validation requires the v2 manifest's creation-time root/store/file identity and access-policy
+receipts, then holds the manifest and every declared database-file descriptor through
+recovery-clone creation, SQLite integrity checking, and terminal revalidation. Object replacement,
+byte mutation, and access-policy change have distinct failure codes; timestamp-only changes do not
+fail when the protected properties remain stable.
 
 ## Recover For Analysis
 

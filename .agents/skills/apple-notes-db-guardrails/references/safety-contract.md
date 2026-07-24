@@ -45,6 +45,10 @@ directory revalidation, and the terminal protected-property check. A same-byte i
 is an identity mismatch; a mode/owner/group/flags change is an access-policy mismatch; an in-place
 byte change is a content mismatch. Do not accept a fresh pathname open as proof about the object
 that supplied earlier validation evidence.
+The v2 snapshot and patch manifests must persist creation-time identity and access-policy receipts
+for their root directories and database files; snapshots also persist the nested store-directory
+receipt. Validators compare all receipt fields before consuming SQLite bytes and reject v1
+manifests rather than silently applying the weaker contract.
 
 Treat these outcomes separately:
 
@@ -211,6 +215,15 @@ fsync that same parent descriptor, and terminally revalidate the installed root 
 Never reopen the parent pathname between rename and durability. A temporary parent-path
 replacement therefore cannot redirect publication evidence, while identity or access-policy
 changes on the held parent fail separately.
+Create copied database files, standalone recovery files, and manifest temporary files exclusively
+relative to those held directory descriptors. Perform their name-based validation through the same
+descriptors; never reconstruct a full pathname for those operations.
+On writer failure, retain the created file and report the held parent/file descriptor identities,
+access policies, content status, and point-in-time namespace observations. Do not attempt automatic
+name-based cleanup: even descriptor-relative `stat(name)` followed by `unlink(name)` has a
+replacement window and cannot protect deletion target identity. Mark the retained output
+`retry_safe: false`; any later destructive action must independently rebind and match the reported
+object.
 
 After any publication error, compare the private source and destination namespaces with the
 prepared directory's object identity. Report a proved pre-existing destination as
@@ -226,6 +239,10 @@ identity/SHA-256/size/access-policy receipts. Revalidate that tree through the h
 directory, and regular-file descriptors after rename. If final public-parent pathname validation
 fails because an ancestor was permanently replaced, report `destination-install-uncertain` with
 that descriptor receipt; the display path alone is not the recovery locator.
+If source or destination namespace observation is unavailable, still report
+`publication_state: uncertain`, `retry_safe: false`, and descriptor-bound parent/prepared-root plus
+last-verified target-tree evidence. Mark unavailable namespace evidence as inconclusive instead of
+omitting the recovery locator.
 
 Standalone database publication uses an atomic no-replace rename from a descriptor-bound private
 file. Bind the creation-time private parent and operate on the exact source and destination leaf
@@ -323,11 +340,15 @@ The helper emits stable error codes, including:
 - `notes-started-during-capture`, `notes-started-during-preflight`;
 - `notes-started-during-verification`;
 - `snapshot-content-mismatch`, `snapshot-file-set-mismatch`;
+- `snapshot-directory-identity-mismatch`;
+- `snapshot-directory-access-policy-mismatch`;
 - `snapshot-file-identity-mismatch`, `snapshot-file-access-policy-mismatch`;
 - `snapshot-file-revalidation-inconclusive`;
 - `backup-not-writeback-grade`, `baseline-identity-mismatch`;
 - `baseline-content-mismatch`, `baseline-access-policy-mismatch`;
 - `patch-file-set-mismatch`, `patch-content-mismatch`;
+- `stage-directory-identity-mismatch`;
+- `stage-directory-access-policy-mismatch`;
 - `patch-file-identity-mismatch`, `patch-file-access-policy-mismatch`;
 - `patch-file-revalidation-inconclusive`;
 - `prepared-directory-identity-mismatch`;
