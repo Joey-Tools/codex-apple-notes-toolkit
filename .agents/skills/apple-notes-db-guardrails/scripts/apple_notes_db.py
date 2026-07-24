@@ -100,7 +100,9 @@ class _BoundRegularFile:
     opened: os.stat_result
     sha256: str
     parent_opened: os.stat_result | None = None
+    parent_fd: int | None = None
     before_write: Callable[[], dict[str, Any] | None] | None = None
+    trusted_alias: _TrustedDirectoryAlias | None = None
 
 
 @dataclass
@@ -112,6 +114,7 @@ class _BoundDirectory:
     parent_fd: int | None = None
     before_write: Callable[[], dict[str, Any] | None] | None = None
     namespace_basename: str | None = None
+    trusted_alias: _TrustedDirectoryAlias | None = None
 
 
 @dataclass
@@ -157,6 +160,7 @@ class _LiveDestinationScope:
     destination: Path
     parent: _BoundDirectory
     revalidate: Callable[[], dict[str, Any]]
+    trusted_alias: _TrustedDirectoryAlias | None
 
 
 @dataclass(frozen=True)
@@ -750,27 +754,41 @@ def _pre_rename_directory_publication_details(
 def _terminal_installed_path_stats(
     destination: Path,
     *,
+    trusted_alias: _TrustedDirectoryAlias | None,
     missing_code: str,
     inconclusive_code: str,
-) -> tuple[os.stat_result, os.stat_result, os.stat_result, os.stat_result]:
+) -> tuple[
+    os.stat_result,
+    os.stat_result,
+    os.stat_result,
+    os.stat_result,
+    dict[str, Any] | None,
+]:
     """Bind one public path through only an exact trusted root alias."""
 
     requested, canonical, alias_spec = _trusted_alias_paths(destination)
     path_parent_fd: int | None = None
-    with ExitStack() as stack:
-        trusted_alias: _TrustedDirectoryAlias | None = None
-        if alias_spec is not None:
-            trusted_alias = stack.enter_context(
-                _bind_trusted_directory_alias(
-                    alias_spec[0],
-                    alias_spec[1],
-                    destination=requested,
-                )
+    alias_receipt: dict[str, Any] | None = None
+    if alias_spec is not None:
+        if trusted_alias is None:
+            raise StoreSafetyError(
+                inconclusive_code,
+                "The installed destination uses a trusted platform alias, but "
+                "the original authorization binding was not carried to the "
+                f"terminal boundary: {requested}",
             )
-            _verify_trusted_directory_alias(
-                trusted_alias,
-                destination=requested,
-            )
+        _assert_trusted_alias_matches_path(trusted_alias, requested)
+        alias_receipt = _verify_trusted_directory_alias(
+            trusted_alias,
+            destination=requested,
+        )
+    elif trusted_alias is not None:
+        raise StoreSafetyError(
+            inconclusive_code,
+            "The terminal destination escaped the trusted platform alias that "
+            f"authorized publication: {requested}",
+        )
+    try:
         try:
             parent_before = os.stat(canonical.parent, follow_symlinks=False)
             path_parent_fd = os.open(canonical.parent, _directory_open_flags())
@@ -796,22 +814,31 @@ def _terminal_installed_path_stats(
             if path_parent_fd is not None:
                 os.close(path_parent_fd)
         if trusted_alias is not None:
-            _verify_trusted_directory_alias(
+            alias_receipt = _verify_trusted_directory_alias(
                 trusted_alias,
                 destination=requested,
             )
-    return parent_before, parent_descriptor, parent_after, leaf
+    except StoreSafetyError:
+        raise
+    except Exception as exc:
+        raise StoreSafetyError(
+            inconclusive_code,
+            f"Cannot terminally revalidate the installed destination: "
+            f"{requested}: {exc}",
+        ) from exc
+    return parent_before, parent_descriptor, parent_after, leaf, alias_receipt
 
 
 def _verify_installed_directory_path(
     binding: _BoundDirectory,
     destination: Path,
-) -> None:
+) -> dict[str, Any] | None:
     """Terminally prove that the public path names the bound directory."""
 
-    parent_before, parent_descriptor, parent_after, leaf = (
+    parent_before, parent_descriptor, parent_after, leaf, alias_receipt = (
         _terminal_installed_path_stats(
             destination,
+            trusted_alias=binding.trusted_alias,
             missing_code="prepared-directory-identity-mismatch",
             inconclusive_code="prepared-directory-revalidation-inconclusive",
         )
@@ -842,6 +869,7 @@ def _verify_installed_directory_path(
             f"The installed path parent or directory changed access policy: "
             f"{destination}",
         )
+    return alias_receipt
 
 
 def _publish_directory_no_replace(
@@ -1240,6 +1268,13 @@ def _publish_directory_no_replace(
             tree_receipt=prepared_tree_receipt,
             tree_verification="creation-receipt-last-verified-before-rename",
         )
+        if binding.trusted_alias is not None:
+            descriptor_bound_destination["trusted_alias_before_terminal"] = (
+                _verify_trusted_directory_alias(
+                    binding.trusted_alias,
+                    destination=destination,
+                )
+            )
         if descriptor_tree_receipt_builder is not None:
             descriptor_bound_destination["tree_receipt"] = (
                 descriptor_tree_receipt_builder(destination.name)
@@ -1247,7 +1282,14 @@ def _publish_directory_no_replace(
             descriptor_bound_destination["tree_verification"] = (
                 "descriptor-revalidated-after-rename"
             )
-        _verify_installed_directory_path(binding, destination)
+        terminal_alias_receipt = _verify_installed_directory_path(
+            binding,
+            destination,
+        )
+        if terminal_alias_receipt is not None:
+            descriptor_bound_destination["trusted_alias"] = terminal_alias_receipt
+        binding.path = destination
+        binding.namespace_basename = destination.name
     except Exception as exc:
         terminal_source_observation = _observe_bound_name(
             parent_fd,
@@ -1404,26 +1446,6 @@ def _hash_fd(fd: int) -> str:
     return digest.hexdigest()
 
 
-def _translate_bound_open_error(
-    path: Path,
-    codes: _FileProtectionCodes,
-    error: StoreSafetyError,
-) -> StoreSafetyError:
-    if error.code in {"source-missing", "source-missing-after-read"}:
-        code = codes.missing
-    elif error.code in {
-        "source-identity-mismatch",
-        "source-not-regular",
-    }:
-        code = codes.identity
-    else:
-        code = codes.inconclusive
-    return StoreSafetyError(
-        code,
-        f"Cannot bind regular file for protected validation: {path}: {error}",
-    )
-
-
 def _verify_bound_regular_file_with_stat(
     bound: _BoundRegularFile,
     codes: _FileProtectionCodes,
@@ -1431,6 +1453,13 @@ def _verify_bound_regular_file_with_stat(
     target: Path,
     stat_target: Callable[[], os.stat_result],
 ) -> dict[str, Any]:
+    if bound.trusted_alias is not None:
+        _assert_trusted_alias_matches_path(bound.trusted_alias, target)
+        _verify_trusted_directory_alias(
+            bound.trusted_alias,
+            destination=target,
+        )
+
     def stat_descriptor() -> os.stat_result:
         try:
             return os.fstat(bound.fd)
@@ -1515,7 +1544,7 @@ def _verify_bound_regular_file_with_stat(
         )
     before_metadata = _metadata(bound.opened)
     after_metadata = _metadata(descriptor_after)
-    return {
+    result = {
         "path": target,
         "sha256": bound.sha256,
         "size": descriptor_after.st_size,
@@ -1528,6 +1557,12 @@ def _verify_bound_regular_file_with_stat(
             if before_metadata[key] != after_metadata[key]
         },
     }
+    if bound.trusted_alias is not None:
+        result["trusted_alias"] = _verify_trusted_directory_alias(
+            bound.trusted_alias,
+            destination=target,
+        )
+    return result
 
 
 def _verify_bound_regular_file(
@@ -1569,66 +1604,12 @@ def _bind_regular_file(
     path: Path,
     codes: _FileProtectionCodes,
 ) -> Iterator[_BoundRegularFile]:
-    parent_fd: int | None = None
-    try:
-        parent_fd = os.open(path.parent, _directory_open_flags())
-        parent_opened = os.fstat(parent_fd)
-        parent_path_before = os.stat(path.parent, follow_symlinks=False)
-        if (
-            not stat.S_ISDIR(parent_opened.st_mode)
-            or not stat.S_ISDIR(parent_path_before.st_mode)
-            or not _same_identity(parent_opened, parent_path_before)
-        ):
-            raise StoreSafetyError(
-                codes.identity,
-                f"Regular-file parent changed while binding: {path.parent}",
-            )
-    except StoreSafetyError:
-        if parent_fd is not None:
-            os.close(parent_fd)
-        raise
-    except OSError as exc:
-        if parent_fd is not None:
-            os.close(parent_fd)
-        raise StoreSafetyError(
-            codes.inconclusive,
-            f"Cannot bind regular-file parent {path.parent}: {exc}",
-        ) from exc
-    try:
-        fd, opened = _open_regular_readonly(path)
-    except StoreSafetyError as exc:
-        os.close(parent_fd)
-        raise _translate_bound_open_error(path, codes, exc) from exc
-    try:
-        try:
-            sha256 = _hash_fd(fd)
-        except OSError as exc:
-            raise StoreSafetyError(
-                codes.inconclusive,
-                f"Cannot hash regular file while binding it: {path}: {exc}",
-            ) from exc
-        bound = _BoundRegularFile(
-            path=path,
-            fd=fd,
-            opened=opened,
-            sha256=sha256,
-            parent_opened=parent_opened,
-        )
-        _verify_bound_regular_file(bound, codes)
-        parent_descriptor = os.fstat(parent_fd)
-        parent_path_after = os.stat(path.parent, follow_symlinks=False)
-        if not _same_identity(parent_opened, parent_descriptor) or not _same_identity(
-            parent_descriptor, parent_path_after
-        ):
-            raise StoreSafetyError(
-                codes.identity,
-                f"Regular-file parent changed while binding: {path.parent}",
-            )
+    requested = Path(os.path.abspath(os.fspath(path)))
+    with (
+        _bind_existing_directory_with_trusted_alias(requested.parent) as parent,
+        _bind_regular_file_at(requested, parent, codes) as bound,
+    ):
         yield bound
-    finally:
-        os.close(fd)
-        if parent_fd is not None:
-            os.close(parent_fd)
 
 
 def _scan_bound_directory_entry_types(
@@ -1828,6 +1809,23 @@ def _scan_exact_bound_directory_entries(
     }
 
 
+def _scan_exact_prepared_directory_entries(
+    binding: _BoundDirectory,
+    expected_types: dict[str, int],
+    *,
+    missing_code: str,
+) -> dict[str, Any]:
+    return _scan_exact_bound_directory_entries(
+        binding,
+        expected_types,
+        missing_code=missing_code,
+        identity_code="prepared-directory-identity-mismatch",
+        access_policy_code="prepared-directory-access-policy-mismatch",
+        inconclusive_code="prepared-directory-revalidation-inconclusive",
+        mismatch_code="prepared-file-set-mismatch",
+    )
+
+
 @contextmanager
 def _bind_directory_at(
     path: Path,
@@ -1937,6 +1935,7 @@ def _bind_directory_at(
         parent_opened=parent.opened,
         parent_fd=parent.fd,
         before_write=parent.before_write,
+        trusted_alias=parent.trusted_alias,
     )
     try:
         yield binding
@@ -2013,7 +2012,9 @@ def _bind_regular_file_at(
             opened=opened,
             sha256=sha256,
             parent_opened=parent.opened,
+            parent_fd=parent.fd,
             before_write=parent.before_write,
+            trusted_alias=parent.trusted_alias,
         )
         _verify_bound_regular_file_at(
             bound,
@@ -2494,6 +2495,9 @@ def _create_bound_directory(
         before_write=(
             parent_binding.before_write if parent_binding is not None else None
         ),
+        trusted_alias=(
+            parent_binding.trusted_alias if parent_binding is not None else None
+        ),
     )
     try:
         try:
@@ -2696,48 +2700,12 @@ def _bind_artifact_root(
 ) -> Iterator[_BoundDirectory]:
     """Bind an artifact root while preserving its public error taxonomy."""
 
-    requested_path, canonical_path, alias_spec = _trusted_alias_paths(path)
+    requested_path, _, _ = _trusted_alias_paths(path)
     entered = False
     try:
-        with ExitStack() as stack:
-            trusted_alias: _TrustedDirectoryAlias | None = None
-            if alias_spec is not None:
-                trusted_alias = stack.enter_context(
-                    _bind_trusted_directory_alias(
-                        alias_spec[0],
-                        alias_spec[1],
-                        destination=requested_path,
-                    )
-                )
-                _verify_trusted_directory_alias(
-                    trusted_alias,
-                    destination=requested_path,
-                )
-            canonical_binding = stack.enter_context(
-                _bind_existing_directory(canonical_path)
-            )
-
-            def revalidate_alias() -> dict[str, Any] | None:
-                if trusted_alias is None:
-                    return None
-                return _verify_trusted_directory_alias(
-                    trusted_alias,
-                    destination=requested_path,
-                )
-
-            binding = _BoundDirectory(
-                path=requested_path,
-                fd=canonical_binding.fd,
-                opened=canonical_binding.opened,
-                parent_opened=canonical_binding.parent_opened,
-                parent_fd=canonical_binding.parent_fd,
-                before_write=revalidate_alias if trusted_alias is not None else None,
-                namespace_basename=canonical_binding.path.name,
-            )
-            revalidate_alias()
+        with _bind_existing_directory_with_trusted_alias(requested_path) as binding:
             entered = True
             yield binding
-            revalidate_alias()
     except StoreSafetyError as exc:
         if entered:
             raise
@@ -2833,14 +2801,27 @@ def _verify_bound_directory_at(
 def _verify_bound_directory_namespace(
     binding: _BoundDirectory,
 ) -> dict[str, Any]:
+    if binding.trusted_alias is not None:
+        _assert_trusted_alias_matches_path(binding.trusted_alias, binding.path)
+        _verify_trusted_directory_alias(
+            binding.trusted_alias,
+            destination=binding.path,
+        )
     if binding.parent_fd is None:
-        return _verify_bound_directory(binding)
-    return _verify_bound_directory_at(
-        binding,
-        parent_fd=binding.parent_fd,
-        basename=_bound_directory_basename(binding),
-        display_path=binding.path,
-    )
+        result = _verify_bound_directory(binding)
+    else:
+        result = _verify_bound_directory_at(
+            binding,
+            parent_fd=binding.parent_fd,
+            basename=_bound_directory_basename(binding),
+            display_path=binding.path,
+        )
+    if binding.trusted_alias is not None:
+        result["trusted_alias"] = _verify_trusted_directory_alias(
+            binding.trusted_alias,
+            destination=binding.path,
+        )
+    return result
 
 
 def _retained_created_regular_file_details(
@@ -3815,157 +3796,6 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _scan_exact_directory_entries(
-    path: Path,
-    expected_types: dict[str, int],
-    *,
-    missing_code: str,
-    mismatch_code: str,
-    bound_identity: dict[str, int] | None = None,
-    bound_access_policy: dict[str, int] | None = None,
-) -> dict[str, Any]:
-    try:
-        path_before = os.stat(path, follow_symlinks=False)
-    except FileNotFoundError as exc:
-        raise StoreSafetyError(missing_code, f"Directory is missing: {path}") from exc
-    except OSError as exc:
-        raise StoreSafetyError(
-            "directory-scan-inconclusive",
-            f"Cannot inspect directory before exact file-set validation: {path}: {exc}",
-        ) from exc
-    if not stat.S_ISDIR(path_before.st_mode):
-        raise StoreSafetyError(
-            mismatch_code,
-            f"Expected a real directory during exact file-set validation: {path}",
-        )
-
-    expected_identity = _identity(path_before)
-    expected_access_policy = _access_policy(path_before)
-    if bound_identity is not None and expected_identity != bound_identity:
-        raise StoreSafetyError(
-            "directory-identity-mismatch",
-            f"Directory object changed between validation phases: {path}",
-        )
-    if (
-        bound_access_policy is not None
-        and expected_access_policy != bound_access_policy
-    ):
-        raise StoreSafetyError(
-            "directory-access-policy-mismatch",
-            f"Directory access policy changed between validation phases: {path}",
-        )
-    scans: list[dict[str, int]] = []
-    for _ in range(2):
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
-        try:
-            fd = os.open(path, flags)
-        except FileNotFoundError as exc:
-            raise StoreSafetyError(
-                "directory-identity-mismatch",
-                f"Directory disappeared during exact file-set validation: {path}",
-            ) from exc
-        except OSError as exc:
-            raise StoreSafetyError(
-                "directory-scan-inconclusive",
-                f"Cannot open directory for exact file-set validation: {path}: {exc}",
-            ) from exc
-        try:
-            opened = os.fstat(fd)
-            if (
-                not stat.S_ISDIR(opened.st_mode)
-                or _identity(opened) != expected_identity
-            ):
-                raise StoreSafetyError(
-                    "directory-identity-mismatch",
-                    f"Directory object changed during exact file-set validation: {path}",
-                )
-            if _access_policy(opened) != expected_access_policy:
-                raise StoreSafetyError(
-                    "directory-access-policy-mismatch",
-                    f"Directory access policy changed during validation: {path}",
-                )
-            try:
-                with os.scandir(fd) as entries:
-                    scan: dict[str, int] = {}
-                    for entry in entries:
-                        name = os.fsdecode(entry.name)
-                        try:
-                            entry_stat = entry.stat(follow_symlinks=False)
-                        except FileNotFoundError as exc:
-                            raise StoreSafetyError(
-                                mismatch_code,
-                                "Directory membership changed during exact file-set "
-                                f"validation: {path}",
-                            ) from exc
-                        except OSError as exc:
-                            raise StoreSafetyError(
-                                "directory-scan-inconclusive",
-                                f"Cannot inspect directory entry without following "
-                                f"links: {path / name}: {exc}",
-                            ) from exc
-                        scan[name] = stat.S_IFMT(entry_stat.st_mode)
-            except StoreSafetyError:
-                raise
-            except OSError as exc:
-                raise StoreSafetyError(
-                    "directory-scan-inconclusive",
-                    f"Cannot enumerate directory for exact file-set validation: "
-                    f"{path}: {exc}",
-                ) from exc
-            opened_after = os.fstat(fd)
-            if _identity(opened_after) != expected_identity:
-                raise StoreSafetyError(
-                    "directory-identity-mismatch",
-                    f"Directory object changed during exact file-set validation: {path}",
-                )
-            if _access_policy(opened_after) != expected_access_policy:
-                raise StoreSafetyError(
-                    "directory-access-policy-mismatch",
-                    f"Directory access policy changed during validation: {path}",
-                )
-            scans.append(scan)
-        finally:
-            os.close(fd)
-
-    try:
-        path_after = os.stat(path, follow_symlinks=False)
-    except FileNotFoundError as exc:
-        raise StoreSafetyError(
-            "directory-identity-mismatch",
-            f"Directory disappeared during final file-set revalidation: {path}",
-        ) from exc
-    except OSError as exc:
-        raise StoreSafetyError(
-            "directory-scan-inconclusive",
-            f"Cannot revalidate directory after exact file-set scan: {path}: {exc}",
-        ) from exc
-    if _identity(path_after) != expected_identity:
-        raise StoreSafetyError(
-            "directory-identity-mismatch",
-            f"Directory path was replaced during exact file-set validation: {path}",
-        )
-    if _access_policy(path_after) != expected_access_policy:
-        raise StoreSafetyError(
-            "directory-access-policy-mismatch",
-            f"Directory access policy changed during validation: {path}",
-        )
-    if scans[0] != scans[1] or scans[1] != expected_types:
-        raise StoreSafetyError(
-            mismatch_code,
-            f"Directory name/type set differs from the exact expected set: {path}",
-        )
-    return {
-        "identity": expected_identity,
-        "access_policy": expected_access_policy,
-        "entry_types": scans[1],
-    }
-
-
 def _write_json_atomic(
     path: Path,
     payload: dict[str, Any],
@@ -3973,7 +3803,7 @@ def _write_json_atomic(
     parent_binding: _BoundDirectory | None = None,
 ) -> dict[str, Any]:
     if parent_binding is None:
-        with _bind_existing_directory(path.parent) as bound_parent:
+        with _bind_existing_directory_with_trusted_alias(path.parent) as bound_parent:
             return _write_json_atomic(
                 path,
                 payload,
@@ -4049,7 +3879,9 @@ def _write_json_atomic(
             opened=opened,
             sha256=sha256,
             parent_opened=parent_binding.opened,
+            parent_fd=parent_binding.fd,
             before_write=parent_binding.before_write,
+            trusted_alias=parent_binding.trusted_alias,
         )
         return _verify_bound_regular_file_at(
             bound,
@@ -4447,25 +4279,43 @@ def _assert_bound_matches_receipt(
 def _bind_prepared_regular_files(
     root: Path,
     *,
+    root_binding: _BoundDirectory,
+    directory_bindings: dict[Path, _BoundDirectory],
     manifest_name: str,
     manifest_payload: dict[str, Any],
     manifest_receipt: dict[str, Any],
     file_receipts: dict[Path, dict[str, Any]],
 ) -> Iterator[dict[Path, _BoundRegularFile]]:
     with ExitStack() as stack:
+
+        def parent_for(relative_path: Path) -> _BoundDirectory:
+            parent_relative = relative_path.parent
+            if parent_relative == Path("."):
+                return root_binding
+            try:
+                return directory_bindings[parent_relative]
+            except KeyError as exc:
+                raise StoreSafetyError(
+                    "prepared-directory-revalidation-inconclusive",
+                    "No descriptor-bound prepared parent was supplied for "
+                    f"{root / relative_path}",
+                ) from exc
+
         manifest_relative = Path(manifest_name)
         bindings = {
             manifest_relative: stack.enter_context(
-                _bind_regular_file(
+                _bind_regular_file_at(
                     root / manifest_relative,
+                    parent_for(manifest_relative),
                     PREPARED_FILE_CODES,
                 )
             )
         }
         for relative_path in file_receipts:
             bindings[relative_path] = stack.enter_context(
-                _bind_regular_file(
+                _bind_regular_file_at(
                     root / relative_path,
+                    parent_for(relative_path),
                     PREPARED_FILE_CODES,
                 )
             )
@@ -4502,23 +4352,40 @@ def _revalidate_published_regular_files(
     file_receipts: dict[Path, dict[str, Any]],
 ) -> None:
     manifest_relative = Path(manifest_name)
+    manifest_binding = bindings[manifest_relative]
+    if manifest_binding.parent_fd is None:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Published manifest has no held parent descriptor: "
+            f"{destination / manifest_relative}",
+        )
     _assert_bound_matches_receipt(
-        bindings[manifest_relative],
+        manifest_binding,
         manifest_receipt,
-        path=destination / manifest_relative,
+        dir_fd=manifest_binding.parent_fd,
+        basename=manifest_relative.name,
     )
     for relative_path, receipt in file_receipts.items():
+        binding = bindings[relative_path]
+        if binding.parent_fd is None:
+            raise StoreSafetyError(
+                "prepared-file-revalidation-inconclusive",
+                f"Published file has no held parent descriptor: "
+                f"{destination / relative_path}",
+            )
         _assert_bound_matches_receipt(
-            bindings[relative_path],
+            binding,
             receipt,
-            path=destination / relative_path,
+            dir_fd=binding.parent_fd,
+            basename=relative_path.name,
         )
     manifest_bytes = _read_bound_file_bytes(
-        bindings[manifest_relative],
+        manifest_binding,
         PREPARED_FILE_CODES,
         max_bytes=MANIFEST_MAX_BYTES,
         too_large_code="manifest-too-large",
-        path=destination / manifest_relative,
+        dir_fd=manifest_binding.parent_fd,
+        basename=manifest_relative.name,
     )
     installed_manifest = _parse_manifest_bytes(
         manifest_bytes,
@@ -4944,6 +4811,101 @@ def _verify_trusted_directory_alias(
         "alias_target_text": target_text_after,
         "canonical_target_receipt": target_receipt,
     }
+
+
+def _assert_trusted_alias_matches_path(
+    binding: _TrustedDirectoryAlias,
+    path: Path,
+) -> tuple[Path, Path]:
+    """Require one path to remain under the exact held alias registration."""
+
+    requested, canonical, alias_spec = _trusted_alias_paths(path)
+    if (
+        alias_spec is None
+        or alias_spec[0] != binding.alias
+        or alias_spec[1] != binding.target
+    ):
+        raise _raise_destination_scope_inconclusive(
+            "A later path boundary does not use the exact platform-trusted "
+            "alias object that authorized the operation: "
+            f"path={requested}, held_alias={binding.alias}, "
+            f"held_target={binding.target}",
+            destination=requested,
+        )
+    alias_parts = binding.alias.parts
+    expected_canonical = binding.target.joinpath(*requested.parts[len(alias_parts) :])
+    if canonical != expected_canonical:
+        raise _raise_destination_scope_inconclusive(
+            "A later path boundary no longer has the canonical mapping bound "
+            "by the held platform alias: "
+            f"path={requested}, canonical={canonical}, "
+            f"expected={expected_canonical}",
+            destination=requested,
+        )
+    return requested, canonical
+
+
+@contextmanager
+def _bind_existing_directory_with_trusted_alias(
+    path: Path,
+    *,
+    trusted_alias: _TrustedDirectoryAlias | None = None,
+) -> Iterator[_BoundDirectory]:
+    """Bind a directory while retaining one exact trusted alias object."""
+
+    requested, canonical, alias_spec = _trusted_alias_paths(path)
+    with ExitStack() as stack:
+        alias_binding = trusted_alias
+        if alias_spec is not None:
+            if alias_binding is None:
+                alias_binding = stack.enter_context(
+                    _bind_trusted_directory_alias(
+                        alias_spec[0],
+                        alias_spec[1],
+                        destination=requested,
+                    )
+                )
+            requested, canonical = _assert_trusted_alias_matches_path(
+                alias_binding,
+                requested,
+            )
+            _verify_trusted_directory_alias(
+                alias_binding,
+                destination=requested,
+            )
+        elif alias_binding is not None:
+            raise _raise_destination_scope_inconclusive(
+                "A later path boundary escaped the platform-trusted alias "
+                "object that authorized the operation: "
+                f"path={requested}, held_alias={alias_binding.alias}",
+                destination=requested,
+            )
+
+        canonical_binding = stack.enter_context(_bind_existing_directory(canonical))
+
+        def revalidate_alias() -> dict[str, Any] | None:
+            if alias_binding is None:
+                return None
+            _assert_trusted_alias_matches_path(alias_binding, requested)
+            return _verify_trusted_directory_alias(
+                alias_binding,
+                destination=requested,
+            )
+
+        binding = _BoundDirectory(
+            path=requested,
+            fd=canonical_binding.fd,
+            opened=canonical_binding.opened,
+            parent_opened=canonical_binding.parent_opened,
+            parent_fd=canonical_binding.parent_fd,
+            before_write=(revalidate_alias if alias_binding is not None else None),
+            namespace_basename=canonical_binding.path.name,
+            trusted_alias=alias_binding,
+        )
+        revalidate_alias()
+        yield binding
+        _verify_bound_directory_namespace(binding)
+        revalidate_alias()
 
 
 def _assert_snapshot_destination_lexically_outside_live_containers(
@@ -5449,6 +5411,7 @@ def _bind_live_safe_destination_parent(
             parent_opened=canonical_output_parent.parent_opened,
             parent_fd=canonical_output_parent.parent_fd,
             namespace_basename=canonical_output_parent.path.name,
+            trusted_alias=trusted_alias,
         )
 
         def revalidate() -> dict[str, Any]:
@@ -5522,6 +5485,7 @@ def _bind_live_safe_destination_parent(
             destination=requested_destination,
             parent=output_parent,
             revalidate=revalidate,
+            trusted_alias=trusted_alias,
         )
 
 
@@ -6402,7 +6366,7 @@ def _descriptor_bound_file_recovery_evidence(
 def _verify_installed_file_path(
     prepared: _BoundRegularFile,
     destination: Path,
-) -> None:
+) -> dict[str, Any] | None:
     """Terminally prove that the public path names the descriptor-bound leaf."""
 
     if prepared.parent_opened is None:
@@ -6410,9 +6374,10 @@ def _verify_installed_file_path(
             "prepared-file-revalidation-inconclusive",
             f"Prepared file has no parent receipt: {prepared.path}",
         )
-    parent_before, parent_descriptor, parent_after, leaf = (
+    parent_before, parent_descriptor, parent_after, leaf, alias_receipt = (
         _terminal_installed_path_stats(
             destination,
+            trusted_alias=prepared.trusted_alias,
             missing_code="prepared-file-identity-mismatch",
             inconclusive_code="prepared-file-revalidation-inconclusive",
         )
@@ -6442,6 +6407,7 @@ def _verify_installed_file_path(
             "prepared-file-access-policy-mismatch",
             f"The installed path parent or leaf changed access policy: {destination}",
         )
+    return alias_receipt
 
 
 @contextmanager
@@ -6822,7 +6788,19 @@ def _publish_file_no_replace_from_parent(
             prepared,
             destination,
         )
-        _verify_installed_file_path(prepared, destination)
+        if prepared.trusted_alias is not None:
+            descriptor_bound_destination["trusted_alias_before_terminal"] = (
+                _verify_trusted_directory_alias(
+                    prepared.trusted_alias,
+                    destination=destination,
+                )
+            )
+        terminal_alias_receipt = _verify_installed_file_path(
+            prepared,
+            destination,
+        )
+        if terminal_alias_receipt is not None:
+            descriptor_bound_destination["trusted_alias"] = terminal_alias_receipt
     except Exception as exc:
         descriptor_bound_prepared_file = _descriptor_bound_file_recovery_evidence(
             parent_fd,
@@ -7522,7 +7500,10 @@ def _terminal_public_standalone_output_receipt(
     }
     try:
         held_before = _verify_bound_directory_namespace(destination_binding)
-        with _bind_existing_directory(output.parent) as public_parent:
+        with _bind_existing_directory_with_trusted_alias(
+            output.parent,
+            trusted_alias=destination_binding.trusted_alias,
+        ) as public_parent:
             public_before = _verify_bound_directory_namespace(public_parent)
             if public_before["identity"] != held_before["identity"]:
                 raise StoreSafetyError(
@@ -7585,6 +7566,7 @@ def _terminal_public_standalone_output_receipt(
         "identity": held_before["identity"],
         "access_policy": held_before["access_policy"],
     }
+    receipt["trusted_alias"] = held_before.get("trusted_alias")
     receipt["main"] = main
     return receipt
 
@@ -7596,7 +7578,9 @@ def _write_standalone_backup_payload(
     destination_binding: _BoundDirectory | None = None,
 ) -> dict[str, Any]:
     if destination_binding is None:
-        with _bind_existing_directory(output.parent) as bound_destination:
+        with _bind_existing_directory_with_trusted_alias(
+            output.parent
+        ) as bound_destination:
             return _write_standalone_backup_payload(
                 payload,
                 output,
@@ -7803,7 +7787,7 @@ def _recover_validated_clone_to_standalone(
         if output_parent_binding is None:
             out.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             output_parent_binding = output_stack.enter_context(
-                _bind_existing_directory(out.parent)
+                _bind_existing_directory_with_trusted_alias(out.parent)
             )
         elif output_parent_binding.path != out.parent:
             raise StoreSafetyError(
@@ -7893,6 +7877,10 @@ def _recover_validated_clone_to_standalone(
                     prepared,
                     out,
                 )
+                if terminal_public_output.get("trusted_alias") is not None:
+                    descriptor_bound_destination["trusted_alias"] = (
+                        terminal_public_output["trusted_alias"]
+                    )
             except Exception as exc:
                 descriptor_bound_prepared_file = (
                     _descriptor_bound_file_recovery_evidence(
@@ -8158,16 +8146,14 @@ def copy_db(
                 manifest_name=SNAPSHOT_MANIFEST,
                 manifest_receipt=manifest_receipt,
             )
-            root_receipt = _scan_exact_directory_entries(
-                partial,
+            manifest_creation_destination_scope = destination_scope.revalidate()
+            root_receipt = _scan_exact_prepared_directory_entries(
+                bound_root,
                 {
                     "group.com.apple.notes": stat.S_IFDIR,
                     SNAPSHOT_MANIFEST: stat.S_IFREG,
                 },
                 missing_code="prepared-directory-identity-mismatch",
-                mismatch_code="prepared-file-set-mismatch",
-                bound_identity=_identity(bound_root.opened),
-                bound_access_policy=_access_policy(bound_root.opened),
             )
             file_receipts = {
                 Path("group.com.apple.notes") / str(record["basename"]): record["copy"]
@@ -8189,6 +8175,10 @@ def copy_db(
             }
             with _bind_prepared_regular_files(
                 partial,
+                root_binding=bound_root,
+                directory_bindings={
+                    Path("group.com.apple.notes"): bound_store,
+                },
                 manifest_name=SNAPSHOT_MANIFEST,
                 manifest_payload=manifest,
                 manifest_receipt=manifest_receipt,
@@ -8197,13 +8187,10 @@ def copy_db(
 
                 def verify_before_snapshot_rename() -> None:
                     destination_scope.revalidate()
-                    _scan_exact_directory_entries(
-                        store_dir,
+                    _scan_exact_prepared_directory_entries(
+                        bound_store,
                         expected_names,
                         missing_code="prepared-file-missing",
-                        mismatch_code="prepared-file-set-mismatch",
-                        bound_identity=store_receipt["identity"],
-                        bound_access_policy=store_receipt["access_policy"],
                     )
                     _revalidate_published_regular_files(
                         partial,
@@ -8217,13 +8204,10 @@ def copy_db(
                     # the nested store directory, then its containing snapshot
                     # root, before publishing the root name.
                     _fsync_bound_directory_descriptor(bound_store)
-                    _scan_exact_directory_entries(
-                        store_dir,
+                    _scan_exact_prepared_directory_entries(
+                        bound_store,
                         expected_names,
                         missing_code="prepared-file-missing",
-                        mismatch_code="prepared-file-set-mismatch",
-                        bound_identity=store_receipt["identity"],
-                        bound_access_policy=store_receipt["access_policy"],
                     )
                     _revalidate_published_regular_files(
                         partial,
@@ -8234,13 +8218,10 @@ def copy_db(
                         file_receipts=file_receipts,
                     )
                     _fsync_bound_directory_descriptor(bound_root)
-                    _scan_exact_directory_entries(
-                        store_dir,
+                    _scan_exact_prepared_directory_entries(
+                        bound_store,
                         expected_names,
                         missing_code="prepared-file-missing",
-                        mismatch_code="prepared-file-set-mismatch",
-                        bound_identity=store_receipt["identity"],
-                        bound_access_policy=store_receipt["access_policy"],
                     )
                     _revalidate_published_regular_files(
                         partial,
@@ -8250,16 +8231,13 @@ def copy_db(
                         manifest_receipt=manifest_receipt,
                         file_receipts=file_receipts,
                     )
-                    _scan_exact_directory_entries(
-                        partial,
+                    _scan_exact_prepared_directory_entries(
+                        bound_root,
                         {
                             "group.com.apple.notes": stat.S_IFDIR,
                             SNAPSHOT_MANIFEST: stat.S_IFREG,
                         },
                         missing_code="prepared-directory-identity-mismatch",
-                        mismatch_code="prepared-file-set-mismatch",
-                        bound_identity=root_receipt["identity"],
-                        bound_access_policy=root_receipt["access_policy"],
                     )
                     destination_scope.revalidate()
 
@@ -8296,24 +8274,18 @@ def copy_db(
                 )
                 try:
                     destination_scope.revalidate()
-                    _scan_exact_directory_entries(
-                        destination,
+                    _scan_exact_prepared_directory_entries(
+                        bound_root,
                         {
                             "group.com.apple.notes": stat.S_IFDIR,
                             SNAPSHOT_MANIFEST: stat.S_IFREG,
                         },
                         missing_code="prepared-directory-identity-mismatch",
-                        mismatch_code="prepared-file-set-mismatch",
-                        bound_identity=root_receipt["identity"],
-                        bound_access_policy=root_receipt["access_policy"],
                     )
-                    _scan_exact_directory_entries(
-                        destination / "group.com.apple.notes",
+                    _scan_exact_prepared_directory_entries(
+                        bound_store,
                         expected_names,
                         missing_code="prepared-file-missing",
-                        mismatch_code="prepared-file-set-mismatch",
-                        bound_identity=store_receipt["identity"],
-                        bound_access_policy=store_receipt["access_policy"],
                     )
                     _revalidate_published_regular_files(
                         destination,
@@ -8323,7 +8295,7 @@ def copy_db(
                         manifest_receipt=manifest_receipt,
                         file_receipts=file_receipts,
                     )
-                    destination_scope.revalidate()
+                    terminal_destination_scope = destination_scope.revalidate()
                 except Exception as exc:
                     raise StoreSafetyError(
                         "destination-install-uncertain",
@@ -8344,6 +8316,9 @@ def copy_db(
         "dest": requested_destination,
         "manifest": requested_destination / SNAPSHOT_MANIFEST,
         "manifest_creation_receipt": manifest_creation_receipt,
+        "manifest_creation_destination_scope": (manifest_creation_destination_scope),
+        "terminal_destination_scope": terminal_destination_scope,
+        "descriptor_bound_destination": publication_receipt,
         "notes_running": notes_running,
         "notes_quit_required": require_notes_quit,
         "classification": manifest["classification"],
@@ -8367,6 +8342,7 @@ def _validated_snapshot_artifact(
     manifest_creation_receipt: dict[str, Any] | None,
     *,
     manifest_creation_receipt_file: Path | None = None,
+    artifact_root_binding: _BoundDirectory | None = None,
 ) -> Iterator[_ValidatedSnapshotArtifact]:
     """Bind snapshot inputs and expose only a private validated recovery clone."""
 
@@ -8378,12 +8354,30 @@ def _validated_snapshot_artifact(
         ) as temp_dir,
         ExitStack() as stack,
     ):
-        artifact_root = stack.enter_context(
-            _bind_artifact_root(
-                snapshot_dir,
-                missing_code="snapshot-missing",
+        if artifact_root_binding is None:
+            artifact_root = stack.enter_context(
+                _bind_artifact_root(
+                    snapshot_dir,
+                    missing_code="snapshot-missing",
+                )
             )
-        )
+        else:
+            artifact_root = artifact_root_binding
+            if artifact_root.path != Path(os.path.abspath(os.fspath(snapshot_dir))):
+                raise StoreSafetyError(
+                    "snapshot-directory-identity-mismatch",
+                    "The supplied snapshot-root binding does not match the "
+                    f"requested artifact: binding={artifact_root.path}, "
+                    f"requested={snapshot_dir}",
+                )
+            _verify_bound_artifact_directory(
+                artifact_root,
+                missing_code="snapshot-missing",
+                identity_code="snapshot-directory-identity-mismatch",
+                access_policy_code="snapshot-directory-access-policy-mismatch",
+                inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+                mismatch_code="snapshot-file-set-mismatch",
+            )
         external_receipt = _manifest_creation_receipt_for_bound_artifact(
             artifact_root,
             manifest_creation_receipt=manifest_creation_receipt,
@@ -8759,7 +8753,7 @@ def merge_db(
             output_parent_binding=destination_scope.parent,
         )
         try:
-            destination_scope.revalidate()
+            terminal_destination_scope = destination_scope.revalidate()
         except Exception as exc:
             details = _publication_details(
                 "uncertain",
@@ -8781,6 +8775,7 @@ def merge_db(
                 details=details,
             ) from exc
     result["standalone_db"] = requested_output
+    result["terminal_destination_scope"] = terminal_destination_scope
     return {
         **result,
         "merged_db": requested_output,
@@ -9023,16 +9018,36 @@ def _exception_chain_contains_permission_error(exc: BaseException) -> bool:
 @contextmanager
 def _bind_manifest_creation_receipt_parent(
     path: Path,
+    *,
+    trusted_alias: _TrustedDirectoryAlias | None = None,
 ) -> Iterator[_BoundDirectory]:
     """Bind a receipt parent while preserving the public receipt taxonomy."""
 
     entered = False
     try:
-        with _bind_existing_directory(path) as binding:
+        requested, _, alias_spec = _trusted_alias_paths(path)
+        carried_alias = (
+            trusted_alias
+            if (
+                trusted_alias is not None
+                and alias_spec == (trusted_alias.alias, trusted_alias.target)
+            )
+            else None
+        )
+        with _bind_existing_directory_with_trusted_alias(
+            requested,
+            trusted_alias=carried_alias,
+        ) as binding:
             entered = True
             yield binding
     except StoreSafetyError as exc:
-        if entered:
+        if entered and exc.code not in {
+            "prepared-directory-missing",
+            "prepared-directory-identity-mismatch",
+            "prepared-directory-access-policy-mismatch",
+            "prepared-directory-revalidation-inconclusive",
+            "snapshot-destination-scope-inconclusive",
+        }:
             raise
         if exc.code == "prepared-directory-missing":
             code = "manifest-creation-receipt-missing"
@@ -9089,7 +9104,8 @@ def _load_external_manifest_creation_receipt(
         mismatch_code=mismatch_code,
     )
     with _bind_manifest_creation_receipt_parent(
-        receipt_file.parent
+        receipt_file.parent,
+        trusted_alias=artifact_root.trusted_alias,
     ) as bound_receipt_parent:
         try:
             _assert_output_ancestors_exclude_snapshot(
@@ -9476,7 +9492,7 @@ def _bind_recovery_output_parent_outside_snapshot(
             snapshot=snapshot,
             display_path=out.parent,
         )
-    with _bind_existing_directory(out.parent) as output_parent:
+    with _bind_existing_directory_with_trusted_alias(out.parent) as output_parent:
         _verify_bound_artifact_directory(
             snapshot_binding,
             missing_code="snapshot-missing",
@@ -9520,20 +9536,30 @@ def recover_snapshot(
     recovered: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
     try:
-        with _validated_snapshot_artifact(
-            snapshot_dir,
-            manifest_creation_receipt,
-            manifest_creation_receipt_file=manifest_creation_receipt_file,
-        ) as artifact:
-            validation = artifact.public_result
+        with ExitStack() as transaction:
+            artifact_root = transaction.enter_context(
+                _bind_artifact_root(
+                    snapshot_dir,
+                    missing_code="snapshot-missing",
+                )
+            )
             _preflight_recovery_output_outside_snapshot(
-                artifact.artifact_root,
+                artifact_root,
                 requested_out,
             )
-            with _bind_live_safe_destination_parent(
-                paths or NoteStorePaths(),
-                requested_out,
-            ) as destination_scope:
+            destination_scope = transaction.enter_context(
+                _bind_live_safe_destination_parent(
+                    paths or NoteStorePaths(),
+                    requested_out,
+                )
+            )
+            with _validated_snapshot_artifact(
+                snapshot_dir,
+                manifest_creation_receipt,
+                manifest_creation_receipt_file=(manifest_creation_receipt_file),
+                artifact_root_binding=artifact_root,
+            ) as artifact:
+                validation = artifact.public_result
                 with _bind_recovery_output_parent_outside_snapshot(
                     artifact.artifact_root,
                     destination_scope.destination,
@@ -9551,6 +9577,7 @@ def recover_snapshot(
                     )
                     destination_scope.revalidate()
                 recovered["standalone_db"] = requested_out
+                recovered["terminal_destination_scope"] = destination_scope.revalidate()
             result = {
                 "snapshot_dir": snapshot_dir,
                 "snapshot_validation": {
@@ -9687,16 +9714,14 @@ def stage_patch(
                 manifest_name=PATCH_MANIFEST,
                 manifest_receipt=manifest_receipt,
             )
-            root_receipt = _scan_exact_directory_entries(
-                partial,
+            manifest_creation_destination_scope = destination_scope.revalidate()
+            root_receipt = _scan_exact_prepared_directory_entries(
+                bound_root,
                 {
                     NOTE_STORE_MAIN: stat.S_IFREG,
                     PATCH_MANIFEST: stat.S_IFREG,
                 },
                 missing_code="prepared-directory-identity-mismatch",
-                mismatch_code="prepared-file-set-mismatch",
-                bound_identity=_identity(bound_root.opened),
-                bound_access_policy=_access_policy(bound_root.opened),
             )
             file_receipts = {Path(NOTE_STORE_MAIN): fingerprint}
             prepared_tree_receipt = {
@@ -9710,6 +9735,8 @@ def stage_patch(
             }
             with _bind_prepared_regular_files(
                 partial,
+                root_binding=bound_root,
+                directory_bindings={},
                 manifest_name=PATCH_MANIFEST,
                 manifest_payload=manifest,
                 manifest_receipt=manifest_receipt,
@@ -9726,16 +9753,13 @@ def stage_patch(
                         manifest_receipt=manifest_receipt,
                         file_receipts=file_receipts,
                     )
-                    _scan_exact_directory_entries(
-                        partial,
+                    _scan_exact_prepared_directory_entries(
+                        bound_root,
                         {
                             NOTE_STORE_MAIN: stat.S_IFREG,
                             PATCH_MANIFEST: stat.S_IFREG,
                         },
                         missing_code="prepared-directory-identity-mismatch",
-                        mismatch_code="prepared-file-set-mismatch",
-                        bound_identity=root_receipt["identity"],
-                        bound_access_policy=root_receipt["access_policy"],
                     )
                     destination_scope.revalidate()
 
@@ -9767,16 +9791,13 @@ def stage_patch(
                 )
                 try:
                     destination_scope.revalidate()
-                    _scan_exact_directory_entries(
-                        dest,
+                    _scan_exact_prepared_directory_entries(
+                        bound_root,
                         {
                             NOTE_STORE_MAIN: stat.S_IFREG,
                             PATCH_MANIFEST: stat.S_IFREG,
                         },
                         missing_code="prepared-directory-identity-mismatch",
-                        mismatch_code="prepared-file-set-mismatch",
-                        bound_identity=root_receipt["identity"],
-                        bound_access_policy=root_receipt["access_policy"],
                     )
                     _revalidate_published_regular_files(
                         dest,
@@ -9786,7 +9807,7 @@ def stage_patch(
                         manifest_receipt=manifest_receipt,
                         file_receipts=file_receipts,
                     )
-                    destination_scope.revalidate()
+                    terminal_destination_scope = destination_scope.revalidate()
                 except Exception as exc:
                     raise StoreSafetyError(
                         "destination-install-uncertain",
@@ -9806,6 +9827,9 @@ def stage_patch(
         "stage_dir": requested_dest,
         "manifest": requested_dest / PATCH_MANIFEST,
         "manifest_creation_receipt": manifest_creation_receipt,
+        "manifest_creation_destination_scope": (manifest_creation_destination_scope),
+        "terminal_destination_scope": terminal_destination_scope,
+        "descriptor_bound_destination": publication_receipt,
         "database": requested_dest / NOTE_STORE_MAIN,
         "sha256": manifest["database"]["sha256"],
         "size": manifest["database"]["size"],

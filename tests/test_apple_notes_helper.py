@@ -736,6 +736,256 @@ raise SystemExit(2)
                 if destination.exists():
                     shutil.rmtree(destination)
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS root alias contract")
+    def test_real_macos_tmp_alias_spans_all_publication_boundaries(self) -> None:
+        alias_root = Path(
+            tempfile.mkdtemp(
+                prefix="apple-notes-trusted-alias-boundaries-",
+                dir="/tmp",
+            )
+        )
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                source = paths.group_container / MODULE.NOTE_STORE_MAIN
+                self._create_db(source)
+                edited = root / "edited.sqlite"
+                self._create_db(edited, value="edited")
+
+                with mock.patch.object(
+                    MODULE,
+                    "notes_is_running",
+                    return_value=False,
+                ):
+                    snapshot = MODULE.copy_db(
+                        paths,
+                        dest=alias_root / "snapshot",
+                        require_notes_quit=True,
+                    )
+                snapshot_dir = Path(snapshot["dest"])
+                receipt_file = alias_root / "snapshot-receipt.json"
+                receipt_file.write_text(
+                    json.dumps(snapshot["manifest_creation_receipt"]),
+                    encoding="utf-8",
+                )
+
+                original_receipt_parent = MODULE._bind_manifest_creation_receipt_parent
+                receipt_alias_pairs: list[tuple[object, object]] = []
+
+                @contextmanager
+                def capture_receipt_parent_alias(
+                    path: Path,
+                    *,
+                    trusted_alias: object = None,
+                ) -> Iterator[MODULE._BoundDirectory]:
+                    with original_receipt_parent(
+                        path,
+                        trusted_alias=trusted_alias,
+                    ) as binding:
+                        receipt_alias_pairs.append(
+                            (trusted_alias, binding.trusted_alias)
+                        )
+                        yield binding
+
+                with mock.patch.object(
+                    MODULE,
+                    "_bind_manifest_creation_receipt_parent",
+                    side_effect=capture_receipt_parent_alias,
+                ):
+                    validation = MODULE.validate_snapshot(
+                        snapshot_dir,
+                        manifest_creation_receipt_file=receipt_file,
+                    )
+
+                merged = MODULE.merge_db(
+                    source,
+                    alias_root / "merged.sqlite",
+                    paths=paths,
+                )
+                recovered = MODULE.recover_snapshot(
+                    snapshot_dir,
+                    alias_root / "recovered.sqlite",
+                    manifest_creation_receipt_file=receipt_file,
+                    paths=paths,
+                )
+                stage = MODULE.stage_patch(
+                    edited,
+                    alias_root / "stage",
+                    paths=paths,
+                )
+
+                self.assertEqual(
+                    validation["sqlite_validation"]["result"],
+                    "ok",
+                )
+                self.assertEqual(len(receipt_alias_pairs), 1)
+                carried_alias, receipt_parent_alias = receipt_alias_pairs[0]
+                self.assertIsNotNone(carried_alias)
+                self.assertIs(carried_alias, receipt_parent_alias)
+
+                alias_receipts = (
+                    snapshot["manifest_creation_destination_scope"]["trusted_alias"],
+                    snapshot["terminal_destination_scope"]["trusted_alias"],
+                    snapshot["descriptor_bound_destination"]["trusted_alias"],
+                    merged["terminal_destination_scope"]["trusted_alias"],
+                    merged["descriptor_bound_destination"]["trusted_alias"],
+                    merged["terminal_public_path_revalidation"]["trusted_alias"],
+                    recovered["recovered"]["terminal_destination_scope"][
+                        "trusted_alias"
+                    ],
+                    recovered["recovered"]["descriptor_bound_destination"][
+                        "trusted_alias"
+                    ],
+                    recovered["recovered"]["terminal_public_path_revalidation"][
+                        "trusted_alias"
+                    ],
+                    stage["manifest_creation_destination_scope"]["trusted_alias"],
+                    stage["terminal_destination_scope"]["trusted_alias"],
+                    stage["descriptor_bound_destination"]["trusted_alias"],
+                )
+                for receipt in alias_receipts:
+                    self.assertIsNotNone(receipt)
+                    self.assertEqual(receipt["alias"], "/tmp")
+                    self.assertEqual(
+                        receipt["canonical_target"],
+                        "/private/tmp",
+                    )
+                    self.assertIn("alias_parent_identity", receipt)
+                    self.assertIn(
+                        "canonical_target_receipt",
+                        receipt,
+                    )
+        finally:
+            shutil.rmtree(alias_root, ignore_errors=True)
+
+    def test_carried_alias_rejects_terminal_retarget_and_replacement(
+        self,
+    ) -> None:
+        operations = ("file-retarget", "directory-replacement")
+        for operation in operations:
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                live_root = root / "live"
+                live_root.mkdir()
+                paths = self._make_paths(live_root)
+                source = paths.group_container / MODULE.NOTE_STORE_MAIN
+                self._create_db(source)
+                target = root / "canonical"
+                alternate = root / "alternate"
+                target.mkdir()
+                alternate.mkdir()
+                alias = root / "trusted-alias"
+                parked_alias = root / "trusted-alias-original"
+                alias.symlink_to(target, target_is_directory=True)
+                registry = ((alias, target),)
+                attacked = False
+
+                if operation == "file-retarget":
+                    original_terminal = MODULE._verify_installed_file_path
+
+                    def attack_terminal(
+                        prepared: MODULE._BoundRegularFile,
+                        destination: Path,
+                    ) -> object:
+                        nonlocal attacked
+                        self.assertIsNotNone(prepared.trusted_alias)
+                        assert prepared.trusted_alias is not None
+                        self.assertEqual(prepared.trusted_alias.alias, alias)
+                        if not attacked:
+                            attacked = True
+                            alias.rename(parked_alias)
+                            alias.symlink_to(
+                                alternate,
+                                target_is_directory=True,
+                            )
+                        return original_terminal(prepared, destination)
+
+                    terminal_name = "_verify_installed_file_path"
+
+                    def invoke_file_operation() -> object:
+                        return MODULE.merge_db(
+                            source,
+                            alias / "merged.sqlite",
+                            paths=paths,
+                        )
+
+                    invoke = invoke_file_operation
+                    installed = target / "merged.sqlite"
+                else:
+                    original_terminal = MODULE._verify_installed_directory_path
+
+                    def attack_terminal(
+                        prepared: MODULE._BoundDirectory,
+                        destination: Path,
+                    ) -> object:
+                        nonlocal attacked
+                        self.assertIsNotNone(prepared.trusted_alias)
+                        assert prepared.trusted_alias is not None
+                        self.assertEqual(prepared.trusted_alias.alias, alias)
+                        if not attacked:
+                            attacked = True
+                            alias.rename(parked_alias)
+                            alias.symlink_to(
+                                target,
+                                target_is_directory=True,
+                            )
+                        return original_terminal(prepared, destination)
+
+                    terminal_name = "_verify_installed_directory_path"
+
+                    def invoke_directory_operation() -> object:
+                        return MODULE.stage_patch(
+                            source,
+                            alias / "stage",
+                            paths=paths,
+                        )
+
+                    invoke = invoke_directory_operation
+                    installed = target / "stage"
+
+                try:
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_trusted_directory_alias_registry",
+                            return_value=registry,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            terminal_name,
+                            side_effect=attack_terminal,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        invoke()
+                    self._assert_safety_code(
+                        "destination-install-uncertain",
+                        raised,
+                    )
+                    self.assertTrue(attacked)
+                    self.assertTrue(installed.exists())
+                    self.assertEqual(list(alternate.iterdir()), [])
+                    alias_evidence = raised.exception.details["recovery_locators"][
+                        "descriptor_bound_destination"
+                    ]["trusted_alias_before_terminal"]
+                    self.assertEqual(
+                        alias_evidence["alias"],
+                        str(alias),
+                    )
+                    self.assertEqual(
+                        alias_evidence["canonical_target"],
+                        str(target),
+                    )
+                finally:
+                    if alias.is_symlink():
+                        alias.unlink()
+                    if parked_alias.exists() or parked_alias.is_symlink():
+                        parked_alias.rename(alias)
+
     def test_trusted_alias_revalidation_rejects_retarget_and_mocked_aba(
         self,
     ) -> None:
@@ -2789,27 +3039,27 @@ raise SystemExit(2)
             self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
             destination = root / "snapshot"
             parked = root.with_name(f"{root.name}-parked")
-            original_scan = MODULE._scan_exact_directory_entries
+            original_scan = MODULE._scan_exact_prepared_directory_entries
             attacked = False
 
             def replace_parent_before_public_scan(
-                path: Path,
+                binding: MODULE._BoundDirectory,
                 expected_types: dict[str, int],
                 **kwargs: object,
             ) -> dict[str, object]:
                 nonlocal attacked
-                if not attacked and path == destination:
+                if not attacked and binding.path == destination:
                     attacked = True
                     root.rename(parked)
                     root.mkdir(mode=0o700)
-                return original_scan(path, expected_types, **kwargs)
+                return original_scan(binding, expected_types, **kwargs)
 
             try:
                 with (
                     mock.patch.object(MODULE, "notes_is_running", return_value=False),
                     mock.patch.object(
                         MODULE,
-                        "_scan_exact_directory_entries",
+                        "_scan_exact_prepared_directory_entries",
                         side_effect=replace_parent_before_public_scan,
                     ),
                     self.assertRaises(MODULE.StoreSafetyError) as raised,
@@ -6192,6 +6442,82 @@ raise SystemExit(2)
                 self._validate_snapshot(snapshot_dir)["sqlite_validation"]["result"],
                 "ok",
             )
+
+    def test_recover_illegal_outputs_stop_before_temp_clone_or_writer(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+            receipt = snapshot["manifest_creation_receipt"]
+            live_alias = root / "live-group-alias"
+            live_alias.symlink_to(
+                paths.group_container,
+                target_is_directory=True,
+            )
+            cases = (
+                (
+                    "group",
+                    paths.group_container / "blocked.sqlite",
+                    "snapshot-destination-inside-live-container",
+                ),
+                (
+                    "app",
+                    paths.app_container / "blocked.sqlite",
+                    "snapshot-destination-inside-live-container",
+                ),
+                (
+                    "reserved",
+                    root / MODULE.NOTE_STORE_MAIN / "blocked.sqlite",
+                    "snapshot-destination-reserved-store-path",
+                ),
+                (
+                    "symlink-alias",
+                    live_alias / "blocked.sqlite",
+                    "snapshot-destination-inside-live-container",
+                ),
+            )
+            for label, destination, expected_code in cases:
+                with (
+                    self.subTest(label=label),
+                    mock.patch.object(
+                        MODULE.tempfile,
+                        "TemporaryDirectory",
+                    ) as temporary_directory,
+                    mock.patch.object(
+                        MODULE,
+                        "_make_recovery_clone_from_bound",
+                    ) as clone,
+                    mock.patch.object(
+                        MODULE,
+                        "_recover_validated_clone_to_standalone",
+                    ) as writer,
+                    mock.patch.object(
+                        MODULE,
+                        "_write_standalone_backup_payload",
+                    ) as standalone_writer,
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE.recover_snapshot(
+                        snapshot_dir,
+                        destination,
+                        receipt,
+                        paths=paths,
+                    )
+                self._assert_safety_code(expected_code, raised)
+                temporary_directory.assert_not_called()
+                clone.assert_not_called()
+                writer.assert_not_called()
+                standalone_writer.assert_not_called()
+                self.assertFalse(destination.exists())
 
     def test_recover_snapshot_rejects_case_variant_and_symlink_aliases(
         self,

@@ -69,9 +69,15 @@ target text, plus the canonical target and its parent, then performs writes thro
 descriptors while revalidating both namespaces. An arbitrary symlink, a case-folded spelling, an
 NFC/NFD variant, a retarget, or an alias replacement fails closed before mutation. Live-container,
 trusted-alias, and destination-ancestor identity and access policy remain bound through
-publication; unrelated child-entry churn is not a content mutation. Treat
+publication. The exact alias binding object is propagated into every derived directory/file
+binding, a same-alias external receipt parent, creator-result scope evidence, and terminal
+public-parent rebind; later boundaries must reuse it rather than authorizing a new alias or
+falling back to the public pathname. Unrelated child-entry churn is not a content mutation. Treat
 `snapshot-destination-scope-inconclusive` as fail-closed, distinct from a proved
 `snapshot-destination-inside-live-container` overlap.
+Successful creator output records the alias-aware
+`manifest_creation_destination_scope`, `terminal_destination_scope`, and
+`descriptor_bound_destination` receipts.
 
 Treat a snapshot captured while Notes is running as tentative.
 Do not use it for absence claims, exact counts, patch planning, or writeback.
@@ -163,6 +169,12 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" recover-snapshot \
 reopens the mutable snapshot paths after validation. Its recovery result carries the snapshot
 manifest and database-file identity, SHA-256, size, and access-policy receipts from that validation
 context rather than replacing them with only the SQLite integrity result.
+Before the validator can create its `TemporaryDirectory`, recovery read-only binds the snapshot,
+proves output/snapshot separation, and acquires the live-safe destination guard. A direct
+group/app-container output, reserved store-name component, or symlink alias into a live container
+therefore fails before temporary-directory creation, recovery cloning, SQLite backup, or any
+standalone writer can run. The snapshot and destination guards remain held through publication
+and terminal validation.
 The output must be a sibling of, never a member of, the snapshot tree. The helper rejects
 object-identity overlap before it can create an output parent: it binds the snapshot root and the
 output's nearest existing ancestor, then traverses `..` through held descriptors and compares

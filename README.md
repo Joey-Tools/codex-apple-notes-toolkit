@@ -18,7 +18,11 @@ partials and uncertain standalone destinations receive precise recovery
 locators. Every output command rejects case/NFD, ancestor/descendant, and
 descriptor-resolved overlap with either live Notes container before its first
 write. Exact Darwin root aliases such as `/tmp -> /private/tmp` are
-registry-bound and continuously revalidated; arbitrary symlinks fail closed.
+registry-bound and continuously revalidated through the same carried alias
+object across receipt loading, creator results, publication, and terminal
+public-path checks; arbitrary symlinks fail closed. Snapshot recovery acquires
+its output/live-container guard before validation can allocate temporary
+storage, clone inputs, or invoke a writer.
 Post-publication ordinary failures retain descriptor-bound, non-retryable
 uncertain-state evidence. Snapshot sidecar and SQLite validation reuse the
 capture-bound file descriptors, and uncertain directory publication records an

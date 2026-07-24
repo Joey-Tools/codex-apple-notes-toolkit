@@ -236,6 +236,12 @@ recovery. The validation artifact exposes the clone and evidence, not the held s
 and its private lifetime covers the complete standalone backup operation. Preserve that artifact's
 manifest and database-file identity, SHA-256, size, and access-policy receipts in the recovery
 result; SQLite integrity output supplements rather than replaces source-integrity evidence.
+Before that validation context can allocate a temporary directory or create a recovery clone, bind
+the snapshot root read-only, prove output/snapshot separation, and acquire the shared live-safe
+destination guard. Direct group/app outputs, reserved store components, and symlink aliases into a
+live container must fail before any temporary directory, clone, SQLite backup, or standalone
+writer is invoked. Retain the snapshot and destination bindings through final publication
+revalidation.
 Before creating any recovery-output parent, bind the snapshot root and the output path's nearest
 existing directory ancestor. Starting from the held output-ancestor descriptor, open only `..`
 relative to each descriptor and compare every directory `(st_dev, st_ino)` with the held snapshot
@@ -273,7 +279,16 @@ the no-follow alias entry identity/access policy, the exact link text, the follo
 target, and the canonical target parent before descending. Use the canonical target descriptors
 for all mutation, and revalidate both alias and canonical namespaces before each write and at
 terminal boundaries. Reject unregistered symlinks, case-only spellings, NFC/NFD variants,
-retargeting, replacement, and mocked ABA observations before mutation.
+retargeting, replacement, and mocked ABA observations before mutation. Carry the same live alias
+binding object through derived prepared directories/files, same-root manifest-receipt parent
+binding, creator-result scope evidence, directory/file installation checks, standalone public
+parent rebind, and all final scans. A later boundary may bind a canonical descendant while that
+object is held, but may not reopen the public alias raw or silently create a replacement alias
+authorization.
+Successful snapshot/stage creator results expose
+`manifest_creation_destination_scope`, `terminal_destination_scope`, and
+`descriptor_bound_destination`; standalone merge/recovery results expose the terminal scope and
+descriptor/public-path receipts with the same alias evidence.
 
 Create the partial root through a parent directory descriptor, immediately bind the root and parent
 descriptors, then create and bind the nested `group.com.apple.notes` store relative to that held
@@ -302,6 +317,9 @@ file, enforce the manifest-size bound, and require stable descriptor reads. Keep
 artifact-root binding alive after the receipt read and use it for every later root operation; bind
 nested directories and regular files only relative to that root. A consumer must not load the
 receipt, release or ignore its root binding, and then reopen the artifact pathname.
+When artifact and receipt share a trusted Darwin alias, the receipt-parent binding must reuse the
+artifact's held alias object and revalidate the public alias entry plus canonical target before and
+after reading.
 Receipt-parent binding never leaks the generic prepared-directory taxonomy: a missing parent is
 `manifest-creation-receipt-missing`, a permission-denied parent is
 `manifest-creation-receipt-unreadable`, and symlink, identity/access-policy, open, or other
