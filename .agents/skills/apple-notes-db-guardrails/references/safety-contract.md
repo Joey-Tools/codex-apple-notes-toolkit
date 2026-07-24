@@ -106,6 +106,10 @@ Run full `PRAGMA integrity_check` after opening the recovery clone.
 When producing an analysis database or patch stage, use SQLite's backup API to create a standalone
 database, normalize it to non-WAL journal mode, close it, and run full `PRAGMA integrity_check`
 again.
+Open the standalone backup source through the held regular-file descriptor with a read-only,
+immutable SQLite URI. Revalidate that same descriptor before and after backup. A pathname
+reopened between those checks is not an acceptable source because a replace-then-restore race can
+otherwise feed SQLite different bytes while both pathname checks appear stable.
 
 Use the following recovery boundary:
 
@@ -144,6 +148,11 @@ commit-then-error or any namespace state that cannot prove commit/non-commit as
 the same destination.
 
 Standalone database publication uses a no-replace hard link from a descriptor-bound private file.
+Bind the private parent and operate on the exact source and destination leaf names relative to that
+descriptor. Immediately before removing the private link, require both names to identify the held
+file. Use link count only as unlink evidence here: require the destination-link increment and the
+private-link decrement on the held descriptor. Do not reinterpret link-count changes elsewhere as
+content mutation.
 Every link, private-link unlink, parent fsync, and final fingerprint error must be classified:
 
 - `uncommitted`: publication is proved not to have committed; `retry_safe` is true only when the
@@ -154,6 +163,15 @@ Every link, private-link unlink, parent fsync, and final fingerprint error must 
 Return `publication_state`, `retry_safe`, and `recovery_locators` in error details. Never encourage
 a retry for `committed` or `uncertain`. Preserve available prepared and destination locators for
 manual recovery.
+
+Pre-publication directory cleanup protects deletion target identity. Reopen and verify the
+creation-time parent, bind the exact prepared root through that parent, recursively remove only
+regular files and directories through held descriptors, then recheck the root name before a
+parent-descriptor-relative `rmdir`. If the root is missing, replaced, or cannot be revalidated,
+preserve the current namespace and return recovery locators instead of traversing it by pathname.
+Access-policy changes remain distinct validation failures, but they do not by themselves change
+which already-bound object cleanup may remove; mtime, ctime, and directory link-count behavior are
+likewise not deletion-identity signals.
 
 ## Patch And Writeback Boundary
 
@@ -220,6 +238,7 @@ The helper emits stable error codes, including:
 - `patch-file-identity-mismatch`, `patch-file-access-policy-mismatch`;
 - `patch-file-revalidation-inconclusive`;
 - `prepared-directory-identity-mismatch`;
+- `prepared-directory-missing`;
 - `prepared-directory-access-policy-mismatch`;
 - `prepared-directory-revalidation-inconclusive`;
 - `prepared-file-identity-mismatch`, `prepared-file-content-mismatch`;

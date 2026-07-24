@@ -66,6 +66,10 @@ Keep `snapshot-manifest.json` with the copied file set.
 Snapshot publication is atomic and no-replace on supported macOS/Linux filesystems.
 The helper binds the private partial directory at creation, verifies every prepared file against
 its creation receipt immediately before rename, and revalidates the same objects after rename.
+If a pre-publication failure requires cleanup, the helper reopens the creation-time parent,
+recursively removes entries through the bound prepared-directory descriptor, and removes the root
+name only while it still identifies that exact directory. A missing, replaced, or inconclusive
+cleanup target is preserved and reported with recovery locators.
 If publication reports `destination-install-uncertain`, preserve the reported paths, do not retry
 into that destination, and inspect whether the prepared directory committed.
 Use `validate-snapshot` before relying on an older snapshot:
@@ -92,6 +96,8 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" recover-snapshot \
 
 `recover-snapshot` consumes the private clone produced by that exact validation pass. It never
 reopens the mutable snapshot paths after validation.
+SQLite opens the validated clone read-only through its held descriptor, so replacing and restoring
+the clone pathname during connection setup cannot substitute another database.
 
 Use `merge-db` only for a copied database file without a snapshot manifest:
 
@@ -106,6 +112,10 @@ For single-file publication failures, inspect `details.publication_state`,
 `details.retry_safe`, and `details.recovery_locators`. Never retry when the state is `committed` or
 `uncertain`; preserve every reported locator. A committed output whose private link could not be
 removed reports `destination-install-committed-cleanup-incomplete`.
+Private-link removal is relative to the bound private parent and must prove the exact prepared
+leaf plus the expected link-count decrement. A missing or replaced leaf and any unproved
+transition retain recovery locators and report committed cleanup-incomplete or uncertain state
+instead of being treated as successful cleanup.
 
 ## Stage And Preflight A Patch
 

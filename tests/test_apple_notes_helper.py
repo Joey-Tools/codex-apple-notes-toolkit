@@ -1045,6 +1045,81 @@ raise SystemExit(2)
             )
             self.assertFalse(recovered.exists())
 
+    def test_recover_snapshot_binds_clone_during_connect_path_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(
+                paths.group_container / MODULE.NOTE_STORE_MAIN,
+                value="validated",
+            )
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = MODULE.copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+            original_recover = MODULE._recover_validated_clone_to_standalone
+            original_connect = MODULE.sqlite3.connect
+            attacked = False
+
+            def recover_with_connect_swap(
+                recovered_main: Path,
+                out: Path,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                replacement = recovered_main.with_name("connect-replacement.sqlite")
+                parked = recovered_main.with_name("connect-validated.sqlite")
+                self._create_db(replacement, value="replacement")
+
+                def connect_with_swap(
+                    database: object,
+                    *args: object,
+                    **connect_kwargs: object,
+                ) -> sqlite3.Connection:
+                    nonlocal attacked
+                    descriptor_uri = isinstance(database, str) and database.startswith(
+                        "file:/dev/fd/"
+                    )
+                    if attacked or (database != recovered_main and not descriptor_uri):
+                        return original_connect(
+                            database,
+                            *args,
+                            **connect_kwargs,
+                        )
+                    attacked = True
+                    os.replace(recovered_main, parked)
+                    os.replace(replacement, recovered_main)
+                    try:
+                        return original_connect(
+                            database,
+                            *args,
+                            **connect_kwargs,
+                        )
+                    finally:
+                        os.replace(recovered_main, replacement)
+                        os.replace(parked, recovered_main)
+
+                with mock.patch.object(
+                    MODULE.sqlite3,
+                    "connect",
+                    side_effect=connect_with_swap,
+                ):
+                    return original_recover(recovered_main, out, **kwargs)
+
+            recovered = root / "recovered.sqlite"
+            with mock.patch.object(
+                MODULE,
+                "_recover_validated_clone_to_standalone",
+                side_effect=recover_with_connect_swap,
+            ):
+                MODULE.recover_snapshot(snapshot_dir, recovered)
+            with closing(sqlite3.connect(recovered)) as conn:
+                recovered_value = conn.execute("SELECT value FROM sample").fetchone()[0]
+        self.assertTrue(attacked)
+        self.assertEqual(recovered_value, "validated")
+
     def test_snapshot_rejects_partial_root_replacement_before_publish(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1086,6 +1161,83 @@ raise SystemExit(2)
             self.assertIsNotNone(replacement_root)
             assert replacement_root is not None
             self.assertTrue(replacement_root.is_dir())
+            self.assertFalse(destination.exists())
+
+    def test_cleanup_preserves_root_swapped_before_recursive_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            destination = root / "stage"
+            original_remove_contents = MODULE._remove_bound_directory_contents
+            attacked = False
+            moved_root: Path | None = None
+            replacement_root: Path | None = None
+
+            def reject_publication(
+                source: Path,
+                target: Path,
+                **kwargs: object,
+            ) -> None:
+                raise MODULE.StoreSafetyError(
+                    "destination-exists",
+                    f"simulated publication failure: {source} -> {target}",
+                )
+
+            def swap_before_recursive_delete(
+                directory_fd: int,
+                display_path: Path,
+            ) -> None:
+                nonlocal attacked, moved_root, replacement_root
+                if not attacked:
+                    attacked = True
+                    moved_root = display_path.with_name(f"{display_path.name}.owned")
+                    display_path.rename(moved_root)
+                    display_path.mkdir(mode=0o700)
+                    replacement_root = display_path
+                    (replacement_root / "do-not-delete").write_text(
+                        "replacement",
+                        encoding="utf-8",
+                    )
+                original_remove_contents(directory_fd, display_path)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_publish_directory_no_replace",
+                    side_effect=reject_publication,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_remove_bound_directory_contents",
+                    side_effect=swap_before_recursive_delete,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.stage_patch(edited, destination)
+            self._assert_safety_code(
+                "prepared-directory-identity-mismatch",
+                raised,
+            )
+            self.assertTrue(attacked)
+            self.assertIsNotNone(moved_root)
+            self.assertIsNotNone(replacement_root)
+            assert moved_root is not None
+            assert replacement_root is not None
+            self.assertTrue(moved_root.is_dir())
+            self.assertEqual(list(moved_root.iterdir()), [])
+            self.assertEqual(
+                (replacement_root / "do-not-delete").read_text(encoding="utf-8"),
+                "replacement",
+            )
+            self.assertEqual(
+                raised.exception.details["cleanup_state"],
+                "preserved-or-incomplete",
+            )
+            self.assertIn(
+                "prepared_parent",
+                raised.exception.details["recovery_locators"],
+            )
             self.assertFalse(destination.exists())
 
     def test_stage_rejects_partial_root_replacement_before_publish(self) -> None:
@@ -1277,10 +1429,8 @@ raise SystemExit(2)
                 **kwargs: object,
             ) -> None:
                 candidate = Path(path) if not isinstance(path, int) else None
-                if (
-                    candidate is not None
-                    and candidate.parent == root
-                    and candidate.name.startswith(".recovered.sqlite.tmp-")
+                if candidate is not None and candidate.name.startswith(
+                    ".recovered.sqlite.tmp-"
                 ):
                     raise OSError(MODULE.errno.EIO, "simulated unlink failure")
                 original_unlink(path, *args, **kwargs)
@@ -1306,6 +1456,65 @@ raise SystemExit(2)
             locators = raised.exception.details["recovery_locators"]
             self.assertTrue(Path(locators["destination"]).is_file())
             self.assertTrue(Path(locators["prepared"]).is_file())
+
+    def test_single_file_leaf_swap_during_unlink_is_uncertain(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            self._create_db(source, value="validated")
+            destination = root / "recovered.sqlite"
+            original_unlink = MODULE.os.unlink
+            attacked = False
+            moved_prepared: Path | None = None
+
+            def swap_during_unlink(
+                path: object,
+                *args: object,
+                **kwargs: object,
+            ) -> None:
+                nonlocal attacked, moved_prepared
+                candidate = Path(path) if not isinstance(path, int) else None
+                if (
+                    not attacked
+                    and candidate is not None
+                    and candidate.name.startswith(".recovered.sqlite.tmp-")
+                ):
+                    attacked = True
+                    prepared = root / candidate.name
+                    moved_prepared = prepared.with_name(f"{prepared.name}.owned")
+                    prepared.rename(moved_prepared)
+                    prepared.write_text("replacement", encoding="utf-8")
+                original_unlink(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    MODULE.os,
+                    "unlink",
+                    side_effect=swap_during_unlink,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.merge_db(source, destination)
+            self._assert_safety_code("destination-install-uncertain", raised)
+            self.assertTrue(attacked)
+            self.assertEqual(
+                raised.exception.details["publication_state"],
+                "uncertain",
+            )
+            self.assertFalse(raised.exception.details["retry_safe"])
+            locators = raised.exception.details["recovery_locators"]
+            self.assertEqual(Path(locators["destination"]), destination)
+            self.assertIsNotNone(moved_prepared)
+            assert moved_prepared is not None
+            self.assertTrue(moved_prepared.is_file())
+            self.assertTrue(destination.is_file())
+            self.assertEqual(
+                moved_prepared.stat().st_ino,
+                destination.stat().st_ino,
+            )
+            with closing(sqlite3.connect(destination)) as conn:
+                recovered_value = conn.execute("SELECT value FROM sample").fetchone()[0]
+            self.assertEqual(recovered_value, "validated")
 
     def test_single_file_parent_fsync_failure_is_uncertain(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
