@@ -4322,6 +4322,7 @@ def _publication_details(
 def _descriptor_bound_prepared_retry_receipt(
     parent_fd: int,
     prepared: _BoundRegularFile,
+    destination: Path,
 ) -> dict[str, Any]:
     """Prove that a failed rename left the complete prepared object retryable."""
 
@@ -4352,6 +4353,32 @@ def _descriptor_bound_prepared_retry_receipt(
         access_policy_code="prepared-file-access-policy-mismatch",
         inconclusive_code="prepared-file-revalidation-inconclusive",
     )
+    target_state, target_observed = _observe_bound_sibling(
+        parent_fd,
+        prepared,
+        destination,
+    )
+    parent = _verify_bound_parent_descriptor(
+        parent_fd,
+        prepared.parent_opened,
+        display_path=prepared.path.parent,
+        identity_code="prepared-file-identity-mismatch",
+        access_policy_code="prepared-file-access-policy-mismatch",
+        inconclusive_code="prepared-file-revalidation-inconclusive",
+    )
+    target_receipt: dict[str, Any] = {
+        "display_path": str(destination),
+        "basename": destination.name,
+        "state": target_state,
+        "verification": "terminal-descriptor-relative-no-follow-observation",
+        "parent_identity": _identity(parent),
+        "evidence_status": (
+            "inconclusive" if target_state == "unavailable" else "checked"
+        ),
+    }
+    if target_state == "present" and target_observed is not None:
+        target_receipt["identity"] = _identity(target_observed)
+        target_receipt["access_policy"] = _access_policy(target_observed)
     return {
         "display_path": str(prepared.path),
         "verification": (
@@ -4363,6 +4390,7 @@ def _descriptor_bound_prepared_retry_receipt(
         "leaf_access_policy": fingerprint["access_policy"],
         "sha256": fingerprint["sha256"],
         "size": fingerprint["size"],
+        "target": target_receipt,
     }
 
 
@@ -4706,6 +4734,7 @@ def _publish_file_no_replace_from_parent(
                 prepared_retry_receipt = _descriptor_bound_prepared_retry_receipt(
                     parent_fd,
                     prepared,
+                    destination,
                 )
             except (OSError, StoreSafetyError) as revalidation_exc:
                 details = _publication_details(
@@ -4745,6 +4774,34 @@ def _publish_file_no_replace_from_parent(
                     f"revalidation: {prepared.path}: {revalidation_exc}",
                     details=details,
                 ) from revalidation_exc
+            terminal_target_state = prepared_retry_receipt["target"]["state"]
+            if terminal_target_state == "present":
+                raise StoreSafetyError(
+                    "destination-exists",
+                    "Recovery destination appeared while the failed rename's "
+                    f"prepared file was being revalidated: {destination}",
+                    details=_publication_details(
+                        "uncommitted",
+                        prepared=prepared,
+                        destination=destination,
+                        retry_safe=False,
+                        descriptor_bound_prepared_file=prepared_retry_receipt,
+                    ),
+                ) from exc
+            if terminal_target_state != "absent":
+                raise StoreSafetyError(
+                    "destination-install-uncertain",
+                    "The failed rename left the prepared file intact, but the "
+                    "destination could not be terminally observed through the "
+                    f"held parent descriptor: {destination}",
+                    details=_publication_details(
+                        "uncertain",
+                        prepared=prepared,
+                        destination=destination,
+                        retry_safe=False,
+                        descriptor_bound_prepared_file=prepared_retry_receipt,
+                    ),
+                ) from exc
             raise StoreSafetyError(
                 "destination-install-failed",
                 f"Cannot install recovered database at {destination}: {exc}",
@@ -5525,9 +5582,9 @@ def _recover_validated_clone_to_standalone(
                 ),
                 output_parent_binding=output_parent_binding,
             )
-    out.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with ExitStack() as output_stack:
         if output_parent_binding is None:
+            out.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             output_parent_binding = output_stack.enter_context(
                 _bind_existing_directory(out.parent)
             )
@@ -6259,56 +6316,411 @@ def merge_db(src: Path, out: Path | None) -> dict[str, Any]:
     }
 
 
-def _path_is_within(candidate: Path, root: Path) -> bool:
+def _directory_identity_key(value: os.stat_result) -> tuple[int, int]:
+    return value.st_dev, value.st_ino
+
+
+@contextmanager
+def _bind_existing_directory_following_aliases(
+    path: Path,
+) -> Iterator[tuple[int, os.stat_result]]:
+    """Bind the directory reached by a stable path, including symlink aliases."""
+
+    fd: int | None = None
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
-        candidate.relative_to(root)
-    except ValueError:
-        return False
-    return True
-
-
-def _reject_recovery_output_inside_snapshot(
-    snapshot_dir: Path,
-    out: Path,
-) -> None:
-    """Reject output namespaces that could mutate the validated snapshot tree."""
-
-    lexical_snapshot = Path(os.path.abspath(os.fspath(snapshot_dir)))
-    lexical_out = Path(os.path.abspath(os.fspath(out)))
-    try:
-        resolved_snapshot = snapshot_dir.resolve(strict=False)
-        resolved_out = out.resolve(strict=False)
-    except (OSError, RuntimeError) as exc:
+        before = os.stat(path)
+        fd = os.open(path, flags)
+        opened = os.fstat(fd)
+        after = os.stat(path)
+    except OSError as exc:
+        if fd is not None:
+            os.close(fd)
         raise StoreSafetyError(
             "recovery-output-scope-inconclusive",
-            "Cannot prove that the recovery output is outside the snapshot tree: "
-            f"snapshot={snapshot_dir}, out={out}: {exc}",
+            f"Cannot bind existing recovery-output ancestor {path}: {exc}",
         ) from exc
-    if _path_is_within(lexical_out, lexical_snapshot) or _path_is_within(
-        resolved_out,
-        resolved_snapshot,
+    if (
+        not stat.S_ISDIR(before.st_mode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(after.st_mode)
+        or not _same_identity(before, opened)
+        or not _same_identity(opened, after)
     ):
+        os.close(fd)
+        raise StoreSafetyError(
+            "recovery-output-scope-inconclusive",
+            "Recovery-output ancestor changed identity while binding through "
+            f"aliases: {path}",
+        )
+    if _access_policy(before) != _access_policy(opened) or _access_policy(
+        opened
+    ) != _access_policy(after):
+        os.close(fd)
+        raise StoreSafetyError(
+            "recovery-output-scope-inconclusive",
+            "Recovery-output ancestor changed access policy while binding "
+            f"through aliases: {path}",
+        )
+    try:
+        yield fd, opened
+    finally:
+        os.close(fd)
+
+
+def _nearest_existing_output_ancestor(
+    output_parent: Path,
+) -> tuple[Path, tuple[str, ...]]:
+    candidate = Path(os.path.abspath(os.fspath(output_parent)))
+    missing_components: list[str] = []
+    while True:
+        try:
+            observed = os.stat(candidate)
+        except FileNotFoundError:
+            parent = candidate.parent
+            if parent == candidate:
+                raise StoreSafetyError(
+                    "recovery-output-scope-inconclusive",
+                    "Cannot locate an existing recovery-output ancestor: "
+                    f"{output_parent}",
+                )
+            missing_components.append(candidate.name)
+            candidate = parent
+            continue
+        except OSError as exc:
+            raise StoreSafetyError(
+                "recovery-output-scope-inconclusive",
+                "Cannot inspect a candidate recovery-output ancestor: "
+                f"{candidate}: {exc}",
+            ) from exc
+        if not stat.S_ISDIR(observed.st_mode):
+            raise StoreSafetyError(
+                "recovery-output-scope-inconclusive",
+                "The nearest existing recovery-output ancestor is not a "
+                f"directory: {candidate}",
+            )
+        return candidate, tuple(reversed(missing_components))
+
+
+def _descriptor_directory_ancestor_chain(
+    start_fd: int,
+    *,
+    display_path: Path,
+) -> list[dict[str, int]]:
+    current_fd: int | None = None
+    flags = _directory_open_flags()
+    chain: list[dict[str, int]] = []
+    try:
+        start = os.fstat(start_fd)
+        current_fd = os.open(".", flags, dir_fd=start_fd)
+        current = os.fstat(current_fd)
+        if (
+            not stat.S_ISDIR(start.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or not _same_identity(start, current)
+        ):
+            raise StoreSafetyError(
+                "recovery-output-scope-inconclusive",
+                "Recovery-output ancestor descriptor changed identity before "
+                f"ancestor traversal: {display_path}",
+            )
+        for _ in range(1024):
+            current = os.fstat(current_fd)
+            if not stat.S_ISDIR(current.st_mode):
+                raise StoreSafetyError(
+                    "recovery-output-scope-inconclusive",
+                    "Recovery-output ancestor traversal reached a non-directory: "
+                    f"{display_path}",
+                )
+            chain.append(
+                {
+                    "device": current.st_dev,
+                    "inode": current.st_ino,
+                }
+            )
+            parent_fd: int | None = None
+            try:
+                parent_fd = os.open("..", flags, dir_fd=current_fd)
+                parent = os.fstat(parent_fd)
+            except OSError:
+                if parent_fd is not None:
+                    os.close(parent_fd)
+                raise
+            if not stat.S_ISDIR(parent.st_mode):
+                os.close(parent_fd)
+                raise StoreSafetyError(
+                    "recovery-output-scope-inconclusive",
+                    "Recovery-output ancestor traversal reached a non-directory "
+                    f"parent: {display_path}",
+                )
+            if _directory_identity_key(parent) == _directory_identity_key(current):
+                os.close(parent_fd)
+                return chain
+            os.close(current_fd)
+            current_fd = parent_fd
+    except StoreSafetyError:
+        raise
+    except OSError as exc:
+        raise StoreSafetyError(
+            "recovery-output-scope-inconclusive",
+            "Cannot traverse recovery-output ancestors through held directory "
+            f"descriptors: {display_path}: {exc}",
+        ) from exc
+    finally:
+        if current_fd is not None:
+            os.close(current_fd)
+    raise StoreSafetyError(
+        "recovery-output-scope-inconclusive",
+        "Recovery-output ancestor traversal exceeded its bounded depth: "
+        f"{display_path}",
+    )
+
+
+def _assert_output_ancestors_exclude_snapshot(
+    output_fd: int,
+    snapshot: os.stat_result,
+    *,
+    display_path: Path,
+) -> list[dict[str, int]]:
+    chain = _descriptor_directory_ancestor_chain(
+        output_fd,
+        display_path=display_path,
+    )
+    snapshot_key = _directory_identity_key(snapshot)
+    if any((row["device"], row["inode"]) == snapshot_key for row in chain):
         raise StoreSafetyError(
             "recovery-output-inside-snapshot",
-            "Recovery output must be a sibling of, not a member of, the immutable "
-            f"snapshot tree: snapshot={snapshot_dir}, out={out}",
+            "Recovery output resolves inside the immutable snapshot object, "
+            "including through a case-insensitive or symlink alias: "
+            f"{display_path}",
         )
+    return chain
+
+
+def _create_bound_output_parent_components(
+    ancestor_fd: int,
+    ancestor: os.stat_result,
+    components: tuple[str, ...],
+    *,
+    snapshot: os.stat_result,
+    display_path: Path,
+) -> None:
+    current_fd: int | None = None
+    current_opened = ancestor
+    flags = _directory_open_flags()
+    try:
+        current_fd = os.open(".", flags, dir_fd=ancestor_fd)
+        if not _same_identity(current_opened, os.fstat(current_fd)):
+            raise StoreSafetyError(
+                "recovery-output-scope-inconclusive",
+                "Bound recovery-output ancestor changed before parent creation: "
+                f"{display_path}",
+            )
+        for component in components:
+            if component in {"", ".", ".."}:
+                raise StoreSafetyError(
+                    "recovery-output-scope-inconclusive",
+                    "Recovery-output parent contains a non-canonical component: "
+                    f"{display_path}",
+                )
+            _assert_output_ancestors_exclude_snapshot(
+                current_fd,
+                snapshot,
+                display_path=display_path,
+            )
+            parent_before = os.fstat(current_fd)
+            if not _same_identity(current_opened, parent_before) or _access_policy(
+                current_opened
+            ) != _access_policy(parent_before):
+                raise StoreSafetyError(
+                    "recovery-output-scope-inconclusive",
+                    "Bound recovery-output ancestor changed before descriptor-"
+                    f"relative parent creation: {display_path}",
+                )
+            try:
+                os.mkdir(component, mode=0o700, dir_fd=current_fd)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise StoreSafetyError(
+                    "recovery-output-scope-inconclusive",
+                    "Cannot create recovery-output parent through its bound "
+                    f"ancestor: {display_path}: {exc}",
+                ) from exc
+            child_fd: int | None = None
+            try:
+                child_before = os.stat(
+                    component,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+                child_fd = os.open(
+                    component,
+                    flags,
+                    dir_fd=current_fd,
+                )
+                child_opened = os.fstat(child_fd)
+                child_after = os.stat(
+                    component,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+                parent_after = os.fstat(current_fd)
+            except OSError as exc:
+                if child_fd is not None:
+                    os.close(child_fd)
+                raise StoreSafetyError(
+                    "recovery-output-scope-inconclusive",
+                    "Cannot bind a descriptor-created recovery-output parent: "
+                    f"{display_path}: {exc}",
+                ) from exc
+            if (
+                not stat.S_ISDIR(child_before.st_mode)
+                or not stat.S_ISDIR(child_opened.st_mode)
+                or not stat.S_ISDIR(child_after.st_mode)
+                or not _same_identity(child_before, child_opened)
+                or not _same_identity(child_opened, child_after)
+                or not _same_identity(current_opened, parent_after)
+            ):
+                os.close(child_fd)
+                raise StoreSafetyError(
+                    "recovery-output-scope-inconclusive",
+                    "A recovery-output parent or its bound ancestor changed "
+                    f"identity during descriptor-relative creation: {display_path}",
+                )
+            if (
+                _access_policy(child_before) != _access_policy(child_opened)
+                or _access_policy(child_opened) != _access_policy(child_after)
+                or _access_policy(current_opened) != _access_policy(parent_after)
+            ):
+                os.close(child_fd)
+                raise StoreSafetyError(
+                    "recovery-output-scope-inconclusive",
+                    "A recovery-output parent or its bound ancestor changed access "
+                    f"policy during descriptor-relative creation: {display_path}",
+                )
+            try:
+                _assert_output_ancestors_exclude_snapshot(
+                    child_fd,
+                    snapshot,
+                    display_path=display_path,
+                )
+            except Exception:
+                os.close(child_fd)
+                raise
+            os.close(current_fd)
+            current_fd = child_fd
+            child_fd = None
+            current_opened = child_opened
+    finally:
+        if current_fd is not None:
+            os.close(current_fd)
+
+
+@contextmanager
+def _bind_recovery_output_parent_outside_snapshot(
+    snapshot_dir: Path,
+    out: Path,
+    *,
+    snapshot_identity: dict[str, int],
+    snapshot_access_policy: dict[str, int],
+) -> Iterator[_BoundDirectory]:
+    """Create and bind an output parent whose descriptor ancestry excludes snapshot."""
+
+    with _bind_existing_directory(snapshot_dir) as snapshot_binding:
+        snapshot = os.fstat(snapshot_binding.fd)
+        if _identity(snapshot) != snapshot_identity:
+            raise StoreSafetyError(
+                "snapshot-directory-identity-mismatch",
+                "Snapshot root changed between validation and recovery-output "
+                f"scope binding: {snapshot_dir}",
+            )
+        if _access_policy(snapshot) != snapshot_access_policy:
+            raise StoreSafetyError(
+                "snapshot-directory-access-policy-mismatch",
+                "Snapshot root access policy changed between validation and "
+                f"recovery-output scope binding: {snapshot_dir}",
+            )
+        try:
+            output_existing = os.stat(out)
+        except FileNotFoundError:
+            output_existing = None
+        except OSError as exc:
+            raise StoreSafetyError(
+                "recovery-output-scope-inconclusive",
+                f"Cannot inspect the recovery output before parent creation: "
+                f"{out}: {exc}",
+            ) from exc
+        if (
+            output_existing is not None
+            and stat.S_ISDIR(output_existing.st_mode)
+            and _directory_identity_key(output_existing)
+            == _directory_identity_key(snapshot)
+        ):
+            raise StoreSafetyError(
+                "recovery-output-inside-snapshot",
+                "Recovery output resolves to the immutable snapshot root, "
+                "including through a case-insensitive or symlink alias: "
+                f"{out}",
+            )
+        nearest_path, missing_components = _nearest_existing_output_ancestor(out.parent)
+        with _bind_existing_directory_following_aliases(nearest_path) as (
+            ancestor_fd,
+            ancestor,
+        ):
+            _assert_output_ancestors_exclude_snapshot(
+                ancestor_fd,
+                snapshot,
+                display_path=nearest_path,
+            )
+            _create_bound_output_parent_components(
+                ancestor_fd,
+                ancestor,
+                missing_components,
+                snapshot=snapshot,
+                display_path=out.parent,
+            )
+        with _bind_existing_directory(out.parent) as output_parent:
+            _verify_bound_directory_namespace(snapshot_binding)
+            _assert_output_ancestors_exclude_snapshot(
+                output_parent.fd,
+                snapshot,
+                display_path=out.parent,
+            )
+            yield output_parent
+            _verify_bound_directory_namespace(output_parent)
+            _assert_output_ancestors_exclude_snapshot(
+                output_parent.fd,
+                snapshot,
+                display_path=out.parent,
+            )
+            _verify_bound_directory_namespace(snapshot_binding)
 
 
 def recover_snapshot(snapshot_dir: Path, out: Path) -> dict[str, Any]:
-    _reject_recovery_output_inside_snapshot(snapshot_dir, out)
     source = snapshot_dir / "group.com.apple.notes" / NOTE_STORE_MAIN
     with _validated_snapshot_artifact(snapshot_dir) as artifact:
-        validation = artifact.public_result
-        recovered = _recover_validated_clone_to_standalone(
-            artifact.recovered_main,
+        with _bind_recovery_output_parent_outside_snapshot(
+            snapshot_dir,
             out,
-            source_db=source,
-            recovery_evidence=artifact.recovery_evidence,
-            source_integrity=artifact.source_integrity,
-            source_revalidate=artifact.revalidate_recovery_clone,
-            source_backup=artifact.backup_recovery_clone,
-        )
+            snapshot_identity=artifact.source_integrity["directories"]["snapshot"][
+                "identity"
+            ],
+            snapshot_access_policy=artifact.source_integrity["directories"]["snapshot"][
+                "access_policy"
+            ],
+        ) as output_parent:
+            validation = artifact.public_result
+            recovered = _recover_validated_clone_to_standalone(
+                artifact.recovered_main,
+                out,
+                source_db=source,
+                recovery_evidence=artifact.recovery_evidence,
+                source_integrity=artifact.source_integrity,
+                source_revalidate=artifact.revalidate_recovery_clone,
+                source_backup=artifact.backup_recovery_clone,
+                output_parent_binding=output_parent,
+            )
         return {
             "snapshot_dir": snapshot_dir,
             "snapshot_validation": {

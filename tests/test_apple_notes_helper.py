@@ -3501,6 +3501,73 @@ raise SystemExit(2)
                 "ok",
             )
 
+    def test_recover_snapshot_rejects_case_variant_and_symlink_aliases(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = MODULE.copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+            case_alias = root / snapshot_dir.name.swapcase()
+            if not case_alias.exists():
+                case_alias.symlink_to(snapshot_dir, target_is_directory=True)
+            symlink_alias = root / "snapshot-symlink-alias"
+            symlink_alias.symlink_to(snapshot_dir, target_is_directory=True)
+            initial_members = sorted(child.name for child in snapshot_dir.iterdir())
+
+            for label, alias in (
+                ("case-variant", case_alias),
+                ("symlink", symlink_alias),
+            ):
+                output_parent = alias / f"{label}-analysis" / "nested"
+                with (
+                    self.subTest(label=label),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE.recover_snapshot(
+                        snapshot_dir,
+                        output_parent / "recovered.sqlite",
+                    )
+                self._assert_safety_code(
+                    "recovery-output-inside-snapshot",
+                    raised,
+                )
+                self.assertFalse(output_parent.exists())
+                self.assertEqual(
+                    sorted(child.name for child in snapshot_dir.iterdir()),
+                    initial_members,
+                )
+
+    def test_recover_snapshot_creates_safe_missing_output_parent_from_descriptor(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = MODULE.copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+            recovered = root / "analysis" / "nested" / "recovered.sqlite"
+
+            result = MODULE.recover_snapshot(snapshot_dir, recovered)
+
+            self.assertEqual(Path(result["recovered"]["standalone_db"]), recovered)
+            with closing(sqlite3.connect(recovered)) as conn:
+                value = conn.execute("SELECT value FROM sample").fetchone()[0]
+            self.assertEqual(value, "ok")
+
     def test_recover_snapshot_creates_output_through_bound_parent_during_swap_restore(
         self,
     ) -> None:
@@ -4294,7 +4361,137 @@ raise SystemExit(2)
                 retry_receipt["sha256"],
                 MODULE._fingerprint_exact_file(Path(locators["prepared"]))["sha256"],
             )
+            self.assertEqual(retry_receipt["target"]["state"], "absent")
+            self.assertEqual(
+                retry_receipt["target"]["verification"],
+                "terminal-descriptor-relative-no-follow-observation",
+            )
             self.assertFalse(destination.exists())
+
+    def test_single_file_rename_failure_target_appears_during_retry_hash(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            destination = root / "recovered.sqlite"
+            original_hash = MODULE._hash_fd
+            rename_failed = False
+            injected = False
+
+            def fail_rename(
+                parent_fd: int,
+                prepared_name: str,
+                target_name: str,
+            ) -> None:
+                nonlocal rename_failed
+                del parent_fd, prepared_name, target_name
+                rename_failed = True
+                raise OSError(MODULE.errno.EIO, "simulated rename failure")
+
+            def hash_and_inject_target(fd: int) -> str:
+                nonlocal injected
+                result = original_hash(fd)
+                if rename_failed and not injected:
+                    destination.write_text("concurrent target", encoding="utf-8")
+                    injected = True
+                return result
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_rename_file_no_replace_at",
+                    side_effect=fail_rename,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_hash_fd",
+                    side_effect=hash_and_inject_target,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.merge_db(source, destination)
+
+            self.assertTrue(injected)
+            self._assert_safety_code("destination-exists", raised)
+            self.assertEqual(
+                raised.exception.details["publication_state"],
+                "uncommitted",
+            )
+            self.assertFalse(raised.exception.details["retry_safe"])
+            retry_receipt = raised.exception.details["recovery_locators"][
+                "descriptor_bound_prepared_file"
+            ]
+            self.assertEqual(retry_receipt["target"]["state"], "present")
+            self.assertEqual(
+                destination.read_text(encoding="utf-8"),
+                "concurrent target",
+            )
+
+    def test_single_file_rename_failure_target_terminal_observation_unavailable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            destination = root / "recovered.sqlite"
+            original_observe = MODULE._observe_bound_sibling
+            rename_failed = False
+            destination_observations = 0
+
+            def fail_rename(
+                parent_fd: int,
+                prepared_name: str,
+                target_name: str,
+            ) -> None:
+                nonlocal rename_failed
+                del parent_fd, prepared_name, target_name
+                rename_failed = True
+                raise OSError(MODULE.errno.EIO, "simulated rename failure")
+
+            def make_terminal_target_unavailable(
+                parent_fd: int,
+                prepared: MODULE._BoundRegularFile,
+                path: Path,
+            ) -> tuple[str, os.stat_result | None]:
+                nonlocal destination_observations
+                if rename_failed and path == destination:
+                    destination_observations += 1
+                    if destination_observations == 2:
+                        return "unavailable", None
+                return original_observe(parent_fd, prepared, path)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_rename_file_no_replace_at",
+                    side_effect=fail_rename,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_observe_bound_sibling",
+                    side_effect=make_terminal_target_unavailable,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.merge_db(source, destination)
+
+            self._assert_safety_code("destination-install-uncertain", raised)
+            self.assertEqual(
+                raised.exception.details["publication_state"],
+                "uncertain",
+            )
+            self.assertFalse(raised.exception.details["retry_safe"])
+            retry_receipt = raised.exception.details["recovery_locators"][
+                "descriptor_bound_prepared_file"
+            ]
+            self.assertEqual(retry_receipt["target"]["state"], "unavailable")
+            self.assertEqual(
+                retry_receipt["target"]["evidence_status"],
+                "inconclusive",
+            )
 
     def test_single_file_rename_failure_with_in_place_content_drift_is_uncertain(
         self,

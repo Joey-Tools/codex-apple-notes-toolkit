@@ -197,9 +197,14 @@ recovery. The validation artifact exposes the clone and evidence, not the held s
 and its private lifetime covers the complete standalone backup operation. Preserve that artifact's
 manifest and database-file identity, SHA-256, size, and access-policy receipts in the recovery
 result; SQLite integrity output supplements rather than replaces source-integrity evidence.
-Reject a recovery output that is lexically within, or resolves through existing symlinks within,
-the snapshot directory before creating the output parent. Keep the standalone output as a snapshot
-sibling so recovery cannot add a member to the exact validated snapshot root.
+Before creating any recovery-output parent, bind the snapshot root and the output path's nearest
+existing directory ancestor. Starting from the held output-ancestor descriptor, open only `..`
+relative to each descriptor and compare every directory `(st_dev, st_ino)` with the held snapshot
+root. Reject any match as `recovery-output-inside-snapshot`; pathname spelling, Unicode/case
+normalization, and symlink aliases are not overlap evidence. Create missing safe parent components
+relative to the proved ancestor with no-follow opens, bind the final output parent, and repeat the
+descriptor ancestry proof. Keep the standalone output as a snapshot sibling so recovery cannot add
+a member to the exact validated snapshot root.
 
 ## Snapshot And Stage Publication
 
@@ -261,7 +266,9 @@ Every rename, parent fsync, and final fingerprint error must be classified:
 
 - `uncommitted`: publication is proved not to have committed; `retry_safe` is true only when the
   destination is absent and the held parent plus prepared-file descriptors revalidate identity,
-  two SHA-256 reads, size, and access policy against their creation receipts;
+  two SHA-256 reads, size, and access policy against their creation receipts, and a terminal
+  descriptor-relative no-follow observation through that same parent still proves the destination
+  absent;
 - `uncertain`: the destination may be committed or its durability/final fingerprint is not proved.
 
 Return `publication_state`, `retry_safe`, and `recovery_locators` in error details. Never encourage
@@ -276,7 +283,9 @@ actual parent/leaf identities, access policies, SHA-256, and size even if the di
 names another namespace.
 Source-name identity plus destination absence alone never makes a failed rename retry-safe.
 In-place byte, size, or access-policy drift retains the failed artifact but changes the result to
-`uncertain` with `retry_safe: false`.
+`uncertain` with `retry_safe: false`. If the destination appears during prepared-file hashing,
+classify it as `destination-exists`, keep publication `uncommitted`, and set `retry_safe: false`;
+if terminal destination observation is unavailable, classify publication as `uncertain`.
 
 Pre-publication failure handling protects deletion target identity by deleting nothing through a
 mutable pathname. While the creation-time root and parent descriptors are still open, revalidate
