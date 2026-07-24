@@ -110,6 +110,11 @@ Open the standalone backup source through the held regular-file descriptor with 
 immutable SQLite URI. Revalidate that same descriptor before and after backup. A pathname
 reopened between those checks is not an acceptable source because a replace-then-restore race can
 otherwise feed SQLite different bytes while both pathname checks appear stable.
+Run the native SQLite backup API into an in-memory destination, serialize that database, and write
+the bytes directly to the exclusively created output descriptor. Never ask SQLite to reopen the
+mutable output pathname. Bind the completed output and run `PRAGMA integrity_check` through its
+read-only descriptor URI; replacing and restoring the output pathname during either write or
+integrity validation must not redirect those operations.
 
 Use the following recovery boundary:
 
@@ -147,31 +152,35 @@ commit-then-error or any namespace state that cannot prove commit/non-commit as
 `destination-install-uncertain`. Preserve an uncertain path for inspection and do not retry into
 the same destination.
 
-Standalone database publication uses a no-replace hard link from a descriptor-bound private file.
-Bind the private parent and operate on the exact source and destination leaf names relative to that
-descriptor. Immediately before removing the private link, require both names to identify the held
-file. Use link count only as unlink evidence here: require the destination-link increment and the
-private-link decrement on the held descriptor. Do not reinterpret link-count changes elsewhere as
-content mutation.
-Every link, private-link unlink, parent fsync, and final fingerprint error must be classified:
+Standalone database publication uses an atomic no-replace rename from a descriptor-bound private
+file. Bind the creation-time private parent and operate on the exact source and destination leaf
+names relative to that descriptor. The rename consumes the prepared name, so there is no later
+path-based unlink window. If the prepared name is replaced immediately before the syscall, the
+replacement may move to the destination but must survive; the held object mismatch makes the
+result uncertain rather than successful.
+Every rename, parent fsync, and final fingerprint error must be classified:
 
 - `uncommitted`: publication is proved not to have committed; `retry_safe` is true only when the
   destination is absent and the prepared object is still bound;
-- `committed`: the destination is proved installed but private-link cleanup failed;
 - `uncertain`: the destination may be committed or its durability/final fingerprint is not proved.
 
 Return `publication_state`, `retry_safe`, and `recovery_locators` in error details. Never encourage
-a retry for `committed` or `uncertain`. Preserve available prepared and destination locators for
-manual recovery.
+a retry for `uncertain`. Include a verified prepared pathname only when its current parent and leaf
+match their creation receipts. Otherwise emit an explicitly unverified locator containing the
+recorded path, device/inode/file type, and parent identity.
 
-Pre-publication directory cleanup protects deletion target identity. Reopen and verify the
-creation-time parent, bind the exact prepared root through that parent, recursively remove only
-regular files and directories through held descriptors, then recheck the root name before a
-parent-descriptor-relative `rmdir`. If the root is missing, replaced, or cannot be revalidated,
-preserve the current namespace and return recovery locators instead of traversing it by pathname.
-Access-policy changes remain distinct validation failures, but they do not by themselves change
-which already-bound object cleanup may remove; mtime, ctime, and directory link-count behavior are
-likewise not deletion-identity signals.
+Pre-publication failure cleanup protects deletion target identity by deleting nothing through a
+mutable pathname. Reopen and verify the creation-time parent, bind and scan the exact prepared root
+through that parent, then preserve the complete partial tree for recovery. Conditional unlink by
+expected inode is not available through the supported POSIX interfaces; an identity check followed
+by `unlink` or `rmdir` is still a race. If the root is missing, replaced, or cannot be revalidated,
+preserve the current namespace and return recovery locators. Access-policy changes remain distinct
+validation failures; mtime, ctime, and directory link-count behavior are not deletion-identity
+signals.
+
+The wrapper invokes generic `python3`, and the helper supports Python 3.9. Keep runtime API calls
+within that compatibility floor unless the wrapper, documentation, and tests adopt a newer
+minimum together.
 
 ## Patch And Writeback Boundary
 
@@ -247,7 +256,6 @@ The helper emits stable error codes, including:
 - `prepared-manifest-mismatch`;
 - `destination-exists`, `destination-install-failed`;
 - `destination-install-uncertain`;
-- `destination-install-committed-cleanup-incomplete`;
 - `post-writeback-identity-mismatch`, `post-writeback-file-set-mismatch`;
 - `post-writeback-content-mismatch`, `post-writeback-access-policy-mismatch`.
 

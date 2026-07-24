@@ -67,9 +67,10 @@ Snapshot publication is atomic and no-replace on supported macOS/Linux filesyste
 The helper binds the private partial directory at creation, verifies every prepared file against
 its creation receipt immediately before rename, and revalidates the same objects after rename.
 If a pre-publication failure requires cleanup, the helper reopens the creation-time parent,
-recursively removes entries through the bound prepared-directory descriptor, and removes the root
-name only while it still identifies that exact directory. A missing, replaced, or inconclusive
-cleanup target is preserved and reported with recovery locators.
+revalidates the exact prepared root through its held descriptor, and preserves the entire partial
+tree. POSIX pathname unlink cannot atomically require an expected inode, so failure cleanup never
+deletes mutable child names. A missing, replaced, or inconclusive target is reported with recovery
+locators.
 If publication reports `destination-install-uncertain`, preserve the reported paths, do not retry
 into that destination, and inspect whether the prepared directory committed.
 Use `validate-snapshot` before relying on an older snapshot:
@@ -98,6 +99,9 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" recover-snapshot \
 reopens the mutable snapshot paths after validation.
 SQLite opens the validated clone read-only through its held descriptor, so replacing and restoring
 the clone pathname during connection setup cannot substitute another database.
+The native SQLite backup API writes first to an in-memory database; serialized database bytes are
+then written directly to the exclusively created output descriptor. Full integrity checking opens
+the prepared standalone file through that same held descriptor.
 
 Use `merge-db` only for a copied database file without a snapshot manifest:
 
@@ -110,12 +114,14 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" merge-db \
 Run queries against the recovered standalone database, never against the live container.
 For single-file publication failures, inspect `details.publication_state`,
 `details.retry_safe`, and `details.recovery_locators`. Never retry when the state is `committed` or
-`uncertain`; preserve every reported locator. A committed output whose private link could not be
-removed reports `destination-install-committed-cleanup-incomplete`.
-Private-link removal is relative to the bound private parent and must prove the exact prepared
-leaf plus the expected link-count decrement. A missing or replaced leaf and any unproved
-transition retain recovery locators and report committed cleanup-incomplete or uncertain state
-instead of being treated as successful cleanup.
+`uncertain`; preserve every reported locator. Publication atomically renames the prepared leaf
+within its bound private parent with no replacement; it does not create and later unlink a private
+hard link. A prepared pathname is reported as verified only while both its parent and leaf still
+match their creation receipts. Otherwise the locator is explicitly unverified and includes the
+creation-time object and parent identities.
+
+The packaged helper remains compatible with Python 3.9. Do not use newer runtime-only call
+arguments, such as `zip(..., strict=True)`, without adding a consistent minimum-version gate.
 
 ## Stage And Preflight A Patch
 

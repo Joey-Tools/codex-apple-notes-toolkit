@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import ctypes.util
 import errno
 import hashlib
 import json
@@ -92,6 +93,7 @@ class _BoundRegularFile:
     fd: int
     opened: os.stat_result
     sha256: str
+    parent_opened: os.stat_result | None = None
 
 
 @dataclass
@@ -246,6 +248,76 @@ def _rename_directory_no_replace(source: Path, destination: Path) -> None:
             os.strerror(error_number),
             os.fspath(source),
             os.fspath(destination),
+        )
+
+
+def _rename_file_no_replace_at(
+    parent_fd: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    """Atomically rename one file within a bound parent without replacement."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source_name)
+    destination_bytes = os.fsencode(destination_name)
+    if sys.platform == "darwin":
+        renameatx_np = getattr(libc, "renameatx_np", None)
+        if renameatx_np is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "renameatx_np is unavailable; refusing a non-atomic publication",
+            )
+        renameatx_np.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            parent_fd,
+            source_bytes,
+            parent_fd,
+            destination_bytes,
+            RENAME_EXCL,
+        )
+    elif sys.platform.startswith("linux"):
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "renameat2 is unavailable; refusing a non-atomic publication",
+            )
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            parent_fd,
+            source_bytes,
+            parent_fd,
+            destination_bytes,
+            RENAME_NOREPLACE,
+        )
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            f"Atomic no-replace file publication is unsupported on {sys.platform}",
+        )
+
+    if result != 0:
+        error_number = ctypes.get_errno() or errno.EIO
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            source_name,
+            destination_name,
         )
 
 
@@ -567,9 +639,35 @@ def _bind_regular_file(
     path: Path,
     codes: _FileProtectionCodes,
 ) -> Iterator[_BoundRegularFile]:
+    parent_fd: int | None = None
+    try:
+        parent_fd = os.open(path.parent, _directory_open_flags())
+        parent_opened = os.fstat(parent_fd)
+        parent_path_before = os.stat(path.parent, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(parent_opened.st_mode)
+            or not stat.S_ISDIR(parent_path_before.st_mode)
+            or not _same_identity(parent_opened, parent_path_before)
+        ):
+            raise StoreSafetyError(
+                codes.identity,
+                f"Regular-file parent changed while binding: {path.parent}",
+            )
+    except StoreSafetyError:
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise
+    except OSError as exc:
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise StoreSafetyError(
+            codes.inconclusive,
+            f"Cannot bind regular-file parent {path.parent}: {exc}",
+        ) from exc
     try:
         fd, opened = _open_regular_readonly(path)
     except StoreSafetyError as exc:
+        os.close(parent_fd)
         raise _translate_bound_open_error(path, codes, exc) from exc
     try:
         try:
@@ -584,11 +682,23 @@ def _bind_regular_file(
             fd=fd,
             opened=opened,
             sha256=sha256,
+            parent_opened=parent_opened,
         )
         _verify_bound_regular_file(bound, codes)
+        parent_descriptor = os.fstat(parent_fd)
+        parent_path_after = os.stat(path.parent, follow_symlinks=False)
+        if not _same_identity(parent_opened, parent_descriptor) or not _same_identity(
+            parent_descriptor, parent_path_after
+        ):
+            raise StoreSafetyError(
+                codes.identity,
+                f"Regular-file parent changed while binding: {path.parent}",
+            )
         yield bound
     finally:
         os.close(fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
 def _read_bound_file_bytes(
@@ -721,7 +831,7 @@ def _remove_bound_directory_if_owned(
     binding: _BoundDirectory | None,
     path: Path,
 ) -> bool:
-    """Remove only the created directory object through bound descriptors."""
+    """Revalidate and preserve a failed prepared tree without pathname deletion."""
 
     recovery_details = {
         "cleanup_state": "preserved-or-incomplete",
@@ -820,10 +930,9 @@ def _remove_bound_directory_if_owned(
                 "prepared-directory-identity-mismatch",
                 f"Prepared directory identity changed before cleanup: {path}",
             )
-        _remove_bound_directory_contents(root_fd, path)
-
         try:
-            root_before_remove = os.fstat(root_fd)
+            os.listdir(root_fd)
+            root_after_scan = os.fstat(root_fd)
             current_root = os.stat(
                 path.name,
                 dir_fd=parent_fd,
@@ -837,50 +946,21 @@ def _remove_bound_directory_if_owned(
         except OSError as exc:
             raise StoreSafetyError(
                 "prepared-directory-revalidation-inconclusive",
-                f"Cannot revalidate prepared-directory root before removal: "
+                f"Cannot revalidate prepared-directory root while preserving it: "
                 f"{path}: {exc}",
             ) from exc
         if (
-            not stat.S_ISDIR(root_before_remove.st_mode)
+            not stat.S_ISDIR(root_after_scan.st_mode)
             or not stat.S_ISDIR(current_root.st_mode)
-            or not _same_identity(binding.opened, root_before_remove)
-            or not _same_identity(root_before_remove, current_root)
+            or not _same_identity(binding.opened, root_after_scan)
+            or not _same_identity(root_after_scan, current_root)
         ):
             raise StoreSafetyError(
                 "prepared-directory-identity-mismatch",
                 "Prepared-directory root name no longer identifies the owned "
                 f"directory; preserving the current namespace: {path}",
             )
-        os.rmdir(path.name, dir_fd=parent_fd)
-        root_after_remove = os.fstat(root_fd)
-        try:
-            replacement = os.stat(
-                path.name,
-                dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            replacement = None
-        except OSError as exc:
-            raise StoreSafetyError(
-                "prepared-directory-revalidation-inconclusive",
-                f"Cannot prove the prepared-directory root-name transition: "
-                f"{path}: {exc}",
-            ) from exc
-        if not _same_identity(root_before_remove, root_after_remove):
-            raise StoreSafetyError(
-                "prepared-directory-identity-mismatch",
-                f"Prepared-directory descriptor identity changed during removal: "
-                f"{path}",
-            )
-        if replacement is not None:
-            raise StoreSafetyError(
-                "prepared-directory-identity-mismatch",
-                "A different object occupies the prepared-directory root name "
-                f"after cleanup; preserving it: {path}",
-            )
-        os.fsync(parent_fd)
-        return True
+        return False
     except StoreSafetyError as exc:
         details = dict(recovery_details)
         details.update(exc.details)
@@ -901,147 +981,6 @@ def _remove_bound_directory_if_owned(
             os.close(root_fd)
         if parent_fd is not None:
             os.close(parent_fd)
-
-
-def _remove_bound_directory_contents(
-    directory_fd: int,
-    display_path: Path,
-) -> None:
-    """Delete regular files and directories through an already-bound root."""
-
-    try:
-        names = sorted(os.listdir(directory_fd))
-    except OSError as exc:
-        raise StoreSafetyError(
-            "prepared-directory-revalidation-inconclusive",
-            f"Cannot list bound prepared directory during cleanup: "
-            f"{display_path}: {exc}",
-        ) from exc
-    for name in names:
-        entry_path = display_path / name
-        try:
-            before = os.stat(
-                name,
-                dir_fd=directory_fd,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError as exc:
-            raise StoreSafetyError(
-                "prepared-file-missing",
-                f"Prepared cleanup entry disappeared: {entry_path}",
-            ) from exc
-        except OSError as exc:
-            raise StoreSafetyError(
-                "prepared-directory-revalidation-inconclusive",
-                f"Cannot inspect prepared cleanup entry {entry_path}: {exc}",
-            ) from exc
-
-        if stat.S_ISREG(before.st_mode):
-            _remove_bound_regular_cleanup_entry(
-                directory_fd,
-                name,
-                entry_path,
-            )
-            continue
-        if stat.S_ISDIR(before.st_mode):
-            _remove_bound_directory_cleanup_entry(
-                directory_fd,
-                name,
-                entry_path,
-                before,
-            )
-            continue
-        raise StoreSafetyError(
-            "prepared-file-set-mismatch",
-            f"Refusing to remove an unbound non-regular cleanup entry: {entry_path}",
-        )
-
-
-def _remove_bound_regular_cleanup_entry(
-    parent_fd: int,
-    name: str,
-    display_path: Path,
-) -> None:
-    try:
-        os.unlink(name, dir_fd=parent_fd)
-    except FileNotFoundError as exc:
-        raise StoreSafetyError(
-            "prepared-file-missing",
-            f"Prepared cleanup file disappeared: {display_path}",
-        ) from exc
-    except PermissionError as exc:
-        raise StoreSafetyError(
-            "prepared-file-revalidation-inconclusive",
-            f"Prepared cleanup file is unreadable: {display_path}",
-        ) from exc
-    except OSError as exc:
-        raise StoreSafetyError(
-            "prepared-file-revalidation-inconclusive",
-            f"Cannot remove prepared cleanup file {display_path}: {exc}",
-        ) from exc
-
-
-def _remove_bound_directory_cleanup_entry(
-    parent_fd: int,
-    name: str,
-    display_path: Path,
-    before: os.stat_result,
-) -> None:
-    fd: int | None = None
-    try:
-        fd = os.open(
-            name,
-            _directory_open_flags(),
-            dir_fd=parent_fd,
-        )
-        descriptor = os.fstat(fd)
-        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if (
-            not stat.S_ISDIR(descriptor.st_mode)
-            or not stat.S_ISDIR(current.st_mode)
-            or not _same_identity(before, descriptor)
-            or not _same_identity(descriptor, current)
-        ):
-            raise StoreSafetyError(
-                "prepared-directory-identity-mismatch",
-                f"Prepared cleanup directory identity changed: {display_path}",
-            )
-        _remove_bound_directory_contents(fd, display_path)
-        descriptor_before_remove = os.fstat(fd)
-        current_before_remove = os.stat(
-            name,
-            dir_fd=parent_fd,
-            follow_symlinks=False,
-        )
-        if not _same_identity(
-            descriptor, descriptor_before_remove
-        ) or not _same_identity(descriptor_before_remove, current_before_remove):
-            raise StoreSafetyError(
-                "prepared-directory-identity-mismatch",
-                "Prepared cleanup directory name no longer identifies the "
-                f"bound object: {display_path}",
-            )
-        os.rmdir(name, dir_fd=parent_fd)
-    except StoreSafetyError:
-        raise
-    except FileNotFoundError as exc:
-        raise StoreSafetyError(
-            "prepared-directory-missing",
-            f"Prepared cleanup directory disappeared: {display_path}",
-        ) from exc
-    except PermissionError as exc:
-        raise StoreSafetyError(
-            "prepared-directory-revalidation-inconclusive",
-            f"Prepared cleanup directory is unreadable: {display_path}",
-        ) from exc
-    except OSError as exc:
-        raise StoreSafetyError(
-            "prepared-directory-revalidation-inconclusive",
-            f"Cannot remove prepared cleanup directory {display_path}: {exc}",
-        ) from exc
-    finally:
-        if fd is not None:
-            os.close(fd)
 
 
 def _write_all(fd: int, payload: bytes) -> None:
@@ -1215,7 +1154,12 @@ def _capture_database_files(
                 record["copy"] = opened.copied
             records.append(record)
 
-        for opened, record in zip(opened_sources, records, strict=True):
+        if len(opened_sources) != len(records):
+            raise StoreSafetyError(
+                "source-revalidation-inconclusive",
+                "Internal capture records do not match the bound source set",
+            )
+        for opened, record in zip(opened_sources, records):
             final_descriptor = os.fstat(opened.fd)
             try:
                 final_path = os.stat(opened.path, follow_symlinks=False)
@@ -1947,9 +1891,20 @@ def _inspect_sidecars(main_path: Path) -> dict[str, Any]:
     }
 
 
-def _sqlite_integrity(db_path: Path) -> dict[str, Any]:
+def _sqlite_integrity(
+    database: Path | _BoundRegularFile,
+) -> dict[str, Any]:
+    db_path = database.path if isinstance(database, _BoundRegularFile) else database
+    connect_target: Path | str
+    connect_kwargs: dict[str, Any] = {}
+    if isinstance(database, _BoundRegularFile):
+        _verify_bound_regular_file(database, PREPARED_FILE_CODES)
+        connect_target = _bound_sqlite_readonly_uri(database)
+        connect_kwargs["uri"] = True
+    else:
+        connect_target = db_path
     try:
-        with closing(sqlite3.connect(db_path)) as conn:
+        with closing(sqlite3.connect(connect_target, **connect_kwargs)) as conn:
             conn.execute("PRAGMA busy_timeout = 5000")
             rows = [
                 str(row[0]) for row in conn.execute("PRAGMA integrity_check").fetchall()
@@ -1961,6 +1916,8 @@ def _sqlite_integrity(db_path: Path) -> dict[str, Any]:
             "sqlite-integrity-failed",
             f"SQLite could not validate {db_path}: {exc}",
         ) from exc
+    if isinstance(database, _BoundRegularFile):
+        _verify_bound_regular_file(database, PREPARED_FILE_CODES)
     if rows != ["ok"]:
         raise StoreSafetyError(
             "sqlite-integrity-failed",
@@ -2048,13 +2005,46 @@ def _fingerprint_file(path: Path) -> dict[str, Any]:
 def _publication_details(
     state: str,
     *,
-    prepared: Path | None,
+    prepared: _BoundRegularFile | None,
     destination: Path,
     retry_safe: bool,
 ) -> dict[str, Any]:
-    locators: dict[str, str] = {"destination": str(destination)}
-    if prepared is not None and _lexists(prepared):
-        locators["prepared"] = str(prepared)
+    locators: dict[str, Any] = {"destination": str(destination)}
+    if prepared is not None:
+        receipt: dict[str, Any] = {
+            "path": str(prepared.path),
+            "identity": _identity(prepared.opened),
+        }
+        if prepared.parent_opened is not None:
+            receipt["parent_identity"] = _identity(prepared.parent_opened)
+        try:
+            parent = os.stat(prepared.path.parent, follow_symlinks=False)
+            leaf = os.stat(prepared.path, follow_symlinks=False)
+        except FileNotFoundError:
+            receipt["verification"] = "absent-or-parent-missing"
+            locators["prepared_unverified"] = receipt
+        except OSError as exc:
+            receipt["verification"] = f"inconclusive: {exc}"
+            locators["prepared_unverified"] = receipt
+        else:
+            parent_matches = (
+                prepared.parent_opened is not None
+                and stat.S_ISDIR(parent.st_mode)
+                and _same_identity(prepared.parent_opened, parent)
+                and _access_policy(prepared.parent_opened) == _access_policy(parent)
+            )
+            leaf_matches = (
+                stat.S_ISREG(leaf.st_mode)
+                and _same_identity(prepared.opened, leaf)
+                and _access_policy(prepared.opened) == _access_policy(leaf)
+            )
+            if parent_matches and leaf_matches:
+                locators["prepared"] = str(prepared.path)
+            else:
+                receipt["verification"] = "creation-receipt-mismatch"
+                receipt["observed_identity"] = _identity(leaf)
+                receipt["observed_parent_identity"] = _identity(parent)
+                locators["prepared_unverified"] = receipt
     return {
         "publication_state": state,
         "retry_safe": retry_safe,
@@ -2109,6 +2099,8 @@ def _bind_publication_parent(
             or not stat.S_ISDIR(parent_after.st_mode)
             or not _same_identity(parent_before, parent_descriptor)
             or not _same_identity(parent_descriptor, parent_after)
+            or prepared.parent_opened is None
+            or not _same_identity(prepared.parent_opened, parent_descriptor)
             or not stat.S_ISREG(prepared_leaf.st_mode)
             or not _same_identity(prepared.opened, prepared_leaf)
         ):
@@ -2120,6 +2112,8 @@ def _bind_publication_parent(
         if (
             _access_policy(parent_before) != _access_policy(parent_descriptor)
             or _access_policy(parent_descriptor) != _access_policy(parent_after)
+            or _access_policy(prepared.parent_opened)
+            != _access_policy(parent_descriptor)
             or _access_policy(prepared.opened) != _access_policy(prepared_leaf)
         ):
             raise StoreSafetyError(
@@ -2153,143 +2147,6 @@ def _observe_bound_sibling(
     return "present", value
 
 
-def _remove_bound_prepared_link(
-    prepared: _BoundRegularFile,
-    destination: Path,
-    parent_fd: int,
-    *,
-    installed_link_count: int,
-) -> None:
-    """Remove the exact private leaf and prove its link-count transition."""
-
-    try:
-        descriptor_before = os.fstat(prepared.fd)
-        prepared_before = os.stat(
-            prepared.path.name,
-            dir_fd=parent_fd,
-            follow_symlinks=False,
-        )
-        destination_before = os.stat(
-            destination.name,
-            dir_fd=parent_fd,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError as exc:
-        raise StoreSafetyError(
-            "prepared-file-missing",
-            f"A required publication link is missing before cleanup: "
-            f"prepared={prepared.path}, destination={destination}",
-        ) from exc
-    except PermissionError as exc:
-        raise StoreSafetyError(
-            "prepared-file-revalidation-inconclusive",
-            f"A publication link is unreadable before cleanup: "
-            f"prepared={prepared.path}, destination={destination}",
-        ) from exc
-    except OSError as exc:
-        raise StoreSafetyError(
-            "prepared-file-revalidation-inconclusive",
-            f"Cannot bind publication links before cleanup: "
-            f"prepared={prepared.path}, destination={destination}: {exc}",
-        ) from exc
-    if (
-        not stat.S_ISREG(descriptor_before.st_mode)
-        or not stat.S_ISREG(prepared_before.st_mode)
-        or not stat.S_ISREG(destination_before.st_mode)
-        or not _same_identity(prepared.opened, descriptor_before)
-        or not _same_identity(descriptor_before, prepared_before)
-        or not _same_identity(descriptor_before, destination_before)
-    ):
-        raise StoreSafetyError(
-            "prepared-file-identity-mismatch",
-            "The private or destination publication leaf no longer identifies "
-            f"the prepared object: prepared={prepared.path}, "
-            f"destination={destination}",
-        )
-    baseline_access = _access_policy(prepared.opened)
-    if (
-        _access_policy(descriptor_before) != baseline_access
-        or _access_policy(prepared_before) != baseline_access
-        or _access_policy(destination_before) != baseline_access
-    ):
-        raise StoreSafetyError(
-            "prepared-file-access-policy-mismatch",
-            "The private or destination publication leaf changed access policy "
-            f"before cleanup: prepared={prepared.path}, "
-            f"destination={destination}",
-        )
-    if descriptor_before.st_nlink != installed_link_count:
-        raise StoreSafetyError(
-            "prepared-file-revalidation-inconclusive",
-            "The prepared object's link count changed before private-link "
-            f"cleanup: {prepared.path}",
-        )
-
-    os.unlink(prepared.path.name, dir_fd=parent_fd)
-
-    try:
-        descriptor_after = os.fstat(prepared.fd)
-        destination_after = os.stat(
-            destination.name,
-            dir_fd=parent_fd,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError as exc:
-        raise StoreSafetyError(
-            "prepared-file-missing",
-            f"The committed destination disappeared during private-link cleanup: "
-            f"{destination}",
-        ) from exc
-    except OSError as exc:
-        raise StoreSafetyError(
-            "prepared-file-revalidation-inconclusive",
-            f"Cannot revalidate publication links after private-link cleanup: "
-            f"{destination}: {exc}",
-        ) from exc
-    try:
-        replacement = os.stat(
-            prepared.path.name,
-            dir_fd=parent_fd,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError:
-        replacement = None
-    except OSError as exc:
-        raise StoreSafetyError(
-            "prepared-file-revalidation-inconclusive",
-            f"Cannot prove private-link namespace cleanup: {prepared.path}: {exc}",
-        ) from exc
-    if replacement is not None:
-        raise StoreSafetyError(
-            "prepared-file-identity-mismatch",
-            "A different object occupies the private prepared leaf after "
-            f"cleanup; preserving it: {prepared.path}",
-        )
-    if not _same_identity(descriptor_before, descriptor_after) or not _same_identity(
-        descriptor_after, destination_after
-    ):
-        raise StoreSafetyError(
-            "prepared-file-identity-mismatch",
-            f"The committed object identity changed during private-link cleanup: "
-            f"{destination}",
-        )
-    if (
-        _access_policy(descriptor_after) != baseline_access
-        or _access_policy(destination_after) != baseline_access
-    ):
-        raise StoreSafetyError(
-            "prepared-file-access-policy-mismatch",
-            "The committed object access policy changed during private-link "
-            f"cleanup: {destination}",
-        )
-    if descriptor_after.st_nlink != installed_link_count - 1:
-        raise StoreSafetyError(
-            "prepared-file-revalidation-inconclusive",
-            "The private leaf is absent, but the prepared object's exact "
-            f"link-count transition is not proved: {prepared.path}",
-        )
-
-
 def _publish_file_no_replace(
     prepared: _BoundRegularFile,
     destination: Path,
@@ -2305,7 +2162,7 @@ def _publish_file_no_replace(
             f"destination={destination}",
             details=_publication_details(
                 "uncommitted",
-                prepared=prepared.path,
+                prepared=prepared,
                 destination=destination,
                 retry_safe=True,
             ),
@@ -2325,7 +2182,7 @@ def _publish_file_no_replace(
             str(exc),
             details=_publication_details(
                 "uncommitted",
-                prepared=prepared.path,
+                prepared=prepared,
                 destination=destination,
                 retry_safe=False,
             ),
@@ -2337,14 +2194,12 @@ def _publish_file_no_replace_from_parent(
     destination: Path,
     parent_fd: int,
 ) -> dict[str, Any]:
-    before_link = os.fstat(prepared.fd)
+    before_rename = os.fstat(prepared.fd)
     try:
-        os.link(
+        _rename_file_no_replace_at(
+            parent_fd,
             prepared.path.name,
             destination.name,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
-            follow_symlinks=False,
         )
     except OSError as exc:
         source_state, source_after = _observe_bound_sibling(
@@ -2357,8 +2212,9 @@ def _publish_file_no_replace_from_parent(
             prepared,
             destination,
         )
-        destination_is_prepared = (
-            destination_state == "present"
+        committed = (
+            source_state == "absent"
+            and destination_state == "present"
             and destination_after is not None
             and _same_identity(prepared.opened, destination_after)
         )
@@ -2367,14 +2223,14 @@ def _publish_file_no_replace_from_parent(
             and source_after is not None
             and _same_identity(prepared.opened, source_after)
         )
-        if destination_is_prepared:
+        if committed:
             raise StoreSafetyError(
                 "destination-install-uncertain",
-                "The destination is linked to the prepared database, but the "
+                "The destination contains the prepared database, but the "
                 f"publication syscall reported an error: {destination}: {exc}",
                 details=_publication_details(
                     "uncertain",
-                    prepared=prepared.path,
+                    prepared=prepared,
                     destination=destination,
                     retry_safe=False,
                 ),
@@ -2389,7 +2245,7 @@ def _publish_file_no_replace_from_parent(
                 f"Recovery destination appeared before installation: {destination}",
                 details=_publication_details(
                     "uncommitted",
-                    prepared=prepared.path,
+                    prepared=prepared,
                     destination=destination,
                     retry_safe=False,
                 ),
@@ -2400,7 +2256,7 @@ def _publish_file_no_replace_from_parent(
                 f"Cannot install recovered database at {destination}: {exc}",
                 details=_publication_details(
                     "uncommitted",
-                    prepared=prepared.path,
+                    prepared=prepared,
                     destination=destination,
                     retry_safe=True,
                 ),
@@ -2412,54 +2268,14 @@ def _publish_file_no_replace_from_parent(
             f"destination={destination}: {exc}",
             details=_publication_details(
                 "uncertain",
-                prepared=prepared.path,
+                prepared=prepared,
                 destination=destination,
                 retry_safe=False,
             ),
         ) from exc
 
     try:
-        _verify_bound_regular_file(
-            prepared,
-            PREPARED_FILE_CODES,
-        )
-        fingerprint = _verify_bound_regular_file(
-            prepared,
-            PREPARED_FILE_CODES,
-            path=destination,
-        )
-        installed = os.fstat(prepared.fd)
-        if (
-            not _same_identity(before_link, installed)
-            or installed.st_nlink != before_link.st_nlink + 1
-        ):
-            raise StoreSafetyError(
-                "prepared-file-revalidation-inconclusive",
-                "The destination link exists, but the prepared object's exact "
-                f"link-count increment is not proved: {destination}",
-            )
-    except StoreSafetyError as exc:
-        raise StoreSafetyError(
-            "destination-install-uncertain",
-            "The link syscall succeeded, but the installed object could not be "
-            f"revalidated: {destination}: {exc}",
-            details=_publication_details(
-                "uncertain",
-                prepared=prepared.path,
-                destination=destination,
-                retry_safe=False,
-            ),
-        ) from exc
-
-    try:
-        _remove_bound_prepared_link(
-            prepared,
-            destination,
-            parent_fd,
-            installed_link_count=installed.st_nlink,
-        )
-    except (OSError, StoreSafetyError) as exc:
-        source_state, source_after = _observe_bound_sibling(
+        source_state, _ = _observe_bound_sibling(
             parent_fd,
             prepared,
             prepared.path,
@@ -2469,41 +2285,18 @@ def _publish_file_no_replace_from_parent(
             prepared,
             destination,
         )
-        committed_and_retained = (
-            source_state == "present"
-            and source_after is not None
-            and _same_identity(prepared.opened, source_after)
-            and destination_state == "present"
-            and destination_after is not None
-            and _same_identity(prepared.opened, destination_after)
-        )
-        if not committed_and_retained:
+        if (
+            source_state != "absent"
+            or destination_state != "present"
+            or destination_after is None
+            or not _same_identity(before_rename, destination_after)
+            or _access_policy(destination_after) != _access_policy(prepared.opened)
+        ):
             raise StoreSafetyError(
-                "destination-install-uncertain",
-                "The link syscall succeeded, but cleanup failed and the current "
-                "prepared/destination namespace cannot prove a retained committed "
-                f"object: prepared={prepared.path}, destination={destination}: "
-                f"{exc}",
-                details=_publication_details(
-                    "uncertain",
-                    prepared=prepared.path,
-                    destination=destination,
-                    retry_safe=False,
-                ),
-            ) from exc
-        raise StoreSafetyError(
-            "destination-install-committed-cleanup-incomplete",
-            "The recovered database is committed, but its private prepared link "
-            f"could not be removed: {prepared.path}: {exc}",
-            details=_publication_details(
-                "committed",
-                prepared=prepared.path,
-                destination=destination,
-                retry_safe=False,
-            ),
-        ) from exc
-
-    try:
+                "prepared-file-identity-mismatch",
+                "The no-replace rename succeeded, but the source/destination "
+                f"namespace does not identify the prepared object: {destination}",
+            )
         fingerprint = _verify_bound_regular_file(
             prepared,
             PREPARED_FILE_CODES,
@@ -2518,11 +2311,11 @@ def _publish_file_no_replace_from_parent(
     except (OSError, StoreSafetyError) as exc:
         raise StoreSafetyError(
             "destination-install-uncertain",
-            "The recovered database was linked into place, but final durability "
+            "The recovered database was renamed into place, but final durability "
             f"or fingerprint validation is unconfirmed: {destination}: {exc}",
             details=_publication_details(
                 "uncertain",
-                prepared=None,
+                prepared=prepared,
                 destination=destination,
                 retry_safe=False,
             ),
@@ -2530,13 +2323,18 @@ def _publish_file_no_replace_from_parent(
     return fingerprint
 
 
-def _bound_sqlite_readonly_uri(
-    source: _BoundRegularFile,
+def _sqlite_descriptor_uri(
+    fd: int,
+    expected: os.stat_result,
+    display_path: Path,
+    *,
+    mode: str,
+    immutable: bool,
 ) -> str:
-    descriptor_path = Path("/dev/fd") / str(source.fd)
+    descriptor_path = Path("/dev/fd") / str(fd)
     probe_fd: int | None = None
     try:
-        descriptor = os.fstat(source.fd)
+        descriptor = os.fstat(fd)
         probe_fd = os.open(
             descriptor_path,
             os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
@@ -2545,24 +2343,177 @@ def _bound_sqlite_readonly_uri(
         if (
             not stat.S_ISREG(descriptor.st_mode)
             or not stat.S_ISREG(descriptor_path_stat.st_mode)
-            or not _same_identity(source.opened, descriptor)
+            or not _same_identity(expected, descriptor)
             or not _same_identity(descriptor, descriptor_path_stat)
         ):
             raise StoreSafetyError(
                 "prepared-file-identity-mismatch",
                 "The SQLite descriptor path does not identify the validated "
-                f"source object: {source.path}",
+                f"object: {display_path}",
             )
     except OSError as exc:
         raise StoreSafetyError(
             "prepared-file-revalidation-inconclusive",
-            "SQLite cannot bind the validated source descriptor through "
+            "SQLite cannot bind the validated descriptor through "
             f"{descriptor_path}: {exc}",
         ) from exc
     finally:
         if probe_fd is not None:
             os.close(probe_fd)
-    return f"file:{descriptor_path}?mode=ro&immutable=1"
+    immutable_arg = "&immutable=1" if immutable else ""
+    return f"file:{descriptor_path}?mode={mode}{immutable_arg}"
+
+
+def _bound_sqlite_readonly_uri(
+    source: _BoundRegularFile,
+) -> str:
+    return _sqlite_descriptor_uri(
+        source.fd,
+        source.opened,
+        source.path,
+        mode="ro",
+        immutable=True,
+    )
+
+
+def _sqlite_backup_bytes(source_uri: str, source_path: Path) -> bytes:
+    """Run the native SQLite backup API into memory and serialize its bytes."""
+
+    library_path = ctypes.util.find_library("sqlite3")
+    if library_path is None:
+        raise StoreSafetyError(
+            "sqlite-recovery-failed",
+            "Cannot locate the native SQLite library required for "
+            f"descriptor-bound backup of {source_path}",
+        )
+    try:
+        library = ctypes.CDLL(library_path)
+        open_v2 = library.sqlite3_open_v2
+        close_v2 = library.sqlite3_close_v2
+        error_message = library.sqlite3_errmsg
+        backup_init = library.sqlite3_backup_init
+        backup_step = library.sqlite3_backup_step
+        backup_finish = library.sqlite3_backup_finish
+        serialize = library.sqlite3_serialize
+        sqlite_free = library.sqlite3_free
+    except (AttributeError, OSError) as exc:
+        raise StoreSafetyError(
+            "sqlite-recovery-failed",
+            "The native SQLite library lacks the required backup/serialize "
+            f"interface for {source_path}: {exc}",
+        ) from exc
+
+    open_v2.argtypes = [
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_int,
+        ctypes.c_char_p,
+    ]
+    open_v2.restype = ctypes.c_int
+    close_v2.argtypes = [ctypes.c_void_p]
+    close_v2.restype = ctypes.c_int
+    error_message.argtypes = [ctypes.c_void_p]
+    error_message.restype = ctypes.c_char_p
+    backup_init.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+    ]
+    backup_init.restype = ctypes.c_void_p
+    backup_step.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    backup_step.restype = ctypes.c_int
+    backup_finish.argtypes = [ctypes.c_void_p]
+    backup_finish.restype = ctypes.c_int
+    serialize.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_longlong),
+        ctypes.c_uint,
+    ]
+    serialize.restype = ctypes.c_void_p
+    sqlite_free.argtypes = [ctypes.c_void_p]
+    sqlite_free.restype = None
+
+    sqlite_ok = 0
+    sqlite_done = 101
+    sqlite_open_readonly = 0x00000001
+    sqlite_open_readwrite = 0x00000002
+    sqlite_open_create = 0x00000004
+    sqlite_open_uri = 0x00000040
+    source_db = ctypes.c_void_p()
+    destination_db = ctypes.c_void_p()
+    backup: int | None = None
+    serialized: int | None = None
+
+    def message(handle: ctypes.c_void_p) -> str:
+        if not handle:
+            return "unknown SQLite error"
+        raw = error_message(handle)
+        return raw.decode("utf-8", errors="replace") if raw else "unknown SQLite error"
+
+    try:
+        result = open_v2(
+            os.fsencode(source_uri),
+            ctypes.byref(source_db),
+            sqlite_open_readonly | sqlite_open_uri,
+            None,
+        )
+        if result != sqlite_ok:
+            raise StoreSafetyError(
+                "sqlite-recovery-failed",
+                f"SQLite cannot open the bound source {source_path}: "
+                f"{message(source_db)}",
+            )
+        result = open_v2(
+            b":memory:",
+            ctypes.byref(destination_db),
+            sqlite_open_readwrite | sqlite_open_create,
+            None,
+        )
+        if result != sqlite_ok:
+            raise StoreSafetyError(
+                "sqlite-recovery-failed",
+                "SQLite cannot create the in-memory backup destination for "
+                f"{source_path}: {message(destination_db)}",
+            )
+        backup = backup_init(destination_db, b"main", source_db, b"main")
+        if not backup:
+            raise StoreSafetyError(
+                "sqlite-recovery-failed",
+                f"SQLite cannot initialize backup of {source_path}: "
+                f"{message(destination_db)}",
+            )
+        step_result = backup_step(backup, -1)
+        finish_result = backup_finish(backup)
+        backup = None
+        if step_result != sqlite_done or finish_result != sqlite_ok:
+            raise StoreSafetyError(
+                "sqlite-recovery-failed",
+                f"SQLite backup failed for {source_path}: {message(destination_db)}",
+            )
+        byte_count = ctypes.c_longlong()
+        serialized = serialize(
+            destination_db,
+            b"main",
+            ctypes.byref(byte_count),
+            0,
+        )
+        if not serialized or byte_count.value <= 0:
+            raise StoreSafetyError(
+                "sqlite-recovery-failed",
+                f"SQLite could not serialize the standalone backup of {source_path}",
+            )
+        return ctypes.string_at(serialized, byte_count.value)
+    finally:
+        if backup is not None:
+            backup_finish(backup)
+        if serialized is not None:
+            sqlite_free(serialized)
+        if destination_db:
+            close_v2(destination_db)
+        if source_db:
+            close_v2(source_db)
 
 
 def _backup_sqlite_to_standalone(
@@ -2587,26 +2538,17 @@ def _backup_sqlite_to_standalone(
         ) from exc
     created = os.fstat(output_fd)
     try:
-        try:
-            path_before = os.stat(output, follow_symlinks=False)
-            if not _same_identity(created, path_before):
-                raise StoreSafetyError(
-                    "prepared-file-identity-mismatch",
-                    f"Standalone recovery output was replaced before backup: {output}",
-                )
-            with (
-                closing(sqlite3.connect(source_uri, uri=True)) as source_conn,
-                closing(sqlite3.connect(output)) as output_conn,
-            ):
-                source_conn.execute("PRAGMA query_only = ON")
-                source_conn.backup(output_conn)
-                output_conn.execute("PRAGMA journal_mode = DELETE")
-                output_conn.commit()
-        except sqlite3.Error as exc:
+        path_before = os.stat(output, follow_symlinks=False)
+        if not _same_identity(created, path_before):
             raise StoreSafetyError(
-                "sqlite-recovery-failed",
-                f"SQLite backup could not create a standalone database: {exc}",
-            ) from exc
+                "prepared-file-identity-mismatch",
+                f"Standalone recovery output was replaced before backup: {output}",
+            )
+        payload = _sqlite_backup_bytes(source_uri, source.path)
+        os.lseek(output_fd, 0, os.SEEK_SET)
+        os.ftruncate(output_fd, 0)
+        _write_all(output_fd, payload)
+        os.fsync(output_fd)
         os.fchmod(output_fd, 0o600)
         descriptor_after = os.fstat(output_fd)
         path_after = os.stat(output, follow_symlinks=False)
@@ -2693,57 +2635,41 @@ def _recover_validated_clone_to_standalone(
         )
     out.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temp_out = out.parent / f".{out.name}.tmp-{uuid.uuid4().hex}"
-    retain_temp = False
-    try:
-        if source_revalidate is not None:
-            source_revalidate()
-        temp_receipt = source_backup(temp_out)
-        if source_revalidate is not None:
-            source_revalidate()
-        with _bind_regular_file(temp_out, PREPARED_FILE_CODES) as prepared:
-            try:
-                _assert_bound_matches_receipt(prepared, temp_receipt)
-                output_integrity = _sqlite_integrity(temp_out)
-                _verify_bound_regular_file(prepared, PREPARED_FILE_CODES)
-                try:
-                    os.fsync(prepared.fd)
-                except OSError as exc:
-                    raise StoreSafetyError(
-                        "destination-install-failed",
-                        "The prepared recovered database could not be made durable "
-                        f"before publication: {temp_out}: {exc}",
-                        details=_publication_details(
-                            "uncommitted",
-                            prepared=temp_out,
-                            destination=out,
-                            retry_safe=True,
-                        ),
-                    ) from exc
-                fingerprint = _publish_file_no_replace(prepared, out)
-            except StoreSafetyError as exc:
-                retain_temp = exc.details.get("publication_state") in {
-                    "committed",
-                    "uncertain",
-                }
-                raise
-        return {
-            "source_db": source_db,
-            "standalone_db": out,
-            "source_recovery": recovery_evidence,
-            "source_integrity": source_integrity,
-            "output_integrity": output_integrity,
-            "sha256": fingerprint["sha256"],
-            "size": fingerprint["size"],
-            "identity": fingerprint["identity"],
-            "access_policy": fingerprint["access_policy"],
-        }
-    finally:
-        if not retain_temp and _lexists(temp_out):
-            os.unlink(temp_out)
-        for suffix in ("-wal", "-shm", "-journal"):
-            temp_sidecar = temp_out.with_name(f"{temp_out.name}{suffix}")
-            if not retain_temp and _lexists(temp_sidecar):
-                os.unlink(temp_sidecar)
+    if source_revalidate is not None:
+        source_revalidate()
+    temp_receipt = source_backup(temp_out)
+    if source_revalidate is not None:
+        source_revalidate()
+    with _bind_regular_file(temp_out, PREPARED_FILE_CODES) as prepared:
+        _assert_bound_matches_receipt(prepared, temp_receipt)
+        output_integrity = _sqlite_integrity(prepared)
+        _verify_bound_regular_file(prepared, PREPARED_FILE_CODES)
+        try:
+            os.fsync(prepared.fd)
+        except OSError as exc:
+            raise StoreSafetyError(
+                "destination-install-failed",
+                "The prepared recovered database could not be made durable "
+                f"before publication: {temp_out}: {exc}",
+                details=_publication_details(
+                    "uncommitted",
+                    prepared=prepared,
+                    destination=out,
+                    retry_safe=True,
+                ),
+            ) from exc
+        fingerprint = _publish_file_no_replace(prepared, out)
+    return {
+        "source_db": source_db,
+        "standalone_db": out,
+        "source_recovery": recovery_evidence,
+        "source_integrity": source_integrity,
+        "output_integrity": output_integrity,
+        "sha256": fingerprint["sha256"],
+        "size": fingerprint["size"],
+        "identity": fingerprint["identity"],
+        "access_policy": fingerprint["access_policy"],
+    }
 
 
 def _recover_to_standalone(src: Path, out: Path) -> dict[str, Any]:
@@ -3094,7 +3020,7 @@ def _validated_snapshot_artifact(
                 PREPARED_FILE_CODES,
             )
         )
-        validated_recovery_integrity = _sqlite_integrity(validated_recovery)
+        validated_recovery_integrity = _sqlite_integrity(validated_recovery_bound)
         _assert_bound_matches_receipt(
             validated_recovery_bound,
             validated_recovery_receipt,
