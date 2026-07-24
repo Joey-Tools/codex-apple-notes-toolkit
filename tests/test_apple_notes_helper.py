@@ -14,7 +14,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import closing
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -2660,6 +2661,16 @@ raise SystemExit(2)
                     [row["status"] for row in sidecar["passes"]],
                     ["absent", "absent"],
                 )
+            public = result["terminal_public_path_revalidation"]
+            self.assertEqual(public["evidence_status"], "checked")
+            self.assertEqual(
+                public["main"]["sha256"],
+                result["sha256"],
+            )
+            self.assertEqual(
+                public["main"]["identity"],
+                result["identity"],
+            )
 
     def test_standalone_publication_rejects_terminal_sidecar_races(
         self,
@@ -2910,6 +2921,152 @@ raise SystemExit(2)
                 [row["status"] for row in passes],
                 ["absent", "present"],
             )
+
+    def test_terminal_sidecar_scan_parent_replacement_is_uncertain(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            output_parent = root / "output"
+            output_parent.mkdir(mode=0o700)
+            merged = output_parent / "merged.sqlite"
+            parked_parent = root / "output-receipt-bound"
+            self._create_db(source)
+            original_stat = MODULE.os.stat
+            original_publish = MODULE._publish_file_no_replace_from_parent
+            published = False
+            attacked = False
+
+            def publish_then_mark(
+                prepared: MODULE._BoundRegularFile,
+                destination: Path,
+                parent_fd: int,
+            ) -> dict[str, object]:
+                nonlocal published
+                result = original_publish(prepared, destination, parent_fd)
+                published = destination == merged
+                return result
+
+            def replace_parent_during_sidecar_scan(
+                path: object,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal attacked
+                if (
+                    published
+                    and not attacked
+                    and path == f"{merged.name}-journal"
+                    and kwargs.get("dir_fd") is not None
+                    and kwargs.get("follow_symlinks") is False
+                ):
+                    output_parent.rename(parked_parent)
+                    output_parent.mkdir(mode=0o700)
+                    attacked = True
+                return original_stat(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_publish_file_no_replace_from_parent",
+                    side_effect=publish_then_mark,
+                ),
+                mock.patch.object(
+                    MODULE.os,
+                    "stat",
+                    side_effect=replace_parent_during_sidecar_scan,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.merge_db(source, merged)
+
+            self.assertTrue(attacked)
+            self._assert_safety_code("destination-install-uncertain", raised)
+            self.assertFalse(merged.exists())
+            parked_main = parked_parent / merged.name
+            self.assertTrue(parked_main.is_file())
+            details = raised.exception.details
+            self.assertEqual(details["publication_state"], "uncertain")
+            self.assertFalse(details["retry_safe"])
+            terminal_public = details["terminal_public_path_revalidation"]
+            self.assertEqual(
+                terminal_public["reason_code"],
+                "prepared-directory-identity-mismatch",
+            )
+            locator = details["recovery_locators"]["descriptor_bound_destination"]
+            self.assertEqual(
+                locator["leaf_identity"],
+                MODULE._identity(parked_main.stat()),
+            )
+
+    def test_terminal_sidecar_scan_main_replacement_is_uncertain(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            merged = root / "merged.sqlite"
+            replacement = root / "replacement.sqlite"
+            self._create_db(source, value="validated")
+            self._create_db(replacement, value="replacement")
+            original_publish = MODULE._publish_file_no_replace_from_parent
+            original_stat = MODULE.os.stat
+            published = False
+            attacked = False
+
+            def publish_then_mark(
+                prepared: MODULE._BoundRegularFile,
+                destination: Path,
+                parent_fd: int,
+            ) -> dict[str, object]:
+                nonlocal published
+                result = original_publish(prepared, destination, parent_fd)
+                published = destination == merged
+                return result
+
+            def replace_main_during_sidecar_scan(
+                path: object,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal attacked
+                if (
+                    published
+                    and not attacked
+                    and path == f"{merged.name}-journal"
+                    and kwargs.get("dir_fd") is not None
+                    and kwargs.get("follow_symlinks") is False
+                ):
+                    os.replace(replacement, merged)
+                    attacked = True
+                return original_stat(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_publish_file_no_replace_from_parent",
+                    side_effect=publish_then_mark,
+                ),
+                mock.patch.object(
+                    MODULE.os,
+                    "stat",
+                    side_effect=replace_main_during_sidecar_scan,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.merge_db(source, merged)
+
+            self.assertTrue(attacked)
+            self._assert_safety_code("destination-install-uncertain", raised)
+            details = raised.exception.details
+            self.assertEqual(details["publication_state"], "uncertain")
+            self.assertFalse(details["retry_safe"])
+            self.assertEqual(
+                details["terminal_public_path_revalidation"]["reason_code"],
+                "prepared-file-identity-mismatch",
+            )
+            with closing(sqlite3.connect(merged)) as conn:
+                value = conn.execute("SELECT value FROM sample").fetchone()[0]
+            self.assertEqual(value, "replacement")
 
     def test_merge_db_preserves_committed_wal_only_row_with_writer_open(
         self,
@@ -3425,10 +3582,11 @@ raise SystemExit(2)
 
             def swap_then_fail(
                 database: object,
+                **kwargs: object,
             ) -> dict[str, object]:
                 nonlocal attacked, moved_prepared, replacement
                 if attacked or not isinstance(database, MODULE._BoundRegularFile):
-                    return original_integrity(database)
+                    return original_integrity(database, **kwargs)
                 attacked = True
                 prepared = database.path
                 moved_prepared = prepared.with_name(f"{prepared.name}.owned")
@@ -3929,16 +4087,21 @@ raise SystemExit(2)
                 json.dumps(snapshot, default=str),
                 encoding="utf-8",
             )
+
+            def load_receipt(path: Path) -> dict[str, object]:
+                with MODULE._bind_existing_directory(snapshot_dir) as artifact_root:
+                    return MODULE._load_external_manifest_creation_receipt(
+                        path,
+                        artifact_root=artifact_root,
+                        artifact_kind="snapshot",
+                        artifact_schema=MODULE.SNAPSHOT_SCHEMA,
+                        manifest_name=MODULE.SNAPSHOT_MANIFEST,
+                    )
+
             receipt_link = root / "receipt-link.json"
             receipt_link.symlink_to(receipt_target.name)
             with self.assertRaises(MODULE.StoreSafetyError) as symlink_raised:
-                MODULE._load_external_manifest_creation_receipt(
-                    receipt_link,
-                    artifact_root=snapshot_dir,
-                    artifact_kind="snapshot",
-                    artifact_schema=MODULE.SNAPSHOT_SCHEMA,
-                    manifest_name=MODULE.SNAPSHOT_MANIFEST,
-                )
+                load_receipt(receipt_link)
             self._assert_safety_code(
                 "manifest-creation-receipt-file-identity-mismatch",
                 symlink_raised,
@@ -3967,13 +4130,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as stat_raised,
             ):
-                MODULE._load_external_manifest_creation_receipt(
-                    receipt_target,
-                    artifact_root=snapshot_dir,
-                    artifact_kind="snapshot",
-                    artifact_schema=MODULE.SNAPSHOT_SCHEMA,
-                    manifest_name=MODULE.SNAPSHOT_MANIFEST,
-                )
+                load_receipt(receipt_target)
             self._assert_safety_code(
                 "manifest-creation-receipt-file-revalidation-inconclusive",
                 stat_raised,
@@ -4241,6 +4398,206 @@ raise SystemExit(2)
                 "manifest-creation-receipt-not-external",
             )
 
+    def test_artifact_swap_between_receipt_load_and_consumption_is_rejected(
+        self,
+    ) -> None:
+        for artifact_kind in ("snapshot", "patch-stage"):
+            with self.subTest(artifact_kind=artifact_kind):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    if artifact_kind == "snapshot":
+                        paths = self._make_paths(root)
+                        self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+                        with mock.patch.object(
+                            MODULE,
+                            "notes_is_running",
+                            return_value=False,
+                        ):
+                            creator_result = self._copy_db(
+                                paths,
+                                dest=root / "snapshot",
+                                require_notes_quit=True,
+                            )
+                        artifact_dir = Path(creator_result["dest"])
+                    else:
+                        edited = root / "edited.sqlite"
+                        self._create_db(edited)
+                        creator_result = self._stage_patch(
+                            edited,
+                            root / "stage",
+                        )
+                        artifact_dir = Path(creator_result["stage_dir"])
+
+                    receipt_file = root / f"{artifact_kind}-creation-result.json"
+                    receipt_file.write_text(
+                        json.dumps(creator_result, default=str),
+                        encoding="utf-8",
+                    )
+                    parked = root / f"{artifact_dir.name}-receipt-bound"
+                    original_load = MODULE._load_external_manifest_creation_receipt
+                    attacked = False
+
+                    def load_then_replace_artifact(
+                        *args: object,
+                        **kwargs: object,
+                    ) -> dict[str, object]:
+                        nonlocal attacked
+                        receipt = original_load(*args, **kwargs)
+                        artifact_dir.rename(parked)
+                        artifact_dir.mkdir(mode=0o700)
+                        (artifact_dir / "attacker-marker").write_text(
+                            "replacement artifact",
+                            encoding="utf-8",
+                        )
+                        attacked = True
+                        return receipt
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_load_external_manifest_creation_receipt",
+                            side_effect=load_then_replace_artifact,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        if artifact_kind == "snapshot":
+                            MODULE.validate_snapshot(
+                                artifact_dir,
+                                manifest_creation_receipt_file=receipt_file,
+                            )
+                        else:
+                            MODULE.validate_patch_stage(
+                                artifact_dir,
+                                manifest_creation_receipt_file=receipt_file,
+                            )
+
+                    self.assertTrue(attacked)
+                    self._assert_safety_code(
+                        "directory-identity-mismatch",
+                        raised,
+                    )
+                    self.assertTrue(parked.is_dir())
+                    self.assertEqual(
+                        {entry.name for entry in artifact_dir.iterdir()},
+                        {"attacker-marker"},
+                    )
+
+    def test_manifest_consumer_reuses_receipt_bound_root_during_swap_restore(
+        self,
+    ) -> None:
+        for artifact_kind in ("snapshot", "patch-stage"):
+            with self.subTest(artifact_kind=artifact_kind):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    if artifact_kind == "snapshot":
+                        paths = self._make_paths(root)
+                        self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+                        with mock.patch.object(
+                            MODULE,
+                            "notes_is_running",
+                            return_value=False,
+                        ):
+                            creator_result = self._copy_db(
+                                paths,
+                                dest=root / "snapshot",
+                                require_notes_quit=True,
+                            )
+                        artifact_dir = Path(creator_result["dest"])
+                        manifest_name = MODULE.SNAPSHOT_MANIFEST
+                    else:
+                        edited = root / "edited.sqlite"
+                        self._create_db(edited)
+                        creator_result = self._stage_patch(
+                            edited,
+                            root / "stage",
+                        )
+                        artifact_dir = Path(creator_result["stage_dir"])
+                        manifest_name = MODULE.PATCH_MANIFEST
+
+                    receipt_file = root / f"{artifact_kind}-creation-result.json"
+                    receipt_file.write_text(
+                        json.dumps(creator_result, default=str),
+                        encoding="utf-8",
+                    )
+                    parked = root / f"{artifact_dir.name}-receipt-bound"
+                    original_load = MODULE._load_external_manifest_creation_receipt
+                    original_bind_at = MODULE._bind_regular_file_at
+                    receipt_root_id: int | None = None
+                    attacked = False
+
+                    def record_receipt_root(
+                        *args: object,
+                        **kwargs: object,
+                    ) -> dict[str, object]:
+                        nonlocal receipt_root_id
+                        artifact_root = kwargs["artifact_root"]
+                        receipt_root_id = id(artifact_root)
+                        return original_load(*args, **kwargs)
+
+                    @contextmanager
+                    def bind_manifest_during_swap(
+                        path: Path,
+                        parent: MODULE._BoundDirectory,
+                        codes: MODULE._FileProtectionCodes,
+                    ) -> object:
+                        nonlocal attacked
+                        if (
+                            not attacked
+                            and path.name == manifest_name
+                            and parent.path == artifact_dir
+                        ):
+                            self.assertEqual(id(parent), receipt_root_id)
+                            artifact_dir.rename(parked)
+                            artifact_dir.mkdir(mode=0o700)
+                            restored = False
+                            try:
+                                with original_bind_at(
+                                    path,
+                                    parent,
+                                    codes,
+                                ) as bound:
+                                    artifact_dir.rmdir()
+                                    parked.rename(artifact_dir)
+                                    restored = True
+                                    attacked = True
+                                    yield bound
+                            finally:
+                                if not restored:
+                                    artifact_dir.rmdir()
+                                    parked.rename(artifact_dir)
+                            return
+                        with original_bind_at(path, parent, codes) as bound:
+                            yield bound
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_load_external_manifest_creation_receipt",
+                            side_effect=record_receipt_root,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_bind_regular_file_at",
+                            side_effect=bind_manifest_during_swap,
+                        ),
+                    ):
+                        if artifact_kind == "snapshot":
+                            validation = MODULE.validate_snapshot(
+                                artifact_dir,
+                                manifest_creation_receipt_file=receipt_file,
+                            )
+                        else:
+                            validation = MODULE.validate_patch_stage(
+                                artifact_dir,
+                                manifest_creation_receipt_file=receipt_file,
+                            )
+
+                    self.assertTrue(attacked)
+                    self.assertEqual(
+                        validation["sqlite_validation"]["result"],
+                        "ok",
+                    )
+
     def test_validate_snapshot_enforces_creation_identity_and_access_receipts(
         self,
     ) -> None:
@@ -4489,8 +4846,11 @@ raise SystemExit(2)
             stage = Path(self._stage_patch(edited, root / "stage")["stage_dir"])
             original_integrity = MODULE._sqlite_integrity
 
-            def replace_after_integrity(path: Path) -> dict[str, object]:
-                result = original_integrity(path)
+            def replace_after_integrity(
+                path: Path,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                result = original_integrity(path, **kwargs)
                 replacement = root / "replacement-stage"
                 shutil.copytree(stage, replacement)
                 stage.rename(root / "original-stage")
@@ -4517,8 +4877,11 @@ raise SystemExit(2)
             stage.chmod(0o700)
             original_integrity = MODULE._sqlite_integrity
 
-            def chmod_after_integrity(path: Path) -> dict[str, object]:
-                result = original_integrity(path)
+            def chmod_after_integrity(
+                path: Path,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                result = original_integrity(path, **kwargs)
                 stage.chmod(0o750)
                 return result
 
@@ -4691,9 +5054,12 @@ raise SystemExit(2)
                     original_integrity = MODULE._sqlite_integrity
                     attacked = False
 
-                    def replace_after_integrity(path: Path) -> dict[str, object]:
+                    def replace_after_integrity(
+                        path: Path,
+                        **kwargs: object,
+                    ) -> dict[str, object]:
                         nonlocal attacked
-                        result = original_integrity(path)
+                        result = original_integrity(path, **kwargs)
                         if not attacked:
                             attacked = True
                             replacement = target.with_name(
@@ -4749,9 +5115,12 @@ raise SystemExit(2)
                     original_integrity = MODULE._sqlite_integrity
                     attacked = False
 
-                    def chmod_after_integrity(path: Path) -> dict[str, object]:
+                    def chmod_after_integrity(
+                        path: Path,
+                        **kwargs: object,
+                    ) -> dict[str, object]:
                         nonlocal attacked
-                        result = original_integrity(path)
+                        result = original_integrity(path, **kwargs)
                         if not attacked:
                             attacked = True
                             target.chmod(0o640)
@@ -4802,9 +5171,12 @@ raise SystemExit(2)
                     original_integrity = MODULE._sqlite_integrity
                     attacked = False
 
-                    def mutate_after_integrity(path: Path) -> dict[str, object]:
+                    def mutate_after_integrity(
+                        path: Path,
+                        **kwargs: object,
+                    ) -> dict[str, object]:
                         nonlocal attacked
-                        result = original_integrity(path)
+                        result = original_integrity(path, **kwargs)
                         if not attacked:
                             attacked = True
                             with target.open("ab") as handle:
@@ -4834,9 +5206,12 @@ raise SystemExit(2)
             original_integrity = MODULE._sqlite_integrity
             touched = False
 
-            def touch_after_integrity(path: Path) -> dict[str, object]:
+            def touch_after_integrity(
+                path: Path,
+                **kwargs: object,
+            ) -> dict[str, object]:
                 nonlocal touched
-                result = original_integrity(path)
+                result = original_integrity(path, **kwargs)
                 if not touched:
                     touched = True
                     current = staged_db.stat()
@@ -4939,6 +5314,45 @@ raise SystemExit(2)
         for receipt in validation["source_integrity"]["directories"].values():
             self.assertIn("identity", receipt)
             self.assertIn("access_policy", receipt)
+
+    def test_recover_snapshot_binds_artifact_root_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+            recovered = root / "recovered.sqlite"
+            original_bind = MODULE._bind_existing_directory
+            snapshot_bind_count = 0
+
+            @contextmanager
+            def count_snapshot_bind(
+                path: Path,
+            ) -> Iterator[MODULE._BoundDirectory]:
+                nonlocal snapshot_bind_count
+                if path == snapshot_dir:
+                    snapshot_bind_count += 1
+                with original_bind(path) as binding:
+                    yield binding
+
+            with mock.patch.object(
+                MODULE,
+                "_bind_existing_directory",
+                side_effect=count_snapshot_bind,
+            ):
+                result = self._recover_snapshot(snapshot_dir, recovered)
+
+            self.assertEqual(snapshot_bind_count, 1)
+            self.assertEqual(
+                Path(result["recovered"]["standalone_db"]),
+                recovered,
+            )
 
     def test_recover_snapshot_rejects_terminal_output_wal_race(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

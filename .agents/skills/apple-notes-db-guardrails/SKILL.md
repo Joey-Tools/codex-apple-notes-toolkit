@@ -117,12 +117,16 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" validate-snapshot \
 ```
 
 Validation requires the caller-preserved artifact-external receipt before parsing the v3
-manifest. It first compares the held manifest's identity, SHA-256, size, and access policy with
-that external receipt, then consumes the manifest's creation-time root/store/file receipts and
-holds the manifest and every declared database-file descriptor through
-recovery-clone creation, SQLite integrity checking, and terminal revalidation. Object replacement,
-byte mutation, and access-policy change have distinct failure codes; timestamp-only changes do not
-fail when the protected properties remain stable.
+manifest. The validator binds the artifact root once before loading that receipt. Receipt
+externality proof and loading, root membership scans, manifest binding, nested-store binding,
+database-file binding, recovery-clone creation, SQLite integrity checking, and terminal scans all
+reuse that exact root descriptor or child descriptors opened relative to it; no later artifact
+consumer reopens the root pathname. It first compares the held manifest's identity, SHA-256, size,
+and access policy with the external receipt, then consumes the manifest's creation-time
+root/store/file receipts and holds the manifest and every declared database-file descriptor
+through recovery-clone creation, SQLite integrity checking, and terminal revalidation. Object
+replacement, byte mutation, and access-policy change have distinct failure codes; timestamp-only
+changes do not fail when the protected properties remain stable.
 
 ## Recover For Analysis
 
@@ -167,10 +171,12 @@ creation receipt only after two consecutive same-descriptor readbacks plus size,
 and descriptor-relative pathname identity/access checks all match that pre-bound expectation.
 After the main file is published, fsynced, terminally rehashed, and path-verified, the helper keeps
 its parent directory descriptor open and observes the output's `-wal`, `-shm`, and `-journal`
-names twice without following links. Any present entry of any type, permission failure, or
-unverifiable observation makes the already-published result `destination-install-uncertain`.
-Preserve the main and observed names, do not retry or delete, quiesce the writer, and rebind for
-inspection.
+names twice without following links. It then rebinds the public parent pathname, proves that it is
+still the held parent object with the same access policy, and revalidates the public main name's
+identity, SHA-256, size, and access policy before success. Any present sidecar entry of any type,
+permission failure, unverifiable observation, persistent parent replacement, or public-main
+replacement makes the already-published result `destination-install-uncertain`. Preserve the main
+and observed names, do not retry or delete, quiesce the writer, and rebind for inspection.
 Once a sidecar-free standalone image has been validated and bound, later backup copies only that
 held image. A newly injected adjacent WAL is neither discovered nor trusted.
 An ephemeral namespace replace-and-restore during SQLite backup may not be reported, but it cannot

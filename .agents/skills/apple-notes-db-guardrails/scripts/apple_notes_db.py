@@ -136,6 +136,7 @@ class _RecoveryClone:
 @dataclass(frozen=True)
 class _ValidatedSnapshotArtifact:
     public_result: dict[str, Any]
+    artifact_root: _BoundDirectory
     recovered_main: Path
     recovery_evidence: dict[str, Any]
     source_integrity: dict[str, Any]
@@ -1641,6 +1642,247 @@ def _scan_bound_directory_entry_types(
     return scans[1]
 
 
+def _translated_bound_directory_error(
+    error: StoreSafetyError,
+    *,
+    path: Path,
+    missing_code: str,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+    mismatch_code: str,
+) -> StoreSafetyError:
+    if error.code == "prepared-directory-missing":
+        code = missing_code
+    elif error.code in {
+        "prepared-directory-identity-mismatch",
+        "directory-identity-mismatch",
+    }:
+        code = "directory-identity-mismatch"
+    elif error.code in {
+        "prepared-directory-access-policy-mismatch",
+        "directory-access-policy-mismatch",
+    }:
+        code = "directory-access-policy-mismatch"
+    elif error.code == "prepared-file-set-mismatch":
+        code = mismatch_code
+    else:
+        code = "directory-scan-inconclusive"
+    return StoreSafetyError(
+        code,
+        f"Cannot validate the descriptor-bound artifact directory {path}: {error}",
+    )
+
+
+def _verify_bound_artifact_directory(
+    binding: _BoundDirectory,
+    *,
+    missing_code: str,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+    mismatch_code: str,
+) -> dict[str, Any]:
+    try:
+        return _verify_bound_directory_namespace(binding)
+    except StoreSafetyError as exc:
+        raise _translated_bound_directory_error(
+            exc,
+            path=binding.path,
+            missing_code=missing_code,
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+            mismatch_code=mismatch_code,
+        ) from exc
+
+
+def _scan_exact_bound_directory_entries(
+    binding: _BoundDirectory,
+    expected_types: dict[str, int],
+    *,
+    missing_code: str,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+    mismatch_code: str,
+) -> dict[str, Any]:
+    before = _verify_bound_artifact_directory(
+        binding,
+        missing_code=missing_code,
+        identity_code=identity_code,
+        access_policy_code=access_policy_code,
+        inconclusive_code=inconclusive_code,
+        mismatch_code=mismatch_code,
+    )
+    try:
+        entries = _scan_bound_directory_entry_types(binding)
+    except StoreSafetyError as exc:
+        raise _translated_bound_directory_error(
+            exc,
+            path=binding.path,
+            missing_code=missing_code,
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+            mismatch_code=mismatch_code,
+        ) from exc
+    after = _verify_bound_artifact_directory(
+        binding,
+        missing_code=missing_code,
+        identity_code=identity_code,
+        access_policy_code=access_policy_code,
+        inconclusive_code=inconclusive_code,
+        mismatch_code=mismatch_code,
+    )
+    if before["identity"] != after["identity"]:
+        raise StoreSafetyError(
+            "directory-identity-mismatch",
+            f"Artifact directory identity changed during validation: {binding.path}",
+        )
+    if before["access_policy"] != after["access_policy"]:
+        raise StoreSafetyError(
+            "directory-access-policy-mismatch",
+            "Artifact directory access policy changed during validation: "
+            f"{binding.path}",
+        )
+    if entries != expected_types:
+        raise StoreSafetyError(
+            mismatch_code,
+            "Descriptor-bound artifact directory name/type set differs from the "
+            f"exact expected set: {binding.path}",
+        )
+    return {
+        "identity": after["identity"],
+        "access_policy": after["access_policy"],
+        "entry_types": entries,
+    }
+
+
+@contextmanager
+def _bind_directory_at(
+    path: Path,
+    parent: _BoundDirectory,
+    *,
+    missing_code: str,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+) -> Iterator[_BoundDirectory]:
+    """Bind one child directory only through an already held parent."""
+
+    if path.parent != parent.path:
+        raise StoreSafetyError(
+            identity_code,
+            "Descriptor-relative child binding requires the declared artifact "
+            f"parent: child={path}, parent={parent.path}",
+        )
+    child_fd: int | None = None
+
+    def verify_parent() -> os.stat_result:
+        try:
+            current = os.fstat(parent.fd)
+        except OSError as exc:
+            raise StoreSafetyError(
+                inconclusive_code,
+                f"Cannot revalidate held artifact parent {parent.path}: {exc}",
+            ) from exc
+        if not stat.S_ISDIR(current.st_mode) or not _same_identity(
+            parent.opened, current
+        ):
+            raise StoreSafetyError(
+                identity_code,
+                f"Held artifact parent identity changed: {parent.path}",
+            )
+        if _access_policy(current) != _access_policy(parent.opened):
+            raise StoreSafetyError(
+                access_policy_code,
+                f"Held artifact parent access policy changed: {parent.path}",
+            )
+        return current
+
+    try:
+        parent_before = verify_parent()
+        child_before = os.stat(
+            path.name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+        child_fd = os.open(
+            path.name,
+            _directory_open_flags(),
+            dir_fd=parent.fd,
+        )
+        child_opened = os.fstat(child_fd)
+        child_after = os.stat(
+            path.name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+        parent_after = verify_parent()
+    except FileNotFoundError as exc:
+        if child_fd is not None:
+            os.close(child_fd)
+        raise StoreSafetyError(
+            missing_code,
+            f"Descriptor-bound artifact child directory is missing: {path}",
+        ) from exc
+    except StoreSafetyError:
+        if child_fd is not None:
+            os.close(child_fd)
+        raise
+    except OSError as exc:
+        if child_fd is not None:
+            os.close(child_fd)
+        raise StoreSafetyError(
+            inconclusive_code,
+            f"Cannot bind artifact child directory {path}: {exc}",
+        ) from exc
+    if (
+        not stat.S_ISDIR(child_before.st_mode)
+        or not stat.S_ISDIR(child_opened.st_mode)
+        or not stat.S_ISDIR(child_after.st_mode)
+        or not _same_identity(child_before, child_opened)
+        or not _same_identity(child_opened, child_after)
+        or not _same_identity(parent_before, parent_after)
+    ):
+        os.close(child_fd)
+        raise StoreSafetyError(
+            identity_code,
+            f"Artifact child directory changed identity while binding: {path}",
+        )
+    if (
+        _access_policy(child_before) != _access_policy(child_opened)
+        or _access_policy(child_opened) != _access_policy(child_after)
+        or _access_policy(parent_before) != _access_policy(parent_after)
+    ):
+        os.close(child_fd)
+        raise StoreSafetyError(
+            access_policy_code,
+            f"Artifact child directory changed access policy while binding: {path}",
+        )
+    binding = _BoundDirectory(
+        path=path,
+        fd=child_fd,
+        opened=child_opened,
+        parent_opened=parent.opened,
+        parent_fd=parent.fd,
+    )
+    try:
+        yield binding
+        verify_parent()
+        _verify_bound_artifact_directory(
+            binding,
+            missing_code=missing_code,
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+            mismatch_code=identity_code,
+        )
+    finally:
+        os.close(child_fd)
+
+
 @contextmanager
 def _bind_regular_file_at(
     path: Path,
@@ -2368,6 +2610,36 @@ def _bind_existing_directory(path: Path) -> Iterator[_BoundDirectory]:
     finally:
         os.close(directory_fd)
         os.close(parent_fd)
+
+
+@contextmanager
+def _bind_artifact_root(
+    path: Path,
+    *,
+    missing_code: str,
+) -> Iterator[_BoundDirectory]:
+    """Bind an artifact root while preserving its public error taxonomy."""
+
+    entered = False
+    try:
+        with _bind_existing_directory(path) as binding:
+            entered = True
+            yield binding
+    except StoreSafetyError as exc:
+        if entered:
+            raise
+        if exc.code == "prepared-directory-missing":
+            code = missing_code
+        elif exc.code == "prepared-directory-identity-mismatch":
+            code = "directory-identity-mismatch"
+        elif exc.code == "prepared-directory-access-policy-mismatch":
+            code = "directory-access-policy-mismatch"
+        else:
+            code = "directory-scan-inconclusive"
+        raise StoreSafetyError(
+            code,
+            f"Cannot bind artifact root {path}: {exc}",
+        ) from exc
 
 
 def _verify_bound_directory_with_stat(
@@ -3835,8 +4107,15 @@ def _assert_bound_manifest_creation_receipt(
     bound: _BoundRegularFile,
     creation_receipt: dict[str, Any],
     codes: _FileProtectionCodes,
+    *,
+    parent: _BoundDirectory,
 ) -> dict[str, Any]:
-    current = _verify_bound_regular_file(bound, codes)
+    current = _verify_bound_regular_file_at(
+        bound,
+        codes,
+        dir_fd=parent.fd,
+        basename=bound.path.name,
+    )
     expected = creation_receipt["manifest"]
     if current["identity"] != expected["identity"]:
         raise StoreSafetyError(
@@ -3936,12 +4215,16 @@ def _load_bound_manifest(
     bound: _BoundRegularFile,
     codes: _FileProtectionCodes,
     expected_schema: str,
+    *,
+    parent: _BoundDirectory | None = None,
 ) -> dict[str, Any]:
     payload_bytes = _read_bound_file_bytes(
         bound,
         codes,
         max_bytes=MANIFEST_MAX_BYTES,
         too_large_code="manifest-too-large",
+        dir_fd=parent.fd if parent is not None else None,
+        basename=bound.path.name if parent is not None else None,
     )
     return _parse_manifest_bytes(
         payload_bytes,
@@ -4697,12 +4980,22 @@ def _inspect_bound_sidecars(
 
 def _sqlite_integrity(
     database: Path | _BoundRegularFile,
+    *,
+    parent: _BoundDirectory | None = None,
 ) -> dict[str, Any]:
     db_path = database.path if isinstance(database, _BoundRegularFile) else database
     connect_target: Path | str
     connect_kwargs: dict[str, Any] = {}
     if isinstance(database, _BoundRegularFile):
-        _verify_bound_regular_file(database, PREPARED_FILE_CODES)
+        if parent is None:
+            _verify_bound_regular_file(database, PREPARED_FILE_CODES)
+        else:
+            _verify_bound_regular_file_at(
+                database,
+                PREPARED_FILE_CODES,
+                dir_fd=parent.fd,
+                basename=database.path.name,
+            )
         connect_target = _bound_sqlite_readonly_uri(database)
         connect_kwargs["uri"] = True
     else:
@@ -4721,7 +5014,15 @@ def _sqlite_integrity(
             f"SQLite could not validate {db_path}: {exc}",
         ) from exc
     if isinstance(database, _BoundRegularFile):
-        _verify_bound_regular_file(database, PREPARED_FILE_CODES)
+        if parent is None:
+            _verify_bound_regular_file(database, PREPARED_FILE_CODES)
+        else:
+            _verify_bound_regular_file_at(
+                database,
+                PREPARED_FILE_CODES,
+                dir_fd=parent.fd,
+                basename=database.path.name,
+            )
     if rows != ["ok"]:
         raise StoreSafetyError(
             "sqlite-integrity-failed",
@@ -4767,6 +5068,8 @@ def _make_recovery_clone_from_bound(
     files: dict[str, _BoundRegularFile],
     destination: Path,
     codes: _FileProtectionCodes,
+    *,
+    source_parent: _BoundDirectory,
 ) -> _RecoveryClone:
     """Copy an already-bound store without reopening mutable source paths."""
 
@@ -4781,7 +5084,12 @@ def _make_recovery_clone_from_bound(
             bound = files.get(basename)
             if bound is None:
                 continue
-            source = _verify_bound_regular_file(bound, codes)
+            source = _verify_bound_regular_file_at(
+                bound,
+                codes,
+                dir_fd=source_parent.fd,
+                basename=basename,
+            )
             copied = _copy_fd(
                 bound.fd,
                 destination / basename,
@@ -4795,6 +5103,12 @@ def _make_recovery_clone_from_bound(
                     codes.content,
                     f"Bound source changed while creating recovery clone: {bound.path}",
                 )
+            _verify_bound_regular_file_at(
+                bound,
+                codes,
+                dir_fd=source_parent.fd,
+                basename=basename,
+            )
             records.append(
                 {
                     "basename": basename,
@@ -6147,6 +6461,91 @@ def _terminal_standalone_sidecar_absence_receipt(
     return receipt
 
 
+def _terminal_public_standalone_output_receipt(
+    destination_binding: _BoundDirectory,
+    prepared: _BoundRegularFile,
+    output: Path,
+) -> dict[str, Any]:
+    """Rebind the public parent and re-prove the published main object."""
+
+    receipt: dict[str, Any] = {
+        "schema": "apple-notes-standalone-public-output-receipt/v1",
+        "display_path": str(output),
+        "verification": (
+            "public-parent-rebound-to-held-parent-and-main-rehashed-through-"
+            "rebound-parent"
+        ),
+        "evidence_status": "checked",
+    }
+    try:
+        held_before = _verify_bound_directory_namespace(destination_binding)
+        with _bind_existing_directory(output.parent) as public_parent:
+            public_before = _verify_bound_directory_namespace(public_parent)
+            if public_before["identity"] != held_before["identity"]:
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "The public standalone-output parent no longer identifies "
+                    f"the held publication parent: {output.parent}",
+                )
+            if public_before["access_policy"] != held_before["access_policy"]:
+                raise StoreSafetyError(
+                    "prepared-directory-access-policy-mismatch",
+                    "The public standalone-output parent access policy differs "
+                    f"from the held publication parent: {output.parent}",
+                )
+            main = _verify_bound_regular_file_at(
+                prepared,
+                PREPARED_FILE_CODES,
+                dir_fd=public_parent.fd,
+                basename=output.name,
+            )
+            held_after = _verify_bound_directory_namespace(destination_binding)
+            public_after = _verify_bound_directory_namespace(public_parent)
+            if (
+                held_after["identity"] != held_before["identity"]
+                or public_after["identity"] != held_before["identity"]
+            ):
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "The public or held standalone-output parent changed during "
+                    f"terminal main-file revalidation: {output.parent}",
+                )
+            if (
+                held_after["access_policy"] != held_before["access_policy"]
+                or public_after["access_policy"] != held_before["access_policy"]
+            ):
+                raise StoreSafetyError(
+                    "prepared-directory-access-policy-mismatch",
+                    "The public or held standalone-output parent access policy "
+                    f"changed during terminal main-file revalidation: {output.parent}",
+                )
+            main = _verify_bound_regular_file_at(
+                prepared,
+                PREPARED_FILE_CODES,
+                dir_fd=public_parent.fd,
+                basename=output.name,
+            )
+    except StoreSafetyError as exc:
+        receipt["evidence_status"] = "inconclusive"
+        receipt["reason_code"] = exc.code
+        receipt["error"] = str(exc)
+        receipt["safe_action"] = (
+            "preserve-descriptor-bound-main-and-observed-names-do-not-retry-"
+            "or-delete-quiesce-writer-and-rebind"
+        )
+        exc.details = _merge_recovery_details(
+            exc.details,
+            {"terminal_public_path_revalidation": receipt},
+        )
+        raise
+    receipt["parent"] = {
+        "identity": held_before["identity"],
+        "access_policy": held_before["access_policy"],
+    }
+    receipt["main"] = main
+    return receipt
+
+
 def _write_standalone_backup_payload(
     payload: bytes,
     output: Path,
@@ -6405,7 +6804,10 @@ def _recover_validated_clone_to_standalone(
                 dir_fd=output_parent_binding.fd,
                 basename=temp_out.name,
             )
-            output_integrity = _sqlite_integrity(prepared)
+            output_integrity = _sqlite_integrity(
+                prepared,
+                parent=output_parent_binding,
+            )
             _verify_bound_regular_file_at(
                 prepared,
                 PREPARED_FILE_CODES,
@@ -6436,6 +6838,11 @@ def _recover_validated_clone_to_standalone(
                     output_parent_binding,
                     out,
                 )
+                terminal_public_output = _terminal_public_standalone_output_receipt(
+                    output_parent_binding,
+                    prepared,
+                    out,
+                )
             except StoreSafetyError as exc:
                 descriptor_bound_destination: dict[str, Any] | None = None
                 try:
@@ -6456,12 +6863,14 @@ def _recover_validated_clone_to_standalone(
                     descriptor_bound_destination=descriptor_bound_destination,
                 )
                 details = _merge_recovery_details(details, exc.details)
-                details["terminal_sidecar_error_code"] = exc.code
+                details["terminal_output_error_code"] = exc.code
+                if "terminal_sidecar_revalidation" in exc.details:
+                    details["terminal_sidecar_error_code"] = exc.code
                 raise StoreSafetyError(
                     "destination-install-uncertain",
                     "The standalone database was published and its main-file "
-                    "receipt completed, but terminal sidecar absence is "
-                    f"unconfirmed: {out}: {exc}",
+                    "receipt completed, but its terminal sidecar/public-path "
+                    f"state is unconfirmed: {out}: {exc}",
                     details=details,
                 ) from exc
     return {
@@ -6475,6 +6884,7 @@ def _recover_validated_clone_to_standalone(
         "identity": fingerprint["identity"],
         "access_policy": fingerprint["access_policy"],
         "terminal_sidecar_revalidation": terminal_sidecars,
+        "terminal_public_path_revalidation": terminal_public_output,
     }
 
 
@@ -6873,15 +7283,11 @@ def copy_db(
 def _validated_snapshot_artifact(
     snapshot_dir: Path,
     manifest_creation_receipt: dict[str, Any] | None,
+    *,
+    manifest_creation_receipt_file: Path | None = None,
 ) -> Iterator[_ValidatedSnapshotArtifact]:
     """Bind snapshot inputs and expose only a private validated recovery clone."""
 
-    external_receipt = _normalized_manifest_creation_receipt(
-        manifest_creation_receipt,
-        artifact_kind="snapshot",
-        artifact_schema=SNAPSHOT_SCHEMA,
-        manifest_name=SNAPSHOT_MANIFEST,
-    )
     manifest_path = snapshot_dir / SNAPSHOT_MANIFEST
     store_dir = snapshot_dir / "group.com.apple.notes"
     with (
@@ -6890,18 +7296,39 @@ def _validated_snapshot_artifact(
         ) as temp_dir,
         ExitStack() as stack,
     ):
-        snapshot_directory = _scan_exact_directory_entries(
-            snapshot_dir,
+        artifact_root = stack.enter_context(
+            _bind_artifact_root(
+                snapshot_dir,
+                missing_code="snapshot-missing",
+            )
+        )
+        external_receipt = _manifest_creation_receipt_for_bound_artifact(
+            artifact_root,
+            manifest_creation_receipt=manifest_creation_receipt,
+            manifest_creation_receipt_file=manifest_creation_receipt_file,
+            artifact_kind="snapshot",
+            artifact_schema=SNAPSHOT_SCHEMA,
+            manifest_name=SNAPSHOT_MANIFEST,
+        )
+        snapshot_directory = _scan_exact_bound_directory_entries(
+            artifact_root,
             {
                 "group.com.apple.notes": stat.S_IFDIR,
                 SNAPSHOT_MANIFEST: stat.S_IFREG,
             },
             missing_code="snapshot-missing",
+            identity_code="snapshot-directory-identity-mismatch",
+            access_policy_code="snapshot-directory-access-policy-mismatch",
+            inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
             mismatch_code="snapshot-file-set-mismatch",
         )
         try:
             manifest_bound = stack.enter_context(
-                _bind_regular_file(manifest_path, SNAPSHOT_FILE_CODES)
+                _bind_regular_file_at(
+                    manifest_path,
+                    artifact_root,
+                    SNAPSHOT_FILE_CODES,
+                )
             )
         except StoreSafetyError as exc:
             if exc.code == SNAPSHOT_FILE_CODES.missing:
@@ -6914,11 +7341,13 @@ def _validated_snapshot_artifact(
             manifest_bound,
             external_receipt,
             SNAPSHOT_FILE_CODES,
+            parent=artifact_root,
         )
         manifest = _load_bound_manifest(
             manifest_bound,
             SNAPSHOT_FILE_CODES,
             SNAPSHOT_SCHEMA,
+            parent=artifact_root,
         )
         _assert_manifest_external_anchor_declaration(
             manifest,
@@ -6960,10 +7389,23 @@ def _validated_snapshot_artifact(
                 "Snapshot manifest has duplicate or unsupported database file entries",
             )
         expected_store_types = {str(name): stat.S_IFREG for name in expected_names}
-        store_directory = _scan_exact_directory_entries(
-            store_dir,
+        store_binding = stack.enter_context(
+            _bind_directory_at(
+                store_dir,
+                artifact_root,
+                missing_code="snapshot-missing",
+                identity_code="snapshot-directory-identity-mismatch",
+                access_policy_code="snapshot-directory-access-policy-mismatch",
+                inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+            )
+        )
+        store_directory = _scan_exact_bound_directory_entries(
+            store_binding,
             expected_store_types,
             missing_code="snapshot-missing",
+            identity_code="snapshot-directory-identity-mismatch",
+            access_policy_code="snapshot-directory-access-policy-mismatch",
+            inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
             mismatch_code="snapshot-file-set-mismatch",
         )
         _assert_manifest_protection_receipt(
@@ -6990,14 +7432,17 @@ def _validated_snapshot_artifact(
         for basename in NOTE_STORE_BASENAMES:
             if basename in expected_names:
                 bound_files[basename] = stack.enter_context(
-                    _bind_regular_file(
+                    _bind_regular_file_at(
                         store_dir / basename,
+                        store_binding,
                         SNAPSHOT_FILE_CODES,
                     )
                 )
-                current_file = _verify_bound_regular_file(
+                current_file = _verify_bound_regular_file_at(
                     bound_files[basename],
                     SNAPSHOT_FILE_CODES,
+                    dir_fd=store_binding.fd,
+                    basename=basename,
                 )
                 row = manifest_by_name[basename]
                 _assert_manifest_protection_receipt(
@@ -7011,6 +7456,7 @@ def _validated_snapshot_artifact(
             bound_files,
             Path(temp_dir) / "store",
             SNAPSHOT_FILE_CODES,
+            source_parent=store_binding,
         )
         for record in clone.evidence["capture"]:
             basename = record["basename"]
@@ -7073,36 +7519,42 @@ def _validated_snapshot_artifact(
             )
             return result
 
-        _scan_exact_directory_entries(
-            snapshot_dir,
+        _scan_exact_bound_directory_entries(
+            artifact_root,
             {
                 "group.com.apple.notes": stat.S_IFDIR,
                 SNAPSHOT_MANIFEST: stat.S_IFREG,
             },
             missing_code="snapshot-missing",
+            identity_code="snapshot-directory-identity-mismatch",
+            access_policy_code="snapshot-directory-access-policy-mismatch",
+            inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
             mismatch_code="snapshot-file-set-mismatch",
-            bound_identity=snapshot_directory["identity"],
-            bound_access_policy=snapshot_directory["access_policy"],
         )
-        _scan_exact_directory_entries(
-            store_dir,
+        _scan_exact_bound_directory_entries(
+            store_binding,
             expected_store_types,
             missing_code="snapshot-missing",
+            identity_code="snapshot-directory-identity-mismatch",
+            access_policy_code="snapshot-directory-access-policy-mismatch",
+            inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
             mismatch_code="snapshot-file-set-mismatch",
-            bound_identity=store_directory["identity"],
-            bound_access_policy=store_directory["access_policy"],
         )
         verified = [
-            _verify_bound_regular_file(
+            _verify_bound_regular_file_at(
                 bound_files[basename],
                 SNAPSHOT_FILE_CODES,
+                dir_fd=store_binding.fd,
+                basename=basename,
             )
             for basename in NOTE_STORE_BASENAMES
             if basename in bound_files
         ]
-        manifest_integrity = _verify_bound_regular_file(
+        manifest_integrity = _verify_bound_regular_file_at(
             manifest_bound,
             SNAPSHOT_FILE_CODES,
+            dir_fd=artifact_root.fd,
+            basename=SNAPSHOT_MANIFEST,
         )
         source_integrity = {
             "protected_properties": {
@@ -7134,21 +7586,46 @@ def _validated_snapshot_artifact(
         }
         yield _ValidatedSnapshotArtifact(
             public_result=public_result,
+            artifact_root=artifact_root,
             recovered_main=validated_recovery,
             recovery_evidence=clone.evidence,
             source_integrity=source_integrity,
             revalidate_recovery_clone=revalidate_recovery_clone,
             backup_recovery_clone=backup_recovery_clone,
         )
+        _scan_exact_bound_directory_entries(
+            artifact_root,
+            {
+                "group.com.apple.notes": stat.S_IFDIR,
+                SNAPSHOT_MANIFEST: stat.S_IFREG,
+            },
+            missing_code="snapshot-missing",
+            identity_code="snapshot-directory-identity-mismatch",
+            access_policy_code="snapshot-directory-access-policy-mismatch",
+            inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+            mismatch_code="snapshot-file-set-mismatch",
+        )
+        _scan_exact_bound_directory_entries(
+            store_binding,
+            expected_store_types,
+            missing_code="snapshot-missing",
+            identity_code="snapshot-directory-identity-mismatch",
+            access_policy_code="snapshot-directory-access-policy-mismatch",
+            inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+            mismatch_code="snapshot-file-set-mismatch",
+        )
 
 
 def validate_snapshot(
     snapshot_dir: Path,
     manifest_creation_receipt: dict[str, Any] | None = None,
+    *,
+    manifest_creation_receipt_file: Path | None = None,
 ) -> dict[str, Any]:
     with _validated_snapshot_artifact(
         snapshot_dir,
         manifest_creation_receipt,
+        manifest_creation_receipt_file=manifest_creation_receipt_file,
     ) as artifact:
         return artifact.public_result
 
@@ -7346,21 +7823,49 @@ def _assert_output_ancestors_exclude_snapshot(
 def _load_external_manifest_creation_receipt(
     receipt_file: Path,
     *,
-    artifact_root: Path,
+    artifact_root: _BoundDirectory,
     artifact_kind: str,
     artifact_schema: str,
     manifest_name: str,
 ) -> dict[str, Any]:
     """Read one stable caller-preserved receipt from outside its artifact."""
 
-    with (
-        _bind_existing_directory(artifact_root) as bound_artifact,
-        _bind_existing_directory(receipt_file.parent) as bound_receipt_parent,
-    ):
+    missing_code = (
+        "snapshot-missing" if artifact_kind == "snapshot" else "stage-missing"
+    )
+    identity_code = (
+        "snapshot-directory-identity-mismatch"
+        if artifact_kind == "snapshot"
+        else "stage-directory-identity-mismatch"
+    )
+    access_policy_code = (
+        "snapshot-directory-access-policy-mismatch"
+        if artifact_kind == "snapshot"
+        else "stage-directory-access-policy-mismatch"
+    )
+    inconclusive_code = (
+        SNAPSHOT_FILE_CODES.inconclusive
+        if artifact_kind == "snapshot"
+        else PATCH_FILE_CODES.inconclusive
+    )
+    mismatch_code = (
+        "snapshot-file-set-mismatch"
+        if artifact_kind == "snapshot"
+        else "patch-file-set-mismatch"
+    )
+    _verify_bound_artifact_directory(
+        artifact_root,
+        missing_code=missing_code,
+        identity_code=identity_code,
+        access_policy_code=access_policy_code,
+        inconclusive_code=inconclusive_code,
+        mismatch_code=mismatch_code,
+    )
+    with _bind_existing_directory(receipt_file.parent) as bound_receipt_parent:
         try:
             _assert_output_ancestors_exclude_snapshot(
                 bound_receipt_parent.fd,
-                bound_artifact.opened,
+                artifact_root.opened,
                 display_path=receipt_file.parent,
             )
         except StoreSafetyError as exc:
@@ -7372,7 +7877,8 @@ def _load_external_manifest_creation_receipt(
             raise StoreSafetyError(
                 code,
                 "Manifest creation receipt must be preserved outside the "
-                f"artifact tree: receipt={receipt_file}, artifact={artifact_root}: "
+                "artifact tree: "
+                f"receipt={receipt_file}, artifact={artifact_root.path}: "
                 f"{exc}",
             ) from exc
         receipt_bound = False
@@ -7411,6 +7917,14 @@ def _load_external_manifest_creation_receipt(
                 "Manifest creation receipt could not be read with stable "
                 f"descriptor evidence: {receipt_file}: {exc}",
             ) from exc
+    _verify_bound_artifact_directory(
+        artifact_root,
+        missing_code=missing_code,
+        identity_code=identity_code,
+        access_policy_code=access_policy_code,
+        inconclusive_code=inconclusive_code,
+        mismatch_code=mismatch_code,
+    )
     try:
         payload = json.loads(payload_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -7420,6 +7934,40 @@ def _load_external_manifest_creation_receipt(
         ) from exc
     return _normalized_manifest_creation_receipt(
         payload,
+        artifact_kind=artifact_kind,
+        artifact_schema=artifact_schema,
+        manifest_name=manifest_name,
+    )
+
+
+def _manifest_creation_receipt_for_bound_artifact(
+    artifact_root: _BoundDirectory,
+    *,
+    manifest_creation_receipt: dict[str, Any] | None,
+    manifest_creation_receipt_file: Path | None,
+    artifact_kind: str,
+    artifact_schema: str,
+    manifest_name: str,
+) -> dict[str, Any]:
+    if (
+        manifest_creation_receipt is not None
+        and manifest_creation_receipt_file is not None
+    ):
+        raise StoreSafetyError(
+            "manifest-creation-receipt-invalid",
+            "Supply either an in-memory manifest creation receipt or an "
+            "artifact-external receipt file, not both",
+        )
+    if manifest_creation_receipt_file is not None:
+        return _load_external_manifest_creation_receipt(
+            manifest_creation_receipt_file,
+            artifact_root=artifact_root,
+            artifact_kind=artifact_kind,
+            artifact_schema=artifact_schema,
+            manifest_name=manifest_name,
+        )
+    return _normalized_manifest_creation_receipt(
+        manifest_creation_receipt,
         artifact_kind=artifact_kind,
         artifact_schema=artifact_schema,
         manifest_name=manifest_name,
@@ -7548,103 +8096,117 @@ def _create_bound_output_parent_components(
 
 @contextmanager
 def _bind_recovery_output_parent_outside_snapshot(
-    snapshot_dir: Path,
+    snapshot_binding: _BoundDirectory,
     out: Path,
-    *,
-    snapshot_identity: dict[str, int],
-    snapshot_access_policy: dict[str, int],
 ) -> Iterator[_BoundDirectory]:
     """Create and bind an output parent whose descriptor ancestry excludes snapshot."""
 
-    with _bind_existing_directory(snapshot_dir) as snapshot_binding:
-        snapshot = os.fstat(snapshot_binding.fd)
-        if _identity(snapshot) != snapshot_identity:
-            raise StoreSafetyError(
-                "snapshot-directory-identity-mismatch",
-                "Snapshot root changed between validation and recovery-output "
-                f"scope binding: {snapshot_dir}",
-            )
-        if _access_policy(snapshot) != snapshot_access_policy:
-            raise StoreSafetyError(
-                "snapshot-directory-access-policy-mismatch",
-                "Snapshot root access policy changed between validation and "
-                f"recovery-output scope binding: {snapshot_dir}",
-            )
-        try:
-            output_existing = os.stat(out)
-        except FileNotFoundError:
-            output_existing = None
-        except OSError as exc:
-            raise StoreSafetyError(
-                "recovery-output-scope-inconclusive",
-                f"Cannot inspect the recovery output before parent creation: "
-                f"{out}: {exc}",
-            ) from exc
-        if (
-            output_existing is not None
-            and stat.S_ISDIR(output_existing.st_mode)
-            and _directory_identity_key(output_existing)
-            == _directory_identity_key(snapshot)
-        ):
-            raise StoreSafetyError(
-                "recovery-output-inside-snapshot",
-                "Recovery output resolves to the immutable snapshot root, "
-                "including through a case-insensitive or symlink alias: "
-                f"{out}",
-            )
-        nearest_path, missing_components = _nearest_existing_output_ancestor(out.parent)
-        with _bind_existing_directory_following_aliases(nearest_path) as (
+    snapshot_dir = snapshot_binding.path
+    snapshot_receipt = _verify_bound_artifact_directory(
+        snapshot_binding,
+        missing_code="snapshot-missing",
+        identity_code="snapshot-directory-identity-mismatch",
+        access_policy_code="snapshot-directory-access-policy-mismatch",
+        inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+        mismatch_code="snapshot-file-set-mismatch",
+    )
+    snapshot = os.fstat(snapshot_binding.fd)
+    if _identity(snapshot) != snapshot_receipt["identity"]:
+        raise StoreSafetyError(
+            "snapshot-directory-identity-mismatch",
+            f"Held snapshot root differs from its transaction receipt: {snapshot_dir}",
+        )
+    if _access_policy(snapshot) != snapshot_receipt["access_policy"]:
+        raise StoreSafetyError(
+            "snapshot-directory-access-policy-mismatch",
+            "Held snapshot root access policy differs from its transaction "
+            f"receipt: {snapshot_dir}",
+        )
+    try:
+        output_existing = os.stat(out)
+    except FileNotFoundError:
+        output_existing = None
+    except OSError as exc:
+        raise StoreSafetyError(
+            "recovery-output-scope-inconclusive",
+            f"Cannot inspect the recovery output before parent creation: {out}: {exc}",
+        ) from exc
+    if (
+        output_existing is not None
+        and stat.S_ISDIR(output_existing.st_mode)
+        and _directory_identity_key(output_existing)
+        == _directory_identity_key(snapshot)
+    ):
+        raise StoreSafetyError(
+            "recovery-output-inside-snapshot",
+            "Recovery output resolves to the immutable snapshot root, "
+            "including through a case-insensitive or symlink alias: "
+            f"{out}",
+        )
+    nearest_path, missing_components = _nearest_existing_output_ancestor(out.parent)
+    with _bind_existing_directory_following_aliases(nearest_path) as (
+        ancestor_fd,
+        ancestor,
+    ):
+        _assert_output_ancestors_exclude_snapshot(
+            ancestor_fd,
+            snapshot,
+            display_path=nearest_path,
+        )
+        _create_bound_output_parent_components(
             ancestor_fd,
             ancestor,
-        ):
-            _assert_output_ancestors_exclude_snapshot(
-                ancestor_fd,
-                snapshot,
-                display_path=nearest_path,
-            )
-            _create_bound_output_parent_components(
-                ancestor_fd,
-                ancestor,
-                missing_components,
-                snapshot=snapshot,
-                display_path=out.parent,
-            )
-        with _bind_existing_directory(out.parent) as output_parent:
-            _verify_bound_directory_namespace(snapshot_binding)
-            _assert_output_ancestors_exclude_snapshot(
-                output_parent.fd,
-                snapshot,
-                display_path=out.parent,
-            )
-            yield output_parent
-            _verify_bound_directory_namespace(output_parent)
-            _assert_output_ancestors_exclude_snapshot(
-                output_parent.fd,
-                snapshot,
-                display_path=out.parent,
-            )
-            _verify_bound_directory_namespace(snapshot_binding)
+            missing_components,
+            snapshot=snapshot,
+            display_path=out.parent,
+        )
+    with _bind_existing_directory(out.parent) as output_parent:
+        _verify_bound_artifact_directory(
+            snapshot_binding,
+            missing_code="snapshot-missing",
+            identity_code="snapshot-directory-identity-mismatch",
+            access_policy_code="snapshot-directory-access-policy-mismatch",
+            inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+            mismatch_code="snapshot-file-set-mismatch",
+        )
+        _assert_output_ancestors_exclude_snapshot(
+            output_parent.fd,
+            snapshot,
+            display_path=out.parent,
+        )
+        yield output_parent
+        _verify_bound_directory_namespace(output_parent)
+        _assert_output_ancestors_exclude_snapshot(
+            output_parent.fd,
+            snapshot,
+            display_path=out.parent,
+        )
+        _verify_bound_artifact_directory(
+            snapshot_binding,
+            missing_code="snapshot-missing",
+            identity_code="snapshot-directory-identity-mismatch",
+            access_policy_code="snapshot-directory-access-policy-mismatch",
+            inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+            mismatch_code="snapshot-file-set-mismatch",
+        )
 
 
 def recover_snapshot(
     snapshot_dir: Path,
     out: Path,
     manifest_creation_receipt: dict[str, Any] | None = None,
+    *,
+    manifest_creation_receipt_file: Path | None = None,
 ) -> dict[str, Any]:
     source = snapshot_dir / "group.com.apple.notes" / NOTE_STORE_MAIN
     with _validated_snapshot_artifact(
         snapshot_dir,
         manifest_creation_receipt,
+        manifest_creation_receipt_file=manifest_creation_receipt_file,
     ) as artifact:
         with _bind_recovery_output_parent_outside_snapshot(
-            snapshot_dir,
+            artifact.artifact_root,
             out,
-            snapshot_identity=artifact.source_integrity["directories"]["snapshot"][
-                "identity"
-            ],
-            snapshot_access_policy=artifact.source_integrity["directories"]["snapshot"][
-                "access_policy"
-            ],
         ) as output_parent:
             validation = artifact.public_result
             recovered = _recover_validated_clone_to_standalone(
@@ -7862,27 +8424,41 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
 def validate_patch_stage(
     stage_dir: Path,
     manifest_creation_receipt: dict[str, Any] | None = None,
+    *,
+    manifest_creation_receipt_file: Path | None = None,
 ) -> dict[str, Any]:
-    external_receipt = _normalized_manifest_creation_receipt(
-        manifest_creation_receipt,
-        artifact_kind="patch-stage",
-        artifact_schema=PATCH_SCHEMA,
-        manifest_name=PATCH_MANIFEST,
-    )
     expected_stage_types = {
         NOTE_STORE_MAIN: stat.S_IFREG,
         PATCH_MANIFEST: stat.S_IFREG,
     }
-    stage_directory = _scan_exact_directory_entries(
-        stage_dir,
-        expected_stage_types,
-        missing_code="stage-missing",
-        mismatch_code="patch-file-set-mismatch",
-    )
     with ExitStack() as stack:
+        artifact_root = stack.enter_context(
+            _bind_artifact_root(
+                stage_dir,
+                missing_code="stage-missing",
+            )
+        )
+        external_receipt = _manifest_creation_receipt_for_bound_artifact(
+            artifact_root,
+            manifest_creation_receipt=manifest_creation_receipt,
+            manifest_creation_receipt_file=manifest_creation_receipt_file,
+            artifact_kind="patch-stage",
+            artifact_schema=PATCH_SCHEMA,
+            manifest_name=PATCH_MANIFEST,
+        )
+        stage_directory = _scan_exact_bound_directory_entries(
+            artifact_root,
+            expected_stage_types,
+            missing_code="stage-missing",
+            identity_code="stage-directory-identity-mismatch",
+            access_policy_code="stage-directory-access-policy-mismatch",
+            inconclusive_code=PATCH_FILE_CODES.inconclusive,
+            mismatch_code="patch-file-set-mismatch",
+        )
         manifest_bound = stack.enter_context(
-            _bind_regular_file(
+            _bind_regular_file_at(
                 stage_dir / PATCH_MANIFEST,
+                artifact_root,
                 PATCH_FILE_CODES,
             )
         )
@@ -7890,11 +8466,13 @@ def validate_patch_stage(
             manifest_bound,
             external_receipt,
             PATCH_FILE_CODES,
+            parent=artifact_root,
         )
         manifest = _load_bound_manifest(
             manifest_bound,
             PATCH_FILE_CODES,
             PATCH_SCHEMA,
+            parent=artifact_root,
         )
         _assert_manifest_external_anchor_declaration(
             manifest,
@@ -7928,8 +8506,9 @@ def validate_patch_stage(
                 "Patch manifest database path is not canonical",
             )
         database_bound = stack.enter_context(
-            _bind_regular_file(
+            _bind_regular_file_at(
                 stage_dir / NOTE_STORE_MAIN,
+                artifact_root,
                 PATCH_FILE_CODES,
             )
         )
@@ -7938,7 +8517,12 @@ def validate_patch_stage(
             "access_policy": database.get("access_policy"),
         }
         _assert_manifest_protection_receipt(
-            _verify_bound_regular_file(database_bound, PATCH_FILE_CODES),
+            _verify_bound_regular_file_at(
+                database_bound,
+                PATCH_FILE_CODES,
+                dir_fd=artifact_root.fd,
+                basename=NOTE_STORE_MAIN,
+            ),
             database_creation_receipt,
             label="patch database",
             identity_code=PATCH_FILE_CODES.identity,
@@ -7951,6 +8535,7 @@ def validate_patch_stage(
                 {NOTE_STORE_MAIN: database_bound},
                 Path(temp_dir) / "store",
                 PATCH_FILE_CODES,
+                source_parent=artifact_root,
             )
             fingerprint = clone.evidence["capture"][0]["source"]
             if fingerprint["sha256"] != database.get("sha256") or fingerprint[
@@ -7968,22 +8553,30 @@ def validate_patch_stage(
                     recovered_store,
                     clone.receipt,
                 )
-            integrity = _sqlite_integrity(database_bound)
-        _scan_exact_directory_entries(
-            stage_dir,
+            integrity = _sqlite_integrity(
+                database_bound,
+                parent=artifact_root,
+            )
+        _scan_exact_bound_directory_entries(
+            artifact_root,
             expected_stage_types,
             missing_code="stage-missing",
+            identity_code="stage-directory-identity-mismatch",
+            access_policy_code="stage-directory-access-policy-mismatch",
+            inconclusive_code=PATCH_FILE_CODES.inconclusive,
             mismatch_code="patch-file-set-mismatch",
-            bound_identity=stage_directory["identity"],
-            bound_access_policy=stage_directory["access_policy"],
         )
-        database_integrity = _verify_bound_regular_file(
+        database_integrity = _verify_bound_regular_file_at(
             database_bound,
             PATCH_FILE_CODES,
+            dir_fd=artifact_root.fd,
+            basename=NOTE_STORE_MAIN,
         )
-        manifest_integrity = _verify_bound_regular_file(
+        manifest_integrity = _verify_bound_regular_file_at(
             manifest_bound,
             PATCH_FILE_CODES,
+            dir_fd=artifact_root.fd,
+            basename=PATCH_MANIFEST,
         )
         return {
             "stage_dir": stage_dir,
@@ -8104,6 +8697,8 @@ def preflight_writeback(
     stage_dir: Path,
     backup_manifest_creation_receipt: dict[str, Any] | None = None,
     stage_manifest_creation_receipt: dict[str, Any] | None = None,
+    backup_manifest_creation_receipt_file: Path | None = None,
+    stage_manifest_creation_receipt_file: Path | None = None,
 ) -> dict[str, Any]:
     if notes_is_running():
         raise StoreSafetyError(
@@ -8112,6 +8707,7 @@ def preflight_writeback(
     backup = validate_snapshot(
         backup_dir,
         backup_manifest_creation_receipt,
+        manifest_creation_receipt_file=(backup_manifest_creation_receipt_file),
     )
     manifest = backup["manifest"]
     if (
@@ -8130,6 +8726,7 @@ def preflight_writeback(
     stage = validate_patch_stage(
         stage_dir,
         stage_manifest_creation_receipt,
+        manifest_creation_receipt_file=stage_manifest_creation_receipt_file,
     )
     live = fingerprint_note_store(paths)
     _compare_live_to_baseline(live, manifest)
@@ -8170,6 +8767,8 @@ def verify_writeback(
     stage_dir: Path,
     backup_manifest_creation_receipt: dict[str, Any] | None = None,
     stage_manifest_creation_receipt: dict[str, Any] | None = None,
+    backup_manifest_creation_receipt_file: Path | None = None,
+    stage_manifest_creation_receipt_file: Path | None = None,
 ) -> dict[str, Any]:
     if notes_is_running():
         raise StoreSafetyError(
@@ -8178,6 +8777,7 @@ def verify_writeback(
     backup = validate_snapshot(
         backup_dir,
         backup_manifest_creation_receipt,
+        manifest_creation_receipt_file=(backup_manifest_creation_receipt_file),
     )
     baseline_manifest = backup["manifest"]
     if (
@@ -8196,6 +8796,7 @@ def verify_writeback(
     stage = validate_patch_stage(
         stage_dir,
         stage_manifest_creation_receipt,
+        manifest_creation_receipt_file=stage_manifest_creation_receipt_file,
     )
     live = validate_database_recovery(paths.group_container / NOTE_STORE_MAIN)
     current = {record["basename"]: record["source"] for record in live["capture"]}
@@ -8461,12 +9062,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             emit_json(
                 validate_snapshot(
                     args.snapshot_dir,
-                    _load_external_manifest_creation_receipt(
-                        args.manifest_creation_receipt_file,
-                        artifact_root=args.snapshot_dir,
-                        artifact_kind="snapshot",
-                        artifact_schema=SNAPSHOT_SCHEMA,
-                        manifest_name=SNAPSHOT_MANIFEST,
+                    manifest_creation_receipt_file=(
+                        args.manifest_creation_receipt_file
                     ),
                 )
             )
@@ -8475,12 +9072,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 recover_snapshot(
                     args.snapshot_dir,
                     args.out,
-                    _load_external_manifest_creation_receipt(
-                        args.manifest_creation_receipt_file,
-                        artifact_root=args.snapshot_dir,
-                        artifact_kind="snapshot",
-                        artifact_schema=SNAPSHOT_SCHEMA,
-                        manifest_name=SNAPSHOT_MANIFEST,
+                    manifest_creation_receipt_file=(
+                        args.manifest_creation_receipt_file
                     ),
                 )
             )
@@ -8490,12 +9083,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             emit_json(
                 validate_patch_stage(
                     args.stage_dir,
-                    _load_external_manifest_creation_receipt(
-                        args.manifest_creation_receipt_file,
-                        artifact_root=args.stage_dir,
-                        artifact_kind="patch-stage",
-                        artifact_schema=PATCH_SCHEMA,
-                        manifest_name=PATCH_MANIFEST,
+                    manifest_creation_receipt_file=(
+                        args.manifest_creation_receipt_file
                     ),
                 )
             )
@@ -8505,23 +9094,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                     _paths_from_args(args),
                     backup_dir=args.backup_dir,
                     stage_dir=args.stage_dir,
-                    backup_manifest_creation_receipt=(
-                        _load_external_manifest_creation_receipt(
-                            args.backup_manifest_creation_receipt_file,
-                            artifact_root=args.backup_dir,
-                            artifact_kind="snapshot",
-                            artifact_schema=SNAPSHOT_SCHEMA,
-                            manifest_name=SNAPSHOT_MANIFEST,
-                        )
+                    backup_manifest_creation_receipt_file=(
+                        args.backup_manifest_creation_receipt_file
                     ),
-                    stage_manifest_creation_receipt=(
-                        _load_external_manifest_creation_receipt(
-                            args.stage_manifest_creation_receipt_file,
-                            artifact_root=args.stage_dir,
-                            artifact_kind="patch-stage",
-                            artifact_schema=PATCH_SCHEMA,
-                            manifest_name=PATCH_MANIFEST,
-                        )
+                    stage_manifest_creation_receipt_file=(
+                        args.stage_manifest_creation_receipt_file
                     ),
                 )
             )
@@ -8531,23 +9108,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                     _paths_from_args(args),
                     backup_dir=args.backup_dir,
                     stage_dir=args.stage_dir,
-                    backup_manifest_creation_receipt=(
-                        _load_external_manifest_creation_receipt(
-                            args.backup_manifest_creation_receipt_file,
-                            artifact_root=args.backup_dir,
-                            artifact_kind="snapshot",
-                            artifact_schema=SNAPSHOT_SCHEMA,
-                            manifest_name=SNAPSHOT_MANIFEST,
-                        )
+                    backup_manifest_creation_receipt_file=(
+                        args.backup_manifest_creation_receipt_file
                     ),
-                    stage_manifest_creation_receipt=(
-                        _load_external_manifest_creation_receipt(
-                            args.stage_manifest_creation_receipt_file,
-                            artifact_root=args.stage_dir,
-                            artifact_kind="patch-stage",
-                            artifact_schema=PATCH_SCHEMA,
-                            manifest_name=PATCH_MANIFEST,
-                        )
+                    stage_manifest_creation_receipt_file=(
+                        args.stage_manifest_creation_receipt_file
                     ),
                 )
             )

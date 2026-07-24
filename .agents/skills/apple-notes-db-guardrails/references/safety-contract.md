@@ -50,9 +50,13 @@ their root directories and database files; snapshots also persist the nested sto
 receipt. Their successful creator results separately return an
 `apple-notes-manifest-creation-receipt/v1` object containing the manifest's exact SHA-256, size,
 identity, and access policy. The caller must preserve that result outside the artifact. Validators
-require the external receipt and compare it with the held manifest before parsing or trusting any
-manifest field. Reject v1/v2 manifests and missing receipts rather than silently deriving an
-anchor from current artifact bytes.
+bind the artifact root once before loading the external receipt. The receipt externality proof and
+read, exact root scan, manifest open/read, nested-store binding, declared-file binding,
+recovery-clone capture, SQLite integrity check, and terminal scans must reuse that same held root
+object or child descriptors opened relative to it. No artifact consumer may reopen the root
+pathname after the receipt load. Compare the external receipt with the descriptor-relative held
+manifest before parsing or trusting any manifest field. Reject v1/v2 manifests and missing
+receipts rather than silently deriving an anchor from current artifact bytes.
 
 Treat these outcomes separately:
 
@@ -190,15 +194,18 @@ another anonymous image from those exact bytes, and never scans its containing d
 new WAL, SHM, or rollback journal. An adjacent sidecar injected after standalone validation cannot
 be admitted into the final backup.
 
-After standalone main-file publication, parent fsync, terminal main-file rehash, and public-path
-proof, retain the output-parent descriptor and perform two complete no-follow namespace passes for
-the final output's `-wal`, `-shm`, and `-journal` names. `FileNotFoundError` is absent; any successful
-stat is present regardless of file type; `PermissionError` is unreadable; every other `OSError` is
-unverifiable. All three names must be absent in both passes. Because the main file is already
-published, any non-absent or inconclusive observation is
-`destination-install-uncertain`, never an uncommitted or successful result. Preserve the strong
-descriptor-bound main receipt and point-in-time sidecar observations, but do not call an unbound
-sidecar display path a verified recovery locator.
+After standalone main-file publication, parent fsync, terminal main-file rehash, and the initial
+public-path proof, retain the output-parent descriptor and perform two complete no-follow namespace
+passes for the final output's `-wal`, `-shm`, and `-journal` names. `FileNotFoundError` is absent;
+any successful stat is present regardless of file type; `PermissionError` is unreadable; every
+other `OSError` is unverifiable. All three names must be absent in both passes. After both passes,
+rebind the public parent pathname, require its identity and access policy to match the still-held
+parent, and re-prove the public main name's identity, SHA-256, size, and access policy through that
+rebound parent before returning success. Because the main file is already published, any
+non-absent or inconclusive sidecar observation, unreadable public path, persistent parent
+replacement, or public-main mismatch is `destination-install-uncertain`, never an uncommitted or
+successful result. Preserve the strong descriptor-bound main receipt and point-in-time sidecar
+observations, but do not call an unbound sidecar display path a verified recovery locator.
 
 The protected recovery property is that SQLite consumes exactly the image derived from the
 creation-receipt-bound main descriptor plus the last committed checksum-valid WAL prefix.
@@ -263,7 +270,10 @@ consumer may supply either that complete creator result or the nested
 `manifest_creation_receipt`; it may not self-bootstrap a receipt from the current manifest.
 Before loading a CLI receipt file, bind its parent and the artifact root and traverse descriptor
 ancestors to prove the receipt is outside the artifact. Bind the receipt as a no-follow regular
-file, enforce the manifest-size bound, and require stable descriptor reads.
+file, enforce the manifest-size bound, and require stable descriptor reads. Keep that exact
+artifact-root binding alive after the receipt read and use it for every later root operation; bind
+nested directories and regular files only relative to that root. A consumer must not load the
+receipt, release or ignore its root binding, and then reopen the artifact pathname.
 On writer failure, retain the created file and report the held parent/file descriptor identities,
 access policies, content status, and point-in-time namespace observations. Do not attempt automatic
 name-based cleanup: even descriptor-relative `stat(name)` followed by `unlink(name)` has a
