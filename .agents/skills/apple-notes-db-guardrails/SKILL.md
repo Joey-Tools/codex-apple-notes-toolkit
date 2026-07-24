@@ -93,6 +93,12 @@ without that structure is treated as possibly post-mutation with inconclusive cl
 fields, or wrong field types is inside the same possible-mutation boundary: the helper safely
 extracts any recoverable basename/FD, captures conservative evidence, closes transferred FDs, and
 unions malformed-result, provider-failure, and install locators with worst-case cleanup.
+Supervisor `details` cross a closed, bounded schema before conservative merging; malformed nested
+locator containers are rejected and recorded rather than converted with generic `dict(...)`.
+Transport evidence is completed before the first received FD leaves the cleanup-owned list. If
+normalization, evidence construction, or merging fails, every received FD is closed first and the
+helper emits a fixed `mutation_performed: true`, `retry_safe: false`, inconclusive-cleanup
+transport locator without retrying the failing provider structure.
 After validating the returned descriptor/name pair, the helper installs that exact object with
 atomic no-replace rename and revalidates the target around the carried scope checks. Replacement
 or access-policy drift fails closed with a structured retained-object locator; unproved handoff

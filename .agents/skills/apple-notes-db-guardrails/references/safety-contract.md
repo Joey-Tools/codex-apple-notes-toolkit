@@ -322,6 +322,16 @@ non-socket/wrong socket type detected before the first send attempt is a proved 
 receive failure, timeout, truncation, malformed JSON, nonce/schema/status mismatch, or
 descriptor-count error is possibly post-mutation and must retain every received FD until
 conservative evidence is captured.
+Treat provider `details` as untrusted protocol input even after JSON decoding. Normalize only the
+documented boolean, bounded-string, state-enum, and bounded closed-JSON locator fields; reject
+unknown or malformed nested locator containers with an explicit normalization receipt. Build and
+merge the complete transport failure receipt while all SCM_RIGHTS descriptors remain in the
+cleanup-owned list, then explicitly transfer at most the first evidence FD into the structured
+failure. If normalization internals, receipt construction, or conservative merge raises an
+ordinary exception, close every received descriptor before returning a fixed transport locator
+with `mutation_performed: true`, `retry_safe: false`, inconclusive cleanup, no transferred FD, and
+the evidence-construction failure type. Never re-enter the same untrusted merge after removing an
+FD from cleanup ownership.
 
 A creator that raises after entering its mutation boundary must use
 `_IdentityBoundDirectoryCreationFailure` and transfer the created staging basename, open

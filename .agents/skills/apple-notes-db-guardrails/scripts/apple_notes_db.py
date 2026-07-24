@@ -61,6 +61,12 @@ DIRECTORY_CREATOR_RESPONSE_SCHEMA = "apple-notes-directory-creator-response/v1"
 DIRECTORY_CREATOR_MAX_MESSAGE_BYTES = 64 * 1024
 DIRECTORY_CREATOR_MAX_RECEIVED_FDS = 8
 DIRECTORY_CREATOR_TIMEOUT_SECONDS = 5.0
+DIRECTORY_CREATOR_PROVIDER_MAX_LOCATORS = 16
+DIRECTORY_CREATOR_PROVIDER_MAX_JSON_DEPTH = 4
+DIRECTORY_CREATOR_PROVIDER_MAX_JSON_ITEMS = 32
+DIRECTORY_CREATOR_PROVIDER_MAX_JSON_NODES = 256
+DIRECTORY_CREATOR_PROVIDER_MAX_KEY_CHARS = 128
+DIRECTORY_CREATOR_PROVIDER_MAX_STRING_CHARS = 2048
 
 
 class StoreSafetyError(RuntimeError):
@@ -513,12 +519,322 @@ def _received_rights_descriptors(
     return descriptors
 
 
-def _close_descriptors(descriptors: Iterable[int]) -> None:
+def _close_descriptors(descriptors: Iterable[int]) -> bool:
+    cleanup_complete = True
     for descriptor in descriptors:
         try:
             os.close(descriptor)
-        except OSError:
-            pass
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                cleanup_complete = False
+    return cleanup_complete
+
+
+def _normalize_directory_creator_locator_json(
+    value: object,
+    *,
+    depth: int,
+    remaining_nodes: list[int],
+) -> tuple[bool, Any]:
+    """Copy one provider locator through a bounded closed JSON type grammar."""
+
+    if remaining_nodes[0] <= 0:
+        return False, None
+    remaining_nodes[0] -= 1
+    if value is None or type(value) in {bool, int}:
+        return True, value
+    if type(value) is str:
+        if len(value) > DIRECTORY_CREATOR_PROVIDER_MAX_STRING_CHARS:
+            return False, None
+        return True, value
+    if depth >= DIRECTORY_CREATOR_PROVIDER_MAX_JSON_DEPTH:
+        return False, None
+    if type(value) is list:
+        if len(value) > DIRECTORY_CREATOR_PROVIDER_MAX_JSON_ITEMS:
+            return False, None
+        normalized_items: list[Any] = []
+        for item in value:
+            accepted, normalized = _normalize_directory_creator_locator_json(
+                item,
+                depth=depth + 1,
+                remaining_nodes=remaining_nodes,
+            )
+            if not accepted:
+                return False, None
+            normalized_items.append(normalized)
+        return True, normalized_items
+    if type(value) is dict:
+        if len(value) > DIRECTORY_CREATOR_PROVIDER_MAX_JSON_ITEMS:
+            return False, None
+        normalized_object: dict[str, Any] = {}
+        for key, item in value.items():
+            if (
+                type(key) is not str
+                or not key
+                or len(key) > DIRECTORY_CREATOR_PROVIDER_MAX_KEY_CHARS
+            ):
+                return False, None
+            accepted, normalized = _normalize_directory_creator_locator_json(
+                item,
+                depth=depth + 1,
+                remaining_nodes=remaining_nodes,
+            )
+            if not accepted:
+                return False, None
+            normalized_object[key] = normalized
+        return True, normalized_object
+    return False, None
+
+
+def _normalize_directory_creator_provider_details(
+    value: object,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Normalize untrusted provider details through one closed bounded schema."""
+
+    receipt: dict[str, Any] = {
+        "schema": "apple-notes-directory-creator-provider-details-normalization/v1",
+        "input_type": type(value).__name__[:128],
+        "accepted_fields": [],
+        "ignored_fields": [],
+        "rejected_fields": [],
+        "accepted_locator_count": 0,
+        "rejected_locator_count": 0,
+    }
+    if value is None:
+        receipt["status"] = "absent"
+        return {}, receipt
+    if type(value) is not dict:
+        receipt["status"] = "rejected"
+        receipt["rejected_fields"] = ["details:not-object"]
+        return {}, receipt
+    if len(value) > DIRECTORY_CREATOR_PROVIDER_MAX_JSON_ITEMS:
+        receipt["status"] = "rejected"
+        receipt["rejected_fields"] = ["details:too-many-fields"]
+        return {}, receipt
+
+    normalized: dict[str, Any] = {}
+    accepted_fields: list[str] = receipt["accepted_fields"]
+    rejected_fields: list[str] = receipt["rejected_fields"]
+    known_fields = {
+        "cleanup_state",
+        "creation_authority",
+        "mutation_performed",
+        "provider_install_state",
+        "provider_staging_basename",
+        "publication_state",
+        "recovery_locators",
+        "retry_safe",
+    }
+    if any(type(key) is not str for key in value):
+        rejected_fields.append("details:non-string-key")
+    receipt["ignored_fields"] = sorted(
+        key[:DIRECTORY_CREATOR_PROVIDER_MAX_KEY_CHARS]
+        for key in value
+        if type(key) is str and key not in known_fields
+    )[:DIRECTORY_CREATOR_PROVIDER_MAX_JSON_ITEMS]
+
+    for field in ("mutation_performed", "retry_safe"):
+        if field not in value:
+            continue
+        if type(value[field]) is bool:
+            normalized[field] = value[field]
+            accepted_fields.append(field)
+        else:
+            rejected_fields.append(f"{field}:not-boolean")
+
+    for field in (
+        "creation_authority",
+        "provider_install_state",
+        "provider_staging_basename",
+    ):
+        if field not in value:
+            continue
+        field_value = value[field]
+        if (
+            type(field_value) is str
+            and field_value
+            and len(field_value) <= DIRECTORY_CREATOR_PROVIDER_MAX_STRING_CHARS
+        ):
+            normalized[field] = field_value
+            accepted_fields.append(field)
+        else:
+            rejected_fields.append(f"{field}:invalid-string")
+
+    cleanup_state = value.get("cleanup_state")
+    if "cleanup_state" in value:
+        if type(cleanup_state) is str and cleanup_state in {
+            "complete",
+            "inconclusive",
+            "not-needed",
+            "preserved-no-identity-safe-directory-unlink",
+            "preserved-or-incomplete",
+            "retained",
+        }:
+            normalized["cleanup_state"] = cleanup_state
+            accepted_fields.append("cleanup_state")
+        else:
+            rejected_fields.append("cleanup_state:invalid-value")
+
+    publication_state = value.get("publication_state")
+    if "publication_state" in value:
+        if type(publication_state) is str and publication_state in {
+            "committed",
+            "not-started",
+            "uncertain",
+            "uncommitted",
+        }:
+            normalized["publication_state"] = publication_state
+            accepted_fields.append("publication_state")
+        else:
+            rejected_fields.append("publication_state:invalid-value")
+
+    if "recovery_locators" in value:
+        locator_value = value["recovery_locators"]
+        normalized_locators: dict[str, Any] = {}
+        if type(locator_value) is not dict:
+            rejected_fields.append("recovery_locators:not-object")
+            receipt["rejected_locator_count"] = 1
+        elif len(locator_value) > DIRECTORY_CREATOR_PROVIDER_MAX_LOCATORS:
+            rejected_fields.append("recovery_locators:too-many")
+            receipt["rejected_locator_count"] = len(locator_value)
+        else:
+            for locator_name, locator in locator_value.items():
+                valid_name = (
+                    type(locator_name) is str
+                    and bool(locator_name)
+                    and len(locator_name) <= DIRECTORY_CREATOR_PROVIDER_MAX_KEY_CHARS
+                )
+                if not valid_name or type(locator) is not dict:
+                    receipt["rejected_locator_count"] += 1
+                    rejected_fields.append("recovery_locators:invalid-entry")
+                    continue
+                accepted, normalized_locator = (
+                    _normalize_directory_creator_locator_json(
+                        locator,
+                        depth=0,
+                        remaining_nodes=[DIRECTORY_CREATOR_PROVIDER_MAX_JSON_NODES],
+                    )
+                )
+                if not accepted:
+                    receipt["rejected_locator_count"] += 1
+                    rejected_fields.append(
+                        "recovery_locators:"
+                        f"{locator_name[:DIRECTORY_CREATOR_PROVIDER_MAX_KEY_CHARS]}"
+                        ":invalid-value"
+                    )
+                    continue
+                normalized_locators[locator_name] = normalized_locator
+            if normalized_locators:
+                normalized["recovery_locators"] = normalized_locators
+                accepted_fields.append("recovery_locators")
+                receipt["accepted_locator_count"] = len(normalized_locators)
+
+    has_rejections = bool(
+        receipt["ignored_fields"]
+        or receipt["rejected_fields"]
+        or receipt["rejected_locator_count"]
+    )
+    receipt["status"] = "normalized-with-rejections" if has_rejections else "accepted"
+    return normalized, receipt
+
+
+def _directory_creator_transport_failure_base_details(
+    *,
+    request_id: str,
+    stage: str,
+    response_schema: str | None,
+    reported_basename: str | None,
+    recoverable_basename: str | None,
+    received_descriptor_count: int,
+    descriptor_ownership_transferred: bool,
+    provider_details_normalization: dict[str, Any],
+    evidence_construction_error_type: str | None = None,
+) -> dict[str, Any]:
+    locator: dict[str, Any] = {
+        "schema": "apple-notes-directory-creator-transport-failure/v1",
+        "protected_property": "creation-identity-inconclusive",
+        "request_schema": DIRECTORY_CREATOR_REQUEST_SCHEMA,
+        "response_schema": response_schema,
+        "request_id": request_id,
+        "stage": stage,
+        "request_started": True,
+        "received_descriptor_count": received_descriptor_count,
+        "descriptor_ownership_transferred": descriptor_ownership_transferred,
+        "provider_reported_staging_basename": reported_basename,
+        "provider_details_normalization": provider_details_normalization,
+        "evidence_construction_status": (
+            "failed-closed"
+            if evidence_construction_error_type is not None
+            else "complete"
+        ),
+        "automatic_cleanup_attempted": False,
+    }
+    if evidence_construction_error_type is not None:
+        locator["evidence_construction_error_type"] = evidence_construction_error_type
+        locator["received_descriptor_cleanup_state"] = "pending"
+        locator["evidence_status"] = "inconclusive"
+    return {
+        "mutation_performed": True,
+        "cleanup_state": "inconclusive",
+        "retry_safe": False,
+        "creation_authority": "inherited-supervisor-channel",
+        "provider_install_state": "supervisor-request-started",
+        "provider_staging_basename": recoverable_basename,
+        "recovery_locators": {
+            "directory_creator_supervisor": locator,
+        },
+    }
+
+
+def _build_directory_creator_transport_failure_details(
+    *,
+    provider_details: object,
+    request_id: str,
+    stage: str,
+    response_schema: str | None,
+    reported_basename: str | None,
+    recoverable_basename: str | None,
+    received_descriptor_count: int,
+) -> tuple[dict[str, Any], bool]:
+    """Build transport evidence without allowing an ordinary exception to escape."""
+
+    normalization: dict[str, Any] = {
+        "schema": "apple-notes-directory-creator-provider-details-normalization/v1",
+        "status": "not-started",
+    }
+    try:
+        normalized_provider, normalization = (
+            _normalize_directory_creator_provider_details(provider_details)
+        )
+        local_details = _directory_creator_transport_failure_base_details(
+            request_id=request_id,
+            stage=stage,
+            response_schema=response_schema,
+            reported_basename=reported_basename,
+            recoverable_basename=recoverable_basename,
+            received_descriptor_count=received_descriptor_count,
+            descriptor_ownership_transferred=received_descriptor_count > 0,
+            provider_details_normalization=normalization,
+        )
+        return (
+            _merge_recovery_details(normalized_provider, local_details),
+            True,
+        )
+    except Exception as exc:
+        return (
+            _directory_creator_transport_failure_base_details(
+                request_id=request_id,
+                stage=stage,
+                response_schema=response_schema,
+                reported_basename=reported_basename,
+                recoverable_basename=recoverable_basename,
+                received_descriptor_count=received_descriptor_count,
+                descriptor_ownership_transferred=False,
+                provider_details_normalization=normalization,
+                evidence_construction_error_type=type(exc).__name__[:128],
+            ),
+            False,
+        )
 
 
 def _supervisor_identity_bound_directory_creator(
@@ -569,64 +885,58 @@ def _supervisor_identity_bound_directory_creator(
     request_id = uuid.uuid4().hex
 
     def after_request_failure(message: str, *, stage: str) -> None:
-        transferred_fd = received_descriptors.pop(0) if received_descriptors else None
+        response_basename = (
+            response.get("basename") if isinstance(response, dict) else None
+        )
         reported_basename = (
-            response.get("basename")
-            if isinstance(response, dict) and isinstance(response.get("basename"), str)
-            else None
+            response_basename[:256] if type(response_basename) is str else None
         )
         recoverable_basename = (
-            reported_basename
-            if reported_basename is not None and len(reported_basename) <= 255
+            response_basename
+            if type(response_basename) is str and len(response_basename) <= 255
             else None
         )
-        response_details = (
-            response.get("details")
-            if isinstance(response, dict) and isinstance(response.get("details"), dict)
-            else {}
+        response_schema_value = (
+            response.get("schema") if isinstance(response, dict) else None
         )
-        details = _merge_recovery_details(
-            dict(response_details),
-            {
-                "mutation_performed": True,
-                "cleanup_state": "inconclusive",
-                "retry_safe": False,
-                "creation_authority": "inherited-supervisor-channel",
-                "provider_install_state": "supervisor-request-started",
-                "provider_staging_basename": recoverable_basename,
-                "recovery_locators": {
-                    "directory_creator_supervisor": {
-                        "schema": (
-                            "apple-notes-directory-creator-transport-failure/v1"
-                        ),
-                        "protected_property": "creation-identity-inconclusive",
-                        "request_schema": DIRECTORY_CREATOR_REQUEST_SCHEMA,
-                        "response_schema": (
-                            response.get("schema")
-                            if isinstance(response, dict)
-                            else None
-                        ),
-                        "request_id": request_id,
-                        "stage": stage,
-                        "request_started": True,
-                        "received_descriptor_count": (
-                            len(received_descriptors)
-                            + (1 if transferred_fd is not None else 0)
-                        ),
-                        "descriptor_ownership_transferred": (
-                            transferred_fd is not None
-                        ),
-                        "provider_reported_staging_basename": (
-                            reported_basename[:256]
-                            if reported_basename is not None
-                            else None
-                        ),
-                        "automatic_cleanup_attempted": False,
-                    },
-                },
-            },
+        response_schema = (
+            response_schema_value
+            if type(response_schema_value) is str
+            and len(response_schema_value)
+            <= DIRECTORY_CREATOR_PROVIDER_MAX_STRING_CHARS
+            else None
         )
-        raise _IdentityBoundDirectoryCreationFailure(
+        provider_details = (
+            response.get("details") if isinstance(response, dict) else None
+        )
+        descriptor_count = len(received_descriptors)
+        details, descriptor_transfer_safe = (
+            _build_directory_creator_transport_failure_details(
+                provider_details=provider_details,
+                request_id=request_id,
+                stage=stage,
+                response_schema=response_schema,
+                reported_basename=reported_basename,
+                recoverable_basename=recoverable_basename,
+                received_descriptor_count=descriptor_count,
+            )
+        )
+        if not descriptor_transfer_safe:
+            cleanup_complete = _close_descriptors(received_descriptors)
+            received_descriptors.clear()
+            transport_locator = details["recovery_locators"][
+                "directory_creator_supervisor"
+            ]
+            transport_locator["received_descriptor_cleanup_state"] = (
+                "complete" if cleanup_complete else "inconclusive"
+            )
+
+        transferred_fd = (
+            received_descriptors[0]
+            if descriptor_transfer_safe and received_descriptors
+            else None
+        )
+        failure = _IdentityBoundDirectoryCreationFailure(
             message,
             staging_basename=recoverable_basename,
             fd=transferred_fd,
@@ -638,6 +948,9 @@ def _supervisor_identity_bound_directory_creator(
             ),
             details=details,
         )
+        if transferred_fd is not None:
+            del received_descriptors[0]
+        raise failure
 
     try:
         with supervisor:

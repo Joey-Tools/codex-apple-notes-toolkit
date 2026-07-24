@@ -205,6 +205,89 @@ class AppleNotesHelperTests(unittest.TestCase):
                     os.close(parent_fd)
         return handled
 
+    @staticmethod
+    def _serve_directory_creator_failure_response(
+        server_fd: int,
+        *,
+        details: object,
+    ) -> None:
+        """Create one directory and return its FD with a provider failure."""
+
+        with socket.socket(fileno=server_fd) as supervisor:
+            supervisor.settimeout(10.0)
+            payload, ancillary, flags, _ = supervisor.recvmsg(
+                MODULE.DIRECTORY_CREATOR_MAX_MESSAGE_BYTES,
+                socket.CMSG_SPACE(
+                    array.array("i").itemsize
+                    * MODULE.DIRECTORY_CREATOR_MAX_RECEIVED_FDS
+                ),
+            )
+            if flags & (
+                getattr(socket, "MSG_TRUNC", 0) | getattr(socket, "MSG_CTRUNC", 0)
+            ):
+                raise RuntimeError("test supervisor request was truncated")
+            parent_descriptors = MODULE._received_rights_descriptors(ancillary)
+            if len(parent_descriptors) != 1:
+                MODULE._close_descriptors(parent_descriptors)
+                raise RuntimeError(
+                    "test supervisor expected exactly one parent descriptor"
+                )
+            parent_fd = parent_descriptors.pop()
+            directory_fd: int | None = None
+            try:
+                request = json.loads(payload.decode("utf-8"))
+                if (
+                    request.get("schema") != MODULE.DIRECTORY_CREATOR_REQUEST_SCHEMA
+                    or request.get("operation") != "create-owner-private-directory"
+                    or request.get("prefix") != ".apple-notes-create-"
+                ):
+                    raise RuntimeError("test supervisor rejected request")
+                parent = os.fstat(parent_fd)
+                basename = ".apple-notes-create-malformed-provider-details"
+                os.mkdir(basename, mode=0o700, dir_fd=parent_fd)
+                directory_fd = os.open(
+                    basename,
+                    MODULE._directory_open_flags(),
+                    dir_fd=parent_fd,
+                )
+                opened = os.fstat(directory_fd)
+                response = json.dumps(
+                    {
+                        "schema": MODULE.DIRECTORY_CREATOR_RESPONSE_SCHEMA,
+                        "request_id": request["request_id"],
+                        "status": "failed-after-create",
+                        "basename": basename,
+                        "proof": {
+                            "schema": (
+                                "apple-notes-identity-bound-directory-creation/v1"
+                            ),
+                            "creation_authority": ("test-supervisor-create-then-fail"),
+                            "actual_created_object_descriptor_returned": True,
+                            "namespace_exclusive_during_handoff": True,
+                            "parent_identity": MODULE._identity(parent),
+                            "parent_access_policy": MODULE._access_policy(parent),
+                            "directory_identity": MODULE._identity(opened),
+                            "directory_access_policy": MODULE._access_policy(opened),
+                        },
+                        "details": details,
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                supervisor.sendmsg(
+                    [response],
+                    [
+                        (
+                            socket.SOL_SOCKET,
+                            socket.SCM_RIGHTS,
+                            array.array("i", [directory_fd]),
+                        ),
+                    ],
+                )
+            finally:
+                if directory_fd is not None:
+                    os.close(directory_fd)
+                os.close(parent_fd)
+
     def _copy_db(
         self,
         *args: object,
@@ -540,6 +623,180 @@ raise SystemExit(2)
         self.assertEqual(Path(payload["dest"]), destination)
         self.assertTrue(manifest_exists)
         self.assertTrue(database_exists)
+
+    def test_supervisor_malformed_provider_locators_never_leak_received_fd(
+        self,
+    ) -> None:
+        if not hasattr(os, "fork"):
+            self.skipTest("inherited-FD supervisor integration requires POSIX")
+
+        for force_transport_merge_failure in (False, True):
+            with (
+                self.subTest(
+                    force_transport_merge_failure=(force_transport_merge_failure)
+                ),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                created_path = root / ".apple-notes-create-malformed-provider-details"
+                received_descriptors: list[int] = []
+                transport_merge_primary: list[dict[str, object]] = []
+                client, server = socket.socketpair(
+                    socket.AF_UNIX,
+                    socket.SOCK_DGRAM,
+                )
+                child_pid = os.fork()
+                if child_pid == 0:
+                    client.close()
+                    try:
+                        self._serve_directory_creator_failure_response(
+                            server.detach(),
+                            details={"recovery_locators": 7},
+                        )
+                    except BaseException as exc:
+                        os.write(
+                            2,
+                            (
+                                "test directory creator failure supervisor "
+                                f"failed: {exc!r}\n"
+                            ).encode("utf-8"),
+                        )
+                        os._exit(73)
+                    os._exit(0)
+
+                server.close()
+                original_received_rights = MODULE._received_rights_descriptors
+                original_merge = MODULE._merge_recovery_details
+
+                def capture_received_rights(
+                    ancillary: list[tuple[int, int, bytes]],
+                ) -> list[int]:
+                    descriptors = original_received_rights(ancillary)
+                    received_descriptors.extend(descriptors)
+                    return descriptors
+
+                def merge_with_optional_transport_failure(
+                    primary: dict[str, object],
+                    additional: dict[str, object],
+                ) -> dict[str, object]:
+                    locators = additional.get("recovery_locators")
+                    is_transport_merge = (
+                        type(locators) is dict
+                        and "directory_creator_supervisor" in locators
+                    )
+                    if is_transport_merge:
+                        transport_merge_primary.append(dict(primary))
+                        if force_transport_merge_failure:
+                            raise TypeError(
+                                "simulated transport evidence merge failure"
+                            )
+                    return original_merge(primary, additional)
+
+                parent_fd = os.open(root, MODULE._directory_open_flags())
+                try:
+                    with (
+                        MODULE.directory_creator_supervisor(client.fileno()),
+                        mock.patch.object(
+                            MODULE,
+                            "_IDENTITY_BOUND_DIRECTORY_CREATOR",
+                            MODULE._supervisor_identity_bound_directory_creator,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_received_rights_descriptors",
+                            side_effect=capture_received_rights,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_merge_recovery_details",
+                            side_effect=merge_with_optional_transport_failure,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        MODULE._create_and_install_directory_at(
+                            parent_fd,
+                            os.fstat(parent_fd),
+                            "installed",
+                            display_path=root / "installed",
+                            revalidate_scope=None,
+                            identity_code=("prepared-directory-identity-mismatch"),
+                            access_policy_code=(
+                                "prepared-directory-access-policy-mismatch"
+                            ),
+                            inconclusive_code=(
+                                "prepared-directory-revalidation-inconclusive"
+                            ),
+                            collision_code=("prepared-directory-identity-mismatch"),
+                        )
+                finally:
+                    os.close(parent_fd)
+                    client.close()
+                    _, child_status = os.waitpid(child_pid, 0)
+
+                self.assertTrue(os.WIFEXITED(child_status))
+                self.assertEqual(os.WEXITSTATUS(child_status), 0)
+                self.assertTrue(created_path.is_dir())
+                self.assertFalse((root / "installed").exists())
+                self.assertEqual(len(received_descriptors), 1)
+                with self.assertRaises(OSError) as closed:
+                    os.fstat(received_descriptors[0])
+                self.assertEqual(closed.exception.errno, errno.EBADF)
+
+                self._assert_safety_code(
+                    "directory-creation-identity-inconclusive",
+                    raised,
+                )
+                details = raised.exception.details
+                self.assertTrue(details["mutation_performed"])
+                self.assertFalse(details["retry_safe"])
+                self.assertEqual(details["cleanup_state"], "inconclusive")
+                self.assertIn(
+                    "identity_bound_directory_creation_failure",
+                    details["recovery_locators"],
+                )
+                self.assertIn(
+                    "created_directory_install",
+                    details["recovery_locators"],
+                )
+                transport = details["recovery_locators"]["directory_creator_supervisor"]
+                normalization = transport["provider_details_normalization"]
+                self.assertEqual(
+                    normalization["status"],
+                    "normalized-with-rejections",
+                )
+                self.assertIn(
+                    "recovery_locators:not-object",
+                    normalization["rejected_fields"],
+                )
+                self.assertEqual(len(transport_merge_primary), 1)
+                self.assertNotIn(
+                    "recovery_locators",
+                    transport_merge_primary[0],
+                )
+                if force_transport_merge_failure:
+                    self.assertEqual(
+                        transport["evidence_construction_status"],
+                        "failed-closed",
+                    )
+                    self.assertEqual(
+                        transport["evidence_construction_error_type"],
+                        "TypeError",
+                    )
+                    self.assertFalse(
+                        transport["descriptor_ownership_transferred"],
+                    )
+                    self.assertEqual(
+                        transport["received_descriptor_cleanup_state"],
+                        "complete",
+                    )
+                else:
+                    self.assertEqual(
+                        transport["evidence_construction_status"],
+                        "complete",
+                    )
+                    self.assertTrue(
+                        transport["descriptor_ownership_transferred"],
+                    )
 
     def test_notes_state_probe_ignores_malicious_path_shadow(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -3,7 +3,7 @@ id: 20260724-andb001
 title: Apple Notes Publication And Creator Failure Hardening
 status: completed
 created: 2026-07-24
-updated: 2026-07-24
+updated: 2026-07-25
 branch: codex/apple-db-hardening
 pr:
 supersedes: []
@@ -24,6 +24,7 @@ superseded_by:
 - Trusted directory creators can transfer create-then-fail evidence through a structured exception; unstructured failures conservatively report possible mutation and inconclusive cleanup.
 - `copy-db`, `merge-db`, `recover-snapshot`, and `stage-patch` accept an inherited connected supervisor FD and exchange parent/created directory descriptors with request-bound `SCM_RIGHTS` messages.
 - `None`, unexpected mappings or objects, missing fields, and wrong field types are classified after possible creation; recoverable FDs are evidence-captured and closed, and locator/cleanup conclusions merge conservatively.
+- Supervisor provider details now pass a bounded closed schema before merging; malformed nested locators cannot remove a received FD from cleanup ownership, and any evidence-construction failure closes all received descriptors before emitting a fixed conservative locator.
 - Recovery-detail merging keeps mutation, retry, cleanup, and locator conclusions conservative.
 
 ## Next Steps
@@ -34,9 +35,11 @@ superseded_by:
 
 - Base commit: `393a87d57d3e6e03d625a384b8fbb16a2538df58`
 - Fresh-review follow-up base: `fdd702dcd774a8331c0505d5d9da4b04c7245d18`
+- Transport-evidence follow-up base: `2c6f77c798e7d57e52f359ca3efec5a86b883e39`
 - Targeted adversarial tests: `python3 -m unittest <eight focused test cases>` (`8` tests passed)
 - Supervisor/malformed-result tests: `python3 -m unittest <four focused test cases>` (`4` tests passed)
-- Full repository suite: Python `3.14.0`, `python3 -m unittest discover -s tests -p 'test_*.py'` (`203` tests passed)
+- Malformed provider-locator transport test: `python3 -m unittest tests.test_apple_notes_helper.AppleNotesHelperTests.test_supervisor_malformed_provider_locators_never_leak_received_fd` (`1` test with normal-merge and forced-merge-failure subtests passed)
+- Full repository suite: Python `3.14.0`, `python3 -m unittest discover -s tests -p 'test_*.py'` (`204` tests passed)
 - Static checks: `ruff check`, `ruff format --check`, `python3 -m py_compile`, `bash -n`, `shellcheck`, and `git diff --check`
 - Skill validation: isolated `quick_validate.py` with `PyYAML` (`Skill is valid!`; direct local validation lacked that dependency)
 - Journal validation: `project_journal.py validate --repo <worktree>`
