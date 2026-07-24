@@ -6,7 +6,12 @@ The canonical database workflow lives in
 `.agents/skills/apple-notes-db-guardrails/`. Its packaged helper captures stable
 SQLite/WAL/SHM snapshots, validates SQLite recovery, stages sidecar-free patches,
 publishes snapshot/stage directories without replacing existing paths, and
-verifies explicit writeback boundaries. It does not mutate the live Notes store.
+verifies explicit writeback boundaries. Standalone recovery applies committed
+WAL frames from descriptor-bound inputs before SQLite consumes an anonymous
+descriptor-backed image. Clone creation receipts bind the exact copied directory
+and file set across sidecar inspection and recovery, while already validated
+standalone artifacts never rediscover adjacent sidecars. It does not mutate the
+live Notes store.
 
 `scripts/apple_notes_helper.sh` remains the top-level Notes/AppleScript wrapper
 and delegates database subcommands to the skill-packaged helper.

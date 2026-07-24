@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -72,6 +73,27 @@ raise SystemExit(2)
         conn.commit()
         self.assertTrue(path.with_name(f"{path.name}-wal").exists())
         self.assertTrue(path.with_name(f"{path.name}-shm").exists())
+        return conn
+
+    def _create_checkpointed_then_wal_only_db(
+        self,
+        path: Path,
+    ) -> sqlite3.Connection:
+        conn = sqlite3.connect(path)
+        self.assertEqual(conn.execute("PRAGMA journal_mode = WAL").fetchone()[0], "wal")
+        conn.execute("PRAGMA wal_autocheckpoint = 0")
+        conn.execute("CREATE TABLE evidence(value TEXT NOT NULL)")
+        conn.execute("INSERT INTO evidence VALUES ('checkpointed')")
+        conn.commit()
+        checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        self.assertIsNotNone(checkpoint)
+        assert checkpoint is not None
+        self.assertEqual(checkpoint[0], 0)
+        conn.execute("INSERT INTO evidence VALUES ('wal-only')")
+        conn.commit()
+        wal = path.with_name(f"{path.name}-wal")
+        self.assertTrue(wal.exists())
+        self.assertGreater(wal.stat().st_size, 32)
         return conn
 
     def _make_paths(self, root: Path) -> MODULE.NoteStorePaths:
@@ -583,6 +605,417 @@ raise SystemExit(2)
             self.assertEqual(result["output_integrity"]["result"], "ok")
             self.assertFalse(merged.with_name(f"{merged.name}-wal").exists())
             self.assertFalse(merged.with_name(f"{merged.name}-shm").exists())
+
+    def test_merge_db_preserves_committed_wal_only_row_with_writer_open(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            writer = self._create_checkpointed_then_wal_only_db(source)
+            try:
+                merged = root / "merged.sqlite"
+                MODULE.merge_db(source, merged)
+                with closing(sqlite3.connect(merged)) as recovered:
+                    values = [
+                        str(row[0])
+                        for row in recovered.execute(
+                            "SELECT value FROM evidence ORDER BY rowid"
+                        )
+                    ]
+                source_values = [
+                    str(row[0])
+                    for row in writer.execute(
+                        "SELECT value FROM evidence ORDER BY rowid"
+                    )
+                ]
+            finally:
+                writer.close()
+        self.assertEqual(source_values, ["checkpointed", "wal-only"])
+        self.assertEqual(values, source_values)
+
+    def test_clone_receipt_rejects_directory_replacement_after_sidecar_inspection(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            destination = root / "clone"
+            parked = root / "parked-clone"
+            replacement = root / "replacement-clone"
+            original_inspect = MODULE._inspect_bound_sidecars
+
+            def replace_after_inspection(
+                store: MODULE._BoundRecoveryStore,
+            ) -> dict[str, object]:
+                result = original_inspect(store)
+                replacement.mkdir()
+                self._create_db(replacement / source.name, value="replacement")
+                os.replace(destination, parked)
+                os.replace(replacement, destination)
+                return result
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_inspect_bound_sidecars",
+                    side_effect=replace_after_inspection,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._make_recovery_clone(source, destination)
+        self._assert_safety_code(
+            "prepared-directory-identity-mismatch",
+            raised,
+        )
+
+    def test_clone_receipt_rejects_main_replacement_after_sidecar_inspection(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            destination = root / "clone"
+            original_inspect = MODULE._inspect_bound_sidecars
+
+            def replace_after_inspection(
+                store: MODULE._BoundRecoveryStore,
+            ) -> dict[str, object]:
+                result = original_inspect(store)
+                copied = destination / source.name
+                replacement = root / "replacement.sqlite"
+                replacement.write_bytes(copied.read_bytes())
+                replacement.chmod(copied.stat().st_mode & 0o777)
+                os.replace(replacement, copied)
+                return result
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_inspect_bound_sidecars",
+                    side_effect=replace_after_inspection,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._make_recovery_clone(source, destination)
+        self._assert_safety_code(
+            "prepared-file-identity-mismatch",
+            raised,
+        )
+
+    def test_clone_receipt_rejects_new_member_after_sidecar_inspection(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            destination = root / "clone"
+            original_inspect = MODULE._inspect_bound_sidecars
+
+            def inject_after_inspection(
+                store: MODULE._BoundRecoveryStore,
+            ) -> dict[str, object]:
+                result = original_inspect(store)
+                (destination / "unexpected-sidecar").write_bytes(b"injected")
+                return result
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_inspect_bound_sidecars",
+                    side_effect=inject_after_inspection,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._make_recovery_clone(source, destination)
+        self._assert_safety_code("prepared-file-set-mismatch", raised)
+
+    def test_clone_receipt_binds_wal_identity_content_and_access_policy(
+        self,
+    ) -> None:
+        attacks = (
+            ("identity", "prepared-file-identity-mismatch"),
+            ("content", "prepared-file-content-mismatch"),
+            ("access", "prepared-file-access-policy-mismatch"),
+        )
+        for attack, expected_code in attacks:
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                source = root / MODULE.NOTE_STORE_MAIN
+                writer = self._create_checkpointed_then_wal_only_db(source)
+                try:
+                    clone = MODULE._make_recovery_clone(source, root / "clone")
+                    wal = clone.main_path.with_name(f"{clone.main_path.name}-wal")
+                    if attack == "identity":
+                        replacement = root / "replacement-wal"
+                        replacement.write_bytes(wal.read_bytes())
+                        replacement.chmod(wal.stat().st_mode & 0o777)
+                        os.replace(replacement, wal)
+                    elif attack == "content":
+                        payload = bytearray(wal.read_bytes())
+                        payload[-1] ^= 0xFF
+                        wal.write_bytes(payload)
+                    else:
+                        wal.chmod(0o400)
+                    with (
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                        MODULE._bind_recovery_store(
+                            clone.main_path,
+                            creation_receipt=clone.receipt,
+                        ),
+                    ):
+                        pass
+                    self._assert_safety_code(expected_code, raised)
+                finally:
+                    writer.close()
+
+    def test_standalone_backup_ignores_wal_created_after_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "validated.sqlite"
+            setup = self._create_checkpointed_then_wal_only_db(source)
+            setup.close()
+            for suffix in ("-wal", "-shm"):
+                sidecar = source.with_name(f"{source.name}{suffix}")
+                if sidecar.exists():
+                    sidecar.unlink()
+            self.assertFalse(source.with_name(f"{source.name}-wal").exists())
+            output = root / "output.sqlite"
+            with MODULE._bind_regular_file(
+                source,
+                MODULE.PREPARED_FILE_CODES,
+            ) as bound:
+                writer = sqlite3.connect(source)
+                try:
+                    self.assertEqual(
+                        writer.execute("PRAGMA journal_mode = WAL").fetchone()[0],
+                        "wal",
+                    )
+                    writer.execute("PRAGMA wal_autocheckpoint = 0")
+                    writer.execute("INSERT INTO evidence VALUES ('injected-wal')")
+                    writer.commit()
+                    self.assertTrue(source.with_name(f"{source.name}-wal").exists())
+                    MODULE._backup_bound_regular_to_standalone(bound, output)
+                finally:
+                    writer.close()
+            with closing(sqlite3.connect(output)) as recovered:
+                values = [
+                    str(row[0])
+                    for row in recovered.execute(
+                        "SELECT value FROM evidence ORDER BY rowid"
+                    )
+                ]
+        self.assertEqual(values, ["checkpointed", "wal-only"])
+
+    def test_wal_header_rejects_database_header_page_size_sentinel(self) -> None:
+        prefix = struct.pack(
+            ">6I",
+            0x377F0683,
+            MODULE.WAL_VERSION,
+            1,
+            0,
+            0x12345678,
+            0x9ABCDEF0,
+        )
+        checksum = MODULE._wal_checksum(prefix, ">")
+        payload = prefix + struct.pack(">2I", *checksum)
+        with self.assertRaises(MODULE.StoreSafetyError) as raised:
+            MODULE._inspect_wal_payload(payload, Path("sentinel.wal"))
+        self._assert_safety_code("wal-invalid", raised)
+
+    def test_wal_header_accepts_direct_65536_page_size(self) -> None:
+        prefix = struct.pack(
+            ">6I",
+            0x377F0683,
+            MODULE.WAL_VERSION,
+            65536,
+            0,
+            0x12345678,
+            0x9ABCDEF0,
+        )
+        checksum = MODULE._wal_checksum(prefix, ">")
+        payload = prefix + struct.pack(">2I", *checksum)
+        result = MODULE._inspect_wal_payload(payload, Path("65536.wal"))
+        self.assertEqual(result["page_size"], 65536)
+        self.assertEqual(result["status"], "valid")
+
+    def test_bound_backup_rejects_wal_replacement_during_sqlite_backup(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            source = source_dir / MODULE.NOTE_STORE_MAIN
+            writer = self._create_checkpointed_then_wal_only_db(source)
+            wal = source.with_name(f"{source.name}-wal")
+            parked = root / "parked-wal"
+            replacement = root / "replacement-wal"
+            replacement.write_bytes(wal.read_bytes())
+            replacement.chmod(wal.stat().st_mode & 0o777)
+            output = root / "output.sqlite"
+            original_backup = MODULE._sqlite_backup_bytes
+            attacked = False
+
+            def replace_wal_during_backup(
+                source_uri: str,
+                source_path: Path,
+            ) -> bytes:
+                nonlocal attacked
+                attacked = True
+                os.replace(wal, parked)
+                os.replace(replacement, wal)
+                return original_backup(source_uri, source_path)
+
+            try:
+                with (
+                    MODULE._bind_recovery_store(
+                        source,
+                    ) as store,
+                    mock.patch.object(
+                        MODULE,
+                        "_sqlite_backup_bytes",
+                        side_effect=replace_wal_during_backup,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE._backup_sqlite_to_standalone(store, output)
+                self._assert_safety_code(
+                    "prepared-file-identity-mismatch",
+                    raised,
+                )
+                self.assertTrue(attacked)
+                self.assertFalse(output.exists())
+            finally:
+                if wal.exists():
+                    os.replace(wal, replacement)
+                if parked.exists():
+                    os.replace(parked, wal)
+                writer.close()
+
+    def test_bound_backup_ignores_replaced_directory_namespace_during_sqlite_backup(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            source = source_dir / MODULE.NOTE_STORE_MAIN
+            writer = self._create_checkpointed_then_wal_only_db(source)
+            replacement_dir = root / "replacement"
+            replacement_dir.mkdir()
+            self._create_db(
+                replacement_dir / MODULE.NOTE_STORE_MAIN,
+                value="replacement",
+            )
+            parked_dir = root / "parked-source"
+            output = root / "output.sqlite"
+            original_backup = MODULE._sqlite_backup_bytes
+            attacked = False
+
+            def replace_directory_during_backup(
+                source_uri: str,
+                source_path: Path,
+            ) -> bytes:
+                nonlocal attacked
+                attacked = True
+                os.replace(source_dir, parked_dir)
+                os.replace(replacement_dir, source_dir)
+                try:
+                    return original_backup(source_uri, source_path)
+                finally:
+                    os.replace(source_dir, replacement_dir)
+                    os.replace(parked_dir, source_dir)
+
+            try:
+                with (
+                    MODULE._bind_recovery_store(
+                        source,
+                    ) as store,
+                    mock.patch.object(
+                        MODULE,
+                        "_sqlite_backup_bytes",
+                        side_effect=replace_directory_during_backup,
+                    ),
+                ):
+                    MODULE._backup_sqlite_to_standalone(store, output)
+                with closing(sqlite3.connect(output)) as recovered:
+                    values = [
+                        str(row[0])
+                        for row in recovered.execute(
+                            "SELECT value FROM evidence ORDER BY rowid"
+                        )
+                    ]
+                with closing(
+                    sqlite3.connect(replacement_dir / MODULE.NOTE_STORE_MAIN)
+                ) as replacement_db:
+                    replacement_value = replacement_db.execute(
+                        "SELECT value FROM sample"
+                    ).fetchone()[0]
+            finally:
+                writer.close()
+        self.assertTrue(attacked)
+        self.assertEqual(values, ["checkpointed", "wal-only"])
+        self.assertEqual(replacement_value, "replacement")
+
+    def test_bound_backup_rejects_persistent_directory_replacement_during_backup(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            source = source_dir / MODULE.NOTE_STORE_MAIN
+            writer = self._create_checkpointed_then_wal_only_db(source)
+            replacement_dir = root / "replacement"
+            replacement_dir.mkdir()
+            self._create_db(
+                replacement_dir / MODULE.NOTE_STORE_MAIN,
+                value="replacement",
+            )
+            parked_dir = root / "parked-source"
+            output = root / "output.sqlite"
+            original_backup = MODULE._sqlite_backup_bytes
+            attacked = False
+
+            def replace_directory_during_backup(
+                source_uri: str,
+                source_path: Path,
+            ) -> bytes:
+                nonlocal attacked
+                attacked = True
+                os.replace(source_dir, parked_dir)
+                os.replace(replacement_dir, source_dir)
+                return original_backup(source_uri, source_path)
+
+            try:
+                with (
+                    MODULE._bind_recovery_store(
+                        source,
+                    ) as store,
+                    mock.patch.object(
+                        MODULE,
+                        "_sqlite_backup_bytes",
+                        side_effect=replace_directory_during_backup,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE._backup_sqlite_to_standalone(store, output)
+                self._assert_safety_code(
+                    "prepared-directory-identity-mismatch",
+                    raised,
+                )
+                self.assertTrue(attacked)
+                self.assertFalse(output.exists())
+            finally:
+                if source_dir.exists():
+                    os.replace(source_dir, replacement_dir)
+                if parked_dir.exists():
+                    os.replace(parked_dir, source_dir)
+                writer.close()
 
     def test_merge_writes_backup_through_bound_output_after_path_swap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1212,6 +1645,65 @@ raise SystemExit(2)
                 raised,
             )
             self.assertFalse(recovered.exists())
+
+    def test_recover_snapshot_ignores_wal_injected_beside_validated_artifact(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(
+                paths.group_container / MODULE.NOTE_STORE_MAIN,
+                value="validated",
+            )
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = MODULE.copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+            original_recover = MODULE._recover_validated_clone_to_standalone
+            injected = False
+
+            def inject_wal_then_recover(
+                recovered_main: Path,
+                out: Path,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                nonlocal injected
+                attacker = recovered_main.with_name("attacker.sqlite")
+                shutil.copy2(recovered_main, attacker)
+                writer = sqlite3.connect(attacker)
+                try:
+                    self.assertEqual(
+                        writer.execute("PRAGMA journal_mode = WAL").fetchone()[0],
+                        "wal",
+                    )
+                    writer.execute("PRAGMA wal_autocheckpoint = 0")
+                    writer.execute("UPDATE sample SET value = 'injected-from-wal'")
+                    writer.commit()
+                    attacker_wal = attacker.with_name(f"{attacker.name}-wal")
+                    injected_wal = recovered_main.with_name(
+                        f"{recovered_main.name}-wal"
+                    )
+                    shutil.copy2(attacker_wal, injected_wal)
+                    injected = injected_wal.exists()
+                    return original_recover(recovered_main, out, **kwargs)
+                finally:
+                    writer.close()
+
+            recovered = root / "recovered.sqlite"
+            with mock.patch.object(
+                MODULE,
+                "_recover_validated_clone_to_standalone",
+                side_effect=inject_wal_then_recover,
+            ):
+                MODULE.recover_snapshot(snapshot_dir, recovered)
+            with closing(sqlite3.connect(recovered)) as conn:
+                recovered_value = conn.execute("SELECT value FROM sample").fetchone()[0]
+        self.assertTrue(injected)
+        self.assertEqual(recovered_value, "validated")
 
     def test_recover_snapshot_binds_clone_during_connect_path_swap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

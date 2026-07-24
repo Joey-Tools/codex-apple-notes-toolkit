@@ -106,15 +106,56 @@ Run full `PRAGMA integrity_check` after opening the recovery clone.
 When producing an analysis database or patch stage, use SQLite's backup API to create a standalone
 database, normalize it to non-WAL journal mode, close it, and run full `PRAGMA integrity_check`
 again.
-Open the standalone backup source through the held regular-file descriptor with a read-only,
-immutable SQLite URI. Revalidate that same descriptor before and after backup. A pathname
-reopened between those checks is not an acceptable source because a replace-then-restore race can
-otherwise feed SQLite different bytes while both pathname checks appear stable.
+Bind the private recovery directory first, then open the main database and present WAL relative to
+that held directory descriptor. Keep the directory, main, and WAL descriptors open across byte
+capture and SQLite backup. Before and after SQLite consumption, require:
+
+- the directory descriptor and pathname to identify the same directory object with the same mode,
+  owner, group, and platform flags;
+- two descriptor-relative directory scans to retain the exact name/type map captured at binding;
+- the main and WAL descriptor identities, SHA-256 values, sizes, and access policies to remain
+  stable and to match their descriptor-relative names; and
+- any WAL classified as authoritative by the validated recovery evidence to remain present.
+
+Create and retain a recovery-clone receipt before releasing the creation-time directory
+descriptor. Bind that receipt to the created directory identity/access policy, every copied
+main/WAL/SHM identity/SHA-256/size/access policy, and the exact directory name/type map. Inspect
+WAL and derived SHM bytes only through the receipt-bound copied descriptors. Every later recovery
+binding must match this creation receipt before consuming bytes. Persistent directory or file
+replacement, byte or access-policy mutation, and entry addition/removal between copy, sidecar
+inspection, and later binding therefore fail closed.
+
+Parse and apply the checksum-valid WAL frames through the last commit frame to the stable held
+main-database bytes. Use that commit frame's database-size field as the final page count. Reject a
+page-size mismatch, invalid commit boundary, or database growth that cannot be bounded by the main
+database plus the committed frame count.
+The WAL header stores page size as an unsigned 32-bit value. Accept `65536` directly; reject `1`
+instead of applying the SQLite database-header 16-bit `1 => 65536` sentinel rule to WAL bytes.
+Write the recovered image to an anonymous temporary regular-file descriptor and open only that
+descriptor through a read-only, immutable SQLite URI. Revalidate the anonymous descriptor before
+and after the native backup. SQLite never receives or reopens the mutable main, WAL, or containing
+directory pathname, so a replace-then-restore namespace race during SQLite open cannot substitute
+different source bytes.
 Run the native SQLite backup API into an in-memory destination, serialize that database, and write
 the bytes directly to the exclusively created output descriptor. Never ask SQLite to reopen the
 mutable output pathname. Bind the completed output and run `PRAGMA integrity_check` through its
 read-only descriptor URI; replacing and restoring the output pathname during either write or
 integrity validation must not redirect those operations.
+
+Treat a validated sidecar-free standalone file as a different source profile from a recovery
+store. Its later backup reads and revalidates only the already held main-file descriptor, builds
+another anonymous image from those exact bytes, and never scans its containing directory for a
+new WAL, SHM, or rollback journal. An adjacent sidecar injected after standalone validation cannot
+be admitted into the final backup.
+
+The protected recovery property is that SQLite consumes exactly the image derived from the
+creation-receipt-bound main descriptor plus the last committed checksum-valid WAL prefix.
+Persistent missing, unreadable, replaced, content-mutated, access-policy-mutated, or
+directory-membership-mutated input fails before the output path is created or published. An
+ephemeral namespace replacement restored before terminal revalidation may not be reported; it
+cannot alter the already captured descriptor bytes or redirect SQLite's anonymous input. This
+mechanism still does not provide a transactional cross-file snapshot while another process writes.
+Require Notes to stay quit whenever the result must be authoritative.
 
 Use the following recovery boundary:
 
@@ -234,7 +275,7 @@ The helper emits stable error codes, including:
 - `store-file-set-mismatch`;
 - `directory-identity-mismatch`, `directory-access-policy-mismatch`;
 - `directory-scan-inconclusive`;
-- `wal-invalid`, `sqlite-integrity-failed`;
+- `wal-invalid`, `sqlite-recovery-failed`, `sqlite-integrity-failed`;
 - `wal-shm-commit-mismatch`;
 - `notes-started-during-capture`, `notes-started-during-preflight`;
 - `notes-started-during-verification`;
@@ -272,4 +313,6 @@ The helper does not:
 - make a main/WAL/SHM filesystem replacement atomic;
 - mutate the live Notes store;
 - validate every macOS ACL, extended attribute, File Provider policy, or external process;
+- bound peak memory independently of recovered database size; native backup and serialization keep
+  a complete recovered image in memory;
 - replace a case-specific rollback plan and Joey's explicit writeback approval.

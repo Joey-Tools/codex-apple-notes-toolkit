@@ -21,7 +21,7 @@ from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Union
 
 
 GROUP_CONTAINER = Path.home() / "Library/Group Containers/group.com.apple.notes"
@@ -102,6 +102,29 @@ class _BoundDirectory:
     fd: int
     opened: os.stat_result
     parent_opened: os.stat_result
+
+
+@dataclass
+class _BoundRecoveryStore:
+    directory: _BoundDirectory
+    main_name: str
+    files: dict[str, _BoundRegularFile]
+    entry_types: dict[str, int]
+
+
+@dataclass(frozen=True)
+class _RecoveryStoreReceipt:
+    directory_identity: dict[str, int]
+    directory_access_policy: dict[str, int]
+    entry_types: dict[str, int]
+    files: dict[str, dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class _RecoveryClone:
+    main_path: Path
+    evidence: dict[str, Any]
+    receipt: _RecoveryStoreReceipt
 
 
 @dataclass(frozen=True)
@@ -527,14 +550,13 @@ def _translate_bound_open_error(
     )
 
 
-def _verify_bound_regular_file(
+def _verify_bound_regular_file_with_stat(
     bound: _BoundRegularFile,
     codes: _FileProtectionCodes,
     *,
-    path: Path | None = None,
+    target: Path,
+    stat_target: Callable[[], os.stat_result],
 ) -> dict[str, Any]:
-    target = path or bound.path
-
     def stat_descriptor() -> os.stat_result:
         try:
             return os.fstat(bound.fd)
@@ -546,7 +568,7 @@ def _verify_bound_regular_file(
 
     def stat_path() -> os.stat_result:
         try:
-            return os.stat(target, follow_symlinks=False)
+            return stat_target()
         except FileNotFoundError as exc:
             raise StoreSafetyError(
                 codes.missing,
@@ -634,6 +656,40 @@ def _verify_bound_regular_file(
     }
 
 
+def _verify_bound_regular_file(
+    bound: _BoundRegularFile,
+    codes: _FileProtectionCodes,
+    *,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    target = path or bound.path
+    return _verify_bound_regular_file_with_stat(
+        bound,
+        codes,
+        target=target,
+        stat_target=lambda: os.stat(target, follow_symlinks=False),
+    )
+
+
+def _verify_bound_regular_file_at(
+    bound: _BoundRegularFile,
+    codes: _FileProtectionCodes,
+    *,
+    dir_fd: int,
+    basename: str,
+) -> dict[str, Any]:
+    return _verify_bound_regular_file_with_stat(
+        bound,
+        codes,
+        target=bound.path,
+        stat_target=lambda: os.stat(
+            basename,
+            dir_fd=dir_fd,
+            follow_symlinks=False,
+        ),
+    )
+
+
 @contextmanager
 def _bind_regular_file(
     path: Path,
@@ -701,6 +757,446 @@ def _bind_regular_file(
             os.close(parent_fd)
 
 
+def _scan_bound_directory_entry_types(
+    binding: _BoundDirectory,
+) -> dict[str, int]:
+    scans: list[dict[str, int]] = []
+    for _ in range(2):
+        child_fd: int | None = None
+        try:
+            child_fd = os.open(
+                ".",
+                _directory_open_flags(),
+                dir_fd=binding.fd,
+            )
+            opened = os.fstat(child_fd)
+            if not stat.S_ISDIR(opened.st_mode) or not _same_identity(
+                binding.opened, opened
+            ):
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "The descriptor-relative recovery directory no longer "
+                    f"identifies its bound object: {binding.path}",
+                )
+            if _access_policy(opened) != _access_policy(binding.opened):
+                raise StoreSafetyError(
+                    "prepared-directory-access-policy-mismatch",
+                    "The descriptor-relative recovery directory access policy "
+                    f"changed: {binding.path}",
+                )
+            with os.scandir(child_fd) as entries:
+                scan: dict[str, int] = {}
+                for entry in entries:
+                    name = os.fsdecode(entry.name)
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError as exc:
+                        raise StoreSafetyError(
+                            "prepared-file-set-mismatch",
+                            "Recovery-directory membership changed during "
+                            f"descriptor-relative scan: {binding.path}",
+                        ) from exc
+                    except OSError as exc:
+                        raise StoreSafetyError(
+                            "prepared-directory-revalidation-inconclusive",
+                            "Cannot inspect a recovery-directory entry without "
+                            f"following links: {binding.path / name}: {exc}",
+                        ) from exc
+                    scan[name] = stat.S_IFMT(entry_stat.st_mode)
+            after = os.fstat(child_fd)
+            if not _same_identity(binding.opened, after):
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "Recovery-directory identity changed during descriptor-relative "
+                    f"scan: {binding.path}",
+                )
+            if _access_policy(after) != _access_policy(binding.opened):
+                raise StoreSafetyError(
+                    "prepared-directory-access-policy-mismatch",
+                    "Recovery-directory access policy changed during "
+                    f"descriptor-relative scan: {binding.path}",
+                )
+            scans.append(scan)
+        except StoreSafetyError:
+            raise
+        except OSError as exc:
+            raise StoreSafetyError(
+                "prepared-directory-revalidation-inconclusive",
+                "Cannot scan the bound recovery directory through its descriptor: "
+                f"{binding.path}: {exc}",
+            ) from exc
+        finally:
+            if child_fd is not None:
+                os.close(child_fd)
+    if scans[0] != scans[1]:
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "Recovery-directory membership changed between descriptor-relative "
+            f"scans: {binding.path}",
+        )
+    return scans[1]
+
+
+@contextmanager
+def _bind_regular_file_at(
+    path: Path,
+    parent: _BoundDirectory,
+    codes: _FileProtectionCodes,
+) -> Iterator[_BoundRegularFile]:
+    try:
+        path_before = os.stat(
+            path.name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            codes.missing,
+            f"Descriptor-relative regular-file path is missing: {path}",
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            codes.inconclusive,
+            f"Cannot inspect descriptor-relative regular file {path}: {exc}",
+        ) from exc
+    if not stat.S_ISREG(path_before.st_mode):
+        raise StoreSafetyError(
+            codes.identity,
+            f"Descriptor-relative source is not a regular file: {path}",
+        )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path.name, flags, dir_fd=parent.fd)
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            codes.missing,
+            f"Descriptor-relative regular file disappeared before open: {path}",
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            codes.inconclusive,
+            f"Cannot safely open descriptor-relative regular file {path}: {exc}",
+        ) from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or not _same_identity(path_before, opened):
+            raise StoreSafetyError(
+                codes.identity,
+                f"Descriptor-relative regular file was replaced while opening: {path}",
+            )
+        try:
+            sha256 = _hash_fd(fd)
+        except OSError as exc:
+            raise StoreSafetyError(
+                codes.inconclusive,
+                f"Cannot hash descriptor-relative regular file {path}: {exc}",
+            ) from exc
+        bound = _BoundRegularFile(
+            path=path,
+            fd=fd,
+            opened=opened,
+            sha256=sha256,
+            parent_opened=parent.opened,
+        )
+        _verify_bound_regular_file_at(
+            bound,
+            codes,
+            dir_fd=parent.fd,
+            basename=path.name,
+        )
+        yield bound
+    finally:
+        os.close(fd)
+
+
+def _verify_bound_recovery_store(
+    store: _BoundRecoveryStore,
+) -> dict[str, Any]:
+    directory = _verify_bound_directory(store.directory)
+    files = {
+        basename: _verify_bound_regular_file_at(
+            bound,
+            PREPARED_FILE_CODES,
+            dir_fd=store.directory.fd,
+            basename=basename,
+        )
+        for basename, bound in store.files.items()
+    }
+    entries = _scan_bound_directory_entry_types(store.directory)
+    if entries != store.entry_types:
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "Recovery-directory name/type membership changed while SQLite "
+            f"consumed the bound store: {store.directory.path}",
+        )
+    return {
+        "directory": directory,
+        "files": files,
+        "entry_types": entries,
+    }
+
+
+def _assert_recovery_store_matches_receipt(
+    store: _BoundRecoveryStore,
+    receipt: _RecoveryStoreReceipt,
+) -> dict[str, Any]:
+    current = _verify_bound_recovery_store(store)
+    directory = current["directory"]
+    if directory["identity"] != receipt.directory_identity:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            "Recovery-directory identity differs from its creation receipt: "
+            f"{store.directory.path}",
+        )
+    if directory["access_policy"] != receipt.directory_access_policy:
+        raise StoreSafetyError(
+            "prepared-directory-access-policy-mismatch",
+            "Recovery-directory access policy differs from its creation receipt: "
+            f"{store.directory.path}",
+        )
+    if current["entry_types"] != receipt.entry_types:
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "Recovery-directory membership differs from its creation receipt: "
+            f"{store.directory.path}",
+        )
+    if set(store.files) != set(receipt.files):
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "Bound recovery files differ from the creation receipt: "
+            f"{store.directory.path}",
+        )
+    for basename, file_receipt in receipt.files.items():
+        _assert_bound_matches_receipt(
+            store.files[basename],
+            file_receipt,
+            dir_fd=store.directory.fd,
+            basename=basename,
+        )
+    return current
+
+
+def _recovery_store_creation_receipt(
+    directory: _BoundDirectory,
+    main_name: str,
+    file_receipts: dict[str, dict[str, Any]],
+) -> _RecoveryStoreReceipt:
+    expected_entries = {basename: stat.S_IFREG for basename in file_receipts}
+    directory_receipt = _verify_bound_directory(directory)
+    entries = _scan_bound_directory_entry_types(directory)
+    if entries != expected_entries:
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "Recovery clone membership differs from the exact copied file set: "
+            f"{directory.path}",
+        )
+    receipt = _RecoveryStoreReceipt(
+        directory_identity=dict(directory_receipt["identity"]),
+        directory_access_policy=dict(directory_receipt["access_policy"]),
+        entry_types=dict(expected_entries),
+        files={
+            basename: dict(file_receipt)
+            for basename, file_receipt in file_receipts.items()
+        },
+    )
+    if main_name not in file_receipts:
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "Recovery clone creation receipt does not contain its main database: "
+            f"{directory.path / main_name}",
+        )
+    with _bind_recovery_store(
+        directory.path / main_name,
+        creation_receipt=receipt,
+    ) as store:
+        _assert_recovery_store_matches_receipt(store, receipt)
+    return receipt
+
+
+def _require_authoritative_wal(
+    store: _BoundRecoveryStore,
+    recovery_evidence: dict[str, Any],
+) -> None:
+    authoritative = (
+        recovery_evidence.get("sidecars", {})
+        .get("recovery", {})
+        .get("authoritative_files", [])
+    )
+    wal_name = f"{store.main_name}-wal"
+    if wal_name in authoritative and wal_name not in store.files:
+        raise StoreSafetyError(
+            "prepared-file-missing",
+            "The validated recovery evidence requires a committed WAL, but the "
+            f"bound recovery store no longer contains it: "
+            f"{store.directory.path / wal_name}",
+        )
+
+
+@contextmanager
+def _bind_recovery_store(
+    main_path: Path,
+    *,
+    creation_receipt: _RecoveryStoreReceipt | None = None,
+) -> Iterator[_BoundRecoveryStore]:
+    directory_path = main_path.parent
+    parent_fd: int | None = None
+    directory_fd: int | None = None
+    try:
+        parent_fd = os.open(directory_path.parent, _directory_open_flags())
+        parent_opened = os.fstat(parent_fd)
+        directory_before = os.stat(
+            directory_path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        directory_fd = os.open(
+            directory_path.name,
+            _directory_open_flags(),
+            dir_fd=parent_fd,
+        )
+        directory_opened = os.fstat(directory_fd)
+        directory_after = os.stat(
+            directory_path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(directory_before.st_mode)
+            or not stat.S_ISDIR(directory_opened.st_mode)
+            or not _same_identity(directory_before, directory_opened)
+            or not _same_identity(directory_opened, directory_after)
+        ):
+            raise StoreSafetyError(
+                "prepared-directory-identity-mismatch",
+                f"Recovery directory was replaced while binding: {directory_path}",
+            )
+        if _access_policy(directory_before) != _access_policy(
+            directory_opened
+        ) or _access_policy(directory_opened) != _access_policy(directory_after):
+            raise StoreSafetyError(
+                "prepared-directory-access-policy-mismatch",
+                "Recovery-directory access policy changed while binding: "
+                f"{directory_path}",
+            )
+    except StoreSafetyError:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise
+    except FileNotFoundError as exc:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise StoreSafetyError(
+            "prepared-directory-missing",
+            f"Recovery directory is missing: {directory_path}",
+        ) from exc
+    except OSError as exc:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Cannot bind recovery directory {directory_path}: {exc}",
+        ) from exc
+    assert directory_fd is not None
+    assert parent_fd is not None
+    directory = _BoundDirectory(
+        path=directory_path,
+        fd=directory_fd,
+        opened=directory_opened,
+        parent_opened=parent_opened,
+    )
+    os.close(parent_fd)
+    parent_fd = None
+    try:
+        initial_entries = _scan_bound_directory_entry_types(directory)
+        if creation_receipt is not None:
+            current_directory = _verify_bound_directory(directory)
+            if current_directory["identity"] != creation_receipt.directory_identity:
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "Recovery directory differs from its creation receipt: "
+                    f"{directory_path}",
+                )
+            if (
+                current_directory["access_policy"]
+                != creation_receipt.directory_access_policy
+            ):
+                raise StoreSafetyError(
+                    "prepared-directory-access-policy-mismatch",
+                    "Recovery-directory access policy differs from its creation "
+                    f"receipt: {directory_path}",
+                )
+            if initial_entries != creation_receipt.entry_types:
+                raise StoreSafetyError(
+                    "prepared-file-set-mismatch",
+                    "Recovery-directory membership differs from its creation "
+                    f"receipt: {directory_path}",
+                )
+        main_name = main_path.name
+        wal_name = f"{main_name}-wal"
+        if initial_entries.get(main_name) != stat.S_IFREG:
+            code = (
+                "prepared-file-missing"
+                if main_name not in initial_entries
+                else "prepared-file-identity-mismatch"
+            )
+            raise StoreSafetyError(
+                code,
+                f"Recovery main database is missing or not regular: {main_path}",
+            )
+        if wal_name in initial_entries and initial_entries[wal_name] != stat.S_IFREG:
+            raise StoreSafetyError(
+                "prepared-file-identity-mismatch",
+                "Recovery WAL is present but not a regular file: "
+                f"{directory_path / wal_name}",
+            )
+        with ExitStack() as stack:
+            basenames = (
+                list(creation_receipt.files)
+                if creation_receipt is not None
+                else [
+                    basename
+                    for basename in (main_name, wal_name)
+                    if basename in initial_entries
+                ]
+            )
+            files: dict[str, _BoundRegularFile] = {}
+            for basename in basenames:
+                if initial_entries.get(basename) != stat.S_IFREG:
+                    raise StoreSafetyError(
+                        "prepared-file-identity-mismatch",
+                        "Recovery receipt names a missing or non-regular file: "
+                        f"{directory_path / basename}",
+                    )
+                files[basename] = stack.enter_context(
+                    _bind_regular_file_at(
+                        directory_path / basename,
+                        directory,
+                        PREPARED_FILE_CODES,
+                    )
+                )
+            store = _BoundRecoveryStore(
+                directory=directory,
+                main_name=main_name,
+                files=files,
+                entry_types=initial_entries,
+            )
+            _verify_bound_recovery_store(store)
+            if creation_receipt is not None:
+                _assert_recovery_store_matches_receipt(
+                    store,
+                    creation_receipt,
+                )
+            yield store
+    finally:
+        os.close(directory_fd)
+
+
 def _read_bound_file_bytes(
     bound: _BoundRegularFile,
     codes: _FileProtectionCodes,
@@ -708,6 +1204,8 @@ def _read_bound_file_bytes(
     max_bytes: int,
     too_large_code: str,
     path: Path | None = None,
+    dir_fd: int | None = None,
+    basename: str | None = None,
 ) -> bytes:
     if bound.opened.st_size > max_bytes:
         raise StoreSafetyError(
@@ -734,7 +1232,15 @@ def _read_bound_file_bytes(
             codes.content,
             f"Bound file bytes changed while reading: {bound.path}",
         )
-    _verify_bound_regular_file(bound, codes, path=path)
+    if dir_fd is not None and basename is not None:
+        _verify_bound_regular_file_at(
+            bound,
+            codes,
+            dir_fd=dir_fd,
+            basename=basename,
+        )
+    else:
+        _verify_bound_regular_file(bound, codes, path=path)
     return bytes(payload)
 
 
@@ -1115,7 +1621,10 @@ def _revalidate_open_source(
 
 
 def _capture_database_files(
-    main_path: Path, destination_dir: Path | None = None
+    main_path: Path,
+    destination_dir: Path | None = None,
+    *,
+    destination_binding: _BoundDirectory | None = None,
 ) -> list[dict[str, Any]]:
     before_paths = _discover_database_files(main_path)
     before_names = [path.name for path in before_paths]
@@ -1133,7 +1642,16 @@ def _capture_database_files(
             )
 
         if destination_dir is not None:
-            destination_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+            if destination_binding is None:
+                destination_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+            else:
+                if destination_binding.path != destination_dir:
+                    raise StoreSafetyError(
+                        "prepared-directory-identity-mismatch",
+                        "Recovery destination binding does not match the copy target: "
+                        f"{destination_dir}",
+                    )
+                _verify_bound_directory(destination_binding)
 
         for opened in opened_sources:
             if destination_dir is None:
@@ -1205,6 +1723,8 @@ def _capture_database_files(
                 "store-file-set-mismatch",
                 "SQLite/WAL/SHM membership changed during capture",
             )
+        if destination_binding is not None:
+            _verify_bound_directory(destination_binding)
         return records
     finally:
         for opened in opened_sources:
@@ -1509,31 +2029,42 @@ def _assert_bound_matches_receipt(
     receipt: dict[str, Any],
     *,
     path: Path | None = None,
+    dir_fd: int | None = None,
+    basename: str | None = None,
 ) -> dict[str, Any]:
-    current = _verify_bound_regular_file(
-        bound,
-        PREPARED_FILE_CODES,
-        path=path,
-    )
+    if (dir_fd is None) != (basename is None):
+        raise ValueError("dir_fd and basename must be supplied together")
+    if dir_fd is not None and basename is not None:
+        current = _verify_bound_regular_file_at(
+            bound,
+            PREPARED_FILE_CODES,
+            dir_fd=dir_fd,
+            basename=basename,
+        )
+        target = bound.path
+    else:
+        current = _verify_bound_regular_file(
+            bound,
+            PREPARED_FILE_CODES,
+            path=path,
+        )
+        target = path or bound.path
     if current["identity"] != receipt.get("identity"):
         raise StoreSafetyError(
             "prepared-file-identity-mismatch",
-            f"Prepared file identity differs from its creation receipt: "
-            f"{path or bound.path}",
+            f"Prepared file identity differs from its creation receipt: {target}",
         )
     if current["access_policy"] != receipt.get("access_policy"):
         raise StoreSafetyError(
             "prepared-file-access-policy-mismatch",
-            f"Prepared file access policy differs from its creation receipt: "
-            f"{path or bound.path}",
+            f"Prepared file access policy differs from its creation receipt: {target}",
         )
     if current["sha256"] != receipt.get("sha256") or current["size"] != receipt.get(
         "size"
     ):
         raise StoreSafetyError(
             "prepared-file-content-mismatch",
-            f"Prepared file bytes differ from its creation receipt: "
-            f"{path or bound.path}",
+            f"Prepared file bytes differ from its creation receipt: {target}",
         )
     return current
 
@@ -1713,8 +2244,8 @@ def _wal_checksum(
     return checksum0, checksum1
 
 
-def _inspect_wal(wal_path: Path) -> dict[str, Any]:
-    size = wal_path.stat().st_size
+def _inspect_wal_payload(payload: bytes, wal_path: Path) -> dict[str, Any]:
+    size = len(payload)
     if size == 0:
         return {
             "present": True,
@@ -1723,63 +2254,58 @@ def _inspect_wal(wal_path: Path) -> dict[str, Any]:
             "frame_count": 0,
             "commit_frame_count": 0,
         }
-    with wal_path.open("rb") as handle:
-        header = handle.read(32)
-        if len(header) != 32:
-            raise StoreSafetyError(
-                "wal-invalid", f"WAL header is truncated: {wal_path}"
-            )
-        magic, version, raw_page_size, _, salt1, salt2, stored0, stored1 = (
-            struct.unpack(">8I", header)
+    header = payload[:32]
+    if len(header) != 32:
+        raise StoreSafetyError("wal-invalid", f"WAL header is truncated: {wal_path}")
+    magic, version, raw_page_size, _, salt1, salt2, stored0, stored1 = struct.unpack(
+        ">8I", header
+    )
+    if magic not in WAL_MAGIC_NUMBERS:
+        raise StoreSafetyError("wal-invalid", f"WAL magic is invalid: {wal_path}")
+    if version != WAL_VERSION:
+        raise StoreSafetyError(
+            "wal-version-unsupported",
+            f"Unsupported WAL version {version}: {wal_path}",
         )
-        if magic not in WAL_MAGIC_NUMBERS:
-            raise StoreSafetyError("wal-invalid", f"WAL magic is invalid: {wal_path}")
-        if version != WAL_VERSION:
-            raise StoreSafetyError(
-                "wal-version-unsupported",
-                f"Unsupported WAL version {version}: {wal_path}",
-            )
-        page_size = 65536 if raw_page_size == 1 else raw_page_size
-        if page_size < 512 or page_size > 65536 or page_size & (page_size - 1):
-            raise StoreSafetyError(
-                "wal-invalid", f"WAL page size is invalid: {wal_path}"
-            )
-        checksum_byte_order = ">" if magic == 0x377F0683 else "<"
-        checksum = _wal_checksum(header[:24], checksum_byte_order)
-        if checksum != (stored0, stored1):
-            raise StoreSafetyError(
-                "wal-invalid", f"WAL header checksum is invalid: {wal_path}"
-            )
-        frame_size = 24 + page_size
-        frame_bytes = size - 32
-        physical_frame_count, trailing_bytes = divmod(frame_bytes, frame_size)
-        valid_frame_count = 0
-        commit_frame_count = 0
-        last_valid_commit_frame = 0
-        first_invalid_frame: int | None = None
-        for index in range(physical_frame_count):
-            handle.seek(32 + index * frame_size)
-            frame_header = handle.read(24)
-            page = handle.read(page_size)
-            page_number, database_pages, frame_salt1, frame_salt2, _, _ = struct.unpack(
-                ">6I", frame_header
-            )
-            if page_number == 0 or (frame_salt1, frame_salt2) != (salt1, salt2):
-                first_invalid_frame = index + 1
-                break
-            expected_checksum = struct.unpack(">2I", frame_header[16:24])
-            checksum = _wal_checksum(
-                frame_header[:8] + page,
-                checksum_byte_order,
-                checksum,
-            )
-            if checksum != expected_checksum:
-                first_invalid_frame = index + 1
-                break
-            valid_frame_count = index + 1
-            if database_pages:
-                commit_frame_count += 1
-                last_valid_commit_frame = index + 1
+    page_size = raw_page_size
+    if page_size < 512 or page_size > 65536 or page_size & (page_size - 1):
+        raise StoreSafetyError("wal-invalid", f"WAL page size is invalid: {wal_path}")
+    checksum_byte_order = ">" if magic == 0x377F0683 else "<"
+    checksum = _wal_checksum(header[:24], checksum_byte_order)
+    if checksum != (stored0, stored1):
+        raise StoreSafetyError(
+            "wal-invalid", f"WAL header checksum is invalid: {wal_path}"
+        )
+    frame_size = 24 + page_size
+    frame_bytes = size - 32
+    physical_frame_count, trailing_bytes = divmod(frame_bytes, frame_size)
+    valid_frame_count = 0
+    commit_frame_count = 0
+    last_valid_commit_frame = 0
+    first_invalid_frame: int | None = None
+    for index in range(physical_frame_count):
+        offset = 32 + index * frame_size
+        frame_header = payload[offset : offset + 24]
+        page = payload[offset + 24 : offset + frame_size]
+        page_number, database_pages, frame_salt1, frame_salt2, _, _ = struct.unpack(
+            ">6I", frame_header
+        )
+        if page_number == 0 or (frame_salt1, frame_salt2) != (salt1, salt2):
+            first_invalid_frame = index + 1
+            break
+        expected_checksum = struct.unpack(">2I", frame_header[16:24])
+        checksum = _wal_checksum(
+            frame_header[:8] + page,
+            checksum_byte_order,
+            checksum,
+        )
+        if checksum != expected_checksum:
+            first_invalid_frame = index + 1
+            break
+        valid_frame_count = index + 1
+        if database_pages:
+            commit_frame_count += 1
+            last_valid_commit_frame = index + 1
     return {
         "present": True,
         "status": (
@@ -1797,6 +2323,17 @@ def _inspect_wal(wal_path: Path) -> dict[str, Any]:
         "trailing_bytes": trailing_bytes,
         "salt": [salt1, salt2],
     }
+
+
+def _inspect_wal(wal_path: Path) -> dict[str, Any]:
+    try:
+        payload = wal_path.read_bytes()
+    except OSError as exc:
+        raise StoreSafetyError(
+            "wal-invalid",
+            f"Cannot read WAL for validation: {wal_path}: {exc}",
+        ) from exc
+    return _inspect_wal_payload(payload, wal_path)
 
 
 def _parse_shm_header_copy(payload: bytes, offset: int) -> dict[str, Any] | None:
@@ -1823,19 +2360,23 @@ def _parse_shm_header_copy(payload: bytes, offset: int) -> dict[str, Any] | None
     return None
 
 
-def _inspect_sidecars(main_path: Path) -> dict[str, Any]:
+def _classify_sidecar_payloads(
+    main_path: Path,
+    *,
+    wal_payload: bytes | None,
+    shm_payload: bytes | None,
+) -> dict[str, Any]:
     wal_path = main_path.with_name(f"{main_path.name}-wal")
     shm_path = main_path.with_name(f"{main_path.name}-shm")
     wal: dict[str, Any]
-    if wal_path.exists():
-        wal = _inspect_wal(wal_path)
+    if wal_payload is not None:
+        wal = _inspect_wal_payload(wal_payload, wal_path)
     else:
         wal = {"present": False, "status": "absent"}
 
     shm: dict[str, Any] = {"present": False, "status": "absent"}
-    if shm_path.exists():
-        with shm_path.open("rb") as handle:
-            header = handle.read(96)
+    if shm_payload is not None:
+        header = shm_payload[:96]
         copies = [
             parsed
             for parsed in (
@@ -1870,15 +2411,15 @@ def _inspect_sidecars(main_path: Path) -> dict[str, Any]:
             "status": "derived-match"
             if matching_copies
             else "derived-rebuild-required",
-            "size": shm_path.stat().st_size,
+            "size": len(shm_payload),
             "valid_header_copies": len(copies),
             "same_generation_header_copies": len(same_generation),
             "matching_wal_header_copies": matching_copies,
         }
 
-    ignored = [shm_path.name] if shm_path.exists() else []
+    ignored = [shm_path.name] if shm_payload is not None else []
     authoritative = [main_path.name]
-    if wal_path.exists() and wal.get("last_valid_commit_frame", 0) > 0:
+    if wal_payload is not None and wal.get("last_valid_commit_frame", 0) > 0:
         authoritative.append(wal_path.name)
     return {
         "wal": wal,
@@ -1886,9 +2427,59 @@ def _inspect_sidecars(main_path: Path) -> dict[str, Any]:
         "recovery": {
             "authoritative_files": authoritative,
             "ignored_derived_files": ignored,
-            "strategy": "copy main and valid WAL, omit SHM, let SQLite rebuild WAL-index state",
+            "strategy": (
+                "bind copied main/WAL/SHM, ignore derived SHM bytes, and apply the "
+                "checksum-valid committed WAL prefix to an anonymous image"
+            ),
         },
     }
+
+
+def _inspect_sidecars(main_path: Path) -> dict[str, Any]:
+    wal_path = main_path.with_name(f"{main_path.name}-wal")
+    shm_path = main_path.with_name(f"{main_path.name}-shm")
+    try:
+        wal_payload = wal_path.read_bytes() if wal_path.exists() else None
+        shm_payload = shm_path.read_bytes() if shm_path.exists() else None
+    except OSError as exc:
+        raise StoreSafetyError(
+            "wal-invalid",
+            f"Cannot read copied recovery sidecars beside {main_path}: {exc}",
+        ) from exc
+    return _classify_sidecar_payloads(
+        main_path,
+        wal_payload=wal_payload,
+        shm_payload=shm_payload,
+    )
+
+
+def _inspect_bound_sidecars(
+    store: _BoundRecoveryStore,
+) -> dict[str, Any]:
+    wal_name = f"{store.main_name}-wal"
+    shm_name = f"{store.main_name}-shm"
+
+    def read_if_present(basename: str) -> bytes | None:
+        bound = store.files.get(basename)
+        if bound is None:
+            return None
+        return _read_bound_file_bytes(
+            bound,
+            PREPARED_FILE_CODES,
+            max_bytes=bound.opened.st_size,
+            too_large_code="prepared-file-content-mismatch",
+            dir_fd=store.directory.fd,
+            basename=basename,
+        )
+
+    _verify_bound_recovery_store(store)
+    result = _classify_sidecar_payloads(
+        store.directory.path / store.main_name,
+        wal_payload=read_if_present(wal_name),
+        shm_payload=read_if_present(shm_name),
+    )
+    _verify_bound_recovery_store(store)
+    return result
 
 
 def _sqlite_integrity(
@@ -1931,23 +2522,39 @@ def _sqlite_integrity(
     }
 
 
-def _make_recovery_clone(
-    src_main: Path, destination: Path
-) -> tuple[Path, dict[str, Any]]:
-    records = _capture_database_files(src_main, destination)
-    copied_main = destination / src_main.name
-    sidecars = _inspect_sidecars(copied_main)
-    copied_shm = copied_main.with_name(f"{copied_main.name}-shm")
-    if copied_shm.exists():
-        copied_shm.unlink()
-    return copied_main, {"capture": records, "sidecars": sidecars}
+def _make_recovery_clone(src_main: Path, destination: Path) -> _RecoveryClone:
+    with _create_bound_directory(destination) as destination_binding:
+        records = _capture_database_files(
+            src_main,
+            destination,
+            destination_binding=destination_binding,
+        )
+        copied_main = destination / src_main.name
+        file_receipts = {str(record["basename"]): record["copy"] for record in records}
+        receipt = _recovery_store_creation_receipt(
+            destination_binding,
+            src_main.name,
+            file_receipts,
+        )
+        with _bind_recovery_store(
+            copied_main,
+            creation_receipt=receipt,
+        ) as copied_store:
+            sidecars = _inspect_bound_sidecars(copied_store)
+            _assert_recovery_store_matches_receipt(copied_store, receipt)
+        _verify_bound_directory(destination_binding)
+    return _RecoveryClone(
+        main_path=copied_main,
+        evidence={"capture": records, "sidecars": sidecars},
+        receipt=receipt,
+    )
 
 
 def _make_recovery_clone_from_bound(
     files: dict[str, _BoundRegularFile],
     destination: Path,
     codes: _FileProtectionCodes,
-) -> tuple[Path, dict[str, Any]]:
+) -> _RecoveryClone:
     """Copy an already-bound store without reopening mutable source paths."""
 
     if NOTE_STORE_MAIN not in files:
@@ -1955,41 +2562,62 @@ def _make_recovery_clone_from_bound(
             "manifest-invalid",
             "The bound recovery file set has no main SQLite database",
         )
-    destination.mkdir(mode=0o700, parents=True, exist_ok=False)
-    records: list[dict[str, Any]] = []
-    for basename in NOTE_STORE_BASENAMES:
-        bound = files.get(basename)
-        if bound is None:
-            continue
-        source = _verify_bound_regular_file(bound, codes)
-        copied = _copy_fd(bound.fd, destination / basename)
-        if copied["sha256"] != bound.sha256 or copied["size"] != bound.opened.st_size:
-            raise StoreSafetyError(
-                codes.content,
-                f"Bound source changed while creating recovery clone: {bound.path}",
+    with _create_bound_directory(destination) as destination_binding:
+        records: list[dict[str, Any]] = []
+        for basename in NOTE_STORE_BASENAMES:
+            bound = files.get(basename)
+            if bound is None:
+                continue
+            source = _verify_bound_regular_file(bound, codes)
+            copied = _copy_fd(bound.fd, destination / basename)
+            if (
+                copied["sha256"] != bound.sha256
+                or copied["size"] != bound.opened.st_size
+            ):
+                raise StoreSafetyError(
+                    codes.content,
+                    f"Bound source changed while creating recovery clone: {bound.path}",
+                )
+            records.append(
+                {
+                    "basename": basename,
+                    "source": source,
+                    "copy": copied,
+                }
             )
-        records.append(
-            {
-                "basename": basename,
-                "source": source,
-                "copy": copied,
-            }
+        copied_main = destination / NOTE_STORE_MAIN
+        file_receipts = {str(record["basename"]): record["copy"] for record in records}
+        receipt = _recovery_store_creation_receipt(
+            destination_binding,
+            NOTE_STORE_MAIN,
+            file_receipts,
         )
-    copied_main = destination / NOTE_STORE_MAIN
-    sidecars = _inspect_sidecars(copied_main)
-    copied_shm = copied_main.with_name(f"{copied_main.name}-shm")
-    if copied_shm.exists():
-        copied_shm.unlink()
-    return copied_main, {"capture": records, "sidecars": sidecars}
+        with _bind_recovery_store(
+            copied_main,
+            creation_receipt=receipt,
+        ) as copied_store:
+            sidecars = _inspect_bound_sidecars(copied_store)
+            _assert_recovery_store_matches_receipt(copied_store, receipt)
+        _verify_bound_directory(destination_binding)
+    return _RecoveryClone(
+        main_path=copied_main,
+        evidence={"capture": records, "sidecars": sidecars},
+        receipt=receipt,
+    )
 
 
 def validate_database_recovery(src_main: Path) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="apple-notes-recovery-") as temp_dir:
-        recovered_main, evidence = _make_recovery_clone(
-            src_main, Path(temp_dir) / "store"
-        )
-        evidence["sqlite_integrity"] = _sqlite_integrity(recovered_main)
-        return evidence
+        clone = _make_recovery_clone(src_main, Path(temp_dir) / "store")
+        with _bind_recovery_store(
+            clone.main_path,
+            creation_receipt=clone.receipt,
+        ) as recovered_store:
+            _require_authoritative_wal(recovered_store, clone.evidence)
+            clone.evidence["sqlite_integrity"] = _bound_recovery_integrity(
+                recovered_store
+            )
+        return clone.evidence
 
 
 def _fingerprint_file(path: Path) -> dict[str, Any]:
@@ -2376,6 +3004,261 @@ def _bound_sqlite_readonly_uri(
     )
 
 
+def _apply_committed_wal(
+    main_payload: bytes,
+    wal_payload: bytes,
+    wal: dict[str, Any],
+    source_path: Path,
+) -> bytes:
+    last_commit = int(wal.get("last_valid_commit_frame", 0))
+    if last_commit == 0:
+        return main_payload
+    if len(main_payload) < 100 or main_payload[:16] != b"SQLite format 3\0":
+        raise StoreSafetyError(
+            "sqlite-recovery-failed",
+            f"Recovery main database has an invalid SQLite header: {source_path}",
+        )
+    raw_main_page_size = struct.unpack(">H", main_payload[16:18])[0]
+    main_page_size = 65536 if raw_main_page_size == 1 else raw_main_page_size
+    page_size = int(wal["page_size"])
+    if (
+        main_page_size != page_size
+        or len(main_payload) % page_size != 0
+        or len(main_payload) < page_size
+    ):
+        raise StoreSafetyError(
+            "wal-invalid",
+            "The bound WAL page size does not match the complete main database: "
+            f"{source_path}",
+        )
+    frame_size = 24 + page_size
+    final_header_offset = 32 + (last_commit - 1) * frame_size
+    final_database_pages = struct.unpack(
+        ">I",
+        wal_payload[final_header_offset + 4 : final_header_offset + 8],
+    )[0]
+    if final_database_pages == 0:
+        raise StoreSafetyError(
+            "wal-invalid",
+            f"The selected final WAL frame is not a commit frame: {source_path}",
+        )
+    main_pages = len(main_payload) // page_size
+    if final_database_pages > main_pages + last_commit:
+        raise StoreSafetyError(
+            "wal-invalid",
+            "The committed WAL database size exceeds the bounded growth implied "
+            f"by the main database and committed frame count: {source_path}",
+        )
+    recovered = bytearray(main_payload[: final_database_pages * page_size])
+    if len(recovered) < final_database_pages * page_size:
+        recovered.extend(b"\0" * (final_database_pages * page_size - len(recovered)))
+    for index in range(last_commit):
+        offset = 32 + index * frame_size
+        page_number = struct.unpack(">I", wal_payload[offset : offset + 4])[0]
+        if page_number <= final_database_pages:
+            page_start = (page_number - 1) * page_size
+            recovered[page_start : page_start + page_size] = wal_payload[
+                offset + 24 : offset + frame_size
+            ]
+    return bytes(recovered)
+
+
+def _bound_recovery_payload(
+    store: _BoundRecoveryStore,
+) -> bytes:
+    _verify_bound_recovery_store(store)
+    main = store.files[store.main_name]
+    main_payload = _read_bound_file_bytes(
+        main,
+        PREPARED_FILE_CODES,
+        max_bytes=main.opened.st_size,
+        too_large_code="prepared-file-content-mismatch",
+        dir_fd=store.directory.fd,
+        basename=store.main_name,
+    )
+    wal_name = f"{store.main_name}-wal"
+    wal_bound = store.files.get(wal_name)
+    if wal_bound is None:
+        recovered = main_payload
+    else:
+        wal_payload = _read_bound_file_bytes(
+            wal_bound,
+            PREPARED_FILE_CODES,
+            max_bytes=wal_bound.opened.st_size,
+            too_large_code="prepared-file-content-mismatch",
+            dir_fd=store.directory.fd,
+            basename=wal_name,
+        )
+        wal = _inspect_wal_payload(
+            wal_payload,
+            store.directory.path / wal_name,
+        )
+        recovered = _apply_committed_wal(
+            main_payload,
+            wal_payload,
+            wal,
+            store.directory.path / store.main_name,
+        )
+    _verify_bound_recovery_store(store)
+    return recovered
+
+
+def _verify_anonymous_recovery_file(
+    bound: _BoundRegularFile,
+    descriptor_path: Path,
+) -> None:
+    probe_fd: int | None = None
+    try:
+        descriptor_before = os.fstat(bound.fd)
+        probe_fd = os.open(
+            descriptor_path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+        )
+        probe = os.fstat(probe_fd)
+        first_sha256 = _hash_fd(bound.fd)
+        descriptor_between = os.fstat(bound.fd)
+        second_sha256 = _hash_fd(bound.fd)
+        descriptor_after = os.fstat(bound.fd)
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            "Cannot revalidate the anonymous descriptor-backed recovery image "
+            f"for {bound.path}: {exc}",
+        ) from exc
+    finally:
+        if probe_fd is not None:
+            os.close(probe_fd)
+    if (
+        not stat.S_ISREG(descriptor_before.st_mode)
+        or not stat.S_ISREG(probe.st_mode)
+        or not _same_identity(bound.opened, descriptor_before)
+        or not _same_identity(descriptor_before, probe)
+        or not _same_identity(descriptor_before, descriptor_between)
+        or not _same_identity(descriptor_between, descriptor_after)
+    ):
+        raise StoreSafetyError(
+            "prepared-file-identity-mismatch",
+            "Anonymous descriptor-backed recovery image identity changed for "
+            f"{bound.path}",
+        )
+    baseline_access = _access_policy(bound.opened)
+    if any(
+        _access_policy(current) != baseline_access
+        for current in (descriptor_before, probe, descriptor_between, descriptor_after)
+    ):
+        raise StoreSafetyError(
+            "prepared-file-access-policy-mismatch",
+            "Anonymous descriptor-backed recovery image access policy changed for "
+            f"{bound.path}",
+        )
+    if (
+        first_sha256 != bound.sha256
+        or second_sha256 != bound.sha256
+        or descriptor_before.st_size != bound.opened.st_size
+        or descriptor_between.st_size != bound.opened.st_size
+        or descriptor_after.st_size != bound.opened.st_size
+    ):
+        raise StoreSafetyError(
+            "prepared-file-content-mismatch",
+            "Anonymous descriptor-backed recovery image bytes changed for "
+            f"{bound.path}",
+        )
+
+
+@contextmanager
+def _anonymous_recovery_file(
+    payload: bytes,
+    source_path: Path,
+) -> Iterator[_BoundRegularFile]:
+    try:
+        with tempfile.TemporaryFile(prefix="apple-notes-recovered-image-") as handle:
+            fd = handle.fileno()
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            _write_all(fd, payload)
+            os.fsync(fd)
+            os.fchmod(fd, 0o600)
+            opened = os.fstat(fd)
+            bound = _BoundRegularFile(
+                path=source_path,
+                fd=fd,
+                opened=opened,
+                sha256=_hash_fd(fd),
+            )
+            descriptor_path = Path("/dev/fd") / str(fd)
+            _verify_anonymous_recovery_file(bound, descriptor_path)
+            try:
+                yield bound
+            except Exception:
+                raise
+            else:
+                _verify_anonymous_recovery_file(bound, descriptor_path)
+    except StoreSafetyError:
+        raise
+    except OSError as exc:
+        raise StoreSafetyError(
+            "sqlite-recovery-failed",
+            "Cannot prepare the anonymous descriptor-backed recovery image for "
+            f"{source_path}: {exc}",
+        ) from exc
+
+
+def _sqlite_backup_bytes_from_payload(
+    payload: bytes,
+    source_path: Path,
+) -> bytes:
+    """Let SQLite consume only an anonymous descriptor-backed recovery image."""
+
+    with _anonymous_recovery_file(payload, source_path) as bound:
+        source_uri = _bound_sqlite_readonly_uri(bound)
+        return _sqlite_backup_bytes(source_uri, source_path)
+
+
+def _sqlite_integrity_from_payload(
+    payload: bytes,
+    source_path: Path,
+) -> dict[str, Any]:
+    with _anonymous_recovery_file(payload, source_path) as bound:
+        source_uri = _bound_sqlite_readonly_uri(bound)
+        try:
+            with closing(sqlite3.connect(source_uri, uri=True)) as conn:
+                conn.execute("PRAGMA busy_timeout = 5000")
+                rows = [
+                    str(row[0])
+                    for row in conn.execute("PRAGMA integrity_check").fetchall()
+                ]
+                journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0])
+                page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        except sqlite3.Error as exc:
+            raise StoreSafetyError(
+                "sqlite-integrity-failed",
+                f"SQLite could not validate recovered image for {source_path}: {exc}",
+            ) from exc
+    if rows != ["ok"]:
+        raise StoreSafetyError(
+            "sqlite-integrity-failed",
+            f"SQLite integrity_check failed for {source_path}: {rows[:5]}",
+        )
+    return {
+        "result": "ok",
+        "check": "PRAGMA integrity_check",
+        "journal_mode": journal_mode,
+        "page_count": page_count,
+    }
+
+
+def _bound_recovery_integrity(
+    store: _BoundRecoveryStore,
+) -> dict[str, Any]:
+    recovered_payload = _bound_recovery_payload(store)
+    result = _sqlite_integrity_from_payload(
+        recovered_payload,
+        store.directory.path / store.main_name,
+    )
+    _verify_bound_recovery_store(store)
+    return result
+
+
 def _sqlite_backup_bytes(source_uri: str, source_path: Path) -> bytes:
     """Run the native SQLite backup API into memory and serialize its bytes."""
 
@@ -2516,12 +3399,10 @@ def _sqlite_backup_bytes(source_uri: str, source_path: Path) -> bytes:
             close_v2(source_db)
 
 
-def _backup_sqlite_to_standalone(
-    source: _BoundRegularFile,
+def _write_standalone_backup_payload(
+    payload: bytes,
     output: Path,
 ) -> dict[str, Any]:
-    _verify_bound_regular_file(source, PREPARED_FILE_CODES)
-    source_uri = _bound_sqlite_readonly_uri(source)
     flags = (
         os.O_RDWR
         | os.O_CREAT
@@ -2544,7 +3425,6 @@ def _backup_sqlite_to_standalone(
                 "prepared-file-identity-mismatch",
                 f"Standalone recovery output was replaced before backup: {output}",
             )
-        payload = _sqlite_backup_bytes(source_uri, source.path)
         os.lseek(output_fd, 0, os.SEEK_SET)
         os.ftruncate(output_fd, 0)
         _write_all(output_fd, payload)
@@ -2567,7 +3447,6 @@ def _backup_sqlite_to_standalone(
                 f"Standalone recovery output access policy changed during backup: "
                 f"{output}",
             )
-        _verify_bound_regular_file(source, PREPARED_FILE_CODES)
         sha256 = _hash_fd(output_fd)
         return {
             "path": output,
@@ -2587,6 +3466,56 @@ def _backup_sqlite_to_standalone(
         os.close(output_fd)
 
 
+def _backup_bound_store_to_standalone(
+    source: _BoundRecoveryStore,
+    output: Path,
+) -> dict[str, Any]:
+    recovered_payload = _bound_recovery_payload(source)
+    payload = _sqlite_backup_bytes_from_payload(
+        recovered_payload,
+        source.directory.path / source.main_name,
+    )
+    _verify_bound_recovery_store(source)
+    return _write_standalone_backup_payload(payload, output)
+
+
+def _backup_bound_regular_to_standalone(
+    source: _BoundRegularFile,
+    output: Path,
+) -> dict[str, Any]:
+    """Back up an already validated standalone file without sidecar discovery."""
+
+    _verify_bound_regular_file(source, PREPARED_FILE_CODES)
+    source_payload = _read_bound_file_bytes(
+        source,
+        PREPARED_FILE_CODES,
+        max_bytes=source.opened.st_size,
+        too_large_code="prepared-file-content-mismatch",
+    )
+    payload = _sqlite_backup_bytes_from_payload(source_payload, source.path)
+    _verify_bound_regular_file(source, PREPARED_FILE_CODES)
+    result = _write_standalone_backup_payload(payload, output)
+    _verify_bound_regular_file(source, PREPARED_FILE_CODES)
+    return result
+
+
+def _backup_sqlite_to_standalone(
+    source: Union[_BoundRegularFile, _BoundRecoveryStore],
+    output: Path,
+) -> dict[str, Any]:
+    if isinstance(source, _BoundRecoveryStore):
+        return _backup_bound_store_to_standalone(source, output)
+    source_receipt = _verify_bound_regular_file(source, PREPARED_FILE_CODES)
+    with _bind_recovery_store(source.path) as store:
+        _assert_bound_matches_receipt(
+            store.files[store.main_name],
+            source_receipt,
+        )
+        result = _backup_bound_store_to_standalone(store, output)
+    _verify_bound_regular_file(source, PREPARED_FILE_CODES)
+    return result
+
+
 def _recover_validated_clone_to_standalone(
     recovered_main: Path,
     out: Path,
@@ -2598,16 +3527,12 @@ def _recover_validated_clone_to_standalone(
     source_backup: Callable[[Path], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if source_backup is None:
-        with _bind_regular_file(
-            recovered_main,
-            PREPARED_FILE_CODES,
-        ) as recovered_bound:
+        with _bind_recovery_store(recovered_main) as recovered_store:
+            _require_authoritative_wal(recovered_store, recovery_evidence)
 
             def revalidate_bound_source() -> None:
-                _verify_bound_regular_file(
-                    recovered_bound,
-                    PREPARED_FILE_CODES,
-                )
+                _verify_bound_recovery_store(recovered_store)
+                _require_authoritative_wal(recovered_store, recovery_evidence)
 
             return _recover_validated_clone_to_standalone(
                 recovered_main,
@@ -2617,7 +3542,7 @@ def _recover_validated_clone_to_standalone(
                 source_integrity=source_integrity,
                 source_revalidate=revalidate_bound_source,
                 source_backup=lambda output: _backup_sqlite_to_standalone(
-                    recovered_bound,
+                    recovered_store,
                     output,
                 ),
             )
@@ -2674,17 +3599,33 @@ def _recover_validated_clone_to_standalone(
 
 def _recover_to_standalone(src: Path, out: Path) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="apple-notes-merge-") as temp_dir:
-        recovered_main, recovery_evidence = _make_recovery_clone(
-            src, Path(temp_dir) / "store"
-        )
-        source_integrity = _sqlite_integrity(recovered_main)
-        return _recover_validated_clone_to_standalone(
-            recovered_main,
-            out,
-            source_db=src,
-            recovery_evidence=recovery_evidence,
-            source_integrity=source_integrity,
-        )
+        clone = _make_recovery_clone(src, Path(temp_dir) / "store")
+        with _bind_recovery_store(
+            clone.main_path,
+            creation_receipt=clone.receipt,
+        ) as recovered_store:
+            _require_authoritative_wal(recovered_store, clone.evidence)
+            source_integrity = _bound_recovery_integrity(recovered_store)
+
+            def revalidate_bound_source() -> None:
+                _assert_recovery_store_matches_receipt(
+                    recovered_store,
+                    clone.receipt,
+                )
+                _require_authoritative_wal(recovered_store, clone.evidence)
+
+            return _recover_validated_clone_to_standalone(
+                clone.main_path,
+                out,
+                source_db=src,
+                recovery_evidence=clone.evidence,
+                source_integrity=source_integrity,
+                source_revalidate=revalidate_bound_source,
+                source_backup=lambda output: _backup_sqlite_to_standalone(
+                    recovered_store,
+                    output,
+                ),
+            )
 
 
 def copy_db(
@@ -2986,12 +3927,12 @@ def _validated_snapshot_artifact(
                         SNAPSHOT_FILE_CODES,
                     )
                 )
-        recovered_main, recovery = _make_recovery_clone_from_bound(
+        clone = _make_recovery_clone_from_bound(
             bound_files,
             Path(temp_dir) / "store",
             SNAPSHOT_FILE_CODES,
         )
-        for record in recovery["capture"]:
+        for record in clone.evidence["capture"]:
             basename = record["basename"]
             row = manifest_by_name.get(basename)
             source = record["source"]
@@ -3004,14 +3945,15 @@ def _validated_snapshot_artifact(
                     "snapshot-content-mismatch",
                     f"Snapshot bytes no longer match the manifest: {basename}",
                 )
-        sqlite_integrity = _sqlite_integrity(recovered_main)
         validated_recovery = Path(temp_dir) / "validated-recovery.sqlite"
-        with _bind_regular_file(
-            recovered_main,
-            PREPARED_FILE_CODES,
-        ) as recovered_main_bound:
+        with _bind_recovery_store(
+            clone.main_path,
+            creation_receipt=clone.receipt,
+        ) as recovered_store:
+            _require_authoritative_wal(recovered_store, clone.evidence)
+            sqlite_integrity = _bound_recovery_integrity(recovered_store)
             validated_recovery_receipt = _backup_sqlite_to_standalone(
-                recovered_main_bound,
+                recovered_store,
                 validated_recovery,
             )
         validated_recovery_bound = stack.enter_context(
@@ -3037,7 +3979,7 @@ def _validated_snapshot_artifact(
                 validated_recovery_bound,
                 validated_recovery_receipt,
             )
-            result = _backup_sqlite_to_standalone(
+            result = _backup_bound_regular_to_standalone(
                 validated_recovery_bound,
                 output,
             )
@@ -3085,7 +4027,7 @@ def _validated_snapshot_artifact(
             "snapshot_dir": snapshot_dir,
             "manifest": manifest,
             "verified_files": verified,
-            "sidecar_consistency": recovery["sidecars"],
+            "sidecar_consistency": clone.evidence["sidecars"],
             "sqlite_validation": sqlite_integrity,
             "validated_recovery_integrity": validated_recovery_integrity,
             "source_integrity": source_integrity,
@@ -3093,7 +4035,7 @@ def _validated_snapshot_artifact(
         yield _ValidatedSnapshotArtifact(
             public_result=public_result,
             recovered_main=validated_recovery,
-            recovery_evidence=recovery,
+            recovery_evidence=clone.evidence,
             source_integrity=source_integrity,
             revalidate_recovery_clone=revalidate_recovery_clone,
             backup_recovery_clone=backup_recovery_clone,
@@ -3311,12 +4253,12 @@ def validate_patch_stage(stage_dir: Path) -> dict[str, Any]:
         with tempfile.TemporaryDirectory(
             prefix="apple-notes-stage-validation-"
         ) as temp_dir:
-            recovered_main, recovery = _make_recovery_clone_from_bound(
+            clone = _make_recovery_clone_from_bound(
                 {NOTE_STORE_MAIN: database_bound},
                 Path(temp_dir) / "store",
                 PATCH_FILE_CODES,
             )
-            fingerprint = recovery["capture"][0]["source"]
+            fingerprint = clone.evidence["capture"][0]["source"]
             if fingerprint["sha256"] != database.get("sha256") or fingerprint[
                 "size"
             ] != database.get("size"):
@@ -3324,7 +4266,15 @@ def validate_patch_stage(stage_dir: Path) -> dict[str, Any]:
                     "patch-content-mismatch",
                     "Patch database no longer matches its manifest",
                 )
-            integrity = _sqlite_integrity(recovered_main)
+            with _bind_recovery_store(
+                clone.main_path,
+                creation_receipt=clone.receipt,
+            ) as recovered_store:
+                _assert_recovery_store_matches_receipt(
+                    recovered_store,
+                    clone.receipt,
+                )
+            integrity = _sqlite_integrity(database_bound)
         _scan_exact_directory_entries(
             stage_dir,
             expected_stage_types,

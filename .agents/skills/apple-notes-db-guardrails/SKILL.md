@@ -97,11 +97,23 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" recover-snapshot \
 
 `recover-snapshot` consumes the private clone produced by that exact validation pass. It never
 reopens the mutable snapshot paths after validation.
-SQLite opens the validated clone read-only through its held descriptor, so replacing and restoring
-the clone pathname during connection setup cannot substitute another database.
+The recovery step binds the clone directory, main database, and present WAL through held
+descriptors, then revalidates object identity, content, access policy, and directory membership
+against the clone's creation receipt before and after SQLite consumption. The receipt covers the
+created directory, every copied main/WAL/SHM object, and the exact name/type membership, so a
+replacement or injected entry between copying, sidecar inspection, and later recovery binding
+fails closed. Recovery applies the checksum-valid committed WAL prefix to the held main-database
+bytes and gives SQLite only an anonymous descriptor-backed recovered image. SQLite never reopens
+the mutable main, WAL, SHM, or directory pathname.
 The native SQLite backup API writes first to an in-memory database; serialized database bytes are
 then written directly to the exclusively created output descriptor. Full integrity checking opens
 the prepared standalone file through that same held descriptor.
+Once a sidecar-free standalone image has been validated and bound, later backup copies only that
+held image. A newly injected adjacent WAL is neither discovered nor trusted.
+An ephemeral namespace replace-and-restore during SQLite backup may not be reported, but it cannot
+redirect the bytes SQLite consumes. Persistent missing, replacement, content, access-policy, or
+directory-membership changes fail before output publication. This does not make a live
+cross-file snapshot transactional; authoritative recovery still requires Notes to remain quit.
 
 Use `merge-db` only for a copied database file without a snapshot manifest:
 
