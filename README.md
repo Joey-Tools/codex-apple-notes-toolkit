@@ -4,14 +4,16 @@ Generic Apple Notes guardrails and read-only database inspection helpers.
 
 The canonical database workflow lives in
 `.agents/skills/apple-notes-db-guardrails/`. Its packaged helper captures stable
-SQLite/WAL/SHM snapshots, validates SQLite recovery, stages sidecar-free patches,
-publishes snapshot/stage directories without replacing existing paths, and
-verifies explicit writeback boundaries. Standalone recovery applies committed
-WAL frames from descriptor-bound inputs before SQLite consumes an anonymous
-descriptor-backed image. Clone creation receipts bind the exact copied directory
-and file set across sidecar inspection and recovery, while already validated
-standalone artifacts never rediscover adjacent sidecars. It does not mutate the
-live Notes store.
+SQLite/WAL/SHM snapshots, rejects descriptor-bound rollback journals before
+capture, validates SQLite recovery, stages sidecar-free patches, publishes
+snapshot/stage directories without replacing existing paths, and verifies
+explicit writeback boundaries. SHM commit evidence requires checksum-valid,
+identical duplicate headers. Standalone recovery applies committed WAL frames
+from descriptor-bound inputs before SQLite consumes an anonymous
+descriptor-backed image. Publication uses held parent descriptors for rename,
+fsync, and terminal revalidation; retained sensitive partials receive precise
+recovery locators and bounded inventories. It does not mutate the live Notes
+store.
 
 `scripts/apple_notes_helper.sh` remains the top-level Notes/AppleScript wrapper
 and delegates database subcommands to the skill-packaged helper.

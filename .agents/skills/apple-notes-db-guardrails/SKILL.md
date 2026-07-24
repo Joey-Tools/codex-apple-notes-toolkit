@@ -1,6 +1,6 @@
 ---
 name: apple-notes-db-guardrails
-description: Safely audit, copy, recover, stage, or verify Apple Notes container databases on macOS. Use when probing TCC or Full Disk Access for `NoteStore.sqlite`, inspecting Notes SQLite/WAL/SHM state, creating a validated `/tmp` snapshot, preparing a database patch, or guarding a whole-store writeback and recovery.
+description: Safely audit, copy, recover, stage, or verify Apple Notes container databases on macOS. Use when probing TCC or Full Disk Access for `NoteStore.sqlite`, inspecting Notes SQLite/WAL/SHM/rollback-journal state, creating a validated `/tmp` snapshot, preparing a database patch, or guarding a whole-store writeback and recovery.
 ---
 
 # Apple Notes DB Guardrails
@@ -64,13 +64,15 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" copy-db \
 
 Keep `snapshot-manifest.json` with the copied file set.
 Snapshot publication is atomic and no-replace on supported macOS/Linux filesystems.
-The helper binds the private partial directory at creation, verifies every prepared file against
-its creation receipt immediately before rename, and revalidates the same objects after rename.
-If a pre-publication failure requires cleanup, the helper reopens the creation-time parent,
-revalidates the exact prepared root through its held descriptor, and preserves the entire partial
-tree. POSIX pathname unlink cannot atomically require an expected inode, so failure cleanup never
-deletes mutable child names. A missing, replaced, or inconclusive target is reported with recovery
-locators.
+The helper binds the private partial directory and its parent at creation, verifies every prepared
+file against its creation receipt immediately before a descriptor-relative rename, fsyncs the held
+parent descriptor, and performs terminal descriptor-relative revalidation. It never reopens the
+parent pathname for post-rename durability. On an ordinary pre-publication failure, the helper
+preserves the partial tree and attaches a creation-receipt-matched namespace locator plus a bounded
+no-follow sensitive-file inventory to the original error. If the root is replaced or inventory is
+inconclusive, the original error remains primary and reports the separate receipt failure.
+An otherwise unclassified runtime failure becomes `prepared-operation-failed`, retains the
+underlying exception as its cause, and carries the same recovery details.
 If publication reports `destination-install-uncertain`, preserve the reported paths, do not retry
 into that destination, and inspect whether the prepared directory committed.
 Use `validate-snapshot` before relying on an older snapshot:
@@ -105,6 +107,10 @@ replacement or injected entry between copying, sidecar inspection, and later rec
 fails closed. Recovery applies the checksum-valid committed WAL prefix to the held main-database
 bytes and gives SQLite only an anonymous descriptor-backed recovered image. SQLite never reopens
 the mutable main, WAL, SHM, or directory pathname.
+Initial discovery also detects `NoteStore.sqlite-journal` without following links. Any present
+rollback journal is descriptor-bound and then rejected as `rollback-journal-present`; if it cannot
+be bound as one stable regular file, the same reason code is returned as inconclusive. Recovery
+never guesses whether SQLite had finished rollback or whether journal pages remain authoritative.
 The native SQLite backup API writes first to an in-memory database; serialized database bytes are
 then written directly to the exclusively created output descriptor. Full integrity checking opens
 the prepared standalone file through that same held descriptor.

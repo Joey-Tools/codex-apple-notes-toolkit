@@ -53,7 +53,7 @@ Treat these outcomes separately:
 - object replacement;
 - content mismatch;
 - access-policy mismatch;
-- SQLite/WAL/SHM file-set membership change.
+- SQLite/WAL/SHM/rollback-journal file-set membership change.
 
 Do not collapse unreadable, failed revalidation, missing, and mismatched into one result.
 
@@ -70,7 +70,12 @@ For each file:
 4. Compare descriptor identity, content stability, and access policy.
 5. Re-resolve the path without following symlinks and compare object identity.
 
-Recheck the main/WAL/SHM membership after all files have been processed.
+Recheck the main/WAL/SHM/rollback-journal membership after all files have been processed.
+A present `NoteStore.sqlite-journal` is not an ignorable sidecar. Open it without following links,
+bind and hash the same descriptor twice, then fail closed with `rollback-journal-present` before
+copy or recovery. A symlink, non-regular entry, unreadable journal, or unstable journal returns the
+same reason with `binding_status: inconclusive`. Only SQLite may decide whether a hot DELETE or
+PERSIST journal must roll the main database back.
 
 This sequence detects ordinary replacement and mutation races. It does not create a cross-file
 transactional snapshot while Notes is writing. Require Notes to stay quit for exact analysis,
@@ -85,10 +90,14 @@ Validate the WAL header checksum, page size, frame boundaries, per-frame salts, 
 checksums before recovery.
 Follow SQLite recovery semantics by using only the checksum-valid frame prefix through its last
 commit frame and reporting any ignored tail.
-Reject a copy when same-generation SHM says an invalid WAL frame was already committed.
+Reject a copy when trusted same-generation SHM says an invalid WAL frame was already committed.
 
 Treat `NoteStore.sqlite-shm` as a derived WAL-index cache, not as authoritative durable content.
-Inspect its duplicate headers and report whether they match the copied WAL.
+Validate each WAL-index header checksum using its native byte order. A header may prove a committed
+frame only when both 48-byte copies are individually checksum-valid and byte-for-byte identical.
+If either checksum is invalid, one copy is torn, or the valid copies disagree, report
+`derived-rebuild-required`; never upgrade that ambiguous SHM state to
+`wal-shm-commit-mismatch`.
 Do not fail recovery solely because SHM is absent or stale.
 Instead, preserve the raw SHM in the evidence snapshot, omit it from the isolated recovery clone,
 and let SQLite rebuild the WAL index from the main database and valid WAL.
@@ -178,13 +187,15 @@ no-replace operation: `renamex_np(..., RENAME_EXCL)` on macOS or
 instead of falling back to a check-then-rename sequence. An existing destination, including an
 empty directory that appeared after an earlier check, must remain untouched.
 
-Create the partial root through a parent directory descriptor, immediately bind its directory
-descriptor, identity, and access policy, and hold that descriptor through publication. Bind every
+Create the partial root through a parent directory descriptor, immediately bind the root and parent
+descriptors, identities, and access policies, and hold both through publication. Bind every
 prepared regular file and compare it with its creation receipt: exact identity, SHA-256, size, and
 access policy. Parse the installed manifest and require it to equal the in-memory payload. Verify
-the exact no-follow root and nested name/type sets plus every held file immediately before rename,
-then revalidate those same descriptors at their destination paths after rename. A replaced partial
-root must never be removed as though it were the helper-owned directory.
+the exact no-follow root and nested name/type sets plus every held file immediately before rename.
+Rename the source/destination names relative to the held parent, fsync that same parent descriptor,
+and terminally revalidate the installed root relative to it. Never reopen the parent pathname
+between rename and durability. A temporary parent-path replacement therefore cannot redirect
+publication evidence, while identity or access-policy changes on the held parent fail separately.
 
 After any publication error, compare the private source and destination namespaces with the
 prepared directory's object identity. Report a proved pre-existing destination as
@@ -210,14 +221,17 @@ a retry for `uncertain`. Include a verified prepared pathname only when its curr
 match their creation receipts. Otherwise emit an explicitly unverified locator containing the
 recorded path, device/inode/file type, and parent identity.
 
-Pre-publication failure cleanup protects deletion target identity by deleting nothing through a
-mutable pathname. Reopen and verify the creation-time parent, bind and scan the exact prepared root
-through that parent, then preserve the complete partial tree for recovery. Conditional unlink by
-expected inode is not available through the supported POSIX interfaces; an identity check followed
-by `unlink` or `rmdir` is still a race. If the root is missing, replaced, or cannot be revalidated,
-preserve the current namespace and return recovery locators. Access-policy changes remain distinct
-validation failures; mtime, ctime, and directory link-count behavior are not deletion-identity
-signals.
+Pre-publication failure handling protects deletion target identity by deleting nothing through a
+mutable pathname. While the creation-time root and parent descriptors are still open, revalidate
+the exact root relative to the held parent and scan a bounded sensitive-file inventory twice
+without following child links. Preserve the complete partial tree and attach `cleanup_state:
+retained`, the verified root/parent identities, exact namespace, and inventory to the original
+error. If the root is missing, replaced, over the inventory bounds, or cannot be revalidated,
+preserve the current namespace, keep the original error primary, and attach a separate
+`cleanup_error_code` plus recovery locators. Access-policy changes remain distinct validation
+failures; mtime, ctime, and directory link-count behavior are not deletion-identity signals.
+Wrap an unclassified ordinary runtime failure as `prepared-operation-failed`, preserve the
+underlying exception as `__cause__`, and include its type/errno with the retained-partial receipt.
 
 The wrapper invokes generic `python3`, and the helper supports Python 3.9. Keep runtime API calls
 within that compatibility floor unless the wrapper, documentation, and tests adopt a newer
