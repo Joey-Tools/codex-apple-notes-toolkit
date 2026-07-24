@@ -136,6 +136,13 @@ binding must match this creation receipt before consuming bytes. Persistent dire
 replacement, byte or access-policy mutation, and entry addition/removal between copy, sidecar
 inspection, and later binding therefore fail closed.
 
+The initial snapshot copy follows the same rule before writing its manifest: immediately bind the
+copied store relative to the already held nested-directory descriptor, compare every file with the
+capture-time identity/SHA-256/size/access-policy receipt, classify sidecars, and run recovery
+integrity through those held descriptors. Reuse those exact results in the manifest. Do not
+separately reopen copied paths for sidecar or SQLite validation; a same-UID swap-and-restore must
+either be irrelevant to descriptor consumption or fail receipt revalidation.
+
 Parse and apply the checksum-valid WAL frames through the last commit frame to the stable held
 main-database bytes. Use that commit frame's database-size field as the final page count. Reject a
 page-size mismatch, invalid commit boundary, or database growth that cannot be bounded by the main
@@ -211,6 +218,14 @@ prepared directory's object identity. Report a proved pre-existing destination a
 commit-then-error or any namespace state that cannot prove commit/non-commit as
 `destination-install-uncertain`. Preserve an uncertain path for inspection and do not retry into
 the same destination.
+
+Before the publication descriptors close, record a descriptor-bound recovery locator for any
+post-rename uncertain directory. It binds the held publication parent and destination directory
+identity/access policy plus the exact root/nested name-type maps and regular-file
+identity/SHA-256/size/access-policy receipts. Revalidate that tree through the held root, nested
+directory, and regular-file descriptors after rename. If final public-parent pathname validation
+fails because an ancestor was permanently replaced, report `destination-install-uncertain` with
+that descriptor receipt; the display path alone is not the recovery locator.
 
 Standalone database publication uses an atomic no-replace rename from a descriptor-bound private
 file. Bind the creation-time private parent and operate on the exact source and destination leaf

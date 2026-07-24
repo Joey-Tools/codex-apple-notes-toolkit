@@ -68,15 +68,20 @@ The helper binds the private partial directory, its nested `group.com.apple.note
 parents at creation. It verifies every prepared file against its creation receipt, fsyncs copied
 files, then fsyncs the held nested-store and snapshot-root descriptors bottom-up before the
 descriptor-relative rename. It fsyncs the held publication-parent descriptor and performs terminal
-descriptor-relative revalidation. It never reopens a parent pathname for durability. On an
-ordinary pre-publication failure, the helper
+descriptor-relative revalidation. Sidecar classification and SQLite integrity checking consume
+that same receipt-bound copied store through held descriptors; the manifest reuses those exact
+results instead of reopening the copied path. It never reopens a parent pathname for durability.
+On an ordinary pre-publication failure, the helper
 preserves the partial tree and attaches a creation-receipt-matched namespace locator plus a bounded
 no-follow sensitive-file inventory to the original error. If the root is replaced or inventory is
 inconclusive, the original error remains primary and reports the separate receipt failure.
 An otherwise unclassified runtime failure becomes `prepared-operation-failed`, retains the
 underlying exception as its cause, and carries the same recovery details.
 If publication reports `destination-install-uncertain`, preserve the reported paths, do not retry
-into that destination, and inspect whether the prepared directory committed.
+into that destination, and inspect whether the prepared directory committed. A post-rename
+uncertain result includes a descriptor-bound destination receipt with parent/directory identity,
+access policy, and exact nested directory/file tree receipts. That receipt remains the recovery
+locator if an ancestor path was permanently replaced before the descriptors closed.
 Use `validate-snapshot` before relying on an older snapshot:
 
 ```bash
@@ -132,6 +137,9 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" merge-db \
   --src /tmp/<copy>/NoteStore.sqlite \
   --out /tmp/<copy>/NoteStore-analysis.sqlite
 ```
+
+`merge-db` JSON and the compatibility Python launcher expose both `standalone_db` and the legacy
+`merged_db` alias for the same output path.
 
 Run queries against the recovered standalone database, never against the live container.
 For single-file publication failures, inspect `details.publication_state`,

@@ -394,13 +394,121 @@ def _observe_bound_name(
     return "present", value
 
 
+def _descriptor_bound_directory_destination_receipt(
+    binding: _BoundDirectory,
+    destination: Path,
+    *,
+    tree_receipt: dict[str, Any] | None,
+    tree_verification: str,
+    terminal_error: str | None = None,
+) -> dict[str, Any]:
+    if binding.parent_fd is None:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Bound directory has no parent descriptor: {binding.path}",
+        )
+    parent = _verify_bound_parent_descriptor(
+        binding.parent_fd,
+        binding.parent_opened,
+        display_path=destination.parent,
+        identity_code="prepared-directory-identity-mismatch",
+        access_policy_code="prepared-directory-access-policy-mismatch",
+        inconclusive_code="prepared-directory-revalidation-inconclusive",
+    )
+    directory = _verify_bound_directory_at(
+        binding,
+        parent_fd=binding.parent_fd,
+        basename=destination.name,
+        display_path=destination,
+    )
+    receipt: dict[str, Any] = {
+        "display_path": str(destination),
+        "verification": "bound-parent-and-directory-match-creation-receipts",
+        "namespace_note": (
+            "The display path may no longer resolve if its ancestor namespace "
+            "was replaced after descriptor-bound publication"
+        ),
+        "parent_identity": _identity(parent),
+        "parent_access_policy": _access_policy(parent),
+        "directory_identity": directory["identity"],
+        "directory_access_policy": directory["access_policy"],
+        "tree_verification": tree_verification,
+    }
+    if tree_receipt is not None:
+        receipt["tree_receipt"] = tree_receipt
+    if terminal_error is not None:
+        receipt["terminal_validation_error"] = terminal_error
+    return receipt
+
+
+def _verify_installed_directory_path(
+    binding: _BoundDirectory,
+    destination: Path,
+) -> None:
+    """Terminally prove that the public path names the bound directory."""
+
+    path_parent_fd: int | None = None
+    try:
+        parent_before = os.stat(destination.parent, follow_symlinks=False)
+        path_parent_fd = os.open(destination.parent, _directory_open_flags())
+        parent_descriptor = os.fstat(path_parent_fd)
+        leaf = os.stat(
+            destination.name,
+            dir_fd=path_parent_fd,
+            follow_symlinks=False,
+        )
+        parent_after = os.stat(destination.parent, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            f"The installed destination path is missing: {destination}",
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Cannot terminally bind the installed destination path: "
+            f"{destination}: {exc}",
+        ) from exc
+    finally:
+        if path_parent_fd is not None:
+            os.close(path_parent_fd)
+    if (
+        not stat.S_ISDIR(parent_before.st_mode)
+        or not stat.S_ISDIR(parent_descriptor.st_mode)
+        or not stat.S_ISDIR(parent_after.st_mode)
+        or not _same_identity(binding.parent_opened, parent_before)
+        or not _same_identity(parent_before, parent_descriptor)
+        or not _same_identity(parent_descriptor, parent_after)
+        or not stat.S_ISDIR(leaf.st_mode)
+        or not _same_identity(binding.opened, leaf)
+    ):
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            "The installed path parent or directory does not match the "
+            f"descriptor-bound publication receipts: {destination}",
+        )
+    if (
+        _access_policy(binding.parent_opened) != _access_policy(parent_before)
+        or _access_policy(parent_before) != _access_policy(parent_descriptor)
+        or _access_policy(parent_descriptor) != _access_policy(parent_after)
+        or _access_policy(binding.opened) != _access_policy(leaf)
+    ):
+        raise StoreSafetyError(
+            "prepared-directory-access-policy-mismatch",
+            f"The installed path parent or directory changed access policy: "
+            f"{destination}",
+        )
+
+
 def _publish_directory_no_replace(
     source: Path,
     destination: Path,
     *,
     binding: _BoundDirectory | None = None,
     before_rename: Callable[[], None] | None = None,
-) -> None:
+    prepared_tree_receipt: dict[str, Any] | None = None,
+    descriptor_tree_receipt_builder: Callable[[], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     if binding is None or binding.parent_fd is None:
         raise StoreSafetyError(
             "destination-install-failed",
@@ -467,10 +575,43 @@ def _publish_directory_no_replace(
             and _identity(destination_after) == source_identity
         )
         if committed:
+            descriptor_bound_destination: dict[str, Any] | None = None
+            try:
+                descriptor_bound_destination = (
+                    _descriptor_bound_directory_destination_receipt(
+                        binding,
+                        destination,
+                        tree_receipt=prepared_tree_receipt,
+                        tree_verification=(
+                            "creation-receipt-last-verified-before-rename"
+                        ),
+                    )
+                )
+                if descriptor_tree_receipt_builder is not None:
+                    try:
+                        descriptor_bound_destination["tree_receipt"] = (
+                            descriptor_tree_receipt_builder()
+                        )
+                        descriptor_bound_destination["tree_verification"] = (
+                            "descriptor-revalidated-after-rename"
+                        )
+                    except Exception as tree_exc:
+                        descriptor_bound_destination["tree_revalidation_error"] = str(
+                            tree_exc
+                        )
+            except (OSError, StoreSafetyError):
+                descriptor_bound_destination = None
             raise StoreSafetyError(
                 "destination-install-uncertain",
                 "The destination contains the prepared directory, but the "
                 f"publication syscall reported an error: {destination}: {exc}",
+                details=_publication_details(
+                    "uncertain",
+                    prepared=None,
+                    destination=destination,
+                    retry_safe=False,
+                    descriptor_bound_destination=descriptor_bound_destination,
+                ),
             ) from exc
         if (
             exc.errno in {errno.EEXIST, errno.ENOTEMPTY}
@@ -499,6 +640,7 @@ def _publish_directory_no_replace(
             f"paths for inspection: source={source}, destination={destination}: {exc}",
         ) from exc
 
+    descriptor_bound_destination: dict[str, Any] | None = None
     try:
         source_state, _ = _observe_bound_name(parent_fd, source.name)
         destination_state, destination_after = _observe_bound_name(
@@ -544,13 +686,57 @@ def _publish_directory_no_replace(
                 "The private source name reappeared after publication: "
                 f"{source}",
             )
+        descriptor_bound_destination = (
+            _descriptor_bound_directory_destination_receipt(
+                binding,
+                destination,
+                tree_receipt=prepared_tree_receipt,
+                tree_verification="creation-receipt-last-verified-before-rename",
+            )
+        )
+        if descriptor_tree_receipt_builder is not None:
+            descriptor_bound_destination["tree_receipt"] = (
+                descriptor_tree_receipt_builder()
+            )
+            descriptor_bound_destination["tree_verification"] = (
+                "descriptor-revalidated-after-rename"
+            )
+        _verify_installed_directory_path(binding, destination)
     except (OSError, StoreSafetyError) as exc:
+        if descriptor_bound_destination is None:
+            try:
+                descriptor_bound_destination = (
+                    _descriptor_bound_directory_destination_receipt(
+                        binding,
+                        destination,
+                        tree_receipt=prepared_tree_receipt,
+                        tree_verification=(
+                            "creation-receipt-last-verified-before-rename"
+                        ),
+                        terminal_error=str(exc),
+                    )
+                )
+            except (OSError, StoreSafetyError):
+                descriptor_bound_destination = None
+        elif (
+            descriptor_bound_destination.get("tree_verification")
+            != "descriptor-revalidated-after-rename"
+        ):
+            descriptor_bound_destination["tree_revalidation_error"] = str(exc)
         raise StoreSafetyError(
             "destination-install-uncertain",
             "The directory was renamed into place, but descriptor-relative "
             f"durability or terminal validation is unconfirmed: {destination}: "
             f"{exc}",
+            details=_publication_details(
+                "uncertain",
+                prepared=None,
+                destination=destination,
+                retry_safe=False,
+                descriptor_bound_destination=descriptor_bound_destination,
+            ),
         ) from exc
+    return descriptor_bound_destination
 
 
 def _open_regular_readonly(path: Path) -> tuple[int, os.stat_result]:
@@ -1004,7 +1190,15 @@ def _bind_regular_file_at(
 def _verify_bound_recovery_store(
     store: _BoundRecoveryStore,
 ) -> dict[str, Any]:
-    directory = _verify_bound_directory(store.directory)
+    if store.directory.parent_fd is not None:
+        directory = _verify_bound_directory_at(
+            store.directory,
+            parent_fd=store.directory.parent_fd,
+            basename=store.directory.path.name,
+            display_path=store.directory.path,
+        )
+    else:
+        directory = _verify_bound_directory(store.directory)
     files = {
         basename: _verify_bound_regular_file_at(
             bound,
@@ -1068,6 +1262,62 @@ def _assert_recovery_store_matches_receipt(
     return current
 
 
+@contextmanager
+def _bind_recovery_store_from_directory(
+    directory: _BoundDirectory,
+    main_name: str,
+    *,
+    creation_receipt: _RecoveryStoreReceipt,
+) -> Iterator[_BoundRecoveryStore]:
+    """Bind a recovery store relative to an already held directory."""
+
+    if directory.parent_fd is not None:
+        _verify_bound_directory_at(
+            directory,
+            parent_fd=directory.parent_fd,
+            basename=directory.path.name,
+            display_path=directory.path,
+        )
+    else:
+        _verify_bound_directory(directory)
+    initial_entries = _scan_bound_directory_entry_types(directory)
+    if initial_entries != creation_receipt.entry_types:
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "Recovery-directory membership differs from its creation receipt: "
+            f"{directory.path}",
+        )
+    with ExitStack() as stack:
+        files: dict[str, _BoundRegularFile] = {}
+        for basename in creation_receipt.files:
+            if initial_entries.get(basename) != stat.S_IFREG:
+                raise StoreSafetyError(
+                    "prepared-file-identity-mismatch",
+                    "Recovery receipt names a missing or non-regular file: "
+                    f"{directory.path / basename}",
+                )
+            files[basename] = stack.enter_context(
+                _bind_regular_file_at(
+                    directory.path / basename,
+                    directory,
+                    PREPARED_FILE_CODES,
+                )
+            )
+        store = _BoundRecoveryStore(
+            directory=directory,
+            main_name=main_name,
+            files=files,
+            entry_types=initial_entries,
+        )
+        _assert_recovery_store_matches_receipt(store, creation_receipt)
+        try:
+            yield store
+        except Exception:
+            raise
+        else:
+            _assert_recovery_store_matches_receipt(store, creation_receipt)
+
+
 def _recovery_store_creation_receipt(
     directory: _BoundDirectory,
     main_name: str,
@@ -1097,8 +1347,9 @@ def _recovery_store_creation_receipt(
             "Recovery clone creation receipt does not contain its main database: "
             f"{directory.path / main_name}",
         )
-    with _bind_recovery_store(
-        directory.path / main_name,
+    with _bind_recovery_store_from_directory(
+        directory,
+        main_name,
         creation_receipt=receipt,
     ) as store:
         _assert_recovery_store_matches_receipt(store, receipt)
@@ -2667,6 +2918,138 @@ def _revalidate_published_regular_files(
             f"Published manifest differs from the in-memory payload: "
             f"{destination / manifest_relative}",
         )
+
+
+def _descriptor_bound_prepared_tree_receipt(
+    root_binding: _BoundDirectory,
+    *,
+    published_basename: str,
+    root_receipt: dict[str, Any],
+    nested_directories: dict[
+        Path,
+        tuple[_BoundDirectory, dict[str, Any]],
+    ],
+    bindings: dict[Path, _BoundRegularFile],
+    manifest_name: str,
+    manifest_payload: dict[str, Any],
+    manifest_receipt: dict[str, Any],
+    file_receipts: dict[Path, dict[str, Any]],
+) -> dict[str, Any]:
+    """Revalidate an installed prepared tree entirely through held descriptors."""
+
+    if root_binding.parent_fd is None:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Prepared root has no parent descriptor: {root_binding.path}",
+        )
+    root_current = _verify_bound_directory_at(
+        root_binding,
+        parent_fd=root_binding.parent_fd,
+        basename=published_basename,
+        display_path=root_binding.path.parent / published_basename,
+    )
+    root_entries = _scan_bound_directory_entry_types(root_binding)
+    if (
+        root_current["identity"] != root_receipt.get("identity")
+        or root_current["access_policy"] != root_receipt.get("access_policy")
+    ):
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            "Installed prepared root differs from its creation receipt",
+        )
+    if root_entries != root_receipt.get("entry_types"):
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "Installed prepared root membership differs from its creation receipt",
+        )
+
+    directory_bindings: dict[Path, _BoundDirectory] = {
+        Path("."): root_binding,
+    }
+    directory_receipts: dict[str, Any] = {}
+    for relative_path, (directory, receipt) in nested_directories.items():
+        parent = directory_bindings.get(relative_path.parent)
+        if parent is None:
+            raise StoreSafetyError(
+                "prepared-directory-revalidation-inconclusive",
+                f"No bound parent for prepared directory {relative_path}",
+            )
+        current = _verify_bound_directory_at(
+            directory,
+            parent_fd=parent.fd,
+            basename=relative_path.name,
+            display_path=root_binding.path / relative_path,
+        )
+        entries = _scan_bound_directory_entry_types(directory)
+        if (
+            current["identity"] != receipt.get("identity")
+            or current["access_policy"] != receipt.get("access_policy")
+        ):
+            raise StoreSafetyError(
+                "prepared-directory-identity-mismatch",
+                f"Installed prepared directory differs from its creation receipt: "
+                f"{relative_path}",
+            )
+        if entries != receipt.get("entry_types"):
+            raise StoreSafetyError(
+                "prepared-file-set-mismatch",
+                f"Installed prepared directory membership differs from its "
+                f"creation receipt: {relative_path}",
+            )
+        directory_bindings[relative_path] = directory
+        directory_receipts[str(relative_path)] = {
+            **current,
+            "entry_types": entries,
+        }
+
+    manifest_relative = Path(manifest_name)
+    all_file_receipts = {
+        manifest_relative: manifest_receipt,
+        **file_receipts,
+    }
+    current_files: dict[str, Any] = {}
+    for relative_path, receipt in all_file_receipts.items():
+        parent = directory_bindings.get(relative_path.parent)
+        if parent is None:
+            raise StoreSafetyError(
+                "prepared-directory-revalidation-inconclusive",
+                f"No bound parent for prepared file {relative_path}",
+            )
+        current_files[str(relative_path)] = _assert_bound_matches_receipt(
+            bindings[relative_path],
+            receipt,
+            dir_fd=parent.fd,
+            basename=relative_path.name,
+        )
+
+    manifest_parent = directory_bindings[manifest_relative.parent]
+    manifest_bytes = _read_bound_file_bytes(
+        bindings[manifest_relative],
+        PREPARED_FILE_CODES,
+        max_bytes=MANIFEST_MAX_BYTES,
+        too_large_code="manifest-too-large",
+        dir_fd=manifest_parent.fd,
+        basename=manifest_relative.name,
+    )
+    installed_manifest = _parse_manifest_bytes(
+        manifest_bytes,
+        path=root_binding.path / manifest_relative,
+        expected_schema=str(manifest_payload["schema"]),
+    )
+    if installed_manifest != _normalized_json_payload(manifest_payload):
+        raise StoreSafetyError(
+            "prepared-manifest-mismatch",
+            "Descriptor-bound installed manifest differs from the in-memory payload",
+        )
+    return {
+        "schema": "apple-notes-prepared-tree-receipt/v1",
+        "root": {
+            **root_current,
+            "entry_types": root_entries,
+        },
+        "directories": directory_receipts,
+        "files": current_files,
+    }
 
 
 def notes_is_running() -> bool:
@@ -4469,9 +4852,40 @@ def copy_db(
                 destination_binding=bound_store,
             )
             _verify_bound_directory(bound_root)
-            copied_main = store_dir / NOTE_STORE_MAIN
-            sidecars = _inspect_sidecars(copied_main)
-            sqlite_validation = validate_database_recovery(copied_main)
+            expected_names = {
+                str(record["basename"]): stat.S_IFREG for record in captured
+            }
+            recovery_file_receipts = {
+                str(record["basename"]): record["copy"] for record in captured
+            }
+            recovery_store_receipt = _recovery_store_creation_receipt(
+                bound_store,
+                NOTE_STORE_MAIN,
+                recovery_file_receipts,
+            )
+            store_receipt = {
+                "identity": dict(recovery_store_receipt.directory_identity),
+                "access_policy": dict(
+                    recovery_store_receipt.directory_access_policy
+                ),
+                "entry_types": dict(recovery_store_receipt.entry_types),
+            }
+            with _bind_recovery_store_from_directory(
+                bound_store,
+                NOTE_STORE_MAIN,
+                creation_receipt=recovery_store_receipt,
+            ) as copied_store:
+                sidecars = _inspect_bound_sidecars(copied_store)
+                recovery_evidence = {
+                    "capture": captured,
+                    "sidecars": sidecars,
+                }
+                _require_authoritative_wal(copied_store, recovery_evidence)
+                sqlite_integrity = _bound_recovery_integrity(copied_store)
+                _assert_recovery_store_matches_receipt(
+                    copied_store,
+                    recovery_store_receipt,
+                )
             manifest_files = []
             for record in captured:
                 source = record["source"]
@@ -4516,7 +4930,7 @@ def copy_db(
                 },
                 "files": manifest_files,
                 "sidecar_consistency": sidecars,
-                "sqlite_validation": sqlite_validation["sqlite_integrity"],
+                "sqlite_validation": sqlite_integrity,
             }
             if require_notes_quit and notes_is_running():
                 raise StoreSafetyError(
@@ -4528,9 +4942,6 @@ def copy_db(
                 partial / SNAPSHOT_MANIFEST,
                 manifest,
             )
-            expected_names = {
-                str(record["basename"]): stat.S_IFREG for record in captured
-            }
             root_receipt = _scan_exact_directory_entries(
                 partial,
                 {
@@ -4542,15 +4953,23 @@ def copy_db(
                 bound_identity=_identity(bound_root.opened),
                 bound_access_policy=_access_policy(bound_root.opened),
             )
-            store_receipt = _scan_exact_directory_entries(
-                store_dir,
-                expected_names,
-                missing_code="prepared-file-missing",
-                mismatch_code="prepared-file-set-mismatch",
-            )
             file_receipts = {
                 Path("group.com.apple.notes") / str(record["basename"]): record["copy"]
                 for record in captured
+            }
+            prepared_tree_receipt = {
+                "schema": "apple-notes-prepared-tree-receipt/v1",
+                "root": root_receipt,
+                "directories": {
+                    "group.com.apple.notes": store_receipt,
+                },
+                "files": {
+                    SNAPSHOT_MANIFEST: manifest_receipt,
+                    **{
+                        str(relative_path): receipt
+                        for relative_path, receipt in file_receipts.items()
+                    },
+                },
             }
             with _bind_prepared_regular_files(
                 partial,
@@ -4626,12 +5045,34 @@ def copy_db(
                         bound_access_policy=root_receipt["access_policy"],
                     )
 
+                def build_descriptor_snapshot_tree_receipt() -> dict[str, Any]:
+                    return _descriptor_bound_prepared_tree_receipt(
+                        bound_root,
+                        published_basename=destination.name,
+                        root_receipt=root_receipt,
+                        nested_directories={
+                            Path("group.com.apple.notes"): (
+                                bound_store,
+                                store_receipt,
+                            ),
+                        },
+                        bindings=prepared_files,
+                        manifest_name=SNAPSHOT_MANIFEST,
+                        manifest_payload=manifest,
+                        manifest_receipt=manifest_receipt,
+                        file_receipts=file_receipts,
+                    )
+
                 _verify_bound_directory(bound_root)
-                _publish_directory_no_replace(
+                publication_receipt = _publish_directory_no_replace(
                     partial,
                     destination,
                     binding=bound_root,
                     before_rename=verify_before_snapshot_rename,
+                    prepared_tree_receipt=prepared_tree_receipt,
+                    descriptor_tree_receipt_builder=(
+                        build_descriptor_snapshot_tree_receipt
+                    ),
                 )
                 try:
                     _scan_exact_directory_entries(
@@ -4671,6 +5112,7 @@ def copy_db(
                             prepared=None,
                             destination=destination,
                             retry_safe=False,
+                            descriptor_bound_destination=publication_receipt,
                         ),
                     ) from exc
     except StoreSafetyError:
@@ -4898,7 +5340,11 @@ def validate_snapshot(snapshot_dir: Path) -> dict[str, Any]:
 
 def merge_db(src: Path, out: Path | None) -> dict[str, Any]:
     output = out or src.with_name("NoteStore-merged-for-analysis.sqlite")
-    return _recover_to_standalone(src, output)
+    result = _recover_to_standalone(src, output)
+    return {
+        **result,
+        "merged_db": result["standalone_db"],
+    }
 
 
 def recover_snapshot(snapshot_dir: Path, out: Path) -> dict[str, Any]:
@@ -4979,6 +5425,15 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
                 bound_access_policy=_access_policy(bound_root.opened),
             )
             file_receipts = {Path(NOTE_STORE_MAIN): fingerprint}
+            prepared_tree_receipt = {
+                "schema": "apple-notes-prepared-tree-receipt/v1",
+                "root": root_receipt,
+                "directories": {},
+                "files": {
+                    PATCH_MANIFEST: manifest_receipt,
+                    NOTE_STORE_MAIN: fingerprint,
+                },
+            }
             with _bind_prepared_regular_files(
                 partial,
                 manifest_name=PATCH_MANIFEST,
@@ -4997,12 +5452,29 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
                         file_receipts=file_receipts,
                     )
 
+                def build_descriptor_stage_tree_receipt() -> dict[str, Any]:
+                    return _descriptor_bound_prepared_tree_receipt(
+                        bound_root,
+                        published_basename=dest.name,
+                        root_receipt=root_receipt,
+                        nested_directories={},
+                        bindings=prepared_files,
+                        manifest_name=PATCH_MANIFEST,
+                        manifest_payload=manifest,
+                        manifest_receipt=manifest_receipt,
+                        file_receipts=file_receipts,
+                    )
+
                 _verify_bound_directory(bound_root)
-                _publish_directory_no_replace(
+                publication_receipt = _publish_directory_no_replace(
                     partial,
                     dest,
                     binding=bound_root,
                     before_rename=verify_before_stage_rename,
+                    prepared_tree_receipt=prepared_tree_receipt,
+                    descriptor_tree_receipt_builder=(
+                        build_descriptor_stage_tree_receipt
+                    ),
                 )
                 try:
                     _scan_exact_directory_entries(
@@ -5034,6 +5506,7 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
                             prepared=None,
                             destination=dest,
                             retry_safe=False,
+                            descriptor_bound_destination=publication_receipt,
                         ),
                     ) from exc
     except StoreSafetyError:

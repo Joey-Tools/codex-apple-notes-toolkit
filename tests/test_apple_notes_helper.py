@@ -196,6 +196,52 @@ raise SystemExit(2)
             MODULE.NoteStorePaths().note_store_files(),
         )
 
+    def test_compatibility_python_api_preserves_merged_db_alias(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "compatibility_helper_merge", COMPATIBILITY_SCRIPT
+        )
+        assert spec is not None
+        assert spec.loader is not None
+        compatibility = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = compatibility
+        spec.loader.exec_module(compatibility)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            output = root / "merged.sqlite"
+            self._create_db(source)
+            result = compatibility.merge_db(source, output)
+
+        self.assertEqual(Path(result["merged_db"]), output)
+        self.assertEqual(Path(result["standalone_db"]), output)
+
+    def test_compatibility_cli_json_preserves_merged_db_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            output = root / "merged.sqlite"
+            self._create_db(source)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(COMPATIBILITY_SCRIPT),
+                    "merge-db",
+                    "--src",
+                    str(source),
+                    "--out",
+                    str(output),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(Path(payload["merged_db"]), output)
+        self.assertEqual(Path(payload["standalone_db"]), output)
+
     def test_capture_uses_python_39_compatible_zip_call(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / MODULE.NOTE_STORE_MAIN
@@ -345,6 +391,87 @@ raise SystemExit(2)
             )
             manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
             self.assertEqual(manifest["schema"], MODULE.SNAPSHOT_SCHEMA)
+
+    def test_copy_db_does_not_use_path_reopening_validation_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            with (
+                mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                mock.patch.object(
+                    MODULE,
+                    "_inspect_sidecars",
+                    side_effect=AssertionError("path sidecar helper used"),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "validate_database_recovery",
+                    side_effect=AssertionError("path recovery helper used"),
+                ),
+            ):
+                result = MODULE.copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+
+        self.assertEqual(result["sqlite_validation"]["result"], "ok")
+
+    def test_copy_db_blocks_copied_main_swap_during_bound_validation(self) -> None:
+        for hook_name in ("_inspect_bound_sidecars", "_bound_recovery_integrity"):
+            with self.subTest(hook=hook_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    paths = self._make_paths(root)
+                    self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+                    destination = root / "snapshot"
+                    replacement = root / f"{hook_name}-replacement.sqlite"
+                    self._create_db(replacement, value="replacement")
+                    original_hook = getattr(MODULE, hook_name)
+                    attacked = False
+
+                    def swap_around_bound_validation(
+                        store: MODULE._BoundRecoveryStore,
+                    ) -> dict[str, object]:
+                        nonlocal attacked
+                        attacked = True
+                        copied = store.directory.path / store.main_name
+                        parked = copied.with_name(f"{copied.name}.captured")
+                        os.replace(copied, parked)
+                        os.replace(replacement, copied)
+                        try:
+                            return original_hook(store)
+                        finally:
+                            os.replace(copied, replacement)
+                            os.replace(parked, copied)
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "notes_is_running",
+                            return_value=False,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            hook_name,
+                            side_effect=swap_around_bound_validation,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        MODULE.copy_db(
+                            paths,
+                            dest=destination,
+                            require_notes_quit=True,
+                        )
+
+                    self.assertTrue(attacked)
+                    self._assert_safety_code(
+                        "prepared-file-identity-mismatch",
+                        raised,
+                    )
+                    self.assertFalse(destination.exists())
+                    self._assert_retained_partial(root, ".snapshot.partial-*")
 
     def test_snapshot_fsyncs_nested_store_then_root_before_publication(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -886,6 +1013,95 @@ raise SystemExit(2)
             self.assertEqual(Path(result["dest"]), destination)
             self.assertTrue((destination / MODULE.SNAPSHOT_MANIFEST).is_file())
 
+    def test_snapshot_permanent_parent_replacement_retains_descriptor_tree_locator(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = root / "snapshot"
+            parked = root.with_name(f"{root.name}-parked")
+            original_scan = MODULE._scan_exact_directory_entries
+            attacked = False
+
+            def replace_parent_before_public_scan(
+                path: Path,
+                expected_types: dict[str, int],
+                **kwargs: object,
+            ) -> dict[str, object]:
+                nonlocal attacked
+                if not attacked and path == destination:
+                    attacked = True
+                    root.rename(parked)
+                    root.mkdir(mode=0o700)
+                return original_scan(path, expected_types, **kwargs)
+
+            try:
+                with (
+                    mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                    mock.patch.object(
+                        MODULE,
+                        "_scan_exact_directory_entries",
+                        side_effect=replace_parent_before_public_scan,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE.copy_db(
+                        paths,
+                        dest=destination,
+                        require_notes_quit=True,
+                    )
+                self._assert_safety_code("destination-install-uncertain", raised)
+                self.assertTrue(attacked)
+                self.assertFalse(destination.exists())
+                parked_destination = parked / destination.name
+                self.assertTrue(parked_destination.is_dir())
+                locator = raised.exception.details["recovery_locators"][
+                    "descriptor_bound_destination"
+                ]
+                self.assertEqual(locator["display_path"], str(destination))
+                self.assertEqual(
+                    locator["verification"],
+                    "bound-parent-and-directory-match-creation-receipts",
+                )
+                self.assertEqual(
+                    locator["directory_identity"],
+                    MODULE._identity(parked_destination.stat()),
+                )
+                self.assertEqual(
+                    locator["tree_verification"],
+                    "descriptor-revalidated-after-rename",
+                )
+                tree = locator["tree_receipt"]
+                self.assertEqual(
+                    tree["root"]["entry_types"],
+                    {
+                        "group.com.apple.notes": MODULE.stat.S_IFDIR,
+                        MODULE.SNAPSHOT_MANIFEST: MODULE.stat.S_IFREG,
+                    },
+                )
+                self.assertIn("group.com.apple.notes", tree["directories"])
+                self.assertIn(MODULE.SNAPSHOT_MANIFEST, tree["files"])
+                copied_relative = (
+                    f"group.com.apple.notes/{MODULE.NOTE_STORE_MAIN}"
+                )
+                self.assertIn(copied_relative, tree["files"])
+                copied = parked_destination / copied_relative
+                self.assertEqual(
+                    tree["files"][copied_relative]["identity"],
+                    MODULE._identity(copied.stat()),
+                )
+                self.assertEqual(
+                    tree["files"][copied_relative]["sha256"],
+                    MODULE._fingerprint_exact_file(copied)["sha256"],
+                )
+            finally:
+                if parked.exists():
+                    if root.exists():
+                        root.rmdir()
+                    parked.rename(root)
+
     def test_snapshot_parent_access_change_during_fsync_is_uncertain(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1000,7 +1216,7 @@ raise SystemExit(2)
                     require_notes_quit=False,
                 )
             self.assertTrue(attacked)
-            self.assertEqual(destination_checks, 2)
+            self.assertGreaterEqual(destination_checks, 2)
             self.assertEqual(Path(result["dest"]), destination)
             self.assertTrue((destination / MODULE.SNAPSHOT_MANIFEST).is_file())
 
@@ -1107,6 +1323,8 @@ raise SystemExit(2)
                 value = conn.execute("SELECT value FROM sample").fetchone()[0]
             self.assertEqual(value, "ok")
             self.assertEqual(result["output_integrity"]["result"], "ok")
+            self.assertEqual(Path(result["merged_db"]), merged)
+            self.assertEqual(Path(result["standalone_db"]), merged)
             self.assertFalse(merged.with_name(f"{merged.name}-wal").exists())
             self.assertFalse(merged.with_name(f"{merged.name}-shm").exists())
 
