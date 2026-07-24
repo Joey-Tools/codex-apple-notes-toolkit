@@ -4,9 +4,11 @@ import builtins
 import errno
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import shutil
+import signal
 import sqlite3
 import stat
 import struct
@@ -16,7 +18,7 @@ import tempfile
 import unicodedata
 import unittest
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -301,6 +303,146 @@ raise SystemExit(2)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn("preflight-writeback", result.stdout)
 
+    def test_notes_state_probe_ignores_malicious_path_shadow(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            marker = root / "shadow-invoked"
+            shadow = root / "pgrep"
+            shadow.write_text(
+                f"#!/bin/sh\ntouch {marker}\nprintf '99999\\n'\n",
+                encoding="utf-8",
+            )
+            shadow.chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": str(root)}):
+                try:
+                    result = MODULE.notes_is_running()
+                except MODULE.StoreSafetyError as exc:
+                    self.assertEqual(exc.code, "notes-state-unknown")
+                else:
+                    self.assertIsInstance(result, bool)
+            self.assertFalse(marker.exists())
+
+    def test_notes_state_probe_uses_closed_result_matrix(self) -> None:
+        class Probe:
+            def __init__(
+                self,
+                returncode: int,
+                stdout: bytes,
+                stderr: bytes,
+            ) -> None:
+                self.returncode = returncode
+                self.stdout = stdout
+                self.stderr = stderr
+                self.pid = 43210
+
+            def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+                self.timeout = timeout
+                return self.stdout, self.stderr
+
+            def poll(self) -> int:
+                return self.returncode
+
+        cases = (
+            (0, b"123\n456\n", b"", True),
+            (1, b"", b"", False),
+            (0, b"", b"", None),
+            (0, b"not-a-pid\n", b"", None),
+            (1, b"123\n", b"", None),
+            (2, b"", b"", None),
+            (0, b"123\n", b"warning\n", None),
+        )
+        for returncode, stdout, stderr, expected in cases:
+            with self.subTest(
+                returncode=returncode,
+                stdout=stdout,
+                stderr=stderr,
+            ):
+                probe = Probe(returncode, stdout, stderr)
+                with mock.patch.object(
+                    MODULE.subprocess,
+                    "Popen",
+                    return_value=probe,
+                ) as popen:
+                    if expected is None:
+                        with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                            MODULE.notes_is_running()
+                        self._assert_safety_code("notes-state-unknown", raised)
+                    else:
+                        self.assertIs(MODULE.notes_is_running(), expected)
+                argv = popen.call_args.args[0]
+                kwargs = popen.call_args.kwargs
+                self.assertEqual(argv, ["/usr/bin/pgrep", "-x", "Notes"])
+                self.assertEqual(kwargs["cwd"], "/")
+                self.assertEqual(kwargs["env"]["PATH"], "/usr/bin:/bin")
+                self.assertTrue(kwargs["start_new_session"])
+                self.assertEqual(
+                    probe.timeout,
+                    MODULE.NOTES_STATE_TIMEOUT_SECONDS,
+                )
+
+    def test_notes_state_probe_exec_failure_and_timeout_fail_closed(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE.subprocess,
+                "Popen",
+                side_effect=OSError(errno.ENOENT, "missing fixed pgrep"),
+            ),
+            self.assertRaises(MODULE.StoreSafetyError) as exec_raised,
+        ):
+            MODULE.notes_is_running()
+        self._assert_safety_code("notes-state-unknown", exec_raised)
+        self.assertEqual(exec_raised.exception.details["phase"], "exec")
+
+        class HangingProbe:
+            pid = 54321
+            returncode: int | None = None
+
+            def __init__(self) -> None:
+                self.wait_calls = 0
+
+            def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+                raise subprocess.TimeoutExpired(
+                    cmd="/usr/bin/pgrep",
+                    timeout=timeout,
+                )
+
+            def wait(self, *, timeout: float) -> int:
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise subprocess.TimeoutExpired(
+                        cmd="/usr/bin/pgrep",
+                        timeout=timeout,
+                    )
+                self.returncode = -signal.SIGKILL
+                return self.returncode
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+        probe = HangingProbe()
+        with (
+            mock.patch.object(
+                MODULE.subprocess,
+                "Popen",
+                return_value=probe,
+            ),
+            mock.patch.object(MODULE.os, "killpg") as killpg,
+            self.assertRaises(MODULE.StoreSafetyError) as timeout_raised,
+        ):
+            MODULE.notes_is_running()
+        self._assert_safety_code("notes-state-unknown", timeout_raised)
+        self.assertEqual(timeout_raised.exception.details["phase"], "timeout")
+        self.assertTrue(
+            timeout_raised.exception.details["cleanup"]["process_group_reaped"]
+        )
+        self.assertEqual(
+            killpg.call_args_list,
+            [
+                mock.call(probe.pid, signal.SIGTERM),
+                mock.call(probe.pid, signal.SIGKILL),
+            ],
+        )
+
     def test_compatibility_launcher_exports_packaged_api(self) -> None:
         spec = importlib.util.spec_from_file_location(
             "compatibility_helper", COMPATIBILITY_SCRIPT
@@ -573,7 +715,10 @@ raise SystemExit(2)
                 *args: object,
                 **kwargs: object,
             ) -> os.stat_result:
-                if path == paths.app_container and kwargs.get("dir_fd") is None:
+                if (path == paths.app_container and kwargs.get("dir_fd") is None) or (
+                    path == paths.app_container.name
+                    and kwargs.get("dir_fd") is not None
+                ):
                     raise OSError(
                         errno.EIO,
                         "simulated live-container scope failure",
@@ -637,6 +782,110 @@ raise SystemExit(2)
             )
             self.assertEqual(mkdir_calls, [])
             self.assertFalse(destination.exists())
+
+    def test_copy_db_rejects_intermediate_symlink_toward_absent_live_container(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            group = root / "group"
+            group.mkdir()
+            app = root / "initially-absent-app"
+            paths = MODULE.NoteStorePaths(
+                group_container=group,
+                app_container=app,
+            )
+            self._create_db(group / MODULE.NOTE_STORE_MAIN)
+            alias = root / "untrusted-intermediate"
+            alias.symlink_to(app, target_is_directory=True)
+            destination = alias / "nested" / "snapshot"
+
+            with (
+                mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                mock.patch.object(MODULE.os, "mkdir") as mkdir,
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.copy_db(
+                    paths,
+                    dest=destination,
+                    require_notes_quit=True,
+                )
+
+            self._assert_safety_code(
+                "snapshot-destination-scope-inconclusive",
+                raised,
+            )
+            self.assertFalse(raised.exception.details["mutation_performed"])
+            mkdir.assert_not_called()
+            self.assertFalse(app.exists())
+            self.assertFalse(destination.exists())
+
+    def test_component_replacement_before_creation_cannot_redirect_live_namespace(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            group = root / "group"
+            group.mkdir()
+            app = root / "initially-absent-app"
+            paths = MODULE.NoteStorePaths(
+                group_container=group,
+                app_container=app,
+            )
+            self._create_db(group / MODULE.NOTE_STORE_MAIN)
+            safe_root = root / "safe-root"
+            safe_parent = safe_root / "parent"
+            safe_parent.mkdir(parents=True)
+            parked = root / "safe-root-parked"
+            destination = safe_parent / "snapshot"
+            original_verify = MODULE._verify_snapshot_live_container_bindings
+            attacked = False
+
+            def replace_component_before_creation(
+                *args: object,
+                **kwargs: object,
+            ) -> object:
+                nonlocal attacked
+                if not attacked:
+                    attacked = True
+                    safe_root.rename(parked)
+                    safe_root.symlink_to(app, target_is_directory=True)
+                return original_verify(*args, **kwargs)
+
+            try:
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_verify_snapshot_live_container_bindings",
+                        side_effect=replace_component_before_creation,
+                    ),
+                    mock.patch.object(MODULE.os, "mkdir") as mkdir,
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE.copy_db(
+                        paths,
+                        dest=destination,
+                        require_notes_quit=True,
+                    )
+                self._assert_safety_code(
+                    "snapshot-destination-scope-inconclusive",
+                    raised,
+                )
+                self.assertTrue(attacked)
+                self.assertFalse(raised.exception.details["mutation_performed"])
+                mkdir.assert_not_called()
+                self.assertFalse(app.exists())
+                self.assertFalse(destination.exists())
+            finally:
+                if safe_root.is_symlink():
+                    safe_root.unlink()
+                if parked.exists():
+                    parked.rename(safe_root)
 
     def test_copy_db_rejects_case_and_nfd_live_container_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -868,7 +1117,7 @@ raise SystemExit(2)
                 self.subTest(operation=operation),
                 tempfile.TemporaryDirectory() as temp_dir,
             ):
-                root = Path(temp_dir)
+                root = Path(temp_dir).resolve()
                 live_root = root / "live"
                 live_root.mkdir()
                 paths = self._make_paths(live_root)
@@ -990,7 +1239,7 @@ raise SystemExit(2)
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
+            root = Path(temp_dir).resolve()
             live_root = root / "live"
             live_root.mkdir()
             paths = self._make_paths(live_root)
@@ -1008,18 +1257,18 @@ raise SystemExit(2)
                 "_trusted_directory_alias_registry",
                 return_value=registry,
             ):
-                with MODULE._bind_live_safe_destination_parent(
-                    paths,
-                    destination,
-                ) as scope:
-                    alias.unlink()
-                    alias.symlink_to(alternate, target_is_directory=True)
-                    with self.assertRaises(MODULE.StoreSafetyError) as retargeted:
+                with self.assertRaises(MODULE.StoreSafetyError) as retargeted:
+                    with MODULE._bind_live_safe_destination_parent(
+                        paths,
+                        destination,
+                    ) as scope:
+                        alias.unlink()
+                        alias.symlink_to(alternate, target_is_directory=True)
                         scope.revalidate()
-                    self._assert_safety_code(
-                        "snapshot-destination-scope-inconclusive",
-                        retargeted,
-                    )
+                self._assert_safety_code(
+                    "snapshot-destination-scope-inconclusive",
+                    retargeted,
+                )
 
             alias.unlink()
             alias.symlink_to(target, target_is_directory=True)
@@ -1065,7 +1314,7 @@ raise SystemExit(2)
 
     def test_untrusted_case_and_nfd_aliases_fail_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
+            root = Path(temp_dir).resolve()
             live_root = root / "live"
             live_root.mkdir()
             paths = self._make_paths(live_root)
@@ -5224,6 +5473,227 @@ raise SystemExit(2)
                 "manifest-creation-receipt-not-external",
             )
 
+    def test_relative_snapshot_paths_work_across_api_and_cli_boundaries(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            live = paths.group_container / MODULE.NOTE_STORE_MAIN
+            self._create_db(live, value="before")
+            edited = root / "edited.sqlite"
+            self._create_db(edited, value="after")
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+                stage = self._stage_patch(edited, root / "stage")
+            snapshot_receipt_file = root / "snapshot-result.json"
+            snapshot_receipt_file.write_text(
+                json.dumps(snapshot, default=str),
+                encoding="utf-8",
+            )
+            stage_receipt_file = root / "stage-result.json"
+            stage_receipt_file.write_text(
+                json.dumps(stage, default=str),
+                encoding="utf-8",
+            )
+
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                canonical_cwd = Path.cwd()
+
+                validation = MODULE.validate_snapshot(
+                    Path("snapshot"),
+                    snapshot["manifest_creation_receipt"],
+                )
+                self.assertEqual(
+                    Path(validation["snapshot_dir"]),
+                    canonical_cwd / "snapshot",
+                )
+                recovered = MODULE.recover_snapshot(
+                    Path("snapshot"),
+                    Path("api-recovered.sqlite"),
+                    snapshot["manifest_creation_receipt"],
+                    paths=paths,
+                )
+                self.assertEqual(
+                    Path(recovered["recovered"]["standalone_db"]),
+                    canonical_cwd / "api-recovered.sqlite",
+                )
+                with mock.patch.object(
+                    MODULE,
+                    "notes_is_running",
+                    return_value=False,
+                ):
+                    preflight = MODULE.preflight_writeback(
+                        paths,
+                        backup_dir=Path("snapshot"),
+                        stage_dir=Path("stage"),
+                        backup_manifest_creation_receipt=(
+                            snapshot["manifest_creation_receipt"]
+                        ),
+                        stage_manifest_creation_receipt=(
+                            stage["manifest_creation_receipt"]
+                        ),
+                    )
+                self.assertEqual(
+                    Path(preflight["backup_dir"]),
+                    canonical_cwd / "snapshot",
+                )
+                self.assertEqual(
+                    Path(preflight["stage_dir"]),
+                    canonical_cwd / "stage",
+                )
+
+                def run_cli(arguments: list[str]) -> tuple[int, dict[str, object]]:
+                    output = io.StringIO()
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "notes_is_running",
+                            return_value=False,
+                        ),
+                        redirect_stdout(output),
+                    ):
+                        returncode = MODULE.main(arguments)
+                    return returncode, json.loads(output.getvalue())
+
+                common_paths = [
+                    "--group-container",
+                    str(paths.group_container),
+                    "--app-container",
+                    str(paths.app_container),
+                ]
+                cli_cases = (
+                    [
+                        "validate-snapshot",
+                        "--snapshot-dir",
+                        "snapshot",
+                        "--manifest-creation-receipt-file",
+                        "snapshot-result.json",
+                    ],
+                    [
+                        "recover-snapshot",
+                        *common_paths,
+                        "--snapshot-dir",
+                        "snapshot",
+                        "--out",
+                        "cli-recovered.sqlite",
+                        "--manifest-creation-receipt-file",
+                        "snapshot-result.json",
+                    ],
+                    [
+                        "preflight-writeback",
+                        *common_paths,
+                        "--backup-dir",
+                        "snapshot",
+                        "--stage-dir",
+                        "stage",
+                        "--backup-manifest-creation-receipt-file",
+                        "snapshot-result.json",
+                        "--stage-manifest-creation-receipt-file",
+                        "stage-result.json",
+                    ],
+                )
+                for arguments in cli_cases:
+                    with self.subTest(command=arguments[0]):
+                        returncode, payload = run_cli(arguments)
+                        self.assertEqual(returncode, 0, payload)
+
+                replacement = root / "replacement.sqlite"
+                shutil.copyfile(root / "stage" / MODULE.NOTE_STORE_MAIN, replacement)
+                replacement.chmod(stat.S_IMODE(live.stat().st_mode))
+                os.replace(replacement, live)
+                with mock.patch.object(
+                    MODULE,
+                    "notes_is_running",
+                    return_value=False,
+                ):
+                    verified = MODULE.verify_writeback(
+                        paths,
+                        backup_dir=Path("snapshot"),
+                        stage_dir=Path("stage"),
+                        backup_manifest_creation_receipt=(
+                            snapshot["manifest_creation_receipt"]
+                        ),
+                        stage_manifest_creation_receipt=(
+                            stage["manifest_creation_receipt"]
+                        ),
+                    )
+                self.assertTrue(verified["writeback_verified"])
+                returncode, payload = run_cli(
+                    [
+                        "verify-writeback",
+                        *common_paths,
+                        "--backup-dir",
+                        "snapshot",
+                        "--stage-dir",
+                        "stage",
+                        "--backup-manifest-creation-receipt-file",
+                        "snapshot-result.json",
+                        "--stage-manifest-creation-receipt-file",
+                        "stage-result.json",
+                    ]
+                )
+                self.assertEqual(returncode, 0, payload)
+                self.assertTrue(payload["writeback_verified"])
+
+                snapshot_alias = root / "snapshot-alias"
+                snapshot_alias.symlink_to("snapshot", target_is_directory=True)
+                with self.assertRaises(MODULE.StoreSafetyError) as alias_raised:
+                    MODULE.validate_snapshot(
+                        Path("snapshot-alias"),
+                        snapshot["manifest_creation_receipt"],
+                    )
+                self._assert_safety_code(
+                    "directory-identity-mismatch",
+                    alias_raised,
+                )
+
+                original_receipt = MODULE._manifest_creation_receipt_for_bound_artifact
+                parked = root / "snapshot-parked"
+                replacement_snapshot = root / "snapshot-replacement"
+                swapped = False
+
+                def replace_snapshot_after_binding(
+                    *args: object,
+                    **kwargs: object,
+                ) -> dict[str, object]:
+                    nonlocal swapped
+                    if not swapped:
+                        swapped = True
+                        shutil.copytree(root / "snapshot", replacement_snapshot)
+                        (root / "snapshot").rename(parked)
+                        replacement_snapshot.rename(root / "snapshot")
+                    return original_receipt(*args, **kwargs)
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_manifest_creation_receipt_for_bound_artifact",
+                        side_effect=replace_snapshot_after_binding,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as replacement_raised,
+                ):
+                    MODULE.validate_snapshot(
+                        Path("snapshot"),
+                        snapshot["manifest_creation_receipt"],
+                    )
+                self.assertTrue(swapped)
+                self.assertIn(
+                    replacement_raised.exception.code,
+                    {
+                        "snapshot-directory-identity-mismatch",
+                        "directory-identity-mismatch",
+                    },
+                )
+            finally:
+                os.chdir(previous_cwd)
+
     def test_artifact_swap_between_receipt_load_and_consumption_is_rejected(
         self,
     ) -> None:
@@ -6335,23 +6805,25 @@ raise SystemExit(2)
                 )
             snapshot_dir = Path(snapshot["dest"])
             recovered = root / "recovered.sqlite"
-            original_bind = MODULE._bind_existing_directory
+            original_bind = MODULE._bind_artifact_root
             snapshot_bind_count = 0
-            _, expected_bound_snapshot, _ = MODULE._trusted_alias_paths(snapshot_dir)
+            expected_bound_snapshot = Path(os.path.abspath(snapshot_dir))
 
             @contextmanager
             def count_snapshot_bind(
                 path: Path,
+                *,
+                missing_code: str,
             ) -> Iterator[MODULE._BoundDirectory]:
                 nonlocal snapshot_bind_count
                 if path == expected_bound_snapshot:
                     snapshot_bind_count += 1
-                with original_bind(path) as binding:
+                with original_bind(path, missing_code=missing_code) as binding:
                     yield binding
 
             with mock.patch.object(
                 MODULE,
-                "_bind_existing_directory",
+                "_bind_artifact_root",
                 side_effect=count_snapshot_bind,
             ):
                 result = self._recover_snapshot(snapshot_dir, recovered)

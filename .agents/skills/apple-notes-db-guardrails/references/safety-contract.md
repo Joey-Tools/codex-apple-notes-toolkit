@@ -21,12 +21,17 @@ native byte order, recovery, and SHM's non-durable role.
 
 ## Protected Properties
 
-Protect three properties independently:
+Protect five properties independently:
 
 1. **Object identity**: bind the opened regular file to device, inode, and file type, then require
    the pathname to resolve to that same object after the read.
 2. **Content stability**: hash the same opened descriptor twice and require equal SHA-256 and size.
 3. **Access policy**: require mode, owner, group, and platform file flags to remain unchanged.
+4. **Path-component identity**: open each absolute directory component no-follow relative to its
+   already-held parent and reject every symlink/reparse point except an explicitly registered
+   Darwin root-alias object.
+5. **Notes process-state authority**: accept only a closed, validated result from the fixed
+   `/usr/bin/pgrep -x Notes` probe; unknown state never authorizes writeback readiness.
 
 For the snapshot store directory and patch-stage directory, bind object identity and access policy
 in the same way. Treat the complete no-follow entry name/type map as directory content: an extra
@@ -262,7 +267,11 @@ empty directory that appeared after an earlier check, must remain untouched.
 Before `copy-db`, `merge-db`, `recover-snapshot`, or `stage-patch` creates any destination-parent
 component or output, enter one shared live-container guard. Compare case-folded NFD path components
 against both Apple Notes live-container paths and bind those live containers plus the nearest
-existing destination ancestor. Reject either direction of normalized ancestor/descendant overlap.
+existing destination ancestor. Traverse from the filesystem root through every existing component
+with descriptor-relative no-follow `stat`/`open`, retaining each parent/child identity and access
+policy. For an initially absent live container, retain its nearest existing ancestor plus exact
+missing suffix and fail if the first missing component appears. Reject either direction of
+normalized ancestor/descendant overlap.
 A lexical normalized overlap or a descriptor-ancestor identity match proves
 `snapshot-destination-inside-live-container`; an unavailable, replaced, or access-policy-mutated
 binding is `snapshot-destination-scope-inconclusive`. Reject `NoteStore.sqlite`,
@@ -270,8 +279,10 @@ binding is `snapshot-destination-scope-inconclusive`. Reject `NoteStore.sqlite`,
 components even when the corresponding live sidecar is absent. This guard precedes the first
 mkdir, file creation, partial, backup, manifest/receipt, helper output, or rename. Hold and
 revalidate live-container and destination-ancestor object identity, location scope, and access
-policy through publication. Directory child-entry churn is not itself content mutation outside
-those reserved names.
+policy through publication. Use that same nearest-ancestor/component binding for descriptor-relative
+parent creation, creator receipts, publication, and terminal revalidation; an unexpected
+`FileExistsError` for a formerly missing component is a race, not permission to adopt it.
+Directory child-entry churn is not itself content mutation outside those reserved names.
 
 Darwin root aliases are an explicit, exact registry rather than a general symlink exception:
 `/tmp -> /private/tmp`, `/var -> /private/var`, and `/etc -> /private/etc`. Bind the alias parent,
@@ -324,6 +335,12 @@ Receipt-parent binding never leaks the generic prepared-directory taxonomy: a mi
 `manifest-creation-receipt-missing`, a permission-denied parent is
 `manifest-creation-receipt-unreadable`, and symlink, identity/access-policy, open, or other
 revalidation failures are `manifest-creation-receipt-scope-inconclusive`.
+
+Normalize every public snapshot/stage path once with lexical `abspath` semantics and derive the
+artifact root, manifest, nested store/database, and external receipt from that absolute policy.
+Do not use `resolve()` or another symlink-following canonicalizer. Relative API and CLI inputs must
+therefore share one absolute parent policy while component binding still rejects alias, symlink,
+and replacement races.
 On writer failure, retain the created file and report the held parent/file descriptor identities,
 access policies, content status, and point-in-time namespace observations. Do not attempt automatic
 name-based cleanup: even descriptor-relative `stat(name)` followed by `unlink(name)` has a
@@ -423,6 +440,14 @@ within that compatibility floor unless the wrapper, documentation, and tests ado
 minimum together.
 
 ## Patch And Writeback Boundary
+
+The Notes process-state gate launches only `/usr/bin/pgrep -x Notes` with stdin closed, a minimal
+fixed environment, a new process session, and a finite hard deadline. On timeout, terminate and
+reap the entire process group, escalating from `SIGTERM` to `SIGKILL` after a bounded grace period.
+Only return code `0` with one or more positive decimal PID lines means running. Only return code
+`1` with empty stdout and stderr means quit. Exec/collection failure, timeout, stderr, malformed
+PID output, an output/exit mismatch, or any other return code is `notes-state-unknown`; preflight
+and verification must stop rather than treating unknown as quit.
 
 Keep patch preparation separate from live replacement.
 `stage-patch` and `preflight-writeback` are read-only with respect to the live container.

@@ -17,12 +17,19 @@ descriptors for rename, fsync, and terminal revalidation; retained sensitive
 partials and uncertain standalone destinations receive precise recovery
 locators. Every output command rejects case/NFD, ancestor/descendant, and
 descriptor-resolved overlap with either live Notes container before its first
-write. Exact Darwin root aliases such as `/tmp -> /private/tmp` are
+write. Existing destination and live-container paths are bound one no-follow
+component at a time; initially absent live containers retain their nearest
+existing ancestor and missing suffix through creation and terminal checks.
+Exact Darwin root aliases such as `/tmp -> /private/tmp` are
 registry-bound and continuously revalidated through the same carried alias
 object across receipt loading, creator results, publication, and terminal
 public-path checks; arbitrary symlinks fail closed. Snapshot recovery acquires
 its output/live-container guard before validation can allocate temporary
 storage, clone inputs, or invoke a writer.
+Snapshot/stage API and CLI inputs use one absolute lexical path policy for the
+root and every derived member, so relative paths cannot split parent authority.
+Notes process-state checks use fixed `/usr/bin/pgrep`, a minimal environment,
+a hard deadline, process-group cleanup, and a closed fail-unknown result matrix.
 Post-publication ordinary failures retain descriptor-bound, non-retryable
 uncertain-state evidence. Snapshot sidecar and SQLite validation reuse the
 capture-bound file descriptors, and uncertain directory publication records an

@@ -57,8 +57,12 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" copy-db \
 Before creating even the destination parent, every write-producing command (`copy-db`, `merge-db`,
 `recover-snapshot`, and `stage-patch`) enters the same live-container guard. It normalizes the
 requested path with case-folded NFD components and binds the nearest existing ancestor plus both
-Apple Notes live containers. It rejects normalized lexical overlap, either direction of
-ancestor/descendant overlap, or a descriptor-ancestor identity match. It also rejects
+Apple Notes live containers. Every absolute path component is opened no-follow relative to its
+already-held parent; an initially absent live container remains anchored to its nearest existing
+component and missing suffix. The same component chain authorizes parent creation and remains held
+for creator receipts, publication, and terminal revalidation. It rejects normalized lexical
+overlap, either direction of ancestor/descendant overlap, or a descriptor-ancestor identity match.
+It also rejects
 `NoteStore.sqlite`, `-wal`, `-shm`, and `-journal` as path components anywhere in a destination,
 even when that sidecar is currently absent. The guard runs before the first mkdir, file creation,
 rename, partial, backup, receipt, or helper output.
@@ -78,6 +82,12 @@ falling back to the public pathname. Unrelated child-entry churn is not a conten
 Successful creator output records the alias-aware
 `manifest_creation_destination_scope`, `terminal_destination_scope`, and
 `descriptor_bound_destination` receipts.
+
+The Notes-running gate executes only `/usr/bin/pgrep -x Notes` with a minimal fixed environment,
+a hard deadline, and process-group cleanup. Only exit `0` plus one or more decimal PIDs means
+running; only exit `1` with empty stdout/stderr means quit. Timeout, exec failure, diagnostics,
+malformed output, or any other result is `notes-state-unknown` and never authorizes a writeback
+preflight or verification.
 
 Treat a snapshot captured while Notes is running as tentative.
 Do not use it for absence claims, exact counts, patch planning, or writeback.
@@ -140,6 +150,11 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" validate-snapshot \
   --manifest-creation-receipt-file \
     /tmp/<task-backup>.creation-result.json
 ```
+
+Snapshot and stage API/CLI inputs are normalized once to absolute lexical paths without resolving
+symlinks. Root, manifest, nested-store/database, and external-receipt paths are then derived from
+that one policy object, so relative inputs do not mix relative children with an absolute bound
+root. Component-wise no-follow binding still rejects aliases, replacement, and symlink traversal.
 
 Validation requires the caller-preserved artifact-external receipt before parsing the v3
 manifest. The validator binds the artifact root once before loading that receipt. Receipt
