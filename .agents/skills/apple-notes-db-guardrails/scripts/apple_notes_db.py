@@ -540,6 +540,175 @@ def _descriptor_bound_directory_recovery_evidence(
     return evidence
 
 
+def _descriptor_bound_prepared_directory_retry_receipt(
+    binding: _BoundDirectory,
+    *,
+    source: Path,
+    destination: Path,
+    tree_receipt_builder: Callable[[str], dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Prove a failed directory rename left one complete retryable tree."""
+
+    if binding.parent_fd is None:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Prepared directory has no parent descriptor: {source}",
+        )
+    if tree_receipt_builder is None:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            "Directory retry safety requires a complete descriptor-bound tree "
+            f"receipt builder: {source}",
+        )
+    parent = _verify_bound_parent_descriptor(
+        binding.parent_fd,
+        binding.parent_opened,
+        display_path=source.parent,
+        identity_code="prepared-directory-identity-mismatch",
+        access_policy_code="prepared-directory-access-policy-mismatch",
+        inconclusive_code="prepared-directory-revalidation-inconclusive",
+    )
+    tree_receipt = tree_receipt_builder(source.name)
+    root = _verify_bound_directory_at(
+        binding,
+        parent_fd=binding.parent_fd,
+        basename=source.name,
+        display_path=source,
+    )
+    parent = _verify_bound_parent_descriptor(
+        binding.parent_fd,
+        binding.parent_opened,
+        display_path=source.parent,
+        identity_code="prepared-directory-identity-mismatch",
+        access_policy_code="prepared-directory-access-policy-mismatch",
+        inconclusive_code="prepared-directory-revalidation-inconclusive",
+    )
+    target_state, target_observed = _observe_bound_name(
+        binding.parent_fd,
+        destination.name,
+    )
+    parent = _verify_bound_parent_descriptor(
+        binding.parent_fd,
+        binding.parent_opened,
+        display_path=source.parent,
+        identity_code="prepared-directory-identity-mismatch",
+        access_policy_code="prepared-directory-access-policy-mismatch",
+        inconclusive_code="prepared-directory-revalidation-inconclusive",
+    )
+    target_receipt: dict[str, Any] = {
+        "display_path": str(destination),
+        "basename": destination.name,
+        "state": target_state,
+        "verification": "terminal-descriptor-relative-no-follow-observation",
+        "parent_identity": _identity(parent),
+        "evidence_status": (
+            "inconclusive" if target_state == "unavailable" else "checked"
+        ),
+    }
+    if target_state == "present" and target_observed is not None:
+        target_receipt["identity"] = _identity(target_observed)
+        target_receipt["access_policy"] = _access_policy(target_observed)
+    return {
+        "display_path": str(source),
+        "verification": (
+            "bound-parent-root-tree-content-and-access-match-creation-receipts"
+        ),
+        "parent_identity": _identity(parent),
+        "parent_access_policy": _access_policy(parent),
+        "root_identity": root["identity"],
+        "root_access_policy": root["access_policy"],
+        "tree_receipt": tree_receipt,
+        "target": target_receipt,
+    }
+
+
+def _pre_rename_directory_publication_details(
+    binding: _BoundDirectory,
+    *,
+    source: Path,
+    destination: Path,
+    prepared_tree_receipt: dict[str, Any] | None,
+    tree_receipt_builder: Callable[[str], dict[str, Any]] | None,
+) -> tuple[str, dict[str, Any]]:
+    """Classify namespace evidence before this process invokes rename."""
+
+    if binding.parent_fd is None:
+        return (
+            "uncommitted",
+            _publication_details(
+                "uncommitted",
+                prepared=None,
+                destination=destination,
+                retry_safe=False,
+            ),
+        )
+    source_observation = _observe_bound_name(binding.parent_fd, source.name)
+    destination_observation = _observe_bound_name(
+        binding.parent_fd,
+        destination.name,
+    )
+    evidence = _descriptor_bound_directory_recovery_evidence(
+        binding,
+        source=source,
+        destination=destination,
+        source_observation=source_observation,
+        destination_observation=destination_observation,
+        tree_receipt=prepared_tree_receipt,
+    )
+    source_state, _ = source_observation
+    destination_state, destination_stat = destination_observation
+    prepared_is_at_destination = (
+        source_state == "absent"
+        and destination_state == "present"
+        and destination_stat is not None
+        and _same_identity(binding.opened, destination_stat)
+    )
+    namespace_observation_unavailable = (
+        source_state == "unavailable" or destination_state == "unavailable"
+    )
+    descriptor_bound_destination: dict[str, Any] | None = None
+    if prepared_is_at_destination:
+        try:
+            descriptor_bound_destination = (
+                _descriptor_bound_directory_destination_receipt(
+                    binding,
+                    destination,
+                    tree_receipt=prepared_tree_receipt,
+                    tree_verification="creation-receipt-last-verified-before-rename",
+                )
+            )
+            if tree_receipt_builder is not None:
+                try:
+                    descriptor_bound_destination["tree_receipt"] = tree_receipt_builder(
+                        destination.name
+                    )
+                    descriptor_bound_destination["tree_verification"] = (
+                        "descriptor-revalidated-before-local-rename"
+                    )
+                except Exception as tree_exc:
+                    descriptor_bound_destination["tree_revalidation_error"] = str(
+                        tree_exc
+                    )
+        except (OSError, StoreSafetyError):
+            descriptor_bound_destination = None
+    state = (
+        "uncertain"
+        if prepared_is_at_destination or namespace_observation_unavailable
+        else "uncommitted"
+    )
+    return (
+        state,
+        _publication_details(
+            state,
+            prepared=None,
+            destination=destination,
+            retry_safe=False,
+            descriptor_bound_destination=descriptor_bound_destination,
+            descriptor_bound_prepared_root=evidence,
+        ),
+    )
+
+
 def _verify_installed_directory_path(
     binding: _BoundDirectory,
     destination: Path,
@@ -606,54 +775,117 @@ def _publish_directory_no_replace(
     binding: _BoundDirectory | None = None,
     before_rename: Callable[[], None] | None = None,
     prepared_tree_receipt: dict[str, Any] | None = None,
-    descriptor_tree_receipt_builder: Callable[[], dict[str, Any]] | None = None,
+    descriptor_tree_receipt_builder: (Callable[[str], dict[str, Any]] | None) = None,
 ) -> dict[str, Any]:
     if binding is None or binding.parent_fd is None:
         raise StoreSafetyError(
             "destination-install-failed",
             "Directory publication requires creation-time source and parent "
             f"descriptors: {source}",
+            details=_publication_details(
+                "uncommitted",
+                prepared=None,
+                destination=destination,
+                retry_safe=False,
+            ),
         )
     if source.parent != destination.parent or source.parent != binding.path.parent:
         raise StoreSafetyError(
             "destination-install-failed",
             "Descriptor-relative directory publication requires one bound parent: "
             f"source={source}, destination={destination}",
+            details=_publication_details(
+                "uncommitted",
+                prepared=None,
+                destination=destination,
+                retry_safe=False,
+            ),
         )
     parent_fd = binding.parent_fd
-    _verify_bound_parent_descriptor(
-        parent_fd,
-        binding.parent_opened,
-        display_path=source.parent,
-        identity_code="prepared-directory-identity-mismatch",
-        access_policy_code="prepared-directory-access-policy-mismatch",
-        inconclusive_code="prepared-directory-revalidation-inconclusive",
-    )
-    _verify_bound_directory_at(
-        binding,
-        parent_fd=parent_fd,
-        basename=source.name,
-        display_path=source,
-    )
-    source_before = os.fstat(binding.fd)
-    source_identity = _identity(source_before)
-    source_access_policy = _access_policy(source_before)
-    if before_rename is not None:
-        before_rename()
-    _verify_bound_parent_descriptor(
-        parent_fd,
-        binding.parent_opened,
-        display_path=source.parent,
-        identity_code="prepared-directory-identity-mismatch",
-        access_policy_code="prepared-directory-access-policy-mismatch",
-        inconclusive_code="prepared-directory-revalidation-inconclusive",
-    )
-    _verify_bound_directory_at(
-        binding,
-        parent_fd=parent_fd,
-        basename=source.name,
-        display_path=source,
-    )
+    try:
+        _verify_bound_parent_descriptor(
+            parent_fd,
+            binding.parent_opened,
+            display_path=source.parent,
+            identity_code="prepared-directory-identity-mismatch",
+            access_policy_code="prepared-directory-access-policy-mismatch",
+            inconclusive_code="prepared-directory-revalidation-inconclusive",
+        )
+        _verify_bound_directory_at(
+            binding,
+            parent_fd=parent_fd,
+            basename=source.name,
+            display_path=source,
+        )
+        source_before = os.fstat(binding.fd)
+        source_identity = _identity(source_before)
+        source_access_policy = _access_policy(source_before)
+        if before_rename is not None:
+            before_rename()
+        _verify_bound_parent_descriptor(
+            parent_fd,
+            binding.parent_opened,
+            display_path=source.parent,
+            identity_code="prepared-directory-identity-mismatch",
+            access_policy_code="prepared-directory-access-policy-mismatch",
+            inconclusive_code="prepared-directory-revalidation-inconclusive",
+        )
+        _verify_bound_directory_at(
+            binding,
+            parent_fd=parent_fd,
+            basename=source.name,
+            display_path=source,
+        )
+    except StoreSafetyError as exc:
+        publication_state, publication_details = (
+            _pre_rename_directory_publication_details(
+                binding,
+                source=source,
+                destination=destination,
+                prepared_tree_receipt=prepared_tree_receipt,
+                tree_receipt_builder=descriptor_tree_receipt_builder,
+            )
+        )
+        details = _merge_recovery_details(
+            publication_details,
+            exc.details,
+        )
+        details["publication_state"] = publication_state
+        details["retry_safe"] = False
+        if publication_state == "uncertain":
+            raise StoreSafetyError(
+                "destination-install-uncertain",
+                "The directory publication outcome cannot be established "
+                "before this process invoked the publication rename; preserve "
+                f"the descriptor-bound recovery evidence: {destination}: {exc}",
+                details=details,
+            ) from exc
+        exc.details = details
+        raise
+    except OSError as exc:
+        publication_state, details = _pre_rename_directory_publication_details(
+            binding,
+            source=source,
+            destination=destination,
+            prepared_tree_receipt=prepared_tree_receipt,
+            tree_receipt_builder=descriptor_tree_receipt_builder,
+        )
+        details["publication_state"] = publication_state
+        details["retry_safe"] = False
+        if publication_state == "uncertain":
+            raise StoreSafetyError(
+                "destination-install-uncertain",
+                "The directory publication outcome cannot be established "
+                "before this process invoked the publication rename, and "
+                f"validation also failed: {destination}: {exc}",
+                details=details,
+            ) from exc
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            "Directory publication failed before the rename syscall while "
+            f"validating the prepared tree: {source}: {exc}",
+            details=details,
+        ) from exc
 
     try:
         _rename_directory_no_replace_at(
@@ -700,7 +932,7 @@ def _publish_directory_no_replace(
                 if descriptor_tree_receipt_builder is not None:
                     try:
                         descriptor_bound_destination["tree_receipt"] = (
-                            descriptor_tree_receipt_builder()
+                            descriptor_tree_receipt_builder(destination.name)
                         )
                         descriptor_bound_destination["tree_verification"] = (
                             "descriptor-revalidated-after-rename"
@@ -734,6 +966,13 @@ def _publish_directory_no_replace(
             raise StoreSafetyError(
                 "destination-exists",
                 f"Destination appeared before atomic installation: {destination}",
+                details=_publication_details(
+                    "uncommitted",
+                    prepared=None,
+                    destination=destination,
+                    retry_safe=False,
+                    descriptor_bound_prepared_root=(descriptor_bound_prepared_root),
+                ),
             ) from exc
         if (
             source_state == "present"
@@ -741,9 +980,123 @@ def _publish_directory_no_replace(
             and _identity(source_after) == source_identity
             and destination_state == "absent"
         ):
+            try:
+                prepared_retry_receipt = (
+                    _descriptor_bound_prepared_directory_retry_receipt(
+                        binding,
+                        source=source,
+                        destination=destination,
+                        tree_receipt_builder=descriptor_tree_receipt_builder,
+                    )
+                )
+            except (OSError, StoreSafetyError) as revalidation_exc:
+                terminal_source = _observe_bound_name(parent_fd, source.name)
+                terminal_destination = _observe_bound_name(
+                    parent_fd,
+                    destination.name,
+                )
+                terminal_evidence = _descriptor_bound_directory_recovery_evidence(
+                    binding,
+                    source=source,
+                    destination=destination,
+                    source_observation=terminal_source,
+                    destination_observation=terminal_destination,
+                    tree_receipt=prepared_tree_receipt,
+                )
+                source_terminal_state, source_terminal_stat = terminal_source
+                target_terminal_state, _ = terminal_destination
+                source_terminal_matches = (
+                    source_terminal_state == "present"
+                    and source_terminal_stat is not None
+                    and _identity(source_terminal_stat) == source_identity
+                )
+                publication_state = (
+                    "uncommitted"
+                    if source_terminal_matches
+                    and target_terminal_state in {"absent", "present"}
+                    else "uncertain"
+                )
+                details = _publication_details(
+                    publication_state,
+                    prepared=None,
+                    destination=destination,
+                    retry_safe=False,
+                    descriptor_bound_prepared_root=terminal_evidence,
+                )
+                details["retry_revalidation"] = {
+                    "status": "failed",
+                    "error_code": (
+                        revalidation_exc.code
+                        if isinstance(revalidation_exc, StoreSafetyError)
+                        else "prepared-directory-revalidation-inconclusive"
+                    ),
+                    "error": str(revalidation_exc),
+                }
+                details["publication_error"] = {
+                    "errno": exc.errno,
+                    "error": str(exc),
+                }
+                if source_terminal_matches and target_terminal_state == "present":
+                    raise StoreSafetyError(
+                        "destination-exists",
+                        "The destination appeared while the failed directory "
+                        f"rename was being revalidated: {destination}",
+                        details=details,
+                    ) from revalidation_exc
+                if source_terminal_matches and target_terminal_state == "absent":
+                    raise StoreSafetyError(
+                        "destination-install-failed",
+                        "The directory rename is proved uncommitted, but the "
+                        "prepared tree no longer passes complete descriptor-bound "
+                        f"revalidation: {source}: {revalidation_exc}",
+                        details=details,
+                    ) from revalidation_exc
+                raise StoreSafetyError(
+                    "destination-install-uncertain",
+                    "The directory rename failed and its terminal namespace or "
+                    "prepared-tree evidence is inconclusive: "
+                    f"source={source}, destination={destination}: "
+                    f"{revalidation_exc}",
+                    details=details,
+                ) from revalidation_exc
+            terminal_target_state = prepared_retry_receipt["target"]["state"]
+            if terminal_target_state == "present":
+                raise StoreSafetyError(
+                    "destination-exists",
+                    "The destination appeared while the failed directory rename's "
+                    f"prepared tree was being revalidated: {destination}",
+                    details=_publication_details(
+                        "uncommitted",
+                        prepared=None,
+                        destination=destination,
+                        retry_safe=False,
+                        descriptor_bound_prepared_root=prepared_retry_receipt,
+                    ),
+                ) from exc
+            if terminal_target_state != "absent":
+                raise StoreSafetyError(
+                    "destination-install-uncertain",
+                    "The failed directory rename left the prepared tree intact, "
+                    "but the destination could not be terminally observed "
+                    f"through the held parent descriptor: {destination}",
+                    details=_publication_details(
+                        "uncertain",
+                        prepared=None,
+                        destination=destination,
+                        retry_safe=False,
+                        descriptor_bound_prepared_root=prepared_retry_receipt,
+                    ),
+                ) from exc
             raise StoreSafetyError(
                 "destination-install-failed",
                 f"Cannot atomically install directory at {destination}: {exc}",
+                details=_publication_details(
+                    "uncommitted",
+                    prepared=None,
+                    destination=destination,
+                    retry_safe=True,
+                    descriptor_bound_prepared_root=prepared_retry_receipt,
+                ),
             ) from exc
         raise StoreSafetyError(
             "destination-install-uncertain",
@@ -811,7 +1164,7 @@ def _publish_directory_no_replace(
         )
         if descriptor_tree_receipt_builder is not None:
             descriptor_bound_destination["tree_receipt"] = (
-                descriptor_tree_receipt_builder()
+                descriptor_tree_receipt_builder(destination.name)
             )
             descriptor_bound_destination["tree_verification"] = (
                 "descriptor-revalidated-after-rename"
@@ -2804,6 +3157,110 @@ def _revalidate_open_source(
     }
 
 
+def _terminal_revalidate_open_source(
+    opened: _OpenedSource,
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    """Rehash one held source and recheck each protected property."""
+
+    try:
+        descriptor_before = os.fstat(opened.fd)
+    except OSError as exc:
+        raise _source_revalidation_os_error(
+            opened.path,
+            "inspect the descriptor before terminal hashing",
+            exc,
+        ) from exc
+    try:
+        path_before = os.stat(opened.path, follow_symlinks=False)
+    except OSError as exc:
+        raise _source_revalidation_os_error(
+            opened.path,
+            "inspect the source path before terminal hashing",
+            exc,
+        ) from exc
+    try:
+        terminal_sha256 = _hash_fd(opened.fd)
+    except OSError as exc:
+        raise _source_revalidation_os_error(
+            opened.path,
+            "repeat the descriptor hash during terminal revalidation",
+            exc,
+        ) from exc
+    try:
+        descriptor_after = os.fstat(opened.fd)
+    except OSError as exc:
+        raise _source_revalidation_os_error(
+            opened.path,
+            "inspect the descriptor after terminal hashing",
+            exc,
+        ) from exc
+    try:
+        path_after = os.stat(opened.path, follow_symlinks=False)
+    except OSError as exc:
+        raise _source_revalidation_os_error(
+            opened.path,
+            "inspect the source path after terminal hashing",
+            exc,
+        ) from exc
+
+    descriptor_and_path_stats = (
+        descriptor_before,
+        path_before,
+        descriptor_after,
+        path_after,
+    )
+    if any(
+        not stat.S_ISREG(current.st_mode) or not _same_identity(opened.before, current)
+        for current in descriptor_and_path_stats
+    ):
+        raise StoreSafetyError(
+            "source-identity-mismatch",
+            "Source object identity changed during terminal revalidation: "
+            f"{opened.path}",
+        )
+
+    expected_sha256 = str(receipt["sha256"])
+    expected_size = int(receipt["size"])
+    if terminal_sha256 != expected_sha256 or any(
+        current.st_size != expected_size for current in descriptor_and_path_stats
+    ):
+        raise StoreSafetyError(
+            "source-content-mismatch",
+            f"Source bytes changed during terminal revalidation: {opened.path}",
+        )
+
+    expected_access_policy = receipt["access_policy"]
+    if any(
+        _access_policy(current) != expected_access_policy
+        for current in descriptor_and_path_stats
+    ):
+        raise StoreSafetyError(
+            "source-access-policy-mismatch",
+            "Source descriptor or pathname access policy changed during terminal "
+            f"revalidation: {opened.path}",
+        )
+
+    initial_metadata = _metadata(opened.before)
+    terminal_metadata = _metadata(descriptor_after)
+    return {
+        **receipt,
+        "sha256": expected_sha256,
+        "size": expected_size,
+        "identity": _identity(descriptor_after),
+        "access_policy": _access_policy(descriptor_after),
+        "metadata": terminal_metadata,
+        "metadata_transitions": {
+            key: {
+                "before": initial_metadata[key],
+                "after": terminal_metadata[key],
+            }
+            for key in initial_metadata
+            if initial_metadata[key] != terminal_metadata[key]
+        },
+    }
+
+
 def _capture_database_files(
     main_path: Path,
     destination_dir: Path | None = None,
@@ -2911,47 +3368,10 @@ def _capture_database_files(
                 "Internal capture records do not match the bound source set",
             )
         for opened, record in zip(opened_sources, records):
-            try:
-                final_descriptor = os.fstat(opened.fd)
-            except OSError as exc:
-                raise _source_revalidation_os_error(
-                    opened.path,
-                    "inspect the descriptor during final revalidation",
-                    exc,
-                ) from exc
-            try:
-                final_path = os.stat(opened.path, follow_symlinks=False)
-            except OSError as exc:
-                raise _source_revalidation_os_error(
-                    opened.path,
-                    "inspect the source path during final revalidation",
-                    exc,
-                ) from exc
-            if not _same_identity(
-                opened.before, final_descriptor
-            ) or not _same_identity(final_descriptor, final_path):
-                raise StoreSafetyError(
-                    "source-identity-mismatch",
-                    f"Source object identity changed during final revalidation: {opened.path}",
-                )
-            if final_descriptor.st_size != record["source"]["size"]:
-                raise StoreSafetyError(
-                    "source-content-mismatch",
-                    f"Source size changed after hashing: {opened.path}",
-                )
-            if (
-                _stat_ns(final_descriptor, "mtime")
-                != record["source"]["metadata"]["mtime_ns"]
-            ):
-                raise StoreSafetyError(
-                    "source-revalidation-inconclusive",
-                    f"Source mtime changed after its final byte hash: {opened.path}",
-                )
-            if _access_policy(final_descriptor) != record["source"]["access_policy"]:
-                raise StoreSafetyError(
-                    "source-access-policy-mismatch",
-                    f"Source access policy changed during final revalidation: {opened.path}",
-                )
+            record["source"] = _terminal_revalidate_open_source(
+                opened,
+                record["source"],
+            )
 
         final_names = [path.name for path in _discover_database_files(main_path)]
         _reject_new_rollback_journal_membership(
@@ -5359,6 +5779,91 @@ def _sqlite_backup_bytes(source_uri: str, source_path: Path) -> bytes:
             close_v2(source_db)
 
 
+def _terminal_standalone_output_receipt(
+    output_fd: int,
+    output: Path,
+    destination_binding: _BoundDirectory,
+    *,
+    created: os.stat_result,
+    expected_sha256: str,
+    expected_size: int,
+    expected_access_policy: dict[str, int],
+) -> dict[str, Any]:
+    """Verify two consecutive readbacks against the pre-bound payload receipt."""
+
+    last_descriptor: os.stat_result | None = None
+    for attempt in range(2):
+        try:
+            descriptor_before = os.fstat(output_fd)
+            path_before = os.stat(
+                output.name,
+                dir_fd=destination_binding.fd,
+                follow_symlinks=False,
+            )
+            readback_sha256 = _hash_fd(output_fd)
+            descriptor_after = os.fstat(output_fd)
+            path_after = os.stat(
+                output.name,
+                dir_fd=destination_binding.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as exc:
+            raise StoreSafetyError(
+                "prepared-file-missing",
+                "Standalone recovery output disappeared during terminal "
+                f"readback {attempt + 1}: {output}",
+            ) from exc
+        except OSError as exc:
+            raise StoreSafetyError(
+                "prepared-file-revalidation-inconclusive",
+                "Cannot terminally revalidate the standalone recovery output "
+                f"during readback {attempt + 1}: {output}: {exc}",
+            ) from exc
+
+        observations = (
+            descriptor_before,
+            path_before,
+            descriptor_after,
+            path_after,
+        )
+        if any(
+            not stat.S_ISREG(current.st_mode) or not _same_identity(created, current)
+            for current in observations
+        ):
+            raise StoreSafetyError(
+                "prepared-file-identity-mismatch",
+                "Standalone recovery output identity changed during terminal "
+                f"readback {attempt + 1}: {output}",
+            )
+        if readback_sha256 != expected_sha256 or any(
+            current.st_size != expected_size for current in observations
+        ):
+            raise StoreSafetyError(
+                "prepared-file-content-mismatch",
+                "Standalone recovery output differs from the pre-bound payload "
+                f"during terminal readback {attempt + 1}: {output}",
+            )
+        if any(
+            _access_policy(current) != expected_access_policy
+            for current in observations
+        ):
+            raise StoreSafetyError(
+                "prepared-file-access-policy-mismatch",
+                "Standalone recovery output access policy changed during "
+                f"terminal readback {attempt + 1}: {output}",
+            )
+        last_descriptor = descriptor_after
+
+    assert last_descriptor is not None
+    return {
+        "path": output,
+        "sha256": expected_sha256,
+        "size": expected_size,
+        "identity": _identity(last_descriptor),
+        "access_policy": dict(expected_access_policy),
+    }
+
+
 def _write_standalone_backup_payload(
     payload: bytes,
     output: Path,
@@ -5378,6 +5883,9 @@ def _write_standalone_backup_payload(
             f"Standalone output does not use the bound destination directory: {output}",
         )
     _verify_bound_directory_namespace(destination_binding)
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    expected_size = len(payload)
+    expected_mode = 0o600
     flags = (
         os.O_RDWR
         | os.O_CREAT
@@ -5398,6 +5906,8 @@ def _write_standalone_backup_payload(
             f"Cannot exclusively create standalone recovery output {output}: {exc}",
         ) from exc
     created = os.fstat(output_fd)
+    expected_access_policy = _access_policy(created)
+    expected_access_policy["mode"] = expected_mode
     verified_sha256: str | None = None
     try:
         path_before = os.stat(
@@ -5413,38 +5923,18 @@ def _write_standalone_backup_payload(
         os.lseek(output_fd, 0, os.SEEK_SET)
         os.ftruncate(output_fd, 0)
         _write_all(output_fd, payload)
+        os.fchmod(output_fd, expected_mode)
         os.fsync(output_fd)
-        os.fchmod(output_fd, 0o600)
-        descriptor_after = os.fstat(output_fd)
-        path_after = os.stat(
-            output.name,
-            dir_fd=destination_binding.fd,
-            follow_symlinks=False,
+        result = _terminal_standalone_output_receipt(
+            output_fd,
+            output,
+            destination_binding,
+            created=created,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+            expected_access_policy=expected_access_policy,
         )
-        if (
-            not stat.S_ISREG(descriptor_after.st_mode)
-            or not _same_identity(created, descriptor_after)
-            or not _same_identity(descriptor_after, path_after)
-        ):
-            raise StoreSafetyError(
-                "prepared-file-identity-mismatch",
-                f"Standalone recovery output was replaced during backup: {output}",
-            )
-        if _access_policy(descriptor_after) != _access_policy(path_after):
-            raise StoreSafetyError(
-                "prepared-file-access-policy-mismatch",
-                f"Standalone recovery output access policy changed during backup: "
-                f"{output}",
-            )
-        sha256 = _hash_fd(output_fd)
-        verified_sha256 = sha256
-        result = {
-            "path": output,
-            "sha256": sha256,
-            "size": descriptor_after.st_size,
-            "identity": _identity(descriptor_after),
-            "access_policy": _access_policy(descriptor_after),
-        }
+        verified_sha256 = expected_sha256
         return result
     except Exception as exc:
         retained = _retained_created_regular_file_details(
@@ -5954,10 +6444,12 @@ def copy_db(
                         bound_access_policy=root_receipt["access_policy"],
                     )
 
-                def build_descriptor_snapshot_tree_receipt() -> dict[str, Any]:
+                def build_descriptor_snapshot_tree_receipt(
+                    published_basename: str,
+                ) -> dict[str, Any]:
                     return _descriptor_bound_prepared_tree_receipt(
                         bound_root,
-                        published_basename=destination.name,
+                        published_basename=published_basename,
                         root_receipt=root_receipt,
                         nested_directories={
                             Path("group.com.apple.notes"): (
@@ -6825,11 +7317,24 @@ def stage_patch(src: Path, dest: Path) -> dict[str, Any]:
                         manifest_receipt=manifest_receipt,
                         file_receipts=file_receipts,
                     )
+                    _scan_exact_directory_entries(
+                        partial,
+                        {
+                            NOTE_STORE_MAIN: stat.S_IFREG,
+                            PATCH_MANIFEST: stat.S_IFREG,
+                        },
+                        missing_code="prepared-directory-identity-mismatch",
+                        mismatch_code="prepared-file-set-mismatch",
+                        bound_identity=root_receipt["identity"],
+                        bound_access_policy=root_receipt["access_policy"],
+                    )
 
-                def build_descriptor_stage_tree_receipt() -> dict[str, Any]:
+                def build_descriptor_stage_tree_receipt(
+                    published_basename: str,
+                ) -> dict[str, Any]:
                     return _descriptor_bound_prepared_tree_receipt(
                         bound_root,
-                        published_basename=dest.name,
+                        published_basename=published_basename,
                         root_receipt=root_receipt,
                         nested_directories={},
                         bindings=prepared_files,

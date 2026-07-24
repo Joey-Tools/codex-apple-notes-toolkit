@@ -70,7 +70,10 @@ files, then fsyncs the held nested-store and snapshot-root descriptors bottom-up
 descriptor-relative rename. It fsyncs the held publication-parent descriptor and performs terminal
 descriptor-relative revalidation. Sidecar classification and SQLite integrity checking consume
 that same receipt-bound copied store through held descriptors; the manifest reuses those exact
-results instead of reopening the copied path. It never reopens a parent pathname for durability.
+results instead of reopening the copied path. Each live source is terminally rehashed through the
+same held descriptor; descriptor and pathname identity/access policy are checked around that hash,
+while `mtime`, `ctime`, and link-count transitions remain recorded metadata rather than mutation
+signals. It never reopens a parent pathname for durability.
 On an ordinary pre-publication failure, the helper
 preserves the partial tree and attaches a creation-receipt-matched namespace locator plus a bounded
 no-follow sensitive-file inventory to the original error. If the root is replaced or inventory is
@@ -86,6 +89,16 @@ into that destination, and inspect whether the prepared directory committed. A p
 uncertain result includes a descriptor-bound destination receipt with parent/directory identity,
 access policy, and exact nested directory/file tree receipts. That receipt remains the recovery
 locator if an ancestor path was permanently replaced before the descriptors closed.
+For a directory rename that is proved not to have committed, inspect
+`publication_state: uncommitted` and `retry_safe`. The latter is true only after the held parent,
+prepared root, complete directory membership, manifest bytes, every prepared file's
+identity/SHA-256/size/access policy, and a terminal absent target observation all revalidate.
+Target appearance, tree drift, or inconclusive terminal evidence keeps `retry_safe: false` (and
+uses `publication_state: uncertain` when commit/non-commit itself cannot be proved). The outer
+retained-partial receipt augments these fields and locators without discarding them.
+If the exact held prepared root already occupies the destination before the helper's own rename
+syscall, treat the install as uncertain and preserve the descriptor-bound destination/tree receipt
+rather than describing it as uncommitted.
 Use `validate-snapshot` before relying on an older snapshot:
 
 ```bash
@@ -134,7 +147,10 @@ be bound as one stable regular file, the same reason code is returned as inconcl
 never guesses whether SQLite had finished rollback or whether journal pages remain authoritative.
 The native SQLite backup API writes first to an in-memory database; serialized database bytes are
 then written directly to the exclusively created output descriptor. Full integrity checking opens
-the prepared standalone file through that same held descriptor.
+the prepared standalone file through that same held descriptor. Before writing, the standalone
+writer binds the serialized payload's expected SHA-256, byte length, and `0600` mode. It accepts a
+creation receipt only after two consecutive same-descriptor readbacks plus size, access-policy,
+and descriptor-relative pathname identity/access checks all match that pre-bound expectation.
 Once a sidecar-free standalone image has been validated and bound, later backup copies only that
 held image. A newly injected adjacent WAL is neither discovered nor trusted.
 An ephemeral namespace replace-and-restore during SQLite backup may not be reported, but it cannot

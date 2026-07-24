@@ -78,6 +78,13 @@ For each file:
 4. Compare descriptor identity, content stability, and access policy.
 5. Re-resolve the path without following symlinks and compare object identity.
 
+Before releasing any live-source descriptor, hash that same descriptor once more and compare the
+receipt's SHA-256 and size plus descriptor/path identity and access policy both before and after
+that terminal hash. Record any `mtime`, `ctime`, or link-count transition in the returned receipt,
+but do not fail on those metadata signals alone when identity, bytes, and access policy remain
+stable. The terminal pathname access-policy comparison is required even when the descriptor's
+policy still matches an earlier observation.
+
 Recheck the main/WAL/SHM/rollback-journal membership after all files have been processed.
 A present `NoteStore.sqlite-journal` is not an ignorable sidecar. Open it without following links,
 bind and hash the same descriptor twice, then fail closed with `rollback-journal-present` before
@@ -167,6 +174,11 @@ the bytes directly to the exclusively created output descriptor. Never ask SQLit
 mutable output pathname. Bind the completed output and run `PRAGMA integrity_check` through its
 read-only descriptor URI; replacing and restoring the output pathname during either write or
 integrity validation must not redirect those operations.
+Bind the serialized payload's expected SHA-256, exact length, and `0600` mode before creating or
+writing the output. After `fchmod` and `fsync`, require two consecutive same-descriptor hashes to
+match that pre-bound digest; around each hash compare descriptor and descriptor-relative pathname
+identity, size, and full access policy with the creation receipt. Never derive the receipt digest
+or length from bytes first observed after a competing writer could have changed the output.
 
 Treat a validated sidecar-free standalone file as a different source profile from a recovery
 store. Its later backup reads and revalidates only the already held main-file descriptor, builds
@@ -243,6 +255,19 @@ prepared directory's object identity. Report a proved pre-existing destination a
 commit-then-error or any namespace state that cannot prove commit/non-commit as
 `destination-install-uncertain`. Preserve an uncertain path for inspection and do not retry into
 the same destination.
+
+Every proved uncommitted directory publication failure, including an unrelated target that appears
+before the no-replace rename can commit, carries `publication_state: uncommitted` and an explicit
+`retry_safe`. If the exact held prepared root is instead already observed at the destination before
+the local rename syscall, classify the installation as `uncertain` and retain a descriptor-bound
+destination/tree receipt. Set `retry_safe: true` only after descriptor-bound revalidation proves
+the held parent/root identity and access policy, the complete prepared tree membership, manifest
+payload, every file's identity/SHA-256/size/access policy, and a terminal no-follow target
+observation of `absent`. A present unrelated target or prepared-tree/content/access drift is still
+uncommitted when the namespace proves that fact, but is not retry-safe; unavailable or
+contradictory terminal namespace evidence is `publication_state: uncertain`. When the outer
+retained-partial handler adds cleanup and inventory evidence, merge its locators without replacing
+these publication fields or the complete-tree retry receipt.
 
 Before the publication descriptors close, record a descriptor-bound recovery locator for any
 post-rename uncertain directory. It binds the held publication parent and destination directory
@@ -398,6 +423,8 @@ The helper does not:
 - make a main/WAL/SHM filesystem replacement atomic;
 - mutate the live Notes store;
 - validate every macOS ACL, extended attribute, File Provider policy, or external process;
+- prevent a same-UID process from mutating an object immediately after the final descriptor/path
+  comparison; the bounded revalidation window detects observed races but is not a filesystem lock;
 - bound peak memory independently of recovered database size; native backup and serialization keep
   a complete recovered image in memory;
 - replace a case-specific rollback plan and Joey's explicit writeback approval.

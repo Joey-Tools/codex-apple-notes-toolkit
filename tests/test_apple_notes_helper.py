@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -398,7 +399,7 @@ raise SystemExit(2)
             paths = self._make_paths(root)
             self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
             original_hash = MODULE._hash_fd
-            for fail_on_call in (1, 2):
+            for fail_on_call in (1, 2, 3):
                 hash_calls = 0
 
                 def fail_selected_hash(fd: int) -> str:
@@ -426,6 +427,152 @@ raise SystemExit(2)
                     "source-revalidation-inconclusive",
                     raised,
                 )
+
+    def test_source_terminal_revalidation_detects_same_length_in_place_write(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            source = paths.group_container / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            original_revalidate = MODULE._revalidate_open_source
+            original_stat = source.stat()
+            changed = False
+
+            def mutate_after_primary_hashes(
+                opened: MODULE._OpenedSource,
+                second_sha256: str,
+            ) -> dict[str, object]:
+                nonlocal changed
+                result = original_revalidate(opened, second_sha256)
+                if not changed:
+                    changed = True
+                    with source.open("r+b") as handle:
+                        handle.seek(source.stat().st_size // 2)
+                        original = handle.read(1)
+                        self.assertTrue(original)
+                        handle.seek(-1, os.SEEK_CUR)
+                        handle.write(bytes([original[0] ^ 0x01]))
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    self.assertEqual(source.stat().st_size, original_stat.st_size)
+                    os.utime(
+                        source,
+                        ns=(
+                            original_stat.st_atime_ns,
+                            original_stat.st_mtime_ns,
+                        ),
+                    )
+                return result
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_revalidate_open_source",
+                    side_effect=mutate_after_primary_hashes,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.fingerprint_note_store(paths)
+
+        self.assertTrue(changed)
+        self._assert_safety_code("source-content-mismatch", raised)
+
+    def test_source_terminal_revalidation_allows_mtime_only_transition(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            source = paths.group_container / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            original_revalidate = MODULE._revalidate_open_source
+            touched = False
+
+            def touch_after_primary_hashes(
+                opened: MODULE._OpenedSource,
+                second_sha256: str,
+            ) -> dict[str, object]:
+                nonlocal touched
+                result = original_revalidate(opened, second_sha256)
+                if not touched:
+                    touched = True
+                    current = source.stat()
+                    os.utime(
+                        source,
+                        ns=(
+                            current.st_atime_ns,
+                            current.st_mtime_ns + 1_000_000_000,
+                        ),
+                    )
+                return result
+
+            with mock.patch.object(
+                MODULE,
+                "_revalidate_open_source",
+                side_effect=touch_after_primary_hashes,
+            ):
+                result = MODULE.fingerprint_note_store(paths)
+
+        self.assertTrue(touched)
+        self.assertIn("mtime_ns", result["files"][0]["metadata_transitions"])
+
+    def test_source_terminal_revalidation_checks_path_access_policy(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            source = paths.group_container / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            source.chmod(0o600)
+            original_revalidate = MODULE._revalidate_open_source
+            original_stat = MODULE.os.stat
+            after_primary_revalidation = False
+            attacked = False
+
+            def mark_primary_revalidation(
+                opened: MODULE._OpenedSource,
+                second_sha256: str,
+            ) -> dict[str, object]:
+                nonlocal after_primary_revalidation
+                result = original_revalidate(opened, second_sha256)
+                after_primary_revalidation = True
+                return result
+
+            def chmod_before_terminal_path_stat(
+                target: object,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal attacked
+                if (
+                    after_primary_revalidation
+                    and not attacked
+                    and Path(os.fspath(target)) == source
+                ):
+                    attacked = True
+                    source.chmod(0o640)
+                return original_stat(target, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_revalidate_open_source",
+                    side_effect=mark_primary_revalidation,
+                ),
+                mock.patch.object(
+                    MODULE.os,
+                    "stat",
+                    side_effect=chmod_before_terminal_path_stat,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.fingerprint_note_store(paths)
+
+        self.assertTrue(attacked)
+        self._assert_safety_code("source-access-policy-mismatch", raised)
 
     def test_source_descriptor_revalidation_maps_estale_to_inconclusive(
         self,
@@ -885,6 +1032,95 @@ raise SystemExit(2)
                     ]
                     self.assertEqual(len(retained_names), 1)
                     self.assertTrue((root / retained_names[0]).is_file())
+
+    def test_standalone_writer_rejects_same_length_valid_sqlite_race(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            expected = root / "expected.sqlite"
+            competing = root / "competing.sqlite"
+            output = root / "output.sqlite"
+            self._create_db(expected, value="expected")
+            self._create_db(competing, value="attacker")
+            expected_payload = expected.read_bytes()
+            competing_payload = competing.read_bytes()
+            self.assertEqual(len(expected_payload), len(competing_payload))
+            self.assertNotEqual(expected_payload, competing_payload)
+            with closing(sqlite3.connect(competing)) as connection:
+                self.assertEqual(
+                    connection.execute("PRAGMA integrity_check").fetchone(),
+                    ("ok",),
+                )
+
+            original_hash = MODULE._hash_fd
+            attacked = False
+
+            def replace_bytes_before_first_readback(fd: int) -> str:
+                nonlocal attacked
+                if not attacked:
+                    attacked = True
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    os.ftruncate(fd, 0)
+                    MODULE._write_all(fd, competing_payload)
+                    os.fsync(fd)
+                return original_hash(fd)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_hash_fd",
+                    side_effect=replace_bytes_before_first_readback,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._write_standalone_backup_payload(
+                    expected_payload,
+                    output,
+                )
+
+            self.assertTrue(attacked)
+            self._assert_safety_code("prepared-file-content-mismatch", raised)
+            self.assertTrue(output.is_file())
+            self.assertEqual(output.stat().st_size, len(expected_payload))
+            with closing(sqlite3.connect(output)) as connection:
+                value = connection.execute("SELECT value FROM sample").fetchone()
+            self.assertEqual(value, ("attacker",))
+
+    def test_standalone_writer_rejects_access_race_after_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.sqlite"
+            output = root / "output.sqlite"
+            self._create_db(source)
+            payload = source.read_bytes()
+            original_hash = MODULE._hash_fd
+            attacked = False
+
+            def chmod_after_hash(fd: int) -> str:
+                nonlocal attacked
+                digest = original_hash(fd)
+                if not attacked:
+                    attacked = True
+                    os.fchmod(fd, 0o640)
+                return digest
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_hash_fd",
+                    side_effect=chmod_after_hash,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._write_standalone_backup_payload(payload, output)
+
+            self.assertTrue(attacked)
+            self._assert_safety_code(
+                "prepared-file-access-policy-mismatch",
+                raised,
+            )
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o640)
 
     def test_copy_failure_merges_file_and_partial_tree_recovery_locators(
         self,
@@ -1346,6 +1582,11 @@ raise SystemExit(2)
                     require_notes_quit=False,
                 )
             self._assert_safety_code("destination-exists", raised)
+            self.assertEqual(
+                raised.exception.details["publication_state"],
+                "uncommitted",
+            )
+            self.assertFalse(raised.exception.details["retry_safe"])
             self.assertEqual(list(destination.iterdir()), [])
             partial = self._assert_retained_partial(root, ".snapshot.partial-*")
             self.assertEqual(raised.exception.details["cleanup_state"], "retained")
@@ -1390,6 +1631,11 @@ raise SystemExit(2)
             ):
                 MODULE.stage_patch(edited, destination)
             self._assert_safety_code("destination-exists", raised)
+            self.assertEqual(
+                raised.exception.details["publication_state"],
+                "uncommitted",
+            )
+            self.assertFalse(raised.exception.details["retry_safe"])
             self.assertEqual(list(destination.iterdir()), [])
             partial = self._assert_retained_partial(root, ".stage.partial-*")
             self.assertEqual(raised.exception.details["cleanup_state"], "retained")
@@ -1403,6 +1649,377 @@ raise SystemExit(2)
                 inventory,
                 {MODULE.NOTE_STORE_MAIN, MODULE.PATCH_MANIFEST},
             )
+
+    def test_patch_directory_rename_failure_is_retry_safe_only_after_full_receipt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            destination = root / "stage"
+
+            def fail_rename(
+                parent_fd: int,
+                source_name: str,
+                target_name: str,
+            ) -> None:
+                del parent_fd, source_name, target_name
+                raise OSError(MODULE.errno.EIO, "simulated rename failure")
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_rename_directory_no_replace_at",
+                    side_effect=fail_rename,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.stage_patch(edited, destination)
+
+            self._assert_safety_code("destination-install-failed", raised)
+            self.assertEqual(
+                raised.exception.details["publication_state"],
+                "uncommitted",
+            )
+            self.assertTrue(raised.exception.details["retry_safe"])
+            self.assertEqual(raised.exception.details["cleanup_state"], "retained")
+            locators = raised.exception.details["recovery_locators"]
+            retry_receipt = locators["descriptor_bound_prepared_root"]
+            self.assertEqual(
+                retry_receipt["verification"],
+                "bound-parent-root-tree-content-and-access-match-creation-receipts",
+            )
+            self.assertEqual(
+                retry_receipt["tree_receipt"]["schema"],
+                "apple-notes-prepared-tree-receipt/v1",
+            )
+            self.assertEqual(retry_receipt["target"]["state"], "absent")
+            self.assertEqual(
+                retry_receipt["target"]["verification"],
+                "terminal-descriptor-relative-no-follow-observation",
+            )
+            self.assertTrue(Path(locators["prepared_namespace"]).is_dir())
+            self.assertFalse(destination.exists())
+
+    def test_patch_directory_rename_failure_rejects_tree_content_and_access_drift(
+        self,
+    ) -> None:
+        for drift in ("content", "access"):
+            with (
+                self.subTest(drift=drift),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                edited = root / "edited.sqlite"
+                self._create_db(edited)
+                destination = root / "stage"
+
+                def drift_then_fail(
+                    parent_fd: int,
+                    source_name: str,
+                    target_name: str,
+                ) -> None:
+                    del parent_fd, target_name
+                    prepared = root / source_name / MODULE.NOTE_STORE_MAIN
+                    if drift == "content":
+                        with prepared.open("ab") as handle:
+                            handle.write(b"tampered")
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                    else:
+                        prepared.chmod(0o640)
+                    raise OSError(
+                        MODULE.errno.EIO,
+                        f"simulated {drift} drift and rename failure",
+                    )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_rename_directory_no_replace_at",
+                        side_effect=drift_then_fail,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE.stage_patch(edited, destination)
+
+                self._assert_safety_code("destination-install-failed", raised)
+                self.assertEqual(
+                    raised.exception.details["publication_state"],
+                    "uncommitted",
+                )
+                self.assertFalse(raised.exception.details["retry_safe"])
+                self.assertEqual(
+                    raised.exception.details["retry_revalidation"]["error_code"],
+                    (
+                        "prepared-file-content-mismatch"
+                        if drift == "content"
+                        else "prepared-file-access-policy-mismatch"
+                    ),
+                )
+                self.assertEqual(
+                    raised.exception.details["cleanup_state"],
+                    "retained",
+                )
+                self.assertFalse(destination.exists())
+
+    def test_patch_directory_rename_failure_rechecks_terminal_target_absence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            destination = root / "stage"
+            original_tree_receipt = MODULE._descriptor_bound_prepared_tree_receipt
+            rename_failed = False
+            injected = False
+
+            def fail_rename(
+                parent_fd: int,
+                source_name: str,
+                target_name: str,
+            ) -> None:
+                nonlocal rename_failed
+                del parent_fd, source_name, target_name
+                rename_failed = True
+                raise OSError(MODULE.errno.EIO, "simulated rename failure")
+
+            def build_receipt_then_inject_target(
+                *args: object,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                nonlocal injected
+                receipt = original_tree_receipt(*args, **kwargs)
+                if rename_failed and not injected:
+                    destination.mkdir()
+                    injected = True
+                return receipt
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_rename_directory_no_replace_at",
+                    side_effect=fail_rename,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_descriptor_bound_prepared_tree_receipt",
+                    side_effect=build_receipt_then_inject_target,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.stage_patch(edited, destination)
+
+            self.assertTrue(injected)
+            self._assert_safety_code("destination-exists", raised)
+            self.assertEqual(
+                raised.exception.details["publication_state"],
+                "uncommitted",
+            )
+            self.assertFalse(raised.exception.details["retry_safe"])
+            retry_receipt = raised.exception.details["recovery_locators"][
+                "descriptor_bound_prepared_root"
+            ]
+            self.assertEqual(retry_receipt["target"]["state"], "present")
+            self.assertEqual(list(destination.iterdir()), [])
+
+    def test_patch_pre_rename_exact_root_move_is_publication_uncertain(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            destination = root / "stage"
+            original_publish = MODULE._publish_directory_no_replace
+            moved = False
+
+            def publish_after_external_exact_move(
+                source: Path,
+                target: Path,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                original_before_rename = kwargs["before_rename"]
+                self.assertTrue(callable(original_before_rename))
+
+                def move_after_full_prevalidation() -> None:
+                    nonlocal moved
+                    assert callable(original_before_rename)
+                    original_before_rename()
+                    source.rename(target)
+                    moved = True
+
+                kwargs["before_rename"] = move_after_full_prevalidation
+                return original_publish(source, target, **kwargs)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_publish_directory_no_replace",
+                    side_effect=publish_after_external_exact_move,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.stage_patch(edited, destination)
+
+            self.assertTrue(moved)
+            self._assert_safety_code("destination-install-uncertain", raised)
+            self.assertEqual(
+                raised.exception.details["publication_state"],
+                "uncertain",
+            )
+            self.assertFalse(raised.exception.details["retry_safe"])
+            self.assertTrue((destination / MODULE.NOTE_STORE_MAIN).is_file())
+            self.assertTrue((destination / MODULE.PATCH_MANIFEST).is_file())
+            self.assertEqual(list(root.glob(".stage.partial-*")), [])
+            locator = raised.exception.details["recovery_locators"][
+                "descriptor_bound_destination"
+            ]
+            self.assertEqual(
+                locator["tree_verification"],
+                "descriptor-revalidated-before-local-rename",
+            )
+            self.assertEqual(
+                locator["tree_receipt"]["schema"],
+                "apple-notes-prepared-tree-receipt/v1",
+            )
+
+    def test_directory_pre_rename_unavailable_namespace_is_uncertain(
+        self,
+    ) -> None:
+        for unavailable_name in ("source", "destination"):
+            with self.subTest(unavailable_name=unavailable_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    source = root / "partial"
+                    destination = root / "destination"
+                    with MODULE._create_bound_directory(source) as binding:
+                        original_observe = MODULE._observe_bound_name
+                        unavailable_basename = (
+                            source.name
+                            if unavailable_name == "source"
+                            else destination.name
+                        )
+
+                        def observe_with_unavailable_name(
+                            parent_fd: int,
+                            basename: str,
+                        ) -> tuple[str, os.stat_result | None]:
+                            if basename == unavailable_basename:
+                                return "unavailable", None
+                            return original_observe(parent_fd, basename)
+
+                        def fail_before_rename() -> None:
+                            raise MODULE.StoreSafetyError(
+                                "prepared-file-content-mismatch",
+                                "simulated pre-rename validation failure",
+                            )
+
+                        with (
+                            mock.patch.object(
+                                MODULE,
+                                "_observe_bound_name",
+                                side_effect=observe_with_unavailable_name,
+                            ),
+                            self.assertRaises(MODULE.StoreSafetyError) as raised,
+                        ):
+                            MODULE._publish_directory_no_replace(
+                                source,
+                                destination,
+                                binding=binding,
+                                before_rename=fail_before_rename,
+                            )
+
+                        self._assert_safety_code(
+                            "destination-install-uncertain",
+                            raised,
+                        )
+                        self.assertEqual(
+                            raised.exception.details["publication_state"],
+                            "uncertain",
+                        )
+                        self.assertFalse(
+                            raised.exception.details["retry_safe"],
+                        )
+                        evidence = raised.exception.details["recovery_locators"][
+                            "descriptor_bound_prepared_root"
+                        ]
+                        self.assertEqual(
+                            evidence["evidence_status"],
+                            "inconclusive",
+                        )
+                        observation_key = (
+                            "prepared_name"
+                            if unavailable_name == "source"
+                            else "destination_name"
+                        )
+                        observation = evidence["namespace_observations"][
+                            observation_key
+                        ]
+                        self.assertEqual(observation["status"], "unavailable")
+                        self.assertEqual(
+                            observation["evidence_status"],
+                            "inconclusive",
+                        )
+                        self.assertTrue(
+                            evidence["parent"]["matches_creation_receipt"],
+                        )
+                        self.assertTrue(
+                            evidence["prepared_root"]["matches_creation_receipt"],
+                        )
+
+    def test_patch_pre_rename_revalidation_rejects_extra_root_entry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            destination = root / "stage"
+            original_publish = MODULE._publish_directory_no_replace
+            injected = False
+
+            def publish_after_extra_entry_injection(
+                source: Path,
+                target: Path,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                original_before_rename = kwargs["before_rename"]
+                self.assertTrue(callable(original_before_rename))
+
+                def inject_before_full_prevalidation() -> None:
+                    nonlocal injected
+                    (source / "extra-entry").mkdir()
+                    injected = True
+                    assert callable(original_before_rename)
+                    original_before_rename()
+
+                kwargs["before_rename"] = inject_before_full_prevalidation
+                return original_publish(source, target, **kwargs)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_publish_directory_no_replace",
+                    side_effect=publish_after_extra_entry_injection,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.stage_patch(edited, destination)
+
+            self.assertTrue(injected)
+            self._assert_safety_code("prepared-file-set-mismatch", raised)
+            self.assertEqual(
+                raised.exception.details["publication_state"],
+                "uncommitted",
+            )
+            self.assertFalse(raised.exception.details["retry_safe"])
+            self.assertEqual(raised.exception.details["cleanup_state"], "retained")
+            self.assertFalse(destination.exists())
+            partial = self._assert_retained_partial(root, ".stage.partial-*")
+            self.assertTrue((partial / "extra-entry").is_dir())
 
     def test_snapshot_publication_reports_commit_then_error_as_uncertain(
         self,
