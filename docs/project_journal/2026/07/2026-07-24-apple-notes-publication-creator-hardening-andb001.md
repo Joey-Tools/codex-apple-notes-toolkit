@@ -20,6 +20,9 @@ superseded_by:
 - Closed the formal single-review gaps in shell-redirection receipt creation, post-write access-policy baselines, and ctypes row-callback exception propagation.
 - Closed the final formal follow-up gaps in cross-root creator-result alias binding, post-result-commit teardown classification, and standalone pre-write access-policy binding.
 - Closed the final safety-resumption gaps in creator-result artifact creation-receipt binding and simultaneous SQLite callback/revalidation failure evidence.
+- Closed the post-open descriptor-relative source error-classification gap so
+  disappearance, unreadability, and other revalidation uncertainty remain
+  stable probe results instead of escaping as `unexpected-error`.
 
 ## Current State
 
@@ -48,10 +51,17 @@ superseded_by:
 - Standalone recovery files correct and bind effective UID/GID, mode `0600`, flags, identity, and the descriptor-relative leaf before the first sensitive write, then revalidate that baseline at the post-write boundary.
 - Native SQLite row callbacks capture their first `BaseException` inside the ctypes boundary and abort `sqlite3_exec`; ordinary failures keep their cause and cleanup evidence, while `KeyboardInterrupt` and `SystemExit` are re-raised after input teardown.
 - Ordinary SQLite row-callback failures are classified before terminal buffer/binding revalidation; a simultaneous revalidation failure remains primary while structured secondary evidence retains the callback and nested `sqlite_callback_failure`.
+- Descriptor-relative source opens now map post-open descriptor, name, and
+  held-parent revalidation failures through the shared source taxonomy:
+  `source-missing-after-read`, `source-revalidation-unreadable`, or
+  `source-revalidation-inconclusive`. The access probe retains those codes in
+  the affected file record.
 
 ## Next Steps
 
-- No additional work is authorized after this final local-only follow-up; do not push, open a PR, or merge.
+- Run a parent-owned fresh whole-range review for the new signed checkpoint.
+- Update the existing draft PR only after the frozen range is clean; do not
+  merge as part of this checkpoint.
 
 ## Evidence
 
@@ -86,10 +96,21 @@ superseded_by:
 - Final formal-review full suites: Homebrew Python `3.14.3` and system Python `3.9.6` each passed all `239` tests outside the nested sandbox required by the fixed `/usr/bin/pgrep` probe.
 - Final safety-resumption regressions: Python `3.14.3` and `3.9.6` passed pre-bind artifact replacement, post-result-commit in-place content mutation, and simultaneous callback plus terminal buffer/binding failure cases.
 - Final safety-resumption full suites: Homebrew Python `3.14.3` and system Python `3.9.6` each passed all `243` tests outside the nested sandbox required by the fixed `/usr/bin/pgrep` probe.
+- Post-open source-classification regressions: two focused tests passed on
+  Python `3.14.3` and system Python `3.9.6`, covering open-then-disappear,
+  post-open permission/EIO, descriptor `fstat`, held-parent revalidation, and
+  `probe-db-access` result preservation.
+- Final post-open source-classification full suites: Python `3.14.3` and system
+  Python `3.9.6` each passed all `245` tests. The fixed `/usr/bin/pgrep`
+  supervisor case was rerun outside the nested sandbox because sandboxed
+  process-table access returned an intentionally inconclusive probe result.
 - Static checks: full-repository `ruff check`; changed-file `ruff format --check`; `python3 -m py_compile`; CI-scoped `bash -n` and `shellcheck`; and `git diff --check`
 - Formal follow-up static checks: full-repository `ruff check .`; changed-Python `ruff format --check`; Python `3.14.3` and `3.9.6` `py_compile`; `bash -n` and `shellcheck` over both shell scripts; and `git diff --check`
 - Final formal-review static checks: full-repository Ruff `0.13.2`; changed-Python format check; Python `3.14.3` and `3.9.6` bytecode compilation; `bash -n` and ShellCheck over both shell scripts; and `git diff --check`.
 - Final safety-resumption static checks: full-repository Ruff `0.13.2`; changed-Python format check; Python `3.14.3` and `3.9.6` bytecode compilation; `bash -n` and ShellCheck `0.11.0` over both shell scripts; and `git diff --check`.
+- Post-open source-classification static checks: Ruff check/format, Python
+  `3.14.3` and `3.9.6` bytecode compilation with a task-scoped cache,
+  `git diff --check`, and isolated `quick_validate.py` with cached `PyYAML`.
 - Skill validation: isolated `quick_validate.py` with `PyYAML` (`Skill is valid!`; direct local validation lacked that dependency)
 - Final skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)
 - Formal follow-up skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)

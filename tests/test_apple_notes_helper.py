@@ -3836,6 +3836,155 @@ raise SystemExit(2)
             finally:
                 os.close(fd)
 
+    def test_probe_access_preserves_post_open_source_error_classes(self) -> None:
+        cases = (
+            (
+                FileNotFoundError(MODULE.errno.ENOENT, "simulated disappearance"),
+                "source-missing-after-read",
+            ),
+            (
+                PermissionError(MODULE.errno.EACCES, "simulated unreadable source"),
+                "source-revalidation-unreadable",
+            ),
+            (
+                OSError(MODULE.errno.EIO, "simulated source revalidation EIO"),
+                "source-revalidation-inconclusive",
+            ),
+        )
+        for fault, expected_code in cases:
+            with (
+                self.subTest(expected_code=expected_code),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                source = paths.group_container / MODULE.NOTE_STORE_MAIN
+                self._create_db(source)
+                original_stat = MODULE.os.stat
+                target_stats = 0
+
+                def fail_post_open_source_stat(
+                    target: object,
+                    *args: object,
+                    **kwargs: object,
+                ) -> os.stat_result:
+                    nonlocal target_stats
+                    if (
+                        kwargs.get("dir_fd") is not None
+                        and os.fspath(target) == source.name
+                    ):
+                        target_stats += 1
+                        if target_stats == 2:
+                            raise fault
+                    return original_stat(target, *args, **kwargs)
+
+                with mock.patch.object(
+                    MODULE.os,
+                    "stat",
+                    side_effect=fail_post_open_source_stat,
+                ):
+                    result = MODULE.probe_db_access(paths)
+
+                self.assertGreaterEqual(target_stats, 2)
+                source_record = next(
+                    record
+                    for record in result["note_store_files"]
+                    if Path(record["path"]) == source
+                )
+                self.assertTrue(source_record["exists"])
+                self.assertFalse(source_record["readable"])
+                self.assertEqual(source_record["error_code"], expected_code)
+
+    def test_descriptor_relative_open_maps_post_open_fstat_and_parent_errors(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+
+            with MODULE._bind_existing_directory_with_trusted_alias(root) as parent:
+                original_open = MODULE.os.open
+                original_fstat = MODULE.os.fstat
+                opened_source_fd: int | None = None
+
+                def record_source_open(
+                    target: object,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal opened_source_fd
+                    fd = original_open(target, flags, mode, dir_fd=dir_fd)
+                    if dir_fd == parent.fd and os.fspath(target) == source.name:
+                        opened_source_fd = fd
+                    return fd
+
+                def fail_source_fstat(fd: int) -> os.stat_result:
+                    if fd == opened_source_fd:
+                        raise OSError(MODULE.errno.EIO, "simulated fstat EIO")
+                    return original_fstat(fd)
+
+                with (
+                    mock.patch.object(
+                        MODULE.os,
+                        "open",
+                        side_effect=record_source_open,
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "fstat",
+                        side_effect=fail_source_fstat,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE._open_regular_readonly_at(
+                        parent,
+                        source.name,
+                        display_path=source,
+                    )
+
+                self._assert_safety_code(
+                    "source-revalidation-inconclusive",
+                    raised,
+                )
+
+                original_verify = MODULE._verify_bound_directory_namespace
+                source_revalidations = 0
+
+                def fail_post_open_parent_revalidation(
+                    directory: MODULE._BoundDirectory,
+                ) -> dict[str, object]:
+                    nonlocal source_revalidations
+                    if directory.path == root:
+                        source_revalidations += 1
+                        if source_revalidations == 2:
+                            raise PermissionError(
+                                MODULE.errno.EACCES,
+                                "simulated parent access failure",
+                            )
+                    return original_verify(directory)
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_verify_bound_directory_namespace",
+                        side_effect=fail_post_open_parent_revalidation,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE._open_regular_readonly_at(
+                        parent,
+                        source.name,
+                        display_path=source,
+                    )
+
+                self._assert_safety_code(
+                    "source-revalidation-unreadable",
+                    raised,
+                )
+
     def test_source_final_revalidation_maps_generic_os_errors(self) -> None:
         for syscall in ("fstat", "stat"):
             with (

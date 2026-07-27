@@ -2590,12 +2590,26 @@ def _open_regular_readonly_at(
             f"Cannot safely open descriptor-relative source {display_path}: {exc}",
         ) from exc
     try:
-        opened = os.fstat(fd)
-        path_after = os.stat(
-            basename,
-            dir_fd=parent.fd,
-            follow_symlinks=False,
-        )
+        try:
+            opened = os.fstat(fd)
+        except OSError as exc:
+            raise _source_revalidation_os_error(
+                display_path,
+                "inspect the descriptor-relative source after opening it",
+                exc,
+            ) from exc
+        try:
+            path_after = os.stat(
+                basename,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise _source_revalidation_os_error(
+                display_path,
+                "inspect the descriptor-relative source name after opening it",
+                exc,
+            ) from exc
         _verify_bound_source_directory(parent)
         if (
             not stat.S_ISREG(opened.st_mode)
@@ -3682,6 +3696,12 @@ def _verify_bound_source_directory(
 
     try:
         return _verify_bound_directory_namespace(directory)
+    except OSError as exc:
+        raise _source_revalidation_os_error(
+            directory.path,
+            "revalidate the held live-source directory chain",
+            exc,
+        ) from exc
     except StoreSafetyError as exc:
         code = {
             "prepared-directory-missing": "source-missing-after-read",
