@@ -2462,6 +2462,29 @@ def _source_revalidation_os_error(
     )
 
 
+def _causal_os_error(error: BaseException) -> OSError | None:
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, OSError):
+            return current
+        current = current.__cause__
+    return None
+
+
+def _bound_file_revalidation_os_error(
+    path: Path,
+    operation: str,
+    error: OSError,
+    codes: _FileProtectionCodes,
+) -> StoreSafetyError:
+    if codes is SOURCE_FILE_CODES:
+        return _source_revalidation_os_error(path, operation, error)
+    return StoreSafetyError(
+        codes.inconclusive,
+        f"Cannot {operation} during bound regular-file revalidation: {path}: {error}",
+    )
+
+
 def _untrusted_regular_read_open_flags() -> int:
     """Open an untrusted leaf without following links or blocking on a type swap."""
 
@@ -3015,9 +3038,11 @@ def _verify_bound_regular_file_with_stat(
         try:
             return os.fstat(bound.fd)
         except OSError as exc:
-            raise StoreSafetyError(
-                codes.inconclusive,
-                f"Cannot revalidate opened file descriptor for {target}: {exc}",
+            raise _bound_file_revalidation_os_error(
+                target,
+                "revalidate the opened file descriptor",
+                exc,
+                codes,
             ) from exc
 
     def stat_path() -> os.stat_result:
@@ -3029,9 +3054,11 @@ def _verify_bound_regular_file_with_stat(
                 f"Bound regular-file path is missing during revalidation: {target}",
             ) from exc
         except OSError as exc:
-            raise StoreSafetyError(
-                codes.inconclusive,
-                f"Cannot revalidate bound regular-file path {target}: {exc}",
+            raise _bound_file_revalidation_os_error(
+                target,
+                "revalidate the bound regular-file path",
+                exc,
+                codes,
             ) from exc
 
     def verify_properties(
@@ -3064,9 +3091,11 @@ def _verify_bound_regular_file_with_stat(
     try:
         first_sha256 = _hash_fd(bound.fd)
     except OSError as exc:
-        raise StoreSafetyError(
-            codes.inconclusive,
-            f"Cannot hash bound regular file during revalidation: {target}: {exc}",
+        raise _bound_file_revalidation_os_error(
+            target,
+            "hash the bound regular file",
+            exc,
+            codes,
         ) from exc
     descriptor_between = stat_descriptor()
     path_between = stat_path()
@@ -3074,10 +3103,11 @@ def _verify_bound_regular_file_with_stat(
     try:
         second_sha256 = _hash_fd(bound.fd)
     except OSError as exc:
-        raise StoreSafetyError(
-            codes.inconclusive,
-            f"Cannot repeat bound regular-file hash during revalidation: "
-            f"{target}: {exc}",
+        raise _bound_file_revalidation_os_error(
+            target,
+            "repeat the bound regular-file hash",
+            exc,
+            codes,
         ) from exc
     descriptor_after = stat_descriptor()
     path_after = stat_path()
@@ -3553,7 +3583,15 @@ def _bind_regular_file_at(
             f"Cannot safely open descriptor-relative regular file {path}: {exc}",
         ) from exc
     try:
-        opened = os.fstat(fd)
+        try:
+            opened = os.fstat(fd)
+        except OSError as exc:
+            raise _bound_file_revalidation_os_error(
+                path,
+                "inspect the descriptor-relative regular file after opening it",
+                exc,
+                codes,
+            ) from exc
         if not stat.S_ISREG(opened.st_mode) or not _same_identity(path_before, opened):
             raise StoreSafetyError(
                 codes.identity,
@@ -3562,9 +3600,11 @@ def _bind_regular_file_at(
         try:
             sha256 = _hash_fd(fd)
         except OSError as exc:
-            raise StoreSafetyError(
-                codes.inconclusive,
-                f"Cannot hash descriptor-relative regular file {path}: {exc}",
+            raise _bound_file_revalidation_os_error(
+                path,
+                "hash the descriptor-relative regular file after opening it",
+                exc,
+                codes,
             ) from exc
         bound = _BoundRegularFile(
             path=path,
@@ -3703,13 +3743,23 @@ def _verify_bound_source_directory(
             exc,
         ) from exc
     except StoreSafetyError as exc:
-        code = {
-            "prepared-directory-missing": "source-missing-after-read",
-            "prepared-directory-identity-mismatch": "source-identity-mismatch",
-            "prepared-directory-access-policy-mismatch": (
-                "source-access-policy-mismatch"
-            ),
-        }.get(exc.code, "source-revalidation-inconclusive")
+        os_error = _causal_os_error(exc)
+        if os_error is not None:
+            code = _source_revalidation_os_error(
+                directory.path,
+                "revalidate the held live-source directory chain",
+                os_error,
+            ).code
+        else:
+            code = {
+                "prepared-directory-missing": "source-missing-after-read",
+                "prepared-directory-identity-mismatch": "source-identity-mismatch",
+                "directory-identity-mismatch": "source-identity-mismatch",
+                "prepared-directory-access-policy-mismatch": (
+                    "source-access-policy-mismatch"
+                ),
+                "directory-access-policy-mismatch": ("source-access-policy-mismatch"),
+            }.get(exc.code, "source-revalidation-inconclusive")
         raise StoreSafetyError(
             code,
             "The held live-source directory chain failed terminal "
@@ -9078,16 +9128,26 @@ def probe_db_access(paths: NoteStorePaths) -> dict[str, Any]:
                     file_record["error"] = str(exc)
             else:
                 os.close(fd)
-                _verify_bound_directory_namespace(group_binding)
-                file_record.update(
-                    {
-                        "exists": True,
-                        "readable": True,
-                        "size": opened.st_size,
-                        "identity": _identity(opened),
-                        "access_policy": _access_policy(opened),
-                    }
-                )
+                try:
+                    _verify_bound_source_directory(group_binding)
+                except StoreSafetyError as exc:
+                    file_record.update(
+                        {
+                            "exists": True,
+                            "error_code": exc.code,
+                            "error": str(exc),
+                        }
+                    )
+                else:
+                    file_record.update(
+                        {
+                            "exists": True,
+                            "readable": True,
+                            "size": opened.st_size,
+                            "identity": _identity(opened),
+                            "access_policy": _access_policy(opened),
+                        }
+                    )
             file_records.append(file_record)
         return {"paths": entries, "note_store_files": file_records}
     finally:

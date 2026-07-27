@@ -3985,6 +3985,296 @@ raise SystemExit(2)
                     raised,
                 )
 
+    def test_bound_source_file_post_open_errors_close_fd_and_preserve_errno(
+        self,
+    ) -> None:
+        cases = (
+            (
+                FileNotFoundError,
+                MODULE.errno.ENOENT,
+                "source-missing-after-read",
+            ),
+            (
+                PermissionError,
+                MODULE.errno.EACCES,
+                "source-revalidation-unreadable",
+            ),
+            (
+                OSError,
+                MODULE.errno.EIO,
+                "source-revalidation-inconclusive",
+            ),
+        )
+        for operation in ("fstat", "path-stat"):
+            for error_type, error_number, expected_code in cases:
+                with (
+                    self.subTest(operation=operation, expected_code=expected_code),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    root = Path(temp_dir)
+                    source = root / MODULE.NOTE_STORE_MAIN
+                    self._create_db(source)
+                    fault = error_type(error_number, "simulated post-open failure")
+
+                    with MODULE._bind_existing_directory_with_trusted_alias(
+                        root
+                    ) as parent:
+                        original_open = MODULE.os.open
+                        original_fstat = MODULE.os.fstat
+                        original_stat = MODULE.os.stat
+                        opened_source_fd: int | None = None
+                        source_path_stats = 0
+
+                        def record_source_open(
+                            target: object,
+                            flags: int,
+                            mode: int = 0o777,
+                            *,
+                            dir_fd: int | None = None,
+                        ) -> int:
+                            nonlocal opened_source_fd
+                            fd = original_open(target, flags, mode, dir_fd=dir_fd)
+                            if dir_fd == parent.fd and os.fspath(target) == source.name:
+                                opened_source_fd = fd
+                            return fd
+
+                        def fail_source_fstat(fd: int) -> os.stat_result:
+                            if operation == "fstat" and fd == opened_source_fd:
+                                raise fault
+                            return original_fstat(fd)
+
+                        def fail_source_path_stat(
+                            target: object,
+                            *args: object,
+                            **kwargs: object,
+                        ) -> os.stat_result:
+                            nonlocal source_path_stats
+                            if (
+                                kwargs.get("dir_fd") == parent.fd
+                                and os.fspath(target) == source.name
+                            ):
+                                source_path_stats += 1
+                                if operation == "path-stat" and source_path_stats == 2:
+                                    raise fault
+                            return original_stat(target, *args, **kwargs)
+
+                        with (
+                            mock.patch.object(
+                                MODULE.os,
+                                "open",
+                                side_effect=record_source_open,
+                            ),
+                            mock.patch.object(
+                                MODULE.os,
+                                "fstat",
+                                side_effect=fail_source_fstat,
+                            ),
+                            mock.patch.object(
+                                MODULE.os,
+                                "stat",
+                                side_effect=fail_source_path_stat,
+                            ),
+                            self.assertRaises(MODULE.StoreSafetyError) as raised,
+                        ):
+                            with MODULE._bind_regular_file_at(
+                                source,
+                                parent,
+                                MODULE.SOURCE_FILE_CODES,
+                            ):
+                                self.fail("post-open source failure was accepted")
+
+                        self._assert_safety_code(expected_code, raised)
+                        self.assertIsNotNone(opened_source_fd)
+                        assert opened_source_fd is not None
+                        with self.assertRaises(OSError) as closed:
+                            os.fstat(opened_source_fd)
+                        self.assertEqual(closed.exception.errno, errno.EBADF)
+
+    def test_source_directory_revalidation_uses_wrapped_os_error_causes(
+        self,
+    ) -> None:
+        cases = (
+            (
+                FileNotFoundError(MODULE.errno.ENOENT, "simulated parent missing"),
+                "prepared-directory-identity-mismatch",
+                "source-missing-after-read",
+            ),
+            (
+                PermissionError(
+                    MODULE.errno.EACCES,
+                    "simulated parent unreadable",
+                ),
+                "prepared-directory-revalidation-inconclusive",
+                "source-revalidation-unreadable",
+            ),
+            (
+                OSError(MODULE.errno.EIO, "simulated parent revalidation EIO"),
+                "prepared-directory-revalidation-inconclusive",
+                "source-revalidation-inconclusive",
+            ),
+        )
+        for fault, wrapped_code, expected_code in cases:
+            with (
+                self.subTest(expected_code=expected_code),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                fd = os.open(root, MODULE._directory_open_flags())
+                try:
+                    opened = os.fstat(fd)
+                    binding = MODULE._BoundDirectory(
+                        path=root,
+                        fd=fd,
+                        opened=opened,
+                        parent_opened=opened,
+                    )
+                    with (
+                        mock.patch.object(MODULE.os, "stat", side_effect=fault),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        MODULE._verify_bound_source_directory(binding)
+                finally:
+                    os.close(fd)
+
+                self._assert_safety_code(expected_code, raised)
+                wrapped = raised.exception.__cause__
+                self.assertIsInstance(wrapped, MODULE.StoreSafetyError)
+                assert isinstance(wrapped, MODULE.StoreSafetyError)
+                self.assertEqual(wrapped.code, wrapped_code)
+                self.assertIs(wrapped.__cause__, fault)
+
+    def test_source_directory_identity_mismatch_requires_stat_comparison(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            replacement = root / "replacement"
+            replacement.mkdir()
+            fd = os.open(root, MODULE._directory_open_flags())
+            try:
+                opened = os.fstat(fd)
+                binding = MODULE._BoundDirectory(
+                    path=root,
+                    fd=fd,
+                    opened=opened,
+                    parent_opened=opened,
+                )
+                replacement_stat = replacement.stat()
+                with (
+                    mock.patch.object(
+                        MODULE.os,
+                        "stat",
+                        return_value=replacement_stat,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE._verify_bound_source_directory(binding)
+            finally:
+                os.close(fd)
+
+        self._assert_safety_code("source-identity-mismatch", raised)
+        wrapped = raised.exception.__cause__
+        self.assertIsInstance(wrapped, MODULE.StoreSafetyError)
+        assert isinstance(wrapped, MODULE.StoreSafetyError)
+        self.assertEqual(wrapped.code, "prepared-directory-identity-mismatch")
+        self.assertIsNone(wrapped.__cause__)
+
+    def test_probe_records_post_close_parent_revalidation_per_file(self) -> None:
+        cases = (
+            (
+                FileNotFoundError(MODULE.errno.ENOENT, "simulated parent missing"),
+                "source-missing-after-read",
+            ),
+            (
+                PermissionError(
+                    MODULE.errno.EACCES,
+                    "simulated parent unreadable",
+                ),
+                "source-revalidation-unreadable",
+            ),
+            (
+                OSError(MODULE.errno.EIO, "simulated parent revalidation EIO"),
+                "source-revalidation-inconclusive",
+            ),
+        )
+        for fault, expected_code in cases:
+            with (
+                self.subTest(expected_code=expected_code),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                source = paths.group_container / MODULE.NOTE_STORE_MAIN
+                self._create_db(source)
+                original_open_source = MODULE._open_regular_readonly_at
+                original_verify_source = MODULE._verify_bound_source_directory
+                opened_source_fd: int | None = None
+                source_revalidations = 0
+
+                def capture_opened_source(
+                    parent: MODULE._BoundDirectory,
+                    basename: str,
+                    *,
+                    display_path: Path,
+                ) -> tuple[int, os.stat_result]:
+                    nonlocal opened_source_fd
+                    fd, opened = original_open_source(
+                        parent,
+                        basename,
+                        display_path=display_path,
+                    )
+                    if display_path == source:
+                        opened_source_fd = fd
+                    return fd, opened
+
+                def fail_terminal_parent_revalidation(
+                    directory: MODULE._BoundDirectory,
+                ) -> dict[str, object]:
+                    nonlocal source_revalidations
+                    if directory.path == paths.group_container:
+                        source_revalidations += 1
+                        if source_revalidations == 3:
+                            self.assertIsNotNone(opened_source_fd)
+                            assert opened_source_fd is not None
+                            with self.assertRaises(OSError) as closed:
+                                os.fstat(opened_source_fd)
+                            self.assertEqual(closed.exception.errno, errno.EBADF)
+                            with mock.patch.object(
+                                MODULE.os,
+                                "stat",
+                                side_effect=fault,
+                            ):
+                                return original_verify_source(directory)
+                    return original_verify_source(directory)
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_open_regular_readonly_at",
+                        side_effect=capture_opened_source,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_verify_bound_source_directory",
+                        side_effect=fail_terminal_parent_revalidation,
+                    ),
+                ):
+                    result = MODULE.probe_db_access(paths)
+
+                self.assertGreaterEqual(source_revalidations, 3)
+                source_record = next(
+                    record
+                    for record in result["note_store_files"]
+                    if Path(record["path"]) == source
+                )
+                self.assertTrue(source_record["exists"])
+                self.assertFalse(source_record["readable"])
+                self.assertEqual(source_record["error_code"], expected_code)
+                self.assertNotIn("size", source_record)
+                self.assertFalse(
+                    source_record["error_code"].startswith("prepared-directory-")
+                )
+
     def test_source_final_revalidation_maps_generic_os_errors(self) -> None:
         for syscall in ("fstat", "stat"):
             with (

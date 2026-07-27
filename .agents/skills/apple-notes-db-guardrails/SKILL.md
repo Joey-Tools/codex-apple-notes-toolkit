@@ -190,6 +190,10 @@ results instead of reopening the copied path. Each live source is terminally reh
 same held descriptor; descriptor and pathname identity/access policy are checked around that hash,
 while `mtime`, `ctime`, and link-count transitions remain recorded metadata rather than mutation
 signals. It never reopens a parent pathname for durability.
+The access probe closes each successfully opened file descriptor, then performs one final
+source-aware held-parent revalidation inside that file's result boundary before marking it
+readable. Parent disappearance, unreadability, or another revalidation failure remains a
+per-file source error instead of escaping through the generic prepared-directory taxonomy.
 On an ordinary pre-publication failure, the helper
 preserves the partial tree and attaches a creation-receipt-matched namespace locator plus a bounded
 no-follow sensitive-file inventory to the original error. If the root is replaced or inventory is

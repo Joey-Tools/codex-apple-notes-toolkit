@@ -23,6 +23,9 @@ superseded_by:
 - Closed the post-open descriptor-relative source error-classification gap so
   disappearance, unreadability, and other revalidation uncertainty remain
   stable probe results instead of escaping as `unexpected-error`.
+- Closed the remaining bound-file, wrapped-directory, and post-close probe
+  taxonomy gaps so causal OS failures remain missing, unreadable, or
+  inconclusive while only proved property comparisons report mismatches.
 
 ## Current State
 
@@ -56,6 +59,11 @@ superseded_by:
   `source-missing-after-read`, `source-revalidation-unreadable`, or
   `source-revalidation-inconclusive`. The access probe retains those codes in
   the affected file record.
+- Bound source files apply that taxonomy across descriptor stat, path stat, and
+  repeated hashing while still closing the opened descriptor on every failure.
+  Held source-directory translation inspects wrapped OS causes before generic
+  prepared-directory codes, and the probe's post-close parent check now stays
+  inside the affected file result.
 
 ## Next Steps
 
@@ -104,6 +112,13 @@ superseded_by:
   Python `3.9.6` each passed all `245` tests. The fixed `/usr/bin/pgrep`
   supervisor case was rerun outside the nested sandbox because sandboxed
   process-table access returned an intentionally inconclusive probe result.
+- Final causal source-taxonomy regressions: Python `3.14.3` and `3.9.6` each
+  passed nine focused tests covering post-open descriptor/path errno mapping
+  and close, wrapped directory causes versus proved identity mismatch, and
+  post-close probe parent failures retained per file.
+- Final causal source-taxonomy full suites: Python `3.14.3` and `3.9.6` each
+  passed all `249` tests outside the nested sandbox required by the fixed
+  `/usr/bin/pgrep` probe.
 - Static checks: full-repository `ruff check`; changed-file `ruff format --check`; `python3 -m py_compile`; CI-scoped `bash -n` and `shellcheck`; and `git diff --check`
 - Formal follow-up static checks: full-repository `ruff check .`; changed-Python `ruff format --check`; Python `3.14.3` and `3.9.6` `py_compile`; `bash -n` and `shellcheck` over both shell scripts; and `git diff --check`
 - Final formal-review static checks: full-repository Ruff `0.13.2`; changed-Python format check; Python `3.14.3` and `3.9.6` bytecode compilation; `bash -n` and ShellCheck over both shell scripts; and `git diff --check`.
@@ -111,13 +126,23 @@ superseded_by:
 - Post-open source-classification static checks: Ruff check/format, Python
   `3.14.3` and `3.9.6` bytecode compilation with a task-scoped cache,
   `git diff --check`, and isolated `quick_validate.py` with cached `PyYAML`.
+- Final causal source-taxonomy static checks: full-repository Ruff `0.13.2`;
+  changed-Python format check; Python `3.14.3` and `3.9.6` bytecode
+  compilation with task-scoped caches; `bash -n`; ShellCheck `0.11.0`; and
+  `git diff --check`.
 - Skill validation: isolated `quick_validate.py` with `PyYAML` (`Skill is valid!`; direct local validation lacked that dependency)
 - Final skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)
 - Formal follow-up skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)
 - Final formal-review skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)
 - Final safety-resumption skill validation: isolated `quick_validate.py` with cached `PyYAML` (`Skill is valid!`; direct Homebrew Python validation lacked `yaml`)
+- Final causal source-taxonomy skill validation:
+  `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails`
+  (`Skill is valid!`).
 - Final post-fix read-only full-diff review: no findings
 - Journal validation: `project_journal.py validate --repo <worktree>`
 - Formal follow-up journal validation: `project_journal.py validate --repo <worktree>` (`Project journal validation passed.`)
 - Final formal-review journal validation: `project_journal.py validate --repo <worktree>` (`Project journal validation passed.`)
 - Final safety-resumption journal validation: `project_journal.py validate --repo <worktree>` (`Project journal validation passed.`)
+- Final causal source-taxonomy journal validation:
+  `project_journal.py validate --repo <worktree>`
+  (`Project journal validation passed.`).

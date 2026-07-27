@@ -77,6 +77,14 @@ Map generic descriptor/path/hash revalidation failures such as `EIO` or `ESTALE`
 `source-revalidation-inconclusive`; do not let them escape as `unexpected-error`. Continue to map
 `FileNotFoundError` to missing-after-read and `PermissionError` to revalidation-unreadable, while
 identity, content, and access-policy comparison failures keep their dedicated codes.
+Apply that source mapping to post-open descriptor, descriptor-relative path, content-hash, and
+held-parent checks. When a generic prepared-directory error wraps an OS error, inspect its explicit
+cause chain before interpreting the outer code: `ENOENT` is missing, `EACCES`/`EPERM` is
+unreadable, and another OS error is inconclusive. Only an identity or access-policy comparison
+failure without a causal OS error is a proved mismatch. For `probe-db-access`, close the opened
+file descriptor first and keep the final held-parent check inside that file's result boundary;
+failure leaves the file unreadable with the same source classification rather than aborting the
+whole probe with a prepared-directory error.
 
 ## Stable Descriptor Capture
 
