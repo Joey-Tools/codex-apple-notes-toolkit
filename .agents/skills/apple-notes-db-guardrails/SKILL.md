@@ -280,13 +280,18 @@ access policy plus the buffer digest before and after integrity queries and back
 Linux `TemporaryFile` may use `O_TMPFILE`, whose anonymous object is not required to survive
 SQLite VFS full-path processing. The helper therefore never treats a successful Python
 descriptor reopen probe as proof that SQLite can or should reopen that pseudo-path. For a
-recovered WAL-mode image, bytes 18 and 19 are normalized to rollback mode only after the committed
-WAL prefix has been applied; those normalized bytes are written to and receipted from the
-anonymous descriptor before deserialization.
-Connection teardown precedes buffer release. If native close cannot be proved, the helper retains
-the buffer instead of freeing memory SQLite may still reference and reports incomplete
-`sqlite_input_cleanup`; ordinary descriptor cleanup remains anchored to the still-held temporary
-file object.
+recovered image with an exact SQLite header, read/write versions `1/1` are preserved and only the
+exact WAL pair `2/2` is normalized to rollback mode after the committed WAL prefix has been
+applied. Mixed or invalid pairs fail before deserialization. The accepted bytes are written to and
+receipted from the anonymous descriptor before SQLite consumes them.
+Connection teardown precedes buffer release. Every ordinary native runtime or `ctypes` failure is
+classified under the calling SQLite error code and carries structured `sqlite_input_cleanup`
+evidence. If native close cannot be proved, the helper retains the buffer instead of freeing memory
+SQLite may still reference; ordinary descriptor cleanup remains anchored to the still-held
+temporary file object. Native backup cleanup likewise records `sqlite_backup_cleanup` and
+independently attempts every still-safe backup-finish, serialized-buffer-free, and destination-close
+step without retrying an ownership-ambiguous release. Process-control exceptions retain their
+original semantics and are never translated into a safety error.
 Initial discovery also detects `NoteStore.sqlite-journal` without following links. Any present
 rollback journal is descriptor-bound and then rejected as `rollback-journal-present`; if it cannot
 be bound as one stable regular file, the same reason code is returned as inconclusive. Recovery

@@ -6468,16 +6468,142 @@ raise SystemExit(2)
         self.assertEqual(integrity["result"], "ok")
         self.assertEqual(value, "validated")
 
+    def test_wal_header_normalization_accepts_exact_wal_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database = root / MODULE.NOTE_STORE_MAIN
+            self._create_db(database, value="validated")
+            original = database.read_bytes()
+            for version_pair in ((1, 1), (2, 2)):
+                with self.subTest(version_pair=version_pair):
+                    payload = bytearray(original)
+                    payload[18], payload[19] = version_pair
+                    normalized = MODULE._normalize_deserialized_sqlite_header(
+                        bytes(payload),
+                        database,
+                        error_code="sqlite-integrity-failed",
+                    )
+                    self.assertEqual(normalized[18:20], b"\x01\x01")
+                    integrity = MODULE._sqlite_integrity_from_payload(
+                        bytes(payload),
+                        database,
+                    )
+                    backup = MODULE._sqlite_backup_bytes_from_payload(
+                        bytes(payload),
+                        database,
+                    )
+                    recovered = root / "recovered.sqlite"
+                    recovered.write_bytes(backup)
+                    with closing(sqlite3.connect(recovered)) as connection:
+                        value = connection.execute(
+                            "SELECT value FROM sample"
+                        ).fetchone()[0]
+                    self.assertEqual(integrity["result"], "ok")
+                    self.assertEqual(value, "validated")
+
     def test_wal_header_normalization_does_not_mask_invalid_version(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database = Path(temp_dir) / MODULE.NOTE_STORE_MAIN
             self._create_db(database)
-            payload = bytearray(database.read_bytes())
-            payload[18] = 3
-            payload[19] = 2
+            original = database.read_bytes()
+            for version_pair in (
+                (1, 2),
+                (2, 1),
+                (0, 0),
+                (3, 3),
+                (255, 1),
+            ):
+                with self.subTest(version_pair=version_pair):
+                    payload = bytearray(original)
+                    payload[18], payload[19] = version_pair
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_load_native_sqlite_api",
+                            side_effect=AssertionError(
+                                "invalid header pair reached SQLite"
+                            ),
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        MODULE._sqlite_integrity_from_payload(
+                            bytes(payload),
+                            database,
+                        )
+                    self._assert_safety_code(
+                        "sqlite-integrity-failed",
+                        raised,
+                    )
+                    versions = raised.exception.details["sqlite_header_versions"]
+                    self.assertEqual(
+                        (versions["write"], versions["read"]),
+                        version_pair,
+                    )
+            payload = bytearray(original)
+            payload[18], payload[19] = (1, 2)
             with self.assertRaises(MODULE.StoreSafetyError) as raised:
-                MODULE._sqlite_integrity_from_payload(bytes(payload), database)
-        self._assert_safety_code("sqlite-integrity-failed", raised)
+                MODULE._sqlite_backup_bytes_from_payload(
+                    bytes(payload),
+                    database,
+                )
+        self._assert_safety_code("sqlite-recovery-failed", raised)
+
+    def test_anonymous_recovery_rejects_prebaseline_mutations(self) -> None:
+        for attack, expected_code in (
+            ("identity", "prepared-file-identity-mismatch"),
+            ("content", "prepared-file-content-mismatch"),
+            ("access-policy", "prepared-file-access-policy-mismatch"),
+        ):
+            with self.subTest(attack=attack):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    database = Path(temp_dir) / MODULE.NOTE_STORE_MAIN
+                    self._create_db(database, value="validated")
+                    payload = database.read_bytes()
+                    original_write = MODULE._write_all
+                    replacement_handles: list[object] = []
+
+                    def write_then_attack(fd: int, data: bytes) -> None:
+                        original_write(fd, data)
+                        if attack == "identity":
+                            replacement = tempfile.TemporaryFile()
+                            replacement.write(data)
+                            replacement.flush()
+                            os.fchmod(replacement.fileno(), 0o600)
+                            replacement_handles.append(replacement)
+                            os.dup2(replacement.fileno(), fd)
+                        elif attack == "content":
+                            duplicate = os.dup(fd)
+                            try:
+                                os.lseek(duplicate, 0, os.SEEK_SET)
+                                os.write(duplicate, b"X")
+                            finally:
+                                os.close(duplicate)
+                        else:
+                            os.fchmod(fd, 0o400)
+
+                    try:
+                        with (
+                            mock.patch.object(
+                                MODULE,
+                                "_write_all",
+                                side_effect=write_then_attack,
+                            ),
+                            mock.patch.object(
+                                MODULE,
+                                "_verify_anonymous_recovery_file",
+                                wraps=MODULE._verify_anonymous_recovery_file,
+                            ) as verify_mock,
+                            self.assertRaises(MODULE.StoreSafetyError) as raised,
+                        ):
+                            MODULE._sqlite_integrity_from_payload(
+                                payload,
+                                database,
+                            )
+                    finally:
+                        for handle in replacement_handles:
+                            handle.close()
+                self._assert_safety_code(expected_code, raised)
+                verify_mock.assert_not_called()
 
     def test_deserialized_sqlite_input_revalidates_adversarial_mutations(
         self,
@@ -6596,6 +6722,349 @@ raise SystemExit(2)
         self.assertTrue(handles[0].closed)
         close_mock.assert_called_once()
         free_mock.assert_called_once()
+        cleanup = raised.exception.details["sqlite_input_cleanup"]
+        self.assertEqual(cleanup["status"], "complete")
+        self.assertEqual(
+            cleanup["steps"]["connection_close"]["status"],
+            "complete",
+        )
+        self.assertEqual(
+            cleanup["steps"]["buffer_free"]["status"],
+            "complete",
+        )
+
+    def test_deserialize_runtime_failure_is_classified_with_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / MODULE.NOTE_STORE_MAIN
+            self._create_db(database)
+            payload = database.read_bytes()
+            original_close = MODULE._native_sqlite_close
+            original_free = MODULE._native_sqlite_free
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_native_sqlite_deserialize",
+                    side_effect=RuntimeError("simulated ctypes failure"),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_native_sqlite_close",
+                    wraps=original_close,
+                ) as close_mock,
+                mock.patch.object(
+                    MODULE,
+                    "_native_sqlite_free",
+                    wraps=original_free,
+                ) as free_mock,
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._sqlite_integrity_from_payload(payload, database)
+        self._assert_safety_code("sqlite-integrity-failed", raised)
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+        cleanup = raised.exception.details["sqlite_input_cleanup"]
+        self.assertEqual(cleanup["status"], "complete")
+        close_mock.assert_called_once()
+        free_mock.assert_called_once()
+
+    def test_deserialize_revalidation_process_control_is_not_wrapped(self) -> None:
+        for exception_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(exception_type=exception_type.__name__):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    database = Path(temp_dir) / MODULE.NOTE_STORE_MAIN
+                    self._create_db(database)
+                    payload = database.read_bytes()
+                    original_verify = MODULE._verify_deserialized_sqlite_buffer
+                    original_close = MODULE._native_sqlite_close
+                    original_free = MODULE._native_sqlite_free
+                    verify_calls = 0
+
+                    def interrupt_revalidation(
+                        image: MODULE._DeserializedSQLiteImage,
+                        source_path: Path,
+                    ) -> None:
+                        nonlocal verify_calls
+                        verify_calls += 1
+                        if verify_calls == 2:
+                            raise exception_type("simulated process control")
+                        original_verify(image, source_path)
+
+                    with MODULE._anonymous_recovery_file(
+                        payload,
+                        database,
+                        error_code="sqlite-integrity-failed",
+                    ) as bound:
+                        with (
+                            mock.patch.object(
+                                MODULE,
+                                "_verify_deserialized_sqlite_buffer",
+                                side_effect=interrupt_revalidation,
+                            ),
+                            mock.patch.object(
+                                MODULE,
+                                "_native_sqlite_close",
+                                wraps=original_close,
+                            ) as close_mock,
+                            mock.patch.object(
+                                MODULE,
+                                "_native_sqlite_free",
+                                wraps=original_free,
+                            ) as free_mock,
+                            self.assertRaises(exception_type),
+                        ):
+                            with MODULE._deserialized_sqlite_image(
+                                bound,
+                                database,
+                                verify_bound=lambda: (
+                                    MODULE._verify_anonymous_recovery_file(bound)
+                                ),
+                                error_code="sqlite-integrity-failed",
+                                require_backup=False,
+                            ):
+                                raise RuntimeError("simulated consumer failure")
+                close_mock.assert_called_once()
+                free_mock.assert_called_once()
+
+    def test_deserialize_revalidation_is_primary_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / MODULE.NOTE_STORE_MAIN
+            self._create_db(database)
+            payload = database.read_bytes()
+            original_verify = MODULE._verify_deserialized_sqlite_buffer
+            verify_calls = 0
+
+            def fail_revalidation(
+                image: MODULE._DeserializedSQLiteImage,
+                source_path: Path,
+            ) -> None:
+                nonlocal verify_calls
+                verify_calls += 1
+                if verify_calls == 2:
+                    try:
+                        raise OSError(errno.EIO, "simulated buffer read failure")
+                    except OSError as cause:
+                        raise MODULE.StoreSafetyError(
+                            "prepared-file-revalidation-inconclusive",
+                            "simulated SQLite input revalidation failure",
+                        ) from cause
+                original_verify(image, source_path)
+
+            with MODULE._anonymous_recovery_file(
+                payload,
+                database,
+                error_code="sqlite-integrity-failed",
+            ) as bound:
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_verify_deserialized_sqlite_buffer",
+                        side_effect=fail_revalidation,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    with MODULE._deserialized_sqlite_image(
+                        bound,
+                        database,
+                        verify_bound=lambda: (
+                            MODULE._verify_anonymous_recovery_file(bound)
+                        ),
+                        error_code="sqlite-integrity-failed",
+                        require_backup=False,
+                    ):
+                        raise RuntimeError("simulated consumer failure")
+        self._assert_safety_code(
+            "prepared-file-revalidation-inconclusive",
+            raised,
+        )
+        revalidation_error = raised.exception.__cause__
+        self.assertIsInstance(revalidation_error, MODULE.StoreSafetyError)
+        assert isinstance(revalidation_error, MODULE.StoreSafetyError)
+        self.assertIsInstance(revalidation_error.__cause__, OSError)
+        self.assertEqual(
+            raised.exception.details["sqlite_input_secondary_failure"],
+            {
+                "schema": "apple-notes-sqlite-secondary-failure/v1",
+                "phase": "consumer",
+                "error_type": "RuntimeError",
+            },
+        )
+        self.assertEqual(
+            raised.exception.details["sqlite_input_cleanup"]["status"],
+            "complete",
+        )
+
+    def test_deserialize_cleanup_retains_buffer_when_close_is_unproved(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / MODULE.NOTE_STORE_MAIN
+            self._create_db(database)
+            payload = database.read_bytes()
+            original_close = MODULE._native_sqlite_close
+
+            def close_then_raise(
+                api: MODULE._NativeSQLiteApi,
+                connection: ctypes.c_void_p,
+            ) -> int:
+                original_close(api, connection)
+                raise RuntimeError("simulated unproved close")
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_native_sqlite_deserialize",
+                    side_effect=RuntimeError("simulated ctypes failure"),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_native_sqlite_close",
+                    side_effect=close_then_raise,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_native_sqlite_free",
+                ) as free_mock,
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._sqlite_integrity_from_payload(payload, database)
+        self._assert_safety_code("sqlite-integrity-failed", raised)
+        cleanup = raised.exception.details["sqlite_input_cleanup"]
+        self.assertEqual(cleanup["status"], "incomplete")
+        self.assertEqual(
+            cleanup["steps"]["connection_close"]["status"],
+            "failed",
+        )
+        self.assertEqual(
+            cleanup["steps"]["buffer_free"],
+            {
+                "status": "skipped-unsafe",
+                "reason": "database-close-unproved",
+            },
+        )
+        self.assertEqual(cleanup["buffer"]["release_status"], "retained")
+        free_mock.assert_not_called()
+
+    def test_backup_runtime_failure_aggregates_cleanup_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / MODULE.NOTE_STORE_MAIN
+            self._create_db(database, value="validated")
+            payload = database.read_bytes()
+            original_verify = MODULE._verify_deserialized_sqlite_buffer
+            original_close = MODULE._native_sqlite_close
+            original_free = MODULE._native_sqlite_free
+            verify_calls = 0
+            close_calls = 0
+            free_calls = 0
+
+            def fail_after_serialization(
+                image: MODULE._DeserializedSQLiteImage,
+                source_path: Path,
+            ) -> None:
+                nonlocal verify_calls
+                verify_calls += 1
+                if verify_calls == 3:
+                    raise RuntimeError("simulated post-serialization ctypes failure")
+                original_verify(image, source_path)
+
+            def close_then_fail_once(
+                api: MODULE._NativeSQLiteApi,
+                connection: ctypes.c_void_p,
+            ) -> int:
+                nonlocal close_calls
+                close_calls += 1
+                result = original_close(api, connection)
+                if close_calls == 1:
+                    raise OSError(errno.EIO, "simulated destination close failure")
+                return result
+
+            def free_then_fail_once(
+                api: MODULE._NativeSQLiteApi,
+                pointer: int,
+            ) -> None:
+                nonlocal free_calls
+                free_calls += 1
+                original_free(api, pointer)
+                if free_calls == 1:
+                    raise OSError(errno.EIO, "simulated serialized free failure")
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_verify_deserialized_sqlite_buffer",
+                    side_effect=fail_after_serialization,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_native_sqlite_close",
+                    side_effect=close_then_fail_once,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_native_sqlite_free",
+                    side_effect=free_then_fail_once,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._sqlite_backup_bytes_from_payload(payload, database)
+        self._assert_safety_code("sqlite-recovery-failed", raised)
+        backup_cleanup = raised.exception.details["sqlite_backup_cleanup"]
+        self.assertEqual(backup_cleanup["status"], "incomplete")
+        self.assertEqual(
+            backup_cleanup["steps"]["backup_finish"]["status"],
+            "complete",
+        )
+        self.assertEqual(
+            backup_cleanup["steps"]["serialized_free"]["status"],
+            "failed",
+        )
+        self.assertEqual(
+            backup_cleanup["steps"]["destination_close"]["status"],
+            "failed",
+        )
+        self.assertEqual(
+            raised.exception.details["sqlite_input_cleanup"]["status"],
+            "complete",
+        )
+        self.assertEqual(close_calls, 2)
+        self.assertEqual(free_calls, 2)
+
+    def test_backup_cleanup_attempts_every_independent_step(self) -> None:
+        api = mock.Mock(spec=MODULE._NativeSQLiteApi)
+        with (
+            mock.patch.object(
+                MODULE,
+                "_native_sqlite_backup_finish",
+                side_effect=RuntimeError("simulated finish failure"),
+            ) as finish_mock,
+            mock.patch.object(
+                MODULE,
+                "_native_sqlite_free",
+                side_effect=RuntimeError("simulated free failure"),
+            ) as free_mock,
+            mock.patch.object(
+                MODULE,
+                "_native_sqlite_close",
+                side_effect=RuntimeError("simulated close failure"),
+            ) as close_mock,
+        ):
+            cleanup = MODULE._cleanup_sqlite_backup(
+                api,
+                ctypes.c_void_p(11),
+                12,
+                13,
+                finish_step={"status": "not-needed"},
+            )
+        self.assertEqual(cleanup["status"], "incomplete")
+        self.assertEqual(
+            {name: step["status"] for name, step in cleanup["steps"].items()},
+            {
+                "backup_finish": "failed",
+                "serialized_free": "failed",
+                "destination_close": "failed",
+            },
+        )
+        finish_mock.assert_called_once()
+        free_mock.assert_called_once()
+        close_mock.assert_called_once()
 
     def test_failed_recovery_preserves_temp_leaf_replaced_after_binding(
         self,

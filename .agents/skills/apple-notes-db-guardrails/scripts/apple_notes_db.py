@@ -10479,6 +10479,163 @@ def _native_sqlite_exec(
     )
 
 
+def _native_sqlite_backup_init(
+    api: _NativeSQLiteApi,
+    destination: ctypes.c_void_p,
+    source: ctypes.c_void_p,
+) -> int | None:
+    assert api.backup_init is not None
+    backup = api.backup_init(
+        destination,
+        b"main",
+        source,
+        b"main",
+    )
+    return int(backup) if backup else None
+
+
+def _native_sqlite_backup_step(
+    api: _NativeSQLiteApi,
+    backup: int,
+) -> int:
+    assert api.backup_step is not None
+    return int(api.backup_step(backup, -1))
+
+
+def _native_sqlite_backup_finish(
+    api: _NativeSQLiteApi,
+    backup: int,
+) -> int:
+    assert api.backup_finish is not None
+    return int(api.backup_finish(backup))
+
+
+def _native_sqlite_serialize(
+    api: _NativeSQLiteApi,
+    database: ctypes.c_void_p,
+    byte_count: ctypes.c_longlong,
+) -> int | None:
+    assert api.serialize is not None
+    serialized = api.serialize(
+        database,
+        b"main",
+        ctypes.byref(byte_count),
+        0,
+    )
+    return int(serialized) if serialized else None
+
+
+def _sqlite_exception_evidence(exc: Exception) -> dict[str, Any]:
+    evidence: dict[str, Any] = {"error_type": type(exc).__name__}
+    if isinstance(exc, StoreSafetyError):
+        evidence["error_code"] = exc.code
+    try:
+        error_number = getattr(exc, "errno", None)
+    except Exception:
+        error_number = None
+    if isinstance(error_number, int):
+        evidence["errno"] = error_number
+    return evidence
+
+
+def _sqlite_exception_text(exc: Exception) -> str:
+    try:
+        return str(exc)
+    except Exception:
+        return f"<unprintable {type(exc).__name__}>"
+
+
+def _classified_sqlite_failure(
+    primary_error: Exception,
+    *,
+    error_code: str,
+    message: str,
+    cleanup_key: str,
+    cleanup: dict[str, Any],
+) -> StoreSafetyError:
+    if isinstance(primary_error, StoreSafetyError):
+        code = primary_error.code
+        failure_message = _sqlite_exception_text(primary_error)
+        details = dict(primary_error.details)
+    else:
+        code = error_code
+        failure_message = f"{message}: {_sqlite_exception_text(primary_error)}"
+        details = {
+            "sqlite_runtime_failure": _sqlite_exception_evidence(primary_error),
+        }
+    details[cleanup_key] = cleanup
+    return StoreSafetyError(
+        code,
+        failure_message,
+        details=details,
+    )
+
+
+def _cleanup_deserialized_sqlite_input(
+    api: _NativeSQLiteApi | None,
+    database: ctypes.c_void_p,
+    buffer: int | None,
+    *,
+    byte_count: int | None,
+    sha256: str | None,
+) -> dict[str, Any]:
+    close_step: dict[str, Any] = {"status": "not-needed"}
+    free_step: dict[str, Any] = {"status": "not-needed"}
+    close_proved = not bool(database)
+    if api is not None and database:
+        try:
+            close_result = _native_sqlite_close(api, database)
+        except Exception as exc:
+            close_step = {
+                "status": "failed",
+                **_sqlite_exception_evidence(exc),
+            }
+        else:
+            close_proved = close_result == SQLITE_OK
+            close_step = {
+                "status": "complete" if close_proved else "failed",
+                "result": close_result,
+            }
+
+    buffer_release_status = "not-allocated"
+    if api is not None and buffer is not None:
+        if not close_proved:
+            buffer_release_status = "retained"
+            free_step = {
+                "status": "skipped-unsafe",
+                "reason": "database-close-unproved",
+            }
+        else:
+            try:
+                _native_sqlite_free(api, buffer)
+            except Exception as exc:
+                buffer_release_status = "inconclusive"
+                free_step = {
+                    "status": "failed",
+                    **_sqlite_exception_evidence(exc),
+                }
+            else:
+                buffer_release_status = "released"
+                free_step = {"status": "complete"}
+
+    cleanup_complete = all(
+        step["status"] in {"complete", "not-needed"} for step in (close_step, free_step)
+    )
+    return {
+        "schema": "apple-notes-sqlite-input-cleanup/v1",
+        "status": "complete" if cleanup_complete else "incomplete",
+        "steps": {
+            "connection_close": close_step,
+            "buffer_free": free_step,
+        },
+        "buffer": {
+            "release_status": buffer_release_status,
+            "size": byte_count,
+            "sha256": sha256,
+        },
+    }
+
+
 def _verify_deserialized_sqlite_buffer(
     image: _DeserializedSQLiteImage,
     source_path: Path,
@@ -10602,6 +10759,93 @@ def _bound_recovery_payload(
     return recovered
 
 
+def _normalize_deserialized_sqlite_header(
+    payload: bytes,
+    source_path: Path,
+    *,
+    error_code: str,
+) -> bytes:
+    if len(payload) < 20 or payload[:16] != b"SQLite format 3\0":
+        return payload
+    version_pair = (payload[18], payload[19])
+    if version_pair == (1, 1):
+        return payload
+    if version_pair == (2, 2):
+        normalized = bytearray(payload)
+        normalized[18] = 1
+        normalized[19] = 1
+        return bytes(normalized)
+    raise StoreSafetyError(
+        error_code,
+        "SQLite database-header read/write versions are not an accepted pair "
+        f"for descriptor-bound deserialization of {source_path}: "
+        f"{version_pair[0]}/{version_pair[1]}",
+        details={
+            "sqlite_header_versions": {
+                "write": version_pair[0],
+                "read": version_pair[1],
+                "accepted_pairs": [[1, 1], [2, 2]],
+            }
+        },
+    )
+
+
+def _bind_written_anonymous_recovery_file(
+    fd: int,
+    source_path: Path,
+    *,
+    created: os.stat_result,
+    expected_sha256: str,
+    expected_size: int,
+    expected_access_policy: dict[str, int],
+) -> os.stat_result:
+    terminal: os.stat_result | None = None
+    for attempt in range(2):
+        try:
+            descriptor_before = os.fstat(fd)
+            readback_sha256 = _hash_fd(fd)
+            descriptor_after = os.fstat(fd)
+        except OSError as exc:
+            raise StoreSafetyError(
+                "prepared-file-revalidation-inconclusive",
+                "Cannot bind the anonymous descriptor-backed recovery image "
+                f"during readback {attempt + 1} for {source_path}: {exc}",
+            ) from exc
+        if (
+            not stat.S_ISREG(descriptor_before.st_mode)
+            or not stat.S_ISREG(descriptor_after.st_mode)
+            or not _same_identity(created, descriptor_before)
+            or not _same_identity(descriptor_before, descriptor_after)
+        ):
+            raise StoreSafetyError(
+                "prepared-file-identity-mismatch",
+                "Anonymous descriptor-backed recovery image identity changed "
+                f"before binding for {source_path}",
+            )
+        if (
+            _access_policy(descriptor_before) != expected_access_policy
+            or _access_policy(descriptor_after) != expected_access_policy
+        ):
+            raise StoreSafetyError(
+                "prepared-file-access-policy-mismatch",
+                "Anonymous descriptor-backed recovery image access policy "
+                f"changed before binding for {source_path}",
+            )
+        if (
+            readback_sha256 != expected_sha256
+            or descriptor_before.st_size != expected_size
+            or descriptor_after.st_size != expected_size
+        ):
+            raise StoreSafetyError(
+                "prepared-file-content-mismatch",
+                "Anonymous descriptor-backed recovery image bytes changed "
+                f"before binding for {source_path}",
+            )
+        terminal = descriptor_after
+    assert terminal is not None
+    return terminal
+
+
 def _verify_anonymous_recovery_file(
     bound: _BoundRegularFile,
 ) -> None:
@@ -10720,26 +10964,31 @@ def _deserialized_sqlite_image(
     error_code: str,
     require_backup: bool,
 ) -> Iterator[_DeserializedSQLiteImage]:
-    payload = _read_descriptor_bound_sqlite_bytes(bound, verify_bound)
-    expected_sha256 = hashlib.sha256(payload).hexdigest()
-    api = _load_native_sqlite_api(
-        source_path,
-        error_code=error_code,
-        require_backup=require_backup,
-    )
+    api: _NativeSQLiteApi | None = None
     database = ctypes.c_void_p()
-    raw_buffer = api.malloc64(len(payload))
-    if not raw_buffer:
-        raise StoreSafetyError(
-            error_code,
-            "SQLite cannot allocate a read-only deserialization buffer for "
-            f"{source_path}",
-        )
-    buffer = int(raw_buffer)
-    image: _DeserializedSQLiteImage | None = None
-    primary_error: BaseException | None = None
-    cleanup_failure: dict[str, Any] | None = None
+    buffer: int | None = None
+    byte_count: int | None = None
+    expected_sha256: str | None = None
+    primary_error: Exception | None = None
+    consumer_error: Exception | None = None
+    process_control_error: BaseException | None = None
     try:
+        payload = _read_descriptor_bound_sqlite_bytes(bound, verify_bound)
+        byte_count = len(payload)
+        expected_sha256 = hashlib.sha256(payload).hexdigest()
+        api = _load_native_sqlite_api(
+            source_path,
+            error_code=error_code,
+            require_backup=require_backup,
+        )
+        raw_buffer = api.malloc64(byte_count)
+        if not raw_buffer:
+            raise StoreSafetyError(
+                error_code,
+                "SQLite cannot allocate a read-only deserialization buffer for "
+                f"{source_path}",
+            )
+        buffer = int(raw_buffer)
         ctypes.memmove(buffer, payload, len(payload))
         result = api.open_v2(
             b":memory:",
@@ -10769,7 +11018,7 @@ def _deserialized_sqlite_image(
             api=api,
             database=database,
             buffer=buffer,
-            byte_count=len(payload),
+            byte_count=byte_count,
             sha256=expected_sha256,
             bound=bound,
             verify_bound=verify_bound,
@@ -10779,92 +11028,111 @@ def _deserialized_sqlite_image(
         try:
             yield image
         except Exception as exc:
+            consumer_error = exc
             primary_error = exc
             try:
                 _verify_deserialized_sqlite_buffer(image, source_path)
                 verify_bound()
             except Exception as revalidation_error:
                 primary_error = revalidation_error
-                raise revalidation_error from exc
-            raise
         else:
             _verify_deserialized_sqlite_buffer(image, source_path)
             verify_bound()
+    except Exception as exc:
+        if primary_error is None:
+            primary_error = exc
     except BaseException as exc:
-        primary_error = exc
-        raise
-    finally:
-        close_result: int | None = None
-        close_error: Exception | None = None
-        if database:
-            try:
-                close_result = _native_sqlite_close(api, database)
-            except Exception as exc:
-                close_error = exc
-        if database and (close_error is not None or close_result != SQLITE_OK):
-            cleanup_failure = {
-                "status": "retained-in-memory",
-                "close_result": close_result,
-                "close_error_type": (
-                    type(close_error).__name__ if close_error is not None else None
-                ),
-                "buffer_size": len(payload),
-                "buffer_sha256": expected_sha256,
+        process_control_error = exc
+
+    cleanup = _cleanup_deserialized_sqlite_input(
+        api,
+        database,
+        buffer,
+        byte_count=byte_count,
+        sha256=expected_sha256,
+    )
+    if process_control_error is not None:
+        raise process_control_error
+    if primary_error is not None:
+        failure = _classified_sqlite_failure(
+            primary_error,
+            error_code=error_code,
+            message=(f"SQLite descriptor-bound input failed for {source_path}"),
+            cleanup_key="sqlite_input_cleanup",
+            cleanup=cleanup,
+        )
+        if consumer_error is not None and consumer_error is not primary_error:
+            failure.details["sqlite_input_secondary_failure"] = {
+                "schema": "apple-notes-sqlite-secondary-failure/v1",
+                "phase": "consumer",
+                **_sqlite_exception_evidence(consumer_error),
             }
-        else:
-            try:
-                _native_sqlite_free(api, buffer)
-            except Exception as exc:
-                cleanup_failure = {
-                    "status": "inconclusive",
-                    "close_result": close_result,
-                    "free_error_type": type(exc).__name__,
-                    "buffer_size": len(payload),
-                    "buffer_sha256": expected_sha256,
-                }
-        if cleanup_failure is not None:
-            if isinstance(primary_error, StoreSafetyError):
-                primary_error.details["sqlite_input_cleanup"] = cleanup_failure
-            elif primary_error is None:
-                raise StoreSafetyError(
-                    error_code,
-                    "SQLite descriptor-bound input cleanup did not complete for "
-                    f"{source_path}",
-                    details={"sqlite_input_cleanup": cleanup_failure},
-                )
+        raise failure from primary_error
+    if cleanup["status"] != "complete":
+        raise StoreSafetyError(
+            error_code,
+            f"SQLite descriptor-bound input cleanup did not complete for {source_path}",
+            details={"sqlite_input_cleanup": cleanup},
+        )
 
 
 @contextmanager
 def _anonymous_recovery_file(
     payload: bytes,
     source_path: Path,
+    *,
+    error_code: str,
 ) -> Iterator[_BoundRegularFile]:
-    sqlite_payload = payload
-    if (
-        len(payload) >= 20
-        and payload[:16] == b"SQLite format 3\0"
-        and payload[18] in (1, 2)
-        and payload[19] in (1, 2)
-        and (payload[18] == 2 or payload[19] == 2)
-    ):
-        normalized = bytearray(payload)
-        normalized[18] = 1
-        normalized[19] = 1
-        sqlite_payload = bytes(normalized)
+    sqlite_payload = _normalize_deserialized_sqlite_header(
+        payload,
+        source_path,
+        error_code=error_code,
+    )
+    expected_size = len(sqlite_payload)
+    expected_sha256 = hashlib.sha256(sqlite_payload).hexdigest()
     try:
         with tempfile.TemporaryFile(prefix="apple-notes-recovered-image-") as handle:
             fd = handle.fileno()
+            created = os.fstat(fd)
+            if not stat.S_ISREG(created.st_mode):
+                raise StoreSafetyError(
+                    "prepared-file-identity-mismatch",
+                    "Anonymous recovery input was not created as a regular file "
+                    f"for {source_path}",
+                )
+            expected_access_policy = _access_policy(created)
+            expected_access_policy["mode"] = 0o600
+            os.fchmod(fd, 0o600)
+            access_bound = os.fstat(fd)
+            if not _same_identity(created, access_bound):
+                raise StoreSafetyError(
+                    "prepared-file-identity-mismatch",
+                    "Anonymous recovery input identity changed before writing "
+                    f"for {source_path}",
+                )
+            if _access_policy(access_bound) != expected_access_policy:
+                raise StoreSafetyError(
+                    "prepared-file-access-policy-mismatch",
+                    "Anonymous recovery input did not retain the pre-bound 0600 "
+                    f"access policy for {source_path}",
+                )
             os.ftruncate(fd, 0)
             os.lseek(fd, 0, os.SEEK_SET)
             _write_all(fd, sqlite_payload)
             os.fsync(fd)
-            os.fchmod(fd, 0o600)
-            opened = os.fstat(fd)
+            opened = _bind_written_anonymous_recovery_file(
+                fd,
+                source_path,
+                created=created,
+                expected_sha256=expected_sha256,
+                expected_size=expected_size,
+                expected_access_policy=expected_access_policy,
+            )
             bound = _BoundRegularFile(
                 path=source_path,
                 fd=fd,
                 opened=opened,
-                sha256=_hash_fd(fd),
+                sha256=expected_sha256,
             )
             _verify_anonymous_recovery_file(bound)
             try:
@@ -10877,7 +11145,7 @@ def _anonymous_recovery_file(
         raise
     except OSError as exc:
         raise StoreSafetyError(
-            "sqlite-recovery-failed",
+            error_code,
             "Cannot prepare the anonymous descriptor-backed recovery image for "
             f"{source_path}: {exc}",
         ) from exc
@@ -10889,7 +11157,11 @@ def _sqlite_backup_bytes_from_payload(
 ) -> bytes:
     """Back up bytes read from one anonymous, descriptor-bound recovery image."""
 
-    with _anonymous_recovery_file(payload, source_path) as bound:
+    with _anonymous_recovery_file(
+        payload,
+        source_path,
+        error_code="sqlite-recovery-failed",
+    ) as bound:
         with _deserialized_sqlite_image(
             bound,
             source_path,
@@ -11018,7 +11290,11 @@ def _sqlite_integrity_from_payload(
     payload: bytes,
     source_path: Path,
 ) -> dict[str, Any]:
-    with _anonymous_recovery_file(payload, source_path) as bound:
+    with _anonymous_recovery_file(
+        payload,
+        source_path,
+        error_code="sqlite-integrity-failed",
+    ) as bound:
         with _deserialized_sqlite_image(
             bound,
             source_path,
@@ -11041,25 +11317,104 @@ def _bound_recovery_integrity(
     return result
 
 
+def _cleanup_sqlite_backup(
+    api: _NativeSQLiteApi,
+    destination_db: ctypes.c_void_p,
+    backup: int | None,
+    serialized: int | None,
+    *,
+    finish_step: dict[str, Any],
+) -> dict[str, Any]:
+    if backup is not None:
+        try:
+            finish_result = _native_sqlite_backup_finish(api, backup)
+        except Exception as exc:
+            finish_step = {
+                "status": "failed",
+                "resource_state": "inconclusive",
+                **_sqlite_exception_evidence(exc),
+            }
+        else:
+            finish_step = {
+                "status": "complete",
+                "result": finish_result,
+                "resource_state": "released",
+            }
+
+    serialized_free_step: dict[str, Any] = {"status": "not-needed"}
+    serialized_release_status = "not-allocated"
+    if serialized is not None:
+        try:
+            _native_sqlite_free(api, serialized)
+        except Exception as exc:
+            serialized_release_status = "inconclusive"
+            serialized_free_step = {
+                "status": "failed",
+                **_sqlite_exception_evidence(exc),
+            }
+        else:
+            serialized_release_status = "released"
+            serialized_free_step = {"status": "complete"}
+
+    destination_close_step: dict[str, Any] = {"status": "not-needed"}
+    destination_release_status = "not-opened"
+    if destination_db:
+        try:
+            close_result = _native_sqlite_close(api, destination_db)
+        except Exception as exc:
+            destination_release_status = "inconclusive"
+            destination_close_step = {
+                "status": "failed",
+                **_sqlite_exception_evidence(exc),
+            }
+        else:
+            close_proved = close_result == SQLITE_OK
+            destination_release_status = "released" if close_proved else "retained"
+            destination_close_step = {
+                "status": "complete" if close_proved else "failed",
+                "result": close_result,
+            }
+
+    steps = {
+        "backup_finish": finish_step,
+        "serialized_free": serialized_free_step,
+        "destination_close": destination_close_step,
+    }
+    cleanup_complete = all(
+        step["status"] in {"complete", "not-needed"} for step in steps.values()
+    )
+    return {
+        "schema": "apple-notes-sqlite-backup-cleanup/v1",
+        "status": "complete" if cleanup_complete else "incomplete",
+        "steps": steps,
+        "resources": {
+            "serialized": serialized_release_status,
+            "destination": destination_release_status,
+        },
+    }
+
+
 def _sqlite_backup_bytes(
     source: _DeserializedSQLiteImage,
     source_path: Path,
 ) -> bytes:
     """Run the native SQLite backup API into memory and serialize its bytes."""
 
-    source.verify_bound()
-    _verify_deserialized_sqlite_buffer(source, source_path)
     api = source.api
-    assert api.backup_init is not None
-    assert api.backup_step is not None
-    assert api.backup_finish is not None
-    assert api.serialize is not None
     destination_db = ctypes.c_void_p()
     backup: int | None = None
     serialized: int | None = None
     primary_error: BaseException | None = None
+    result_payload: bytes | None = None
+    finish_step: dict[str, Any] = {"status": "not-needed"}
 
     try:
+        source.verify_bound()
+        _verify_deserialized_sqlite_buffer(source, source_path)
+        assert api.backup_init is not None
+        assert api.backup_step is not None
+        assert api.backup_finish is not None
+        assert api.serialize is not None
         result = api.open_v2(
             b":memory:",
             ctypes.byref(destination_db),
@@ -11072,11 +11427,10 @@ def _sqlite_backup_bytes(
                 "SQLite cannot create the in-memory backup destination for "
                 f"{source_path}: {_native_sqlite_message(api, destination_db)}",
             )
-        backup = api.backup_init(
+        backup = _native_sqlite_backup_init(
+            api,
             destination_db,
-            b"main",
             source.database,
-            b"main",
         )
         if not backup:
             raise StoreSafetyError(
@@ -11084,9 +11438,27 @@ def _sqlite_backup_bytes(
                 f"SQLite cannot initialize backup of {source_path}: "
                 f"{_native_sqlite_message(api, destination_db)}",
             )
-        step_result = api.backup_step(backup, -1)
-        finish_result = api.backup_finish(backup)
+        step_result = _native_sqlite_backup_step(api, backup)
+        finishing_backup = backup
         backup = None
+        try:
+            finish_result = _native_sqlite_backup_finish(
+                api,
+                finishing_backup,
+            )
+        except Exception as exc:
+            finish_step = {
+                "status": "failed",
+                "resource_state": "inconclusive",
+                **_sqlite_exception_evidence(exc),
+            }
+            raise
+        else:
+            finish_step = {
+                "status": "complete",
+                "result": finish_result,
+                "resource_state": "released",
+            }
         if step_result != SQLITE_DONE or finish_result != SQLITE_OK:
             raise StoreSafetyError(
                 "sqlite-recovery-failed",
@@ -11094,11 +11466,10 @@ def _sqlite_backup_bytes(
                 f"{source_path}: {_native_sqlite_message(api, destination_db)}",
             )
         byte_count = ctypes.c_longlong()
-        serialized = api.serialize(
+        serialized = _native_sqlite_serialize(
+            api,
             destination_db,
-            b"main",
-            ctypes.byref(byte_count),
-            0,
+            byte_count,
         )
         if not serialized or byte_count.value <= 0:
             raise StoreSafetyError(
@@ -11108,31 +11479,40 @@ def _sqlite_backup_bytes(
         result_payload = ctypes.string_at(serialized, byte_count.value)
         _verify_deserialized_sqlite_buffer(source, source_path)
         source.verify_bound()
-        return result_payload
     except BaseException as exc:
         primary_error = exc
-        raise
-    finally:
-        if backup is not None:
-            api.backup_finish(backup)
-        if serialized is not None:
-            _native_sqlite_free(api, int(serialized))
-        if destination_db:
-            close_result = _native_sqlite_close(api, destination_db)
-            if close_result != SQLITE_OK:
-                cleanup_details = {
-                    "status": "retained-in-memory",
-                    "close_result": close_result,
-                }
-                if isinstance(primary_error, StoreSafetyError):
-                    primary_error.details["sqlite_backup_cleanup"] = cleanup_details
-                elif primary_error is None:
-                    raise StoreSafetyError(
-                        "sqlite-recovery-failed",
-                        "SQLite backup destination cleanup did not complete for "
-                        f"{source_path}",
-                        details={"sqlite_backup_cleanup": cleanup_details},
-                    )
+
+    cleanup = _cleanup_sqlite_backup(
+        api,
+        destination_db,
+        backup,
+        serialized,
+        finish_step=finish_step,
+    )
+    if primary_error is not None:
+        if not isinstance(primary_error, Exception):
+            raise primary_error
+        failure = _classified_sqlite_failure(
+            primary_error,
+            error_code="sqlite-recovery-failed",
+            message=f"SQLite backup failed for {source_path}",
+            cleanup_key="sqlite_backup_cleanup",
+            cleanup=cleanup,
+        )
+        raise failure from primary_error
+    if cleanup["status"] != "complete":
+        raise StoreSafetyError(
+            "sqlite-recovery-failed",
+            f"SQLite backup cleanup did not complete for {source_path}",
+            details={"sqlite_backup_cleanup": cleanup},
+        )
+    if result_payload is None:
+        raise StoreSafetyError(
+            "sqlite-recovery-failed",
+            f"SQLite backup produced no serialized payload for {source_path}",
+            details={"sqlite_backup_cleanup": cleanup},
+        )
+    return result_payload
 
 
 def _terminal_standalone_output_receipt(

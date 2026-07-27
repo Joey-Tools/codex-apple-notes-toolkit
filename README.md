@@ -13,7 +13,12 @@ frame. Standalone recovery applies committed WAL frames
 from descriptor-bound inputs before SQLite consumes a native read-only
 deserialization buffer copied and revalidated from the same anonymous
 descriptor. It never reopens `/dev/fd`, `/proc/self/fd`, or a mutable database
-pathname, including when Linux `TemporaryFile` uses `O_TMPFILE`. Snapshot files,
+pathname, including when Linux `TemporaryFile` uses `O_TMPFILE`.
+Only exact SQLite header version pairs are accepted: `1/1` remains unchanged and
+`2/2` is normalized to `1/1`; mixed or invalid pairs fail closed. Native
+deserialize and backup failures carry structured cleanup evidence, with
+connection close preceding buffer free and independent backup cleanup steps
+aggregated without unsafe release retries. Snapshot files,
 the nested store, and the snapshot root are fsynced bottom-up before
 publication. Publication uses held parent
 descriptors for rename, fsync, and terminal revalidation; retained sensitive

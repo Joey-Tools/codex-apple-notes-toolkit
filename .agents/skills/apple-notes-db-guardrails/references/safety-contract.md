@@ -202,21 +202,31 @@ reopen probe is neither a portability gate nor an input-binding proof. The nativ
 deserialization path is required on Linux and macOS; a missing `sqlite3_deserialize`,
 `sqlite3_malloc64`, query, backup, or serialize interface fails closed under the calling SQLite
 error class.
-SQLite cannot deserialize a WAL-mode header directly. Only after checksum-valid committed WAL
-frames have been applied, set database-header read/write version bytes 18 and 19 to `1`, write
-those normalized bytes into the anonymous descriptor, and bind its receipt. The normalization
-therefore becomes the explicit descriptor content authority rather than an unverified
-post-capture mutation.
-Close the native SQLite connection before releasing its allocation. If connection close is not
-proved, retain the allocation instead of risking a use-after-free and report bounded
-`sqlite_input_cleanup` evidence. The anonymous file descriptor remains owned by its context and is
-closed without a pathname cleanup step.
+SQLite cannot deserialize a WAL-mode header directly. For an exact SQLite database header, byte
+18 is the write version and byte 19 is the read version. Preserve only the exact rollback pair
+`1/1`; only after checksum-valid committed WAL frames have been applied, normalize the exact WAL
+pair `2/2` to `1/1`. Reject mixed and invalid version pairs before deserialization. Write the
+accepted bytes into the anonymous descriptor and bind its receipt, so normalization becomes the
+explicit descriptor content authority rather than an unverified post-capture mutation.
+Close the native SQLite connection before releasing its allocation. Every ordinary native runtime
+or `ctypes` failure must retain the calling SQLite error class and attach bounded
+`sqlite_input_cleanup` evidence. If connection close is not proved, retain the allocation instead
+of risking a use-after-free. The anonymous file descriptor remains owned by its context and is
+closed without a pathname cleanup step. When a consumer failure is superseded by a terminal input
+revalidation failure, keep the revalidation as the primary cause and record the consumer failure
+as structured secondary evidence. Do not translate `KeyboardInterrupt` or `SystemExit`; when one
+is observed before teardown begins, run the safe input cleanup first and then re-raise it.
 Run the native SQLite backup API into an in-memory destination, serialize that database, and write
 the bytes directly to the exclusively created output descriptor. Never ask SQLite to reopen the
 mutable output pathname. Bind the completed output, reread that exact descriptor into the same
 read-only deserialization path, and run `PRAGMA integrity_check` there; replacing and restoring
 the output pathname during either write or integrity validation must not redirect those
 operations.
+For backup failures, attach `sqlite_backup_cleanup` and independently attempt each still-safe
+backup-finish, serialized-buffer-free, and destination-close step even when another cleanup step
+fails. Attempt each owned release at most once; an exception that makes release state ambiguous
+must remain incomplete rather than risking a double finish, double free, use-after-free, or false
+cleanup claim.
 Bind the serialized payload's expected SHA-256, exact length, and `0600` mode before creating or
 writing the output. After `fchmod` and `fsync`, require two consecutive same-descriptor hashes to
 match that pre-bound digest; around each hash compare descriptor and descriptor-relative pathname
