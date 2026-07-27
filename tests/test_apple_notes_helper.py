@@ -668,6 +668,7 @@ raise SystemExit(2)
                     ]
                 )
 
+            self.assertEqual(return_code, 0, stdout.getvalue())
             stdout_payload = json.loads(stdout.getvalue())
             file_payload = json.loads(result_file.read_text(encoding="utf-8"))
             result_stat = os.stat(result_file, follow_symlinks=False)
@@ -678,6 +679,216 @@ raise SystemExit(2)
         self.assertEqual(stat.S_IMODE(result_stat.st_mode), 0o600)
         self.assertEqual(result_stat.st_uid, os.geteuid())
         self.assertEqual(result_stat.st_gid, os.getegid())
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS root alias contract")
+    def test_creator_cli_publishes_results_across_alias_and_nonalias_roots(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory(dir="/tmp") as tmp_dir,
+            tempfile.TemporaryDirectory(dir=REPO_ROOT) as user_dir,
+        ):
+            tmp_root = Path(tmp_dir)
+            user_root = Path(user_dir)
+            cases = (
+                ("copy-db", user_root, tmp_root),
+                ("stage-patch", tmp_root, user_root),
+            )
+            for command, artifact_root, result_root in cases:
+                with self.subTest(command=command):
+                    live_root = artifact_root / f"{command}-live"
+                    live_root.mkdir()
+                    paths = self._make_paths(live_root)
+                    destination = artifact_root / f"{command}-artifact"
+                    result_file = result_root / f"{command}-result.json"
+                    artifact_alias = MODULE._trusted_alias_paths(destination)[2]
+                    result_alias = MODULE._trusted_alias_paths(result_file)[2]
+                    self.assertNotEqual(artifact_alias, result_alias)
+
+                    argv = [
+                        command,
+                        "--group-container",
+                        str(paths.group_container),
+                        "--app-container",
+                        str(paths.app_container),
+                    ]
+                    if command == "copy-db":
+                        self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+                        argv.extend(["--dest", str(destination)])
+                    else:
+                        edited = artifact_root / "edited.sqlite"
+                        self._create_db(edited)
+                        argv.extend(
+                            [
+                                "--src",
+                                str(edited),
+                                "--dest",
+                                str(destination),
+                            ]
+                        )
+                    argv.extend(["--result-file", str(result_file)])
+
+                    stdout = io.StringIO()
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "notes_is_running",
+                            return_value=False,
+                        ),
+                        redirect_stdout(stdout),
+                    ):
+                        return_code = MODULE.main(argv)
+
+                    self.assertEqual(return_code, 0, stdout.getvalue())
+                    stdout_payload = json.loads(stdout.getvalue())
+                    file_payload = json.loads(result_file.read_text(encoding="utf-8"))
+                    self.assertEqual(file_payload, stdout_payload)
+                    self.assertTrue(destination.is_dir())
+                    self.assertEqual(
+                        stat.S_IMODE(
+                            os.stat(result_file, follow_symlinks=False).st_mode
+                        ),
+                        0o600,
+                    )
+
+    def test_creator_cli_independently_binds_distinct_trusted_aliases(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            artifact_target = root / "artifact-target"
+            result_target = root / "result-target"
+            artifact_target.mkdir()
+            result_target.mkdir()
+            artifact_alias = root / "artifact-alias"
+            result_alias = root / "result-alias"
+            artifact_alias.symlink_to(artifact_target, target_is_directory=True)
+            result_alias.symlink_to(result_target, target_is_directory=True)
+            registry = (
+                (artifact_alias, artifact_target),
+                (result_alias, result_target),
+            )
+            destination = artifact_alias / "snapshot"
+            result_file = result_alias / "snapshot-creation-result.json"
+            stdout = io.StringIO()
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_trusted_directory_alias_registry",
+                    return_value=registry,
+                ),
+                mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                redirect_stdout(stdout),
+            ):
+                return_code = MODULE.main(
+                    [
+                        "copy-db",
+                        "--group-container",
+                        str(paths.group_container),
+                        "--app-container",
+                        str(paths.app_container),
+                        "--dest",
+                        str(destination),
+                        "--result-file",
+                        str(result_file),
+                    ]
+                )
+
+            self.assertEqual(return_code, 0, stdout.getvalue())
+            stdout_payload = json.loads(stdout.getvalue())
+            file_payload = json.loads(result_file.read_text(encoding="utf-8"))
+            result_stat = os.stat(result_file, follow_symlinks=False)
+            artifact_exists = (artifact_target / "snapshot").is_dir()
+            result_exists = (result_target / "snapshot-creation-result.json").is_file()
+
+        self.assertEqual(file_payload, stdout_payload)
+        self.assertEqual(Path(file_payload["dest"]), destination)
+        self.assertTrue(artifact_exists)
+        self.assertTrue(result_exists)
+        self.assertEqual(stat.S_IMODE(result_stat.st_mode), 0o600)
+
+    def test_creator_result_teardown_failure_retains_committed_receipt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = root / "snapshot"
+            result_file = root / "snapshot-creation-result.json"
+            expected_result = Path(os.path.abspath(result_file))
+            original_bind = MODULE._bind_live_safe_destination_parent
+
+            @contextmanager
+            def fail_result_scope_after_yield(
+                bound_paths: MODULE.NoteStorePaths,
+                bound_destination: Path,
+            ) -> Iterator[MODULE._LiveDestinationScope]:
+                with original_bind(
+                    bound_paths,
+                    bound_destination,
+                ) as result_scope:
+                    yield result_scope
+                    if result_scope.destination == expected_result:
+                        raise MODULE.StoreSafetyError(
+                            "prepared-directory-identity-mismatch",
+                            "simulated result-scope post-yield failure",
+                        )
+
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                mock.patch.object(
+                    MODULE,
+                    "_bind_live_safe_destination_parent",
+                    side_effect=fail_result_scope_after_yield,
+                ),
+                redirect_stdout(stdout),
+            ):
+                return_code = MODULE.main(
+                    [
+                        "copy-db",
+                        "--group-container",
+                        str(paths.group_container),
+                        "--app-container",
+                        str(paths.app_container),
+                        "--dest",
+                        str(destination),
+                        "--result-file",
+                        str(result_file),
+                    ]
+                )
+
+            error_payload = json.loads(stdout.getvalue())
+            details = error_payload["details"]
+            committed_payload = json.loads(result_file.read_text(encoding="utf-8"))
+            committed_bytes = result_file.read_bytes()
+            artifact_exists = destination.is_dir()
+
+        self.assertEqual(return_code, 1)
+        self.assertEqual(
+            error_payload["error_code"],
+            "result-file-publication-failed",
+        )
+        self.assertTrue(artifact_exists)
+        self.assertEqual(Path(committed_payload["dest"]), destination)
+        self.assertTrue(details["artifact_mutation_performed"])
+        self.assertEqual(
+            details["result_file_publication_state"],
+            "committed",
+        )
+        self.assertFalse(details["retry_safe"])
+        self.assertEqual(
+            details["underlying_error_code"],
+            "prepared-directory-identity-mismatch",
+        )
+        self.assertEqual(
+            details["result_file_receipt"]["sha256"],
+            hashlib.sha256(committed_bytes).hexdigest(),
+        )
 
     def test_stage_cli_safely_publishes_external_result_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4150,7 +4361,7 @@ raise SystemExit(2)
             self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o640)
 
     def test_writers_reject_chmod_during_creation_access_binding(self) -> None:
-        for writer in ("copy", "json"):
+        for writer in ("copy", "json", "standalone"):
             with (
                 self.subTest(writer=writer),
                 tempfile.TemporaryDirectory() as temp_dir,
@@ -4191,11 +4402,17 @@ raise SystemExit(2)
                                     output_dir / MODULE.NOTE_STORE_MAIN,
                                     destination_binding=binding,
                                 )
-                            else:
+                            elif writer == "json":
                                 MODULE._write_json_atomic(
                                     output_dir / "manifest.json",
                                     {"schema": "test/v1"},
                                     parent_binding=binding,
+                                )
+                            else:
+                                MODULE._write_standalone_backup_payload(
+                                    b"standalone-creation-race",
+                                    output_dir / "standalone.sqlite",
+                                    destination_binding=binding,
                                 )
                     finally:
                         if source_fd is not None:
@@ -4207,6 +4424,124 @@ raise SystemExit(2)
                     "prepared-file-access-policy-mismatch",
                     raised,
                 )
+
+    def test_standalone_writer_corrects_inherited_group_before_first_write(
+        self,
+    ) -> None:
+        inherited_groups = [group for group in os.getgroups() if group != os.getegid()]
+        if not inherited_groups:
+            self.skipTest("different supplementary group is unavailable")
+        inherited_group = inherited_groups[0]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "standalone.sqlite"
+            real_open = MODULE.os.open
+            real_fstat = MODULE.os.fstat
+            real_fchown = MODULE.os.fchown
+            real_write_all = MODULE._write_all
+            output_fd: int | None = None
+            inherited_group_applied = False
+            corrected_group = False
+
+            with MODULE._bind_existing_directory(root) as binding:
+
+                def track_output_open(
+                    path: object,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal inherited_group_applied, output_fd
+                    fd = real_open(path, flags, mode, dir_fd=dir_fd)
+                    if os.fspath(path) == output.name and dir_fd == binding.fd:
+                        output_fd = fd
+                        real_fchown(fd, -1, inherited_group)
+                        inherited_group_applied = True
+                    return fd
+
+                def record_group_correction(
+                    fd: int,
+                    uid: int,
+                    gid: int,
+                ) -> None:
+                    nonlocal corrected_group
+                    if fd == output_fd:
+                        self.assertEqual(uid, -1)
+                        self.assertEqual(gid, os.getegid())
+                        corrected_group = True
+                    real_fchown(fd, uid, gid)
+
+                def verify_policy_then_write(fd: int, payload: bytes) -> None:
+                    self.assertTrue(corrected_group)
+                    observed = real_fstat(fd)
+                    self.assertEqual(observed.st_gid, os.getegid())
+                    self.assertEqual(stat.S_IMODE(observed.st_mode), 0o600)
+                    real_write_all(fd, payload)
+
+                with (
+                    mock.patch.object(
+                        MODULE.os,
+                        "open",
+                        side_effect=track_output_open,
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "fchown",
+                        side_effect=record_group_correction,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_write_all",
+                        side_effect=verify_policy_then_write,
+                    ),
+                ):
+                    result = MODULE._write_standalone_backup_payload(
+                        b"standalone-group-policy",
+                        output,
+                        destination_binding=binding,
+                    )
+
+            self.assertTrue(inherited_group_applied)
+            self.assertTrue(corrected_group)
+            self.assertEqual(result["access_policy"]["gid"], os.getegid())
+            self.assertEqual(result["access_policy"]["mode"], 0o600)
+
+    def test_standalone_writer_rejects_chmod_during_write_boundary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "standalone.sqlite"
+            original_write = MODULE._write_all
+            attacked = False
+
+            def write_then_chmod(fd: int, payload: bytes) -> None:
+                nonlocal attacked
+                original_write(fd, payload)
+                if not attacked:
+                    attacked = True
+                    os.fchmod(fd, 0o640)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_write_all",
+                    side_effect=write_then_chmod,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._write_standalone_backup_payload(
+                    b"standalone-write-race",
+                    output,
+                )
+
+            self.assertTrue(attacked)
+            self._assert_safety_code(
+                "prepared-file-access-policy-mismatch",
+                raised,
+            )
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o640)
 
     def test_json_writer_rejects_chmod_during_write_against_creation_policy(
         self,

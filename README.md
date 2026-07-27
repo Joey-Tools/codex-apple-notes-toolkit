@@ -51,7 +51,9 @@ unioned. Unstructured creator failures are never treated as retry-safe.
 Exact Darwin root aliases such as `/tmp -> /private/tmp` are
 registry-bound and continuously revalidated through the same carried alias
 object across receipt loading, creator results, publication, and terminal
-public-path checks; arbitrary symlinks fail closed. Live NoteStore discovery,
+public-path checks; different registered roots and non-alias paths are bound
+independently rather than borrowing another scope's alias authorization.
+Arbitrary symlinks fail closed. Live NoteStore discovery,
 open, hashing, membership checks, and terminal revalidation share one complete
 held no-follow group-container component chain. Every existing untrusted
 regular-file leaf is opened with both `O_NOFOLLOW` and `O_NONBLOCK`, then
@@ -76,6 +78,13 @@ capture-bound file descriptors, and uncertain directory publication records
 an exact descriptor-bound tree receipt. `merge-db` retains the legacy
 `merged_db` JSON key alongside `standalone_db`. The toolkit does not mutate
 the live Notes store.
+
+Creator result-file publication similarly latches its exact terminal receipt:
+late result-scope teardown failures report the artifact mutation, committed
+result-file state, receipt, and non-retryable classification. Standalone
+recovery files bind effective ownership, group, mode, flags, and identity
+before the first sensitive write and revalidate that baseline immediately
+after writing.
 
 `scripts/apple_notes_helper.sh` remains the top-level Notes/AppleScript wrapper
 and delegates database subcommands to the skill-packaged helper.

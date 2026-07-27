@@ -122,7 +122,10 @@ trusted-alias, and destination-ancestor identity and access policy remain bound 
 publication. The exact alias binding object is propagated into every derived directory/file
 binding, a same-alias external receipt parent, creator-result scope evidence, and terminal
 public-parent rebind; later boundaries must reuse it rather than authorizing a new alias or
-falling back to the public pathname. Unrelated child-entry churn is not a content mutation. Treat
+falling back to the public pathname. When an artifact and its external receipt/result use
+different registry entries, or only one uses a registered alias, do not carry the other scope's
+alias object; independently bind and revalidate each exact root scope. Unrelated child-entry churn
+is not a content mutation. Treat
 `snapshot-destination-scope-inconclusive` as fail-closed, distinct from a proved
 `snapshot-destination-inside-live-container` overlap.
 Successful creator output records the alias-aware
@@ -157,7 +160,11 @@ publishes it with an atomic no-replace rename plus held-parent fsync. It revalid
 content, and the complete access policy before and after publication. Its
 `manifest_creation_receipt` anchors the exact creation-time manifest SHA-256, size, identity, and
 access policy. Never regenerate that receipt from a current artifact. Only a successful creator
-result is admissible; a partial or error result is not.
+result is admissible; a partial or error result is not. Once result-file publication returns its
+terminal receipt, that receipt is a monotonic commit latch: any later result-scope teardown or
+post-yield revalidation failure remains `result-file-publication-failed` with
+`artifact_mutation_performed: true`, `result_file_publication_state: committed`,
+`retry_safe: false`, and the exact result-file receipt.
 Snapshot publication is atomic and no-replace on supported macOS/Linux filesystems.
 The live NoteStore is one descriptor transaction: bind the complete group-container path once,
 one no-follow component at a time, then perform main/WAL/SHM/rollback-journal discovery, every
@@ -302,10 +309,14 @@ be bound as one stable regular file, the same reason code is returned as inconcl
 never guesses whether SQLite had finished rollback or whether journal pages remain authoritative.
 The native SQLite backup API writes first to an in-memory database; serialized database bytes are
 then written directly to the exclusively created output descriptor. Full integrity checking opens
-the prepared standalone file through that same held descriptor. Before writing, the standalone
-writer binds the serialized payload's expected SHA-256, byte length, and `0600` mode. It accepts a
-creation receipt only after two consecutive same-descriptor readbacks plus size, access-policy,
-and descriptor-relative pathname identity/access checks all match that pre-bound expectation.
+the prepared standalone file through that same held descriptor. Immediately after exclusive
+creation and before truncating or writing sensitive bytes, the standalone writer corrects the
+descriptor to the effective UID/GID and mode `0600`, then binds its flags, object identity, and
+descriptor-relative no-follow name. It also pre-binds the serialized payload's expected SHA-256
+and byte length. A post-write boundary must still match that creation-time policy; the helper
+accepts a creation receipt only after two consecutive same-descriptor readbacks plus size,
+access-policy, and descriptor-relative pathname identity/access checks all match the pre-bound
+expectation.
 After the main file is published, fsynced, terminally rehashed, and path-verified, the helper keeps
 its parent directory descriptor open and observes the output's `-wal`, `-shm`, and `-journal`
 names twice without following links. It then rebinds the public parent pathname, proves that it is

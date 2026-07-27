@@ -422,7 +422,10 @@ binding object through derived prepared directories/files, same-root manifest-re
 binding, creator-result scope evidence, directory/file installation checks, standalone public
 parent rebind, and all final scans. A later boundary may bind a canonical descendant while that
 object is held, but may not reopen the public alias raw or silently create a replacement alias
-authorization.
+authorization. Carry a trusted alias object into another binding only when both paths resolve
+through the same exact registry pair. If artifact and external result/receipt paths use different
+registry pairs, or only one uses a registered alias, bind the other path independently and keep
+both alias/root proofs separate.
 Successful snapshot/stage creator results expose
 `manifest_creation_destination_scope`, `terminal_destination_scope`, and
 `descriptor_bound_destination`; standalone merge/recovery results expose the terminal scope and
@@ -458,7 +461,13 @@ rejects every pre-existing leaf including symlinks, creates an unpredictable des
 temporary regular file with `O_NOFOLLOW|O_CREAT|O_EXCL`, enforces exact effective owner/group and
 mode `0600` before writing, performs stable content readback, fsyncs the file, publishes with an
 atomic no-replace rename, fsyncs the held parent, and terminally revalidates the external name and
-artifact separation. A consumer may supply either that complete creator result or the nested
+artifact separation. Once the no-replace result-file writer returns its terminal receipt, latch
+that exact receipt as committed before any later artifact, result-scope, post-yield, or
+context-teardown validation. Every later ordinary failure remains
+`result-file-publication-failed` and reports `artifact_mutation_performed: true`,
+`result_file_publication_state: committed`, `retry_safe: false`, and the exact result-file
+receipt. Do not let a late scope error erase or downgrade that committed evidence. A consumer may
+supply either that complete creator result or the nested
 `manifest_creation_receipt`; it may not self-bootstrap a receipt from the current manifest.
 Before loading a CLI receipt file, bind its parent and the artifact root and traverse descriptor
 ancestors to prove the receipt is outside the artifact. Bind the receipt as a no-follow regular

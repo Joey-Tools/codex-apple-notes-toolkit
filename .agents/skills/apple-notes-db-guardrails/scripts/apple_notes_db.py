@@ -229,6 +229,13 @@ class _LiveDestinationScope:
     trusted_alias: _TrustedDirectoryAlias | None
 
 
+@dataclass
+class _CreatorResultDestination:
+    scope: _LiveDestinationScope
+    artifact: Path
+    publication_receipt: dict[str, Any] | None = None
+
+
 @dataclass(frozen=True)
 class _TrustedDirectoryAlias:
     alias: Path
@@ -12035,25 +12042,28 @@ def _write_standalone_backup_payload(
             f"Cannot exclusively create standalone recovery output {output}: {exc}",
         ) from exc
     created = os.fstat(output_fd)
-    expected_access_policy = _access_policy(created)
-    expected_access_policy["mode"] = expected_mode
     verified_sha256: str | None = None
     try:
-        path_before = os.stat(
-            output.name,
-            dir_fd=destination_binding.fd,
-            follow_symlinks=False,
+        _, expected_access_policy = _bind_created_regular_file_access_policy(
+            output_fd,
+            output,
+            destination_binding,
+            created=created,
+            expected_mode=expected_mode,
         )
-        if not _same_identity(created, path_before):
-            raise StoreSafetyError(
-                "prepared-file-identity-mismatch",
-                f"Standalone recovery output was replaced before backup: {output}",
-            )
         os.lseek(output_fd, 0, os.SEEK_SET)
         os.ftruncate(output_fd, 0)
         _write_all(output_fd, payload)
-        os.fchmod(output_fd, expected_mode)
         os.fsync(output_fd)
+        _verify_bound_directory_namespace(destination_binding)
+        _verify_created_regular_file_boundary(
+            output_fd,
+            output,
+            destination_binding,
+            created=created,
+            expected_access_policy=expected_access_policy,
+            phase="post-write pre-readback",
+        )
         result = _terminal_standalone_output_receipt(
             output_fd,
             output,
@@ -14665,7 +14675,7 @@ def _bind_creator_result_destination(
     paths: NoteStorePaths,
     result_file: Path | None,
     artifact: Path,
-) -> Iterator[_LiveDestinationScope | None]:
+) -> Iterator[_CreatorResultDestination | None]:
     if result_file is None:
         yield None
         return
@@ -14675,31 +14685,97 @@ def _bind_creator_result_destination(
         requested_result,
         requested_artifact,
     )
-    with _bind_live_safe_destination_parent(
-        paths,
-        requested_result,
-    ) as result_scope:
-        result_scope.revalidate()
-        _assert_creator_result_name_absent(result_scope)
-        yield result_scope
-        result_scope.revalidate()
+    destination: _CreatorResultDestination | None = None
+    try:
+        with _bind_live_safe_destination_parent(
+            paths,
+            requested_result,
+        ) as result_scope:
+            destination = _CreatorResultDestination(
+                scope=result_scope,
+                artifact=requested_artifact,
+            )
+            result_scope.revalidate()
+            _assert_creator_result_name_absent(result_scope)
+            yield destination
+    except Exception as exc:
+        if (
+            destination is not None
+            and destination.publication_receipt is not None
+            and not (
+                isinstance(exc, StoreSafetyError)
+                and exc.code == "result-file-publication-failed"
+            )
+        ):
+            raise _creator_result_publication_failure(destination, exc) from exc
+        raise
+
+
+def _creator_result_publication_failure(
+    destination: _CreatorResultDestination,
+    exc: Exception,
+) -> StoreSafetyError:
+    result_scope = destination.scope
+    publication_receipt = destination.publication_receipt
+    details = dict(exc.details) if isinstance(exc, StoreSafetyError) else {}
+    details.update(
+        {
+            "artifact": str(destination.artifact),
+            "artifact_mutation_performed": True,
+            "result_file": str(result_scope.destination),
+            "result_file_publication_state": (
+                "committed" if publication_receipt is not None else "uncertain"
+            ),
+            "retry_safe": False,
+            "underlying_error_code": (
+                exc.code if isinstance(exc, StoreSafetyError) else "unexpected-error"
+            ),
+            "underlying_error_type": type(exc).__name__,
+        }
+    )
+    if publication_receipt is not None:
+        details["result_file_receipt"] = publication_receipt
+    return StoreSafetyError(
+        "result-file-publication-failed",
+        "The artifact was created, but its external creator result-file "
+        f"transaction could not complete safely: {result_scope.destination}: {exc}",
+        details=details,
+    )
 
 
 def _write_creator_result_file(
-    result_scope: _LiveDestinationScope,
+    destination: _CreatorResultDestination,
     artifact: Path,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
     """Atomically publish a 0600 creator result outside its artifact."""
 
+    result_scope = destination.scope
     requested_artifact = Path(os.path.abspath(os.fspath(artifact)))
-    publication_receipt: dict[str, Any] | None = None
+    destination.artifact = requested_artifact
     try:
+        _assert_creator_result_file_lexically_external(
+            result_scope.destination,
+            requested_artifact,
+        )
         result_scope.revalidate()
         _assert_creator_result_name_absent(result_scope)
+        _, _, artifact_alias_spec = _trusted_alias_paths(requested_artifact)
+        carried_alias = (
+            result_scope.trusted_alias
+            if (
+                result_scope.trusted_alias is not None
+                and artifact_alias_spec
+                == (
+                    result_scope.trusted_alias.alias,
+                    result_scope.trusted_alias.target,
+                )
+            )
+            else None
+        )
         with _bind_existing_directory_with_trusted_alias(
             requested_artifact,
-            trusted_alias=result_scope.trusted_alias,
+            trusted_alias=carried_alias,
         ) as artifact_root:
             artifact_before = _verify_bound_directory_namespace(artifact_root)
             _assert_output_ancestors_exclude_snapshot(
@@ -14713,6 +14789,7 @@ def _write_creator_result_file(
                 parent_binding=result_scope.parent,
                 ensure_ascii=True,
             )
+            destination.publication_receipt = publication_receipt
             artifact_after = _verify_bound_directory_namespace(artifact_root)
             if artifact_after["identity"] != artifact_before["identity"]:
                 raise StoreSafetyError(
@@ -14734,32 +14811,7 @@ def _write_creator_result_file(
         result_scope.revalidate()
         return publication_receipt
     except Exception as exc:
-        details = dict(exc.details) if isinstance(exc, StoreSafetyError) else {}
-        details.update(
-            {
-                "artifact": str(requested_artifact),
-                "artifact_mutation_performed": True,
-                "result_file": str(result_scope.destination),
-                "result_file_publication_state": (
-                    "committed" if publication_receipt is not None else "uncertain"
-                ),
-                "retry_safe": False,
-                "underlying_error_code": (
-                    exc.code
-                    if isinstance(exc, StoreSafetyError)
-                    else "unexpected-error"
-                ),
-                "underlying_error_type": type(exc).__name__,
-            }
-        )
-        if publication_receipt is not None:
-            details["result_file_receipt"] = publication_receipt
-        raise StoreSafetyError(
-            "result-file-publication-failed",
-            "The artifact was created, but its external creator result file "
-            f"could not be terminally published: {result_scope.destination}: {exc}",
-            details=details,
-        ) from exc
+        raise _creator_result_publication_failure(destination, exc) from exc
 
 
 def _add_container_options(parser: argparse.ArgumentParser) -> None:
