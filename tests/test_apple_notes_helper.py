@@ -680,6 +680,76 @@ raise SystemExit(2)
         self.assertEqual(result_stat.st_uid, os.geteuid())
         self.assertEqual(result_stat.st_gid, os.getegid())
 
+    def test_creator_result_rejects_prebind_artifact_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = root / "snapshot"
+            parked = root / "snapshot-original"
+            result_file = root / "snapshot-creation-result.json"
+            original_write = MODULE._write_creator_result_file
+            attacked = False
+
+            def replace_before_result_binding(
+                result_destination: MODULE._CreatorResultDestination,
+                artifact: Path,
+                payload: dict[str, object],
+            ) -> dict[str, object]:
+                nonlocal attacked
+                requested_artifact = Path(artifact)
+                requested_artifact.rename(parked)
+                shutil.copytree(parked, requested_artifact)
+                attacked = True
+                return original_write(
+                    result_destination,
+                    requested_artifact,
+                    payload,
+                )
+
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                mock.patch.object(
+                    MODULE,
+                    "_write_creator_result_file",
+                    side_effect=replace_before_result_binding,
+                ),
+                redirect_stdout(stdout),
+            ):
+                return_code = MODULE.main(
+                    [
+                        "copy-db",
+                        "--group-container",
+                        str(paths.group_container),
+                        "--app-container",
+                        str(paths.app_container),
+                        "--dest",
+                        str(destination),
+                        "--result-file",
+                        str(result_file),
+                    ]
+                )
+
+            error_payload = json.loads(stdout.getvalue())
+            result_exists = result_file.exists()
+            artifact_exists = destination.is_dir()
+            parked_exists = parked.is_dir()
+
+        self.assertTrue(attacked)
+        self.assertEqual(return_code, 1)
+        self.assertEqual(
+            error_payload["error_code"],
+            "result-file-publication-failed",
+        )
+        self.assertEqual(
+            error_payload["details"]["underlying_error_code"],
+            "prepared-directory-identity-mismatch",
+        )
+        self.assertFalse(result_exists)
+        self.assertTrue(artifact_exists)
+        self.assertTrue(parked_exists)
+
     @unittest.skipUnless(sys.platform == "darwin", "macOS root alias contract")
     def test_creator_cli_publishes_results_across_alias_and_nonalias_roots(
         self,
@@ -926,6 +996,96 @@ raise SystemExit(2)
         self.assertEqual(stat.S_IMODE(result_stat.st_mode), 0o600)
         self.assertEqual(result_stat.st_uid, os.geteuid())
         self.assertEqual(result_stat.st_gid, os.getegid())
+
+    def test_creator_result_rejects_inplace_mutation_after_result_commit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            destination = root / "stage"
+            result_file = root / "stage-creation-result.json"
+            original_write = MODULE._write_json_atomic
+            attacked = False
+
+            def mutate_after_result_commit(
+                path: Path,
+                payload: dict[str, object],
+                **kwargs: object,
+            ) -> dict[str, object]:
+                nonlocal attacked
+                receipt = original_write(
+                    path,
+                    payload,
+                    **kwargs,
+                )
+                if Path(path) == result_file:
+                    database = destination / MODULE.NOTE_STORE_MAIN
+                    with database.open("ab") as handle:
+                        handle.write(b"simulated post-publication mutation")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    attacked = True
+                return receipt
+
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_write_json_atomic",
+                    side_effect=mutate_after_result_commit,
+                ),
+                redirect_stdout(stdout),
+            ):
+                return_code = MODULE.main(
+                    [
+                        "stage-patch",
+                        "--group-container",
+                        str(paths.group_container),
+                        "--app-container",
+                        str(paths.app_container),
+                        "--src",
+                        str(edited),
+                        "--dest",
+                        str(destination),
+                        "--result-file",
+                        str(result_file),
+                    ]
+                )
+
+            error_payload = json.loads(stdout.getvalue())
+            result_exists = result_file.exists()
+            artifact_exists = destination.is_dir()
+            committed_payload = json.loads(result_file.read_text(encoding="utf-8"))
+            committed_bytes = result_file.read_bytes()
+            mutated_sha256 = hashlib.sha256(
+                (destination / MODULE.NOTE_STORE_MAIN).read_bytes()
+            ).hexdigest()
+
+        self.assertTrue(attacked)
+        self.assertEqual(return_code, 1)
+        self.assertEqual(
+            error_payload["error_code"],
+            "result-file-publication-failed",
+        )
+        self.assertEqual(
+            error_payload["details"]["underlying_error_code"],
+            "prepared-file-content-mismatch",
+        )
+        self.assertEqual(
+            error_payload["details"]["result_file_publication_state"],
+            "committed",
+        )
+        self.assertEqual(
+            error_payload["details"]["result_file_receipt"]["sha256"],
+            hashlib.sha256(committed_bytes).hexdigest(),
+        )
+        self.assertTrue(result_exists)
+        self.assertTrue(artifact_exists)
+        self.assertEqual(Path(committed_payload["stage_dir"]), destination)
+        self.assertNotEqual(committed_payload["sha256"], mutated_sha256)
 
     def test_creator_cli_never_replaces_result_leaf_or_writes_inside_artifact(
         self,
@@ -7399,6 +7559,141 @@ raise SystemExit(2)
         self.assertIsInstance(callback_error, MODULE.StoreSafetyError)
         assert isinstance(callback_error, MODULE.StoreSafetyError)
         self.assertIs(callback_error.__cause__, callback_failure)
+
+    def test_sqlite_callback_failure_survives_terminal_buffer_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / MODULE.NOTE_STORE_MAIN
+            self._create_db(database)
+            payload = database.read_bytes()
+            callback_failure = RuntimeError("simulated callback decode failure")
+            original_verify = MODULE._verify_deserialized_sqlite_buffer
+            verify_calls = 0
+
+            def fail_terminal_buffer_revalidation(
+                image: MODULE._DeserializedSQLiteImage,
+                source_path: Path,
+            ) -> None:
+                nonlocal verify_calls
+                verify_calls += 1
+                if verify_calls == 3:
+                    raise MODULE.StoreSafetyError(
+                        "prepared-file-content-mismatch",
+                        "simulated terminal SQLite buffer mutation",
+                    )
+                original_verify(image, source_path)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_decode_sqlite_callback_value",
+                    side_effect=callback_failure,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_verify_deserialized_sqlite_buffer",
+                    side_effect=fail_terminal_buffer_revalidation,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._sqlite_integrity_from_payload(payload, database)
+
+        self._assert_safety_code("prepared-file-content-mismatch", raised)
+        self.assertGreaterEqual(verify_calls, 4)
+        self.assertEqual(
+            raised.exception.details["sqlite_input_secondary_failure"],
+            {
+                "schema": "apple-notes-sqlite-secondary-failure/v1",
+                "phase": "sqlite-row-callback",
+                "error_type": "StoreSafetyError",
+                "error_code": "sqlite-integrity-failed",
+                "sqlite_callback_failure": {
+                    "error_type": "RuntimeError",
+                },
+            },
+        )
+        self.assertEqual(
+            raised.exception.details["sqlite_input_cleanup"]["status"],
+            "complete",
+        )
+
+    def test_sqlite_callback_failure_survives_terminal_binding_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / MODULE.NOTE_STORE_MAIN
+            self._create_db(database)
+            payload = database.read_bytes()
+            callback_failure = RuntimeError("simulated callback decode failure")
+            original_query = MODULE._native_sqlite_query_rows
+            binding_verify_calls = 0
+
+            def query_with_terminal_binding_failure(
+                image: MODULE._DeserializedSQLiteImage,
+                sql: str,
+                source_path: Path,
+                **kwargs: object,
+            ) -> list[list[str | None]]:
+                def fail_terminal_binding_revalidation() -> object:
+                    nonlocal binding_verify_calls
+                    binding_verify_calls += 1
+                    if binding_verify_calls == 2:
+                        raise MODULE.StoreSafetyError(
+                            "prepared-file-identity-mismatch",
+                            "simulated terminal SQLite binding replacement",
+                        )
+                    return image.verify_bound()
+
+                query_image = MODULE._DeserializedSQLiteImage(
+                    api=image.api,
+                    database=image.database,
+                    buffer=image.buffer,
+                    byte_count=image.byte_count,
+                    sha256=image.sha256,
+                    bound=image.bound,
+                    verify_bound=fail_terminal_binding_revalidation,
+                )
+                return original_query(
+                    query_image,
+                    sql,
+                    source_path,
+                    **kwargs,
+                )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_decode_sqlite_callback_value",
+                    side_effect=callback_failure,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_native_sqlite_query_rows",
+                    side_effect=query_with_terminal_binding_failure,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._sqlite_integrity_from_payload(payload, database)
+
+        self._assert_safety_code("prepared-file-identity-mismatch", raised)
+        self.assertEqual(binding_verify_calls, 2)
+        self.assertEqual(
+            raised.exception.details["sqlite_input_secondary_failure"],
+            {
+                "schema": "apple-notes-sqlite-secondary-failure/v1",
+                "phase": "sqlite-row-callback",
+                "error_type": "StoreSafetyError",
+                "error_code": "sqlite-integrity-failed",
+                "sqlite_callback_failure": {
+                    "error_type": "RuntimeError",
+                },
+            },
+        )
+        self.assertEqual(
+            raised.exception.details["sqlite_input_cleanup"]["status"],
+            "complete",
+        )
 
     def test_deserialize_failure_closes_descriptor_and_frees_buffer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

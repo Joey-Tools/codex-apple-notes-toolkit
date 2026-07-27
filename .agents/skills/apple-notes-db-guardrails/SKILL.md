@@ -159,10 +159,16 @@ enforces the current effective owner/group and mode `0600` before writing, fsync
 publishes it with an atomic no-replace rename plus held-parent fsync. It revalidates identity,
 content, and the complete access policy before and after publication. Its
 `manifest_creation_receipt` anchors the exact creation-time manifest SHA-256, size, identity, and
-access policy. Never regenerate that receipt from a current artifact. Only a successful creator
-result is admissible; a partial or error result is not. Once result-file publication returns its
-terminal receipt, that receipt is a monotonic commit latch: any later result-scope teardown or
-post-yield revalidation failure remains `result-file-publication-failed` with
+access policy. Before writing the result, the helper binds the reopened artifact's parent, root,
+exact nested directory memberships, and every file's identity/access policy/SHA-256/size to the
+successful creator payload's `descriptor_bound_destination` tree receipt; the manifest entry must
+also equal `manifest_creation_receipt`. It holds those descriptors through result publication and
+revalidates the full creation receipt immediately after commit, so a post-publication pre-bind
+replacement or in-place mutation cannot publish stale creator evidence. Never regenerate a
+receipt from a current artifact. Only a successful creator result is admissible; a partial or
+error result is not. Once result-file publication returns its terminal receipt, that receipt is a
+monotonic commit latch: any later result-scope teardown or post-yield revalidation failure remains
+`result-file-publication-failed` with
 `artifact_mutation_performed: true`, `result_file_publication_state: committed`,
 `retry_safe: false`, and the exact result-file receipt.
 Snapshot publication is atomic and no-replace on supported macOS/Linux filesystems.
@@ -301,8 +307,12 @@ evidence. If native close cannot be proved, the helper retains the buffer instea
 SQLite may still reference; ordinary descriptor cleanup remains anchored to the still-held
 temporary file object. Native backup cleanup likewise records `sqlite_backup_cleanup` and
 independently attempts every still-safe backup-finish, serialized-buffer-free, and destination-close
-step without retrying an ownership-ambiguous release. Process-control exceptions retain their
-original semantics and are never translated into a safety error.
+step without retrying an ownership-ambiguous release. A `sqlite3_exec` row callback captures its
+first `BaseException` inside the ctypes boundary. It classifies and latches an ordinary callback
+failure before terminal buffer and descriptor-binding revalidation; if either also fails, the
+revalidation remains primary and `sqlite_input_secondary_failure` retains the callback's nested
+`sqlite_callback_failure`. Process-control exceptions retain their original semantics, run safe
+input cleanup first, and are never translated into a safety error.
 Initial discovery also detects `NoteStore.sqlite-journal` without following links. Any present
 rollback journal is descriptor-bound and then rejected as `rollback-journal-present`; if it cannot
 be bound as one stable regular file, the same reason code is returned as inconclusive. Recovery

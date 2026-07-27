@@ -237,6 +237,14 @@ class _CreatorResultDestination:
 
 
 @dataclass(frozen=True)
+class _CreatorArtifactReceiptContract:
+    parent: dict[str, Any]
+    root: dict[str, Any]
+    directories: dict[Path, dict[str, Any]]
+    files: dict[Path, dict[str, Any]]
+
+
+@dataclass(frozen=True)
 class _TrustedDirectoryAlias:
     alias: Path
     target: Path
@@ -10707,6 +10715,27 @@ def _sqlite_exception_evidence(exc: Exception) -> dict[str, Any]:
     return evidence
 
 
+def _sqlite_secondary_failure_evidence(
+    exc: Exception,
+    *,
+    phase: str,
+) -> dict[str, Any]:
+    evidence = {
+        "schema": "apple-notes-sqlite-secondary-failure/v1",
+        "phase": phase,
+        **_sqlite_exception_evidence(exc),
+    }
+    if isinstance(exc, StoreSafetyError):
+        for key in (
+            "sqlite_callback_failure",
+            "sqlite_input_secondary_failure",
+        ):
+            nested = exc.details.get(key)
+            if isinstance(nested, dict):
+                evidence[key] = dict(nested)
+    return evidence
+
+
 def _sqlite_exception_text(exc: Exception) -> str:
     try:
         return str(exc)
@@ -11231,11 +11260,12 @@ def _deserialized_sqlite_image(
             cleanup=cleanup,
         )
         if consumer_error is not None and consumer_error is not primary_error:
-            failure.details["sqlite_input_secondary_failure"] = {
-                "schema": "apple-notes-sqlite-secondary-failure/v1",
-                "phase": "consumer",
-                **_sqlite_exception_evidence(consumer_error),
-            }
+            failure.details["sqlite_input_secondary_failure"] = (
+                _sqlite_secondary_failure_evidence(
+                    consumer_error,
+                    phase="consumer",
+                )
+            )
         raise failure from primary_error
     if cleanup["status"] != "complete":
         raise StoreSafetyError(
@@ -11403,17 +11433,43 @@ def _native_sqlite_query_rows(
             _native_sqlite_free(image.api, int(error_pointer))
     if callback_error is not None and not isinstance(callback_error, Exception):
         raise callback_error
-    _verify_deserialized_sqlite_buffer(image, source_path)
-    image.verify_bound()
+    callback_failure: StoreSafetyError | None = None
     if callback_error is not None:
-        raise StoreSafetyError(
+        callback_failure = StoreSafetyError(
             error_code,
             "SQLite row callback failed while decoding descriptor-bound input "
             f"for {source_path}: {_sqlite_exception_text(callback_error)}",
             details={
                 "sqlite_callback_failure": _sqlite_exception_evidence(callback_error),
             },
-        ) from callback_error
+        )
+    try:
+        _verify_deserialized_sqlite_buffer(image, source_path)
+        image.verify_bound()
+    except Exception as revalidation_error:
+        if callback_failure is None:
+            raise
+        secondary = _sqlite_secondary_failure_evidence(
+            callback_failure,
+            phase="sqlite-row-callback",
+        )
+        if isinstance(revalidation_error, StoreSafetyError):
+            revalidation_error.details["sqlite_input_secondary_failure"] = secondary
+            raise
+        raise StoreSafetyError(
+            error_code,
+            "SQLite terminal input revalidation failed after a row callback "
+            f"failure for {source_path}: "
+            f"{_sqlite_exception_text(revalidation_error)}",
+            details={
+                "sqlite_runtime_failure": _sqlite_exception_evidence(
+                    revalidation_error
+                ),
+                "sqlite_input_secondary_failure": secondary,
+            },
+        ) from revalidation_error
+    if callback_failure is not None:
+        raise callback_failure from callback_error
     if result != SQLITE_OK:
         raise StoreSafetyError(
             error_code,
@@ -14743,6 +14799,438 @@ def _creator_result_publication_failure(
     )
 
 
+def _normalized_creator_artifact_protection_receipt(
+    value: Any,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    try:
+        return _manifest_protection_receipt(value, label=label)
+    except StoreSafetyError as exc:
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            f"Creator artifact creation receipt is malformed for {label}",
+        ) from exc
+
+
+def _normalized_creator_artifact_directory_receipt(
+    value: Any,
+    *,
+    expected_entry_types: dict[str, int],
+    label: str,
+) -> dict[str, Any]:
+    protection = _normalized_creator_artifact_protection_receipt(
+        value,
+        label=label,
+    )
+    if not isinstance(value, dict) or value.get("entry_types") != expected_entry_types:
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            f"Creator artifact directory membership receipt is malformed for {label}",
+        )
+    return {
+        **protection,
+        "entry_types": dict(expected_entry_types),
+    }
+
+
+def _normalized_creator_artifact_file_receipt(
+    value: Any,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    protection = _normalized_creator_artifact_protection_receipt(
+        value,
+        label=label,
+    )
+    if not isinstance(value, dict):
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            f"Creator artifact file receipt is malformed for {label}",
+        )
+    sha256 = value.get("sha256")
+    size = value.get("size")
+    if (
+        not isinstance(sha256, str)
+        or len(sha256) != 64
+        or any(character not in "0123456789abcdef" for character in sha256)
+        or type(size) is not int
+        or size < 0
+    ):
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            f"Creator artifact content receipt is malformed for {label}",
+        )
+    return {
+        **protection,
+        "sha256": sha256,
+        "size": size,
+    }
+
+
+def _creator_artifact_receipt_contract(
+    artifact: Path,
+    payload: dict[str, Any],
+) -> _CreatorArtifactReceiptContract:
+    artifact_keys = [key for key in ("dest", "stage_dir") if key in payload]
+    if len(artifact_keys) != 1:
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator result does not identify exactly one supported artifact",
+        )
+    artifact_key = artifact_keys[0]
+    if artifact_key == "dest":
+        artifact_kind = "snapshot"
+        artifact_schema = SNAPSHOT_SCHEMA
+        manifest_name = SNAPSHOT_MANIFEST
+    else:
+        artifact_kind = "patch-stage"
+        artifact_schema = PATCH_SCHEMA
+        manifest_name = PATCH_MANIFEST
+    try:
+        payload_artifact = _absolute_path(Path(os.fspath(payload[artifact_key])))
+    except (TypeError, ValueError, OSError) as exc:
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator result artifact path is malformed",
+        ) from exc
+    if payload_artifact != artifact:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            "Creator result artifact path differs from the requested artifact: "
+            f"receipt={payload_artifact}, requested={artifact}",
+        )
+
+    manifest_creation_receipt = _normalized_manifest_creation_receipt(
+        payload.get("manifest_creation_receipt"),
+        artifact_kind=artifact_kind,
+        artifact_schema=artifact_schema,
+        manifest_name=manifest_name,
+    )
+    destination_receipt = payload.get("descriptor_bound_destination")
+    if not isinstance(destination_receipt, dict):
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator result has no descriptor-bound destination receipt",
+        )
+    try:
+        receipt_artifact = _absolute_path(
+            Path(os.fspath(destination_receipt.get("display_path")))
+        )
+    except (TypeError, ValueError, OSError) as exc:
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Descriptor-bound destination receipt path is malformed",
+        ) from exc
+    if receipt_artifact != artifact:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            "Descriptor-bound destination receipt names a different artifact: "
+            f"receipt={receipt_artifact}, requested={artifact}",
+        )
+
+    tree_receipt = destination_receipt.get("tree_receipt")
+    if (
+        not isinstance(tree_receipt, dict)
+        or set(tree_receipt) != {"schema", "root", "directories", "files"}
+        or tree_receipt.get("schema") != "apple-notes-prepared-tree-receipt/v1"
+        or not isinstance(tree_receipt.get("directories"), dict)
+        or not isinstance(tree_receipt.get("files"), dict)
+    ):
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Descriptor-bound creator artifact tree receipt is malformed",
+        )
+
+    raw_directories = tree_receipt["directories"]
+    raw_files = tree_receipt["files"]
+    if any(type(name) is not str for name in (*raw_directories, *raw_files)):
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator artifact tree receipt paths must be strings",
+        )
+    directory_paths = {Path(name) for name in raw_directories}
+    file_paths = {Path(name) for name in raw_files}
+    if any(
+        path.is_absolute() or str(path) != name
+        for name, path in zip(
+            raw_directories,
+            (Path(name) for name in raw_directories),
+        )
+    ) or any(
+        path.is_absolute() or str(path) != name
+        for name, path in zip(
+            raw_files,
+            (Path(name) for name in raw_files),
+        )
+    ):
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator artifact tree receipt paths are not canonical relative paths",
+        )
+
+    manifest_relative = Path(manifest_name)
+    if artifact_kind == "snapshot":
+        store_relative = Path("group.com.apple.notes")
+        data_paths = file_paths - {manifest_relative}
+        if (
+            directory_paths != {store_relative}
+            or manifest_relative not in file_paths
+            or not data_paths
+            or any(
+                len(path.parts) != 2
+                or path.parent != store_relative
+                or path.name not in NOTE_STORE_BASENAMES
+                for path in data_paths
+            )
+            or NOTE_STORE_MAIN not in {path.name for path in data_paths}
+        ):
+            raise StoreSafetyError(
+                "prepared-tree-receipt-invalid",
+                "Snapshot creator receipt does not describe the exact supported tree",
+            )
+        expected_root_types = {
+            str(store_relative): stat.S_IFDIR,
+            manifest_name: stat.S_IFREG,
+        }
+        expected_directory_types = {
+            store_relative: {path.name: stat.S_IFREG for path in data_paths},
+        }
+    else:
+        if directory_paths or file_paths != {
+            Path(NOTE_STORE_MAIN),
+            manifest_relative,
+        }:
+            raise StoreSafetyError(
+                "prepared-tree-receipt-invalid",
+                "Patch-stage creator receipt does not describe the exact supported tree",
+            )
+        expected_root_types = {
+            NOTE_STORE_MAIN: stat.S_IFREG,
+            manifest_name: stat.S_IFREG,
+        }
+        expected_directory_types = {}
+
+    parent = _normalized_creator_artifact_protection_receipt(
+        {
+            "identity": destination_receipt.get("parent_identity"),
+            "access_policy": destination_receipt.get("parent_access_policy"),
+        },
+        label="creator artifact parent",
+    )
+    destination_root = _normalized_creator_artifact_protection_receipt(
+        {
+            "identity": destination_receipt.get("directory_identity"),
+            "access_policy": destination_receipt.get("directory_access_policy"),
+        },
+        label="creator artifact destination",
+    )
+    root = _normalized_creator_artifact_directory_receipt(
+        tree_receipt.get("root"),
+        expected_entry_types=expected_root_types,
+        label="creator artifact root",
+    )
+    if (
+        root["identity"] != destination_root["identity"]
+        or root["access_policy"] != destination_root["access_policy"]
+    ):
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator artifact root receipt disagrees with its destination receipt",
+        )
+
+    directories = {
+        relative_path: _normalized_creator_artifact_directory_receipt(
+            raw_directories[str(relative_path)],
+            expected_entry_types=expected_directory_types[relative_path],
+            label=f"creator artifact directory {relative_path}",
+        )
+        for relative_path in expected_directory_types
+    }
+    files = {
+        relative_path: _normalized_creator_artifact_file_receipt(
+            raw_files[str(relative_path)],
+            label=f"creator artifact file {relative_path}",
+        )
+        for relative_path in file_paths
+    }
+    if files[manifest_relative] != manifest_creation_receipt["manifest"]:
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator artifact manifest receipt disagrees with its external "
+            "creation receipt",
+        )
+    return _CreatorArtifactReceiptContract(
+        parent=parent,
+        root=root,
+        directories=directories,
+        files=files,
+    )
+
+
+def _assert_creator_artifact_parent_matches_receipt(
+    artifact_root: _BoundDirectory,
+    receipt: dict[str, Any],
+) -> None:
+    if artifact_root.parent_fd is None:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Creator artifact has no held parent descriptor: {artifact_root.path}",
+        )
+    current = _verify_bound_parent_descriptor(
+        artifact_root.parent_fd,
+        artifact_root.parent_opened,
+        display_path=artifact_root.path.parent,
+        identity_code="prepared-directory-identity-mismatch",
+        access_policy_code="prepared-directory-access-policy-mismatch",
+        inconclusive_code="prepared-directory-revalidation-inconclusive",
+    )
+    if _identity(current) != receipt["identity"]:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            "Creator artifact parent differs from its creation receipt: "
+            f"{artifact_root.path.parent}",
+        )
+    if _access_policy(current) != receipt["access_policy"]:
+        raise StoreSafetyError(
+            "prepared-directory-access-policy-mismatch",
+            "Creator artifact parent access policy differs from its creation "
+            f"receipt: {artifact_root.path.parent}",
+        )
+
+
+def _assert_creator_artifact_directory_matches_receipt(
+    binding: _BoundDirectory,
+    receipt: dict[str, Any],
+    *,
+    missing_code: str,
+) -> None:
+    current = _scan_exact_prepared_directory_entries(
+        binding,
+        receipt["entry_types"],
+        missing_code=missing_code,
+    )
+    if current["identity"] != receipt["identity"]:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            "Creator artifact directory differs from its creation receipt: "
+            f"{binding.path}",
+        )
+    if current["access_policy"] != receipt["access_policy"]:
+        raise StoreSafetyError(
+            "prepared-directory-access-policy-mismatch",
+            "Creator artifact directory access policy differs from its creation "
+            f"receipt: {binding.path}",
+        )
+
+
+@contextmanager
+def _bind_creator_artifact_creation_receipt(
+    artifact_root: _BoundDirectory,
+    artifact: Path,
+    payload: dict[str, Any],
+) -> Iterator[Callable[[], None]]:
+    contract = _creator_artifact_receipt_contract(artifact, payload)
+    _verify_bound_directory_namespace(artifact_root)
+    _assert_creator_artifact_parent_matches_receipt(
+        artifact_root,
+        contract.parent,
+    )
+    _assert_creator_artifact_directory_matches_receipt(
+        artifact_root,
+        contract.root,
+        missing_code="prepared-directory-identity-mismatch",
+    )
+    with ExitStack() as stack:
+        directory_bindings: dict[Path, _BoundDirectory] = {
+            Path("."): artifact_root,
+        }
+        for relative_path in sorted(
+            contract.directories,
+            key=lambda path: (len(path.parts), str(path)),
+        ):
+            parent = directory_bindings.get(relative_path.parent)
+            if parent is None:
+                raise StoreSafetyError(
+                    "prepared-directory-revalidation-inconclusive",
+                    f"Creator artifact receipt has no held parent for {relative_path}",
+                )
+            directory_bindings[relative_path] = stack.enter_context(
+                _bind_directory_at(
+                    artifact / relative_path,
+                    parent,
+                    missing_code="prepared-directory-identity-mismatch",
+                    identity_code="prepared-directory-identity-mismatch",
+                    access_policy_code=("prepared-directory-access-policy-mismatch"),
+                    inconclusive_code=("prepared-directory-revalidation-inconclusive"),
+                )
+            )
+            _assert_creator_artifact_directory_matches_receipt(
+                directory_bindings[relative_path],
+                contract.directories[relative_path],
+                missing_code="prepared-directory-identity-mismatch",
+            )
+
+        file_bindings: dict[Path, _BoundRegularFile] = {}
+        for relative_path in sorted(contract.files, key=str):
+            parent = directory_bindings.get(relative_path.parent)
+            if parent is None:
+                raise StoreSafetyError(
+                    "prepared-directory-revalidation-inconclusive",
+                    f"Creator artifact receipt has no held file parent for "
+                    f"{relative_path}",
+                )
+            file_bindings[relative_path] = stack.enter_context(
+                _bind_regular_file_at(
+                    artifact / relative_path,
+                    parent,
+                    PREPARED_FILE_CODES,
+                )
+            )
+            _assert_bound_matches_receipt(
+                file_bindings[relative_path],
+                contract.files[relative_path],
+                dir_fd=parent.fd,
+                basename=relative_path.name,
+            )
+
+        def revalidate() -> None:
+            _verify_bound_directory_namespace(artifact_root)
+            _assert_creator_artifact_parent_matches_receipt(
+                artifact_root,
+                contract.parent,
+            )
+            _assert_creator_artifact_directory_matches_receipt(
+                artifact_root,
+                contract.root,
+                missing_code="prepared-directory-identity-mismatch",
+            )
+            for relative_path, directory in directory_bindings.items():
+                if relative_path == Path("."):
+                    continue
+                _assert_creator_artifact_directory_matches_receipt(
+                    directory,
+                    contract.directories[relative_path],
+                    missing_code="prepared-directory-identity-mismatch",
+                )
+            for relative_path, bound in file_bindings.items():
+                parent = directory_bindings[relative_path.parent]
+                _assert_bound_matches_receipt(
+                    bound,
+                    contract.files[relative_path],
+                    dir_fd=parent.fd,
+                    basename=relative_path.name,
+                )
+
+        revalidate()
+        try:
+            yield revalidate
+        except Exception:
+            raise
+        else:
+            revalidate()
+
+
 def _write_creator_result_file(
     destination: _CreatorResultDestination,
     artifact: Path,
@@ -14777,37 +15265,30 @@ def _write_creator_result_file(
             requested_artifact,
             trusted_alias=carried_alias,
         ) as artifact_root:
-            artifact_before = _verify_bound_directory_namespace(artifact_root)
-            _assert_output_ancestors_exclude_snapshot(
-                result_scope.parent.fd,
-                artifact_root.opened,
-                display_path=result_scope.destination.parent,
-            )
-            publication_receipt = _write_json_atomic(
-                result_scope.destination,
+            with _bind_creator_artifact_creation_receipt(
+                artifact_root,
+                requested_artifact,
                 payload,
-                parent_binding=result_scope.parent,
-                ensure_ascii=True,
-            )
-            destination.publication_receipt = publication_receipt
-            artifact_after = _verify_bound_directory_namespace(artifact_root)
-            if artifact_after["identity"] != artifact_before["identity"]:
-                raise StoreSafetyError(
-                    "prepared-directory-identity-mismatch",
-                    "Published artifact changed identity while its external "
-                    f"result file was created: {requested_artifact}",
+            ) as revalidate_artifact:
+                _assert_output_ancestors_exclude_snapshot(
+                    result_scope.parent.fd,
+                    artifact_root.opened,
+                    display_path=result_scope.destination.parent,
                 )
-            if artifact_after["access_policy"] != artifact_before["access_policy"]:
-                raise StoreSafetyError(
-                    "prepared-directory-access-policy-mismatch",
-                    "Published artifact changed access policy while its external "
-                    f"result file was created: {requested_artifact}",
+                revalidate_artifact()
+                publication_receipt = _write_json_atomic(
+                    result_scope.destination,
+                    payload,
+                    parent_binding=result_scope.parent,
+                    ensure_ascii=True,
                 )
-            _assert_output_ancestors_exclude_snapshot(
-                result_scope.parent.fd,
-                artifact_root.opened,
-                display_path=result_scope.destination.parent,
-            )
+                destination.publication_receipt = publication_receipt
+                revalidate_artifact()
+                _assert_output_ancestors_exclude_snapshot(
+                    result_scope.parent.fd,
+                    artifact_root.opened,
+                    display_path=result_scope.destination.parent,
+                )
         result_scope.revalidate()
         return publication_receipt
     except Exception as exc:

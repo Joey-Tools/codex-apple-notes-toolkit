@@ -216,10 +216,13 @@ closed without a pathname cleanup step. When a consumer failure is superseded by
 revalidation failure, keep the revalidation as the primary cause and record the consumer failure
 as structured secondary evidence. A `sqlite3_exec` row callback must catch its first
 `BaseException` inside the ctypes boundary, return a nonzero abort code, free SQLite's returned
-error string, and then classify an ordinary callback failure with its original cause. Do not
-translate `KeyboardInterrupt` or `SystemExit`; when either is captured in the callback or observed
-elsewhere before teardown begins, abort the native query, run the safe input cleanup first, and
-then re-raise the original process-control exception.
+error string, and then classify and latch an ordinary callback failure with its original cause
+before either terminal buffer or descriptor-binding revalidation. If either revalidation also
+fails, keep that revalidation primary and preserve the classified callback plus its nested
+`sqlite_callback_failure` as `sqlite_input_secondary_failure`. Do not translate
+`KeyboardInterrupt` or `SystemExit`; when either is captured in the callback or observed elsewhere
+before teardown begins, abort the native query, run the safe input cleanup first, and then re-raise
+the original process-control exception.
 Run the native SQLite backup API into an in-memory destination, serialize that database, and write
 the bytes directly to the exclusively created output descriptor. Never ask SQLite to reopen the
 mutable output pathname. Bind the completed output, reread that exact descriptor into the same
@@ -461,9 +464,17 @@ rejects every pre-existing leaf including symlinks, creates an unpredictable des
 temporary regular file with `O_NOFOLLOW|O_CREAT|O_EXCL`, enforces exact effective owner/group and
 mode `0600` before writing, performs stable content readback, fsyncs the file, publishes with an
 atomic no-replace rename, fsyncs the held parent, and terminally revalidates the external name and
-artifact separation. Once the no-replace result-file writer returns its terminal receipt, latch
-that exact receipt as committed before any later artifact, result-scope, post-yield, or
-context-teardown validation. Every later ordinary failure remains
+artifact separation. Before the result write begins, bind the reopened artifact to the successful
+creator payload's `descriptor_bound_destination` and exact prepared-tree creation receipt rather
+than accepting the reopened object as a new baseline. Require the held parent and artifact root
+identity/access policy, every exact directory membership, and every file identity/access
+policy/SHA-256/size to match that receipt; require the manifest entry to match the separately
+returned `manifest_creation_receipt`. Hold those descriptors through result publication and
+revalidate the complete receipt-bound tree immediately after the result commit. A pre-bind
+directory replacement or in-place content mutation must fail without publishing stale creator
+evidence. Once the no-replace result-file writer returns its terminal receipt, latch that exact
+receipt as committed before any later artifact, result-scope, post-yield, or context-teardown
+validation. Every later ordinary failure remains
 `result-file-publication-failed` and reports `artifact_mutation_performed: true`,
 `result_file_publication_state: committed`, `retry_safe: false`, and the exact result-file
 receipt. Do not let a late scope error erase or downgrade that committed evidence. A consumer may
