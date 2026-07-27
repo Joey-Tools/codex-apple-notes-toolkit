@@ -14,11 +14,11 @@ Usage:
   bash scripts/apple_notes_helper.sh list-folders
   bash scripts/apple_notes_helper.sh show-note-prefix --folder FOLDER --prefix PREFIX
   bash scripts/apple_notes_helper.sh probe-db-access
-  bash scripts/apple_notes_helper.sh copy-db [--dest PATH] [--require-notes-quit] [--directory-creator-fd FD]
+  bash scripts/apple_notes_helper.sh copy-db [--dest PATH] [--result-file PATH] [--require-notes-quit] [--directory-creator-fd FD]
   bash scripts/apple_notes_helper.sh merge-db --src PATH [--out PATH] [--directory-creator-fd FD]
   bash scripts/apple_notes_helper.sh validate-snapshot --snapshot-dir PATH --manifest-creation-receipt-file PATH
   bash scripts/apple_notes_helper.sh recover-snapshot --snapshot-dir PATH --out PATH --manifest-creation-receipt-file PATH [--directory-creator-fd FD]
-  bash scripts/apple_notes_helper.sh stage-patch --src PATH --dest PATH [--directory-creator-fd FD]
+  bash scripts/apple_notes_helper.sh stage-patch --src PATH --dest PATH [--result-file PATH] [--directory-creator-fd FD]
   bash scripts/apple_notes_helper.sh validate-patch-stage --stage-dir PATH --manifest-creation-receipt-file PATH
   bash scripts/apple_notes_helper.sh preflight-writeback --backup-dir PATH --stage-dir PATH --backup-manifest-creation-receipt-file PATH --stage-manifest-creation-receipt-file PATH
   bash scripts/apple_notes_helper.sh verify-writeback --backup-dir PATH --stage-dir PATH --backup-manifest-creation-receipt-file PATH --stage-manifest-creation-receipt-file PATH
@@ -28,8 +28,8 @@ Usage:
 Notes:
   - Notes app-level preflight is performed via osascript inside this wrapper.
   - DB-heavy subcommands delegate to the helper packaged with apple-notes-db-guardrails.
-  - Save successful copy-db/stage-patch JSON outside the artifact and supply it
-    as the required manifest creation receipt for every consuming command.
+  - Use copy-db/stage-patch --result-file to atomically create the successful
+    JSON outside the artifact for every consuming command.
   - Write-producing DB commands require an inherited connected supervisor FD
     for identity-bound directory creation; the wrapper forwards that FD option.
   - No subcommand mutates the live Notes store; writeback remains an explicit separate phase.

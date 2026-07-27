@@ -5,6 +5,8 @@
 - Apple Notes database reads bind untrusted leaves with no-follow, nonblocking opens before regular-file and identity validation.
 - File and directory publication use a monotonic commit latch before post-rename evidence work.
 - Write-producing CLI commands support an inherited supervisor FD protocol for identity-bound directory creation.
+- Snapshot and patch creator CLIs can atomically publish owner-only external result files without shell redirection.
+- Newly created copied/JSON files retain a pre-write identity and access-policy baseline through content and publication validation.
 - Structured, malformed, unstructured, and transport-evidence-construction creator failures retain conservative recovery evidence and close every owned or received FD.
 - Per-workstream implementation and validation records live under `docs/project_journal/`.
 

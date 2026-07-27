@@ -214,8 +214,12 @@ or `ctypes` failure must retain the calling SQLite error class and attach bounde
 of risking a use-after-free. The anonymous file descriptor remains owned by its context and is
 closed without a pathname cleanup step. When a consumer failure is superseded by a terminal input
 revalidation failure, keep the revalidation as the primary cause and record the consumer failure
-as structured secondary evidence. Do not translate `KeyboardInterrupt` or `SystemExit`; when one
-is observed before teardown begins, run the safe input cleanup first and then re-raise it.
+as structured secondary evidence. A `sqlite3_exec` row callback must catch its first
+`BaseException` inside the ctypes boundary, return a nonzero abort code, free SQLite's returned
+error string, and then classify an ordinary callback failure with its original cause. Do not
+translate `KeyboardInterrupt` or `SystemExit`; when either is captured in the callback or observed
+elsewhere before teardown begins, abort the native query, run the safe input cleanup first, and
+then re-raise the original process-control exception.
 Run the native SQLite backup API into an in-memory destination, serialize that database, and write
 the bytes directly to the exclusively created output descriptor. Never ask SQLite to reopen the
 mutable output pathname. Bind the completed output, reread that exact descriptor into the same
@@ -440,11 +444,21 @@ replacement therefore cannot redirect publication evidence, while identity or ac
 changes on the held parent fail separately.
 Create copied database files, standalone recovery files, and manifest temporary files exclusively
 relative to those held directory descriptors. Perform their name-based validation through the same
-descriptors; never reconstruct a full pathname for those operations.
+descriptors; never reconstruct a full pathname for those operations. Immediately after each
+exclusive file creation and before writing bytes, enforce and bind the expected effective
+UID/GID, mode `0600`, file flags, object identity, and descriptor-relative no-follow name. Compare
+the complete creation-bound access policy and identity after the write, around consecutive
+readbacks, immediately before publication, after the name transition, and after parent durability.
+A post-write stat is never allowed to establish a new access-policy baseline.
 After the manifest is durably written, return its exact creation receipt in the successful
 `copy-db` or `stage-patch` result. The result file is a separate caller-owned authority and must be
-stored outside the published artifact, preferably as a sibling created under `umask 077`. A
-consumer may supply either that complete creator result or the nested
+stored outside the published artifact. Use the packaged `--result-file` interface rather than
+shell redirection: it binds the external parent and live-container scope before artifact creation,
+rejects every pre-existing leaf including symlinks, creates an unpredictable descriptor-relative
+temporary regular file with `O_NOFOLLOW|O_CREAT|O_EXCL`, enforces exact effective owner/group and
+mode `0600` before writing, performs stable content readback, fsyncs the file, publishes with an
+atomic no-replace rename, fsyncs the held parent, and terminally revalidates the external name and
+artifact separation. A consumer may supply either that complete creator result or the nested
 `manifest_creation_receipt`; it may not self-bootstrap a receipt from the current manifest.
 Before loading a CLI receipt file, bind its parent and the artifact root and traverse descriptor
 ancestors to prove the receipt is outside the artifact. Bind the receipt as a no-follow regular
@@ -700,6 +714,8 @@ The helper emits stable error codes, including:
 - `manifest-creation-receipt-identity-mismatch`;
 - `manifest-creation-receipt-content-mismatch`;
 - `manifest-creation-receipt-access-policy-mismatch`;
+- `result-file-not-external`, `result-file-exists`;
+- `result-file-scope-inconclusive`, `result-file-publication-failed`;
 - `standalone-output-sidecar-present`;
 - `standalone-output-sidecar-unreadable`;
 - `standalone-output-sidecar-revalidation-inconclusive`;

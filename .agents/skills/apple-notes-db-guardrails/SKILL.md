@@ -48,11 +48,10 @@ Record whether the authoritative source is the live container or a Joey-provided
 Use a unique task-scoped destination:
 
 ```bash
-umask 077
 python3 "$SKILL_DIR/scripts/apple_notes_db.py" copy-db \
   --dest /tmp/<task-snapshot> \
   --directory-creator-fd <inherited-supervisor-fd> \
-  > /tmp/<task-snapshot>.creation-result.json
+  --result-file /tmp/<task-snapshot>.creation-result.json
 ```
 
 Before creating even the destination parent, every write-producing command (`copy-db`, `merge-db`,
@@ -146,11 +145,16 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" copy-db \
   --dest /tmp/<task-backup> \
   --require-notes-quit \
   --directory-creator-fd <inherited-supervisor-fd> \
-  > /tmp/<task-backup>.creation-result.json
+  --result-file /tmp/<task-backup>.creation-result.json
 ```
 
 Keep `snapshot-manifest.json` with the copied file set, and separately preserve the successful
-creation-result JSON outside the snapshot with mode `0600`. Its
+creation-result JSON outside the snapshot. `--result-file` binds the external parent and live
+container scope before artifact creation, rejects pre-existing regular files and symlinks, creates
+an unpredictable descriptor-relative temporary regular file with `O_NOFOLLOW|O_CREAT|O_EXCL`,
+enforces the current effective owner/group and mode `0600` before writing, fsyncs the file, and
+publishes it with an atomic no-replace rename plus held-parent fsync. It revalidates identity,
+content, and the complete access policy before and after publication. Its
 `manifest_creation_receipt` anchors the exact creation-time manifest SHA-256, size, identity, and
 access policy. Never regenerate that receipt from a current artifact. Only a successful creator
 result is admissible; a partial or error result is not.
@@ -382,7 +386,7 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" stage-patch \
   --src /tmp/<edited>/NoteStore-edited.sqlite \
   --dest /tmp/<task-patch-stage> \
   --directory-creator-fd <inherited-supervisor-fd> \
-  > /tmp/<task-patch-stage>.creation-result.json
+  --result-file /tmp/<task-patch-stage>.creation-result.json
 ```
 
 Require the stage to contain only `NoteStore.sqlite` and `patch-manifest.json`.

@@ -550,8 +550,22 @@ raise SystemExit(2)
                 capture_output=True,
                 text=True,
             )
+            copy_help = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(copied_skill / "scripts/apple_notes_db.py"),
+                    "copy-db",
+                    "--help",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn("preflight-writeback", result.stdout)
+        self.assertEqual(copy_help.returncode, 0, msg=copy_help.stderr)
+        self.assertIn("--result-file", copy_help.stdout)
 
     def test_copy_db_cli_uses_inherited_directory_creator_supervisor(
         self,
@@ -627,6 +641,145 @@ raise SystemExit(2)
         self.assertEqual(Path(payload["dest"]), destination)
         self.assertTrue(manifest_exists)
         self.assertTrue(database_exists)
+
+    def test_creator_cli_safely_publishes_external_result_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = root / "snapshot"
+            result_file = root / "snapshot-creation-result.json"
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                redirect_stdout(stdout),
+            ):
+                return_code = MODULE.main(
+                    [
+                        "copy-db",
+                        "--group-container",
+                        str(paths.group_container),
+                        "--app-container",
+                        str(paths.app_container),
+                        "--dest",
+                        str(destination),
+                        "--result-file",
+                        str(result_file),
+                    ]
+                )
+
+            stdout_payload = json.loads(stdout.getvalue())
+            file_payload = json.loads(result_file.read_text(encoding="utf-8"))
+            result_stat = os.stat(result_file, follow_symlinks=False)
+
+        self.assertEqual(return_code, 0)
+        self.assertEqual(file_payload, stdout_payload)
+        self.assertEqual(Path(file_payload["dest"]), destination)
+        self.assertEqual(stat.S_IMODE(result_stat.st_mode), 0o600)
+        self.assertEqual(result_stat.st_uid, os.geteuid())
+        self.assertEqual(result_stat.st_gid, os.getegid())
+
+    def test_stage_cli_safely_publishes_external_result_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            destination = root / "stage"
+            result_file = root / "stage-creation-result.json"
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                return_code = MODULE.main(
+                    [
+                        "stage-patch",
+                        "--group-container",
+                        str(paths.group_container),
+                        "--app-container",
+                        str(paths.app_container),
+                        "--src",
+                        str(edited),
+                        "--dest",
+                        str(destination),
+                        "--result-file",
+                        str(result_file),
+                    ]
+                )
+
+            stdout_payload = json.loads(stdout.getvalue())
+            file_payload = json.loads(result_file.read_text(encoding="utf-8"))
+            result_stat = os.stat(result_file, follow_symlinks=False)
+
+        self.assertEqual(return_code, 0)
+        self.assertEqual(file_payload, stdout_payload)
+        self.assertEqual(Path(file_payload["stage_dir"]), destination)
+        self.assertEqual(stat.S_IMODE(result_stat.st_mode), 0o600)
+        self.assertEqual(result_stat.st_uid, os.geteuid())
+        self.assertEqual(result_stat.st_gid, os.getegid())
+
+    def test_creator_cli_never_replaces_result_leaf_or_writes_inside_artifact(
+        self,
+    ) -> None:
+        for attack in ("existing-file", "symlink", "inside-artifact"):
+            with (
+                self.subTest(attack=attack),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+                destination = root / "snapshot"
+                target = root / "do-not-truncate.json"
+                target.write_text("preserve-me", encoding="utf-8")
+                if attack == "existing-file":
+                    result_file = root / "creation-result.json"
+                    result_file.write_text("existing-result", encoding="utf-8")
+                elif attack == "symlink":
+                    result_file = root / "creation-result.json"
+                    result_file.symlink_to(target)
+                else:
+                    result_file = destination / "creation-result.json"
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ),
+                    redirect_stdout(stdout),
+                ):
+                    return_code = MODULE.main(
+                        [
+                            "copy-db",
+                            "--group-container",
+                            str(paths.group_container),
+                            "--app-container",
+                            str(paths.app_container),
+                            "--dest",
+                            str(destination),
+                            "--result-file",
+                            str(result_file),
+                        ]
+                    )
+
+                self.assertEqual(return_code, 1)
+                self.assertEqual(
+                    json.loads(stdout.getvalue())["error_code"],
+                    (
+                        "result-file-not-external"
+                        if attack == "inside-artifact"
+                        else "result-file-exists"
+                    ),
+                )
+                self.assertFalse(destination.exists())
+                self.assertEqual(
+                    target.read_text(encoding="utf-8"),
+                    "preserve-me",
+                )
+                if attack == "existing-file":
+                    self.assertEqual(
+                        result_file.read_text(encoding="utf-8"),
+                        "existing-result",
+                    )
 
     def test_supervisor_malformed_provider_locators_never_leak_received_fd(
         self,
@@ -3951,6 +4104,173 @@ raise SystemExit(2)
                     self.assertEqual(len(retained_names), 1)
                     self.assertTrue((root / retained_names[0]).is_file())
 
+    def test_copy_rejects_chmod_during_write_against_creation_policy(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.sqlite"
+            source.write_bytes(b"creation-bound-copy")
+            destination_dir = root / "destination"
+            destination = destination_dir / MODULE.NOTE_STORE_MAIN
+            original_write = MODULE._write_all
+            attacked = False
+
+            def write_then_chmod(fd: int, payload: bytes) -> None:
+                nonlocal attacked
+                original_write(fd, payload)
+                if not attacked:
+                    attacked = True
+                    os.fchmod(fd, 0o640)
+
+            with MODULE._create_bound_directory(destination_dir) as binding:
+                source_fd = os.open(source, os.O_RDONLY)
+                try:
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_write_all",
+                            side_effect=write_then_chmod,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        MODULE._copy_fd(
+                            source_fd,
+                            destination,
+                            destination_binding=binding,
+                        )
+                finally:
+                    os.close(source_fd)
+
+            self.assertTrue(attacked)
+            self._assert_safety_code(
+                "prepared-file-access-policy-mismatch",
+                raised,
+            )
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o640)
+
+    def test_writers_reject_chmod_during_creation_access_binding(self) -> None:
+        for writer in ("copy", "json"):
+            with (
+                self.subTest(writer=writer),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                output_dir = root / "output"
+                real_fchmod = MODULE.os.fchmod
+                attacked = False
+
+                def fchmod_then_attack(fd: int, mode: int) -> None:
+                    nonlocal attacked
+                    real_fchmod(fd, mode)
+                    if not attacked and mode == 0o600:
+                        attacked = True
+                        real_fchmod(fd, 0o640)
+
+                with MODULE._create_bound_directory(output_dir) as binding:
+                    if writer == "copy":
+                        source = root / "source.sqlite"
+                        source.write_bytes(b"creation-race")
+                        source_fd = os.open(source, os.O_RDONLY)
+                    else:
+                        source_fd = None
+                    try:
+                        with (
+                            mock.patch.object(
+                                MODULE.os,
+                                "fchmod",
+                                side_effect=fchmod_then_attack,
+                            ),
+                            mock.patch.object(MODULE, "_write_all") as write_mock,
+                            self.assertRaises(MODULE.StoreSafetyError) as raised,
+                        ):
+                            if writer == "copy":
+                                assert source_fd is not None
+                                MODULE._copy_fd(
+                                    source_fd,
+                                    output_dir / MODULE.NOTE_STORE_MAIN,
+                                    destination_binding=binding,
+                                )
+                            else:
+                                MODULE._write_json_atomic(
+                                    output_dir / "manifest.json",
+                                    {"schema": "test/v1"},
+                                    parent_binding=binding,
+                                )
+                    finally:
+                        if source_fd is not None:
+                            os.close(source_fd)
+
+                self.assertTrue(attacked)
+                write_mock.assert_not_called()
+                self._assert_safety_code(
+                    "prepared-file-access-policy-mismatch",
+                    raised,
+                )
+
+    def test_json_writer_rejects_chmod_during_write_against_creation_policy(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "manifest.json"
+            original_write = MODULE._write_all
+            attacked = False
+
+            def write_then_chmod(fd: int, payload: bytes) -> None:
+                nonlocal attacked
+                original_write(fd, payload)
+                if not attacked:
+                    attacked = True
+                    os.fchmod(fd, 0o640)
+
+            with (
+                MODULE._bind_existing_directory(root) as binding,
+                mock.patch.object(
+                    MODULE,
+                    "_write_all",
+                    side_effect=write_then_chmod,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._write_json_atomic(
+                    output,
+                    {"schema": "test/v1"},
+                    parent_binding=binding,
+                )
+
+            self.assertTrue(attacked)
+            self._assert_safety_code(
+                "prepared-file-access-policy-mismatch",
+                raised,
+            )
+            retained = list(root.glob(".manifest.json.tmp-*"))
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(stat.S_IMODE(retained[0].stat().st_mode), 0o640)
+            self.assertFalse(output.exists())
+
+    def test_json_writer_enforces_0600_independent_of_umask(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "result.json"
+            previous_umask = os.umask(0o777)
+            try:
+                with MODULE._bind_existing_directory(root) as binding:
+                    receipt = MODULE._write_json_atomic(
+                        output,
+                        {"schema": "test/v1"},
+                        parent_binding=binding,
+                        ensure_ascii=True,
+                    )
+            finally:
+                os.umask(previous_umask)
+
+            observed = os.stat(output, follow_symlinks=False)
+            self.assertEqual(stat.S_IMODE(observed.st_mode), 0o600)
+            self.assertEqual(observed.st_uid, os.geteuid())
+            self.assertEqual(observed.st_gid, os.getegid())
+            self.assertEqual(receipt["access_policy"]["mode"], 0o600)
+
     def test_standalone_writer_rejects_same_length_valid_sqlite_race(
         self,
     ) -> None:
@@ -6674,6 +6994,76 @@ raise SystemExit(2)
                             handle.close()
                 self.assertTrue(attacked)
                 self._assert_safety_code(expected_code, raised)
+
+    def test_sqlite_callback_process_control_aborts_and_cleans_up(self) -> None:
+        for process_control in (
+            KeyboardInterrupt("simulated callback interrupt"),
+            SystemExit(23),
+        ):
+            with (
+                self.subTest(exception_type=type(process_control).__name__),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                database = Path(temp_dir) / MODULE.NOTE_STORE_MAIN
+                self._create_db(database)
+                payload = database.read_bytes()
+                original_close = MODULE._native_sqlite_close
+                original_free = MODULE._native_sqlite_free
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_decode_sqlite_callback_value",
+                        side_effect=process_control,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_native_sqlite_close",
+                        wraps=original_close,
+                    ) as close_mock,
+                    mock.patch.object(
+                        MODULE,
+                        "_native_sqlite_free",
+                        wraps=original_free,
+                    ) as free_mock,
+                    self.assertRaises(type(process_control)) as raised,
+                ):
+                    MODULE._sqlite_integrity_from_payload(payload, database)
+
+                self.assertIs(raised.exception, process_control)
+                close_mock.assert_called_once()
+                self.assertGreaterEqual(free_mock.call_count, 2)
+
+    def test_sqlite_callback_runtime_failure_keeps_cause_and_cleanup(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / MODULE.NOTE_STORE_MAIN
+            self._create_db(database)
+            payload = database.read_bytes()
+            callback_failure = RuntimeError("simulated callback decode failure")
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_decode_sqlite_callback_value",
+                    side_effect=callback_failure,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._sqlite_integrity_from_payload(payload, database)
+
+        self._assert_safety_code("sqlite-integrity-failed", raised)
+        self.assertEqual(
+            raised.exception.details["sqlite_callback_failure"],
+            {"error_type": "RuntimeError"},
+        )
+        self.assertEqual(
+            raised.exception.details["sqlite_input_cleanup"]["status"],
+            "complete",
+        )
+        callback_error = raised.exception.__cause__
+        self.assertIsInstance(callback_error, MODULE.StoreSafetyError)
+        assert isinstance(callback_error, MODULE.StoreSafetyError)
+        self.assertIs(callback_error.__cause__, callback_failure)
 
     def test_deserialize_failure_closes_descriptor_and_frees_buffer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

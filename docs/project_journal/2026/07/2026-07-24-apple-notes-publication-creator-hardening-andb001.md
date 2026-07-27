@@ -17,6 +17,7 @@ superseded_by:
 - Closed three fail-closed gaps in untrusted leaf opening, post-rename publication classification, and identity-bound directory creation failure recovery.
 - Closed the follow-up production gap by adding a packaged inherited-supervisor creator protocol and conservative malformed-result ownership handling.
 - Closed the final fresh-review gaps in anonymous recovered-image binding, exact SQLite header normalization, and structured native SQLite cleanup.
+- Closed the formal single-review gaps in shell-redirection receipt creation, post-write access-policy baselines, and ctypes row-callback exception propagation.
 
 ## Current State
 
@@ -37,6 +38,9 @@ superseded_by:
 - SQLite header versions accept only exact `1/1` passthrough or exact `2/2` normalization to `1/1`; mixed and invalid pairs fail before deserialization.
 - Ordinary native runtime and `ctypes` failures retain structured input/backup cleanup evidence. Backup finish, serialized-buffer free, and destination close are independently attempted when safe, while process-control exceptions remain untranslated.
 - If consumer and terminal revalidation both fail, revalidation remains the primary cause and the consumer failure is retained as structured secondary evidence.
+- `copy-db` and `stage-patch` now expose `--result-file`, which binds an artifact-external parent, rejects every existing leaf, creates a descriptor-relative no-follow temporary file exclusively, enforces effective UID/GID and mode `0600`, and fsyncs an atomic no-replace publication.
+- Copied database files and JSON temporary files bind their exact identity and full access policy before writing, then revalidate that creation baseline around consecutive content readbacks and every publication/name boundary.
+- Native SQLite row callbacks capture their first `BaseException` inside the ctypes boundary and abort `sqlite3_exec`; ordinary failures keep their cause and cleanup evidence, while `KeyboardInterrupt` and `SystemExit` are re-raised after input teardown.
 
 ## Next Steps
 
@@ -51,6 +55,7 @@ superseded_by:
 - Standalone temp-backup follow-up base: `9b06f7dbb52f1447845c9b3a47c22efd1bbf2259`
 - Linux descriptor-reopen follow-up base: `48e0869ca19f7b905ebbfbbd7cf0dcd9a4e271fc`
 - Final fresh-review safety follow-up base: `0206b99509fda94b005cb5dc0408a6ebc3cc551d`
+- Formal single-review follow-up base: `06b45f4eb3ab01027eb1d70314196b0ff74f0083`
 - Hosted Linux failure evidence: GitHub Actions run `30126900959`, job `89592422565`, head `48e0869ca19f7b905ebbfbbd7cf0dcd9a4e271fc` (`182` `unable to open database file` occurrences rooted at anonymous descriptor URI consumption)
 - Targeted adversarial tests: `python3 -m unittest <eight focused test cases>` (`8` tests passed)
 - Supervisor/malformed-result tests: `python3 -m unittest <four focused test cases>` (`4` tests passed)
@@ -65,8 +70,14 @@ superseded_by:
 - Full repository suite before final runtime selection: Python `3.14.2`, `python3 -B -m unittest tests.test_apple_notes_helper` (`216` tests passed outside the nested sandbox required by the fixed `/usr/bin/pgrep` probe)
 - Final full repository suite: Homebrew Python `3.14.3` (highest compatible installed runtime), `python3 -B -m unittest tests.test_apple_notes_helper` (`217` tests passed outside the nested sandbox required by the fixed `/usr/bin/pgrep` probe)
 - Final fresh-review full repository suite: Homebrew Python `3.14.3`, `python3 -B -m unittest tests.test_apple_notes_helper` (`225` tests passed outside the nested sandbox required by the fixed `/usr/bin/pgrep` probe)
+- Formal single-review follow-up full suite: Homebrew Python `3.14.3`, `/opt/homebrew/bin/python3.14 -B -m unittest tests.test_apple_notes_helper` (`234` tests passed outside the nested sandbox required by the fixed `/usr/bin/pgrep` probe)
+- Formal single-review Python compatibility suite: system Python `3.9.6`, `/usr/bin/python3 -B -m unittest tests.test_apple_notes_helper` (`234` tests passed outside the nested sandbox required by the fixed `/usr/bin/pgrep` probe)
+- Formal follow-up regressions cover safe copy/stage result-file packaging, existing-file/symlink/non-external rejection, restrictive-umask mode enforcement, creation/write-phase `chmod` races, and ordinary/process-control ctypes callback failures.
 - Static checks: full-repository `ruff check`; changed-file `ruff format --check`; `python3 -m py_compile`; CI-scoped `bash -n` and `shellcheck`; and `git diff --check`
+- Formal follow-up static checks: full-repository `ruff check .`; changed-Python `ruff format --check`; Python `3.14.3` and `3.9.6` `py_compile`; `bash -n` and `shellcheck` over both shell scripts; and `git diff --check`
 - Skill validation: isolated `quick_validate.py` with `PyYAML` (`Skill is valid!`; direct local validation lacked that dependency)
 - Final skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)
+- Formal follow-up skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)
 - Final post-fix read-only full-diff review: no findings
 - Journal validation: `project_journal.py validate --repo <worktree>`
+- Formal follow-up journal validation: `project_journal.py validate --repo <worktree>` (`Project journal validation passed.`)

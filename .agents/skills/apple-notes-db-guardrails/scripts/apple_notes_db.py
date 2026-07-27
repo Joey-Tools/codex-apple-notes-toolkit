@@ -68,6 +68,7 @@ DIRECTORY_CREATOR_PROVIDER_MAX_JSON_NODES = 256
 DIRECTORY_CREATOR_PROVIDER_MAX_KEY_CHARS = 128
 DIRECTORY_CREATOR_PROVIDER_MAX_STRING_CHARS = 2048
 SQLITE_OK = 0
+SQLITE_ABORT = 4
 SQLITE_DONE = 101
 SQLITE_OPEN_READWRITE = 0x00000002
 SQLITE_OPEN_CREATE = 0x00000004
@@ -6200,6 +6201,117 @@ def _write_all(fd: int, payload: bytes) -> None:
         offset += written
 
 
+def _bind_created_regular_file_access_policy(
+    fd: int,
+    path: Path,
+    parent: _BoundDirectory,
+    *,
+    created: os.stat_result,
+    expected_mode: int = 0o600,
+) -> tuple[os.stat_result, dict[str, int]]:
+    """Enforce and bind a new file's access policy before writing any bytes."""
+
+    if not stat.S_ISREG(created.st_mode):
+        raise StoreSafetyError(
+            "prepared-file-identity-mismatch",
+            f"Newly created output is not a regular file: {path}",
+        )
+    expected_uid = os.geteuid()
+    expected_gid = os.getegid()
+    try:
+        if created.st_gid != expected_gid:
+            os.fchown(fd, -1, expected_gid)
+        os.fchmod(fd, expected_mode)
+        descriptor = os.fstat(fd)
+        path_stat = os.stat(
+            path.name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            "prepared-file-missing",
+            f"Newly created output disappeared before access binding: {path}",
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Cannot bind the newly created output access policy: {path}: {exc}",
+        ) from exc
+    if (
+        not stat.S_ISREG(descriptor.st_mode)
+        or not stat.S_ISREG(path_stat.st_mode)
+        or not _same_identity(created, descriptor)
+        or not _same_identity(descriptor, path_stat)
+    ):
+        raise StoreSafetyError(
+            "prepared-file-identity-mismatch",
+            f"Newly created output changed identity before writing: {path}",
+        )
+    expected_access_policy = _access_policy(descriptor)
+    if (
+        expected_access_policy["uid"] != expected_uid
+        or expected_access_policy["gid"] != expected_gid
+        or expected_access_policy["mode"] != expected_mode
+        or _access_policy(path_stat) != expected_access_policy
+    ):
+        raise StoreSafetyError(
+            "prepared-file-access-policy-mismatch",
+            "Newly created output did not retain the enforced owner/group/mode "
+            f"before writing: {path}",
+        )
+    return descriptor, expected_access_policy
+
+
+def _verify_created_regular_file_boundary(
+    fd: int,
+    path: Path,
+    parent: _BoundDirectory,
+    *,
+    created: os.stat_result,
+    expected_access_policy: dict[str, int],
+    phase: str,
+) -> os.stat_result:
+    """Revalidate identity and the creation-bound policy at one write boundary."""
+
+    try:
+        descriptor = os.fstat(fd)
+        path_stat = os.stat(
+            path.name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            "prepared-file-missing",
+            f"Created output disappeared during {phase}: {path}",
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Cannot revalidate created output during {phase}: {path}: {exc}",
+        ) from exc
+    if (
+        not stat.S_ISREG(descriptor.st_mode)
+        or not stat.S_ISREG(path_stat.st_mode)
+        or not _same_identity(created, descriptor)
+        or not _same_identity(descriptor, path_stat)
+    ):
+        raise StoreSafetyError(
+            "prepared-file-identity-mismatch",
+            f"Created output changed identity during {phase}: {path}",
+        )
+    if (
+        _access_policy(descriptor) != expected_access_policy
+        or _access_policy(path_stat) != expected_access_policy
+    ):
+        raise StoreSafetyError(
+            "prepared-file-access-policy-mismatch",
+            f"Created output access policy changed during {phase}: {path}",
+        )
+    return descriptor
+
+
 def _copy_fd(
     fd: int,
     destination: Path,
@@ -6237,41 +6349,61 @@ def _copy_fd(
     created = os.fstat(out_fd)
     verified_sha256: str | None = None
     digest = hashlib.sha256()
+    copied_size = 0
     try:
+        _, expected_access_policy = _bind_created_regular_file_access_policy(
+            out_fd,
+            destination,
+            destination_binding,
+            created=created,
+        )
         os.lseek(fd, 0, os.SEEK_SET)
         while True:
             chunk = os.read(fd, CHUNK_SIZE)
             if not chunk:
                 break
             digest.update(chunk)
+            copied_size += len(chunk)
             _write_all(out_fd, chunk)
         os.fsync(out_fd)
         written_sha256 = digest.hexdigest()
-        readback_sha256 = _hash_fd(out_fd)
-        if written_sha256 != readback_sha256:
+        _verify_bound_directory_namespace(destination_binding)
+        opened = _verify_created_regular_file_boundary(
+            out_fd,
+            destination,
+            destination_binding,
+            created=created,
+            expected_access_policy=expected_access_policy,
+            phase="post-copy pre-readback",
+        )
+        if opened.st_size != copied_size:
+            raise StoreSafetyError(
+                "copy-content-mismatch",
+                f"Destination size differs from bytes written: {destination}",
+            )
+        bound = _BoundRegularFile(
+            path=destination,
+            fd=out_fd,
+            opened=opened,
+            sha256=written_sha256,
+            parent_opened=destination_binding.opened,
+            parent_fd=destination_binding.fd,
+            before_write=destination_binding.before_write,
+            trusted_alias=destination_binding.trusted_alias,
+        )
+        result = _verify_bound_regular_file_at(
+            bound,
+            PREPARED_FILE_CODES,
+            dir_fd=destination_binding.fd,
+            basename=destination.name,
+        )
+        if result["size"] != copied_size:
             raise StoreSafetyError(
                 "copy-content-mismatch",
                 f"Destination readback differs from bytes written: {destination}",
             )
+        _verify_bound_directory_namespace(destination_binding)
         verified_sha256 = written_sha256
-        descriptor_stat = os.fstat(out_fd)
-        path_stat = os.stat(
-            destination.name,
-            dir_fd=destination_binding.fd,
-            follow_symlinks=False,
-        )
-        if not _same_identity(descriptor_stat, path_stat):
-            raise StoreSafetyError(
-                "copy-identity-mismatch",
-                f"Destination was replaced during copy: {destination}",
-            )
-        result = {
-            "path": destination,
-            "sha256": written_sha256,
-            "size": descriptor_stat.st_size,
-            "identity": _identity(descriptor_stat),
-            "access_policy": _access_policy(descriptor_stat),
-        }
         return result
     except Exception as exc:
         retained = _retained_created_regular_file_details(
@@ -6932,6 +7064,7 @@ def _write_json_atomic(
     payload: dict[str, Any],
     *,
     parent_binding: _BoundDirectory | None = None,
+    ensure_ascii: bool = False,
 ) -> dict[str, Any]:
     if parent_binding is None:
         with _bind_existing_directory_with_trusted_alias(path.parent) as bound_parent:
@@ -6939,6 +7072,7 @@ def _write_json_atomic(
                 path,
                 payload,
                 parent_binding=bound_parent,
+                ensure_ascii=ensure_ascii,
             )
     if path.parent != parent_binding.path:
         raise StoreSafetyError(
@@ -6972,48 +7106,76 @@ def _write_json_atomic(
     created = os.fstat(fd)
     verified_sha256: str | None = None
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
-            json.dump(
-                payload, handle, indent=2, ensure_ascii=False, default=_json_default
-            )
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        opened = os.fstat(fd)
-        sha256 = _hash_fd(fd)
-        temp_leaf = os.stat(
-            temp_path.name,
-            dir_fd=parent_binding.fd,
-            follow_symlinks=False,
+        _, expected_access_policy = _bind_created_regular_file_access_policy(
+            fd,
+            temp_path,
+            parent_binding,
+            created=created,
         )
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or not _same_identity(created, opened)
-            or not _same_identity(opened, temp_leaf)
-        ):
+        payload_bytes = (
+            json.dumps(
+                payload,
+                indent=2,
+                ensure_ascii=ensure_ascii,
+                default=_json_default,
+            )
+            + "\n"
+        ).encode("utf-8", errors="strict")
+        expected_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        expected_size = len(payload_bytes)
+        _write_all(fd, payload_bytes)
+        os.fsync(fd)
+        _verify_bound_directory_namespace(parent_binding)
+        opened = _verify_created_regular_file_boundary(
+            fd,
+            temp_path,
+            parent_binding,
+            created=created,
+            expected_access_policy=expected_access_policy,
+            phase="post-write pre-readback",
+        )
+        if opened.st_size != expected_size:
             raise StoreSafetyError(
-                "prepared-file-identity-mismatch",
-                f"Manifest temporary file was replaced while writing: {temp_path}",
+                "prepared-file-content-mismatch",
+                f"JSON output size changed while writing: {temp_path}",
             )
-        verified_sha256 = sha256
-        if parent_binding.before_write is not None:
-            parent_binding.before_write()
-        _rename_file_no_replace_at(
-            parent_binding.fd,
-            temp_path.name,
-            path.name,
-        )
-        _fsync_bound_directory_descriptor(parent_binding)
         bound = _BoundRegularFile(
             path=path,
             fd=fd,
             opened=opened,
-            sha256=sha256,
+            sha256=expected_sha256,
             parent_opened=parent_binding.opened,
             parent_fd=parent_binding.fd,
             before_write=parent_binding.before_write,
             trusted_alias=parent_binding.trusted_alias,
         )
+        _verify_bound_regular_file_at(
+            bound,
+            PREPARED_FILE_CODES,
+            dir_fd=parent_binding.fd,
+            basename=temp_path.name,
+        )
+        verified_sha256 = expected_sha256
+        if parent_binding.before_write is not None:
+            parent_binding.before_write()
+        _verify_bound_regular_file_at(
+            bound,
+            PREPARED_FILE_CODES,
+            dir_fd=parent_binding.fd,
+            basename=temp_path.name,
+        )
+        _rename_file_no_replace_at(
+            parent_binding.fd,
+            temp_path.name,
+            path.name,
+        )
+        _verify_bound_regular_file_at(
+            bound,
+            PREPARED_FILE_CODES,
+            dir_fd=parent_binding.fd,
+            basename=path.name,
+        )
+        _fsync_bound_directory_descriptor(parent_binding)
         return _verify_bound_regular_file_at(
             bound,
             PREPARED_FILE_CODES,
@@ -11172,6 +11334,12 @@ def _sqlite_backup_bytes_from_payload(
             return _sqlite_backup_bytes(image, source_path)
 
 
+def _decode_sqlite_callback_value(value: bytes | None) -> str | None:
+    if value is None:
+        return None
+    return value.decode("utf-8", errors="replace")
+
+
 def _native_sqlite_query_rows(
     image: _DeserializedSQLiteImage,
     sql: str,
@@ -11182,6 +11350,7 @@ def _native_sqlite_query_rows(
     image.verify_bound()
     _verify_deserialized_sqlite_buffer(image, source_path)
     rows: list[list[str | None]] = []
+    callback_error: BaseException | None = None
 
     @_SQLITE_EXEC_CALLBACK
     def collect_row(
@@ -11190,17 +11359,21 @@ def _native_sqlite_query_rows(
         values: ctypes.POINTER(ctypes.c_char_p),
         _names: ctypes.POINTER(ctypes.c_char_p),
     ) -> int:
-        rows.append(
-            [
-                (
-                    values[index].decode("utf-8", errors="replace")
-                    if values[index] is not None
-                    else None
-                )
-                for index in range(column_count)
-            ]
-        )
-        return SQLITE_OK
+        nonlocal callback_error
+        if callback_error is not None:
+            return SQLITE_ABORT
+        try:
+            rows.append(
+                [
+                    _decode_sqlite_callback_value(values[index])
+                    for index in range(column_count)
+                ]
+            )
+        except BaseException as exc:
+            callback_error = exc
+            return SQLITE_ABORT
+        else:
+            return SQLITE_OK
 
     error_text = ctypes.c_char_p()
     result: int
@@ -11221,8 +11394,19 @@ def _native_sqlite_query_rows(
         error_pointer = ctypes.cast(error_text, ctypes.c_void_p).value
         if error_pointer is not None:
             _native_sqlite_free(image.api, int(error_pointer))
+    if callback_error is not None and not isinstance(callback_error, Exception):
+        raise callback_error
     _verify_deserialized_sqlite_buffer(image, source_path)
     image.verify_bound()
+    if callback_error is not None:
+        raise StoreSafetyError(
+            error_code,
+            "SQLite row callback failed while decoding descriptor-bound input "
+            f"for {source_path}: {_sqlite_exception_text(callback_error)}",
+            details={
+                "sqlite_callback_failure": _sqlite_exception_evidence(callback_error),
+            },
+        ) from callback_error
     if result != SQLITE_OK:
         raise StoreSafetyError(
             error_code,
@@ -14420,6 +14604,164 @@ def _paths_from_args(args: argparse.Namespace) -> NoteStorePaths:
     )
 
 
+def _assert_creator_result_file_lexically_external(
+    result_file: Path,
+    artifact: Path,
+) -> None:
+    result_requested, result_canonical, _ = _trusted_alias_paths(result_file)
+    artifact_requested, artifact_canonical, _ = _trusted_alias_paths(artifact)
+    for result_path in {result_requested, result_canonical}:
+        result_parts = _normalized_scope_parts(result_path)
+        for artifact_path in {artifact_requested, artifact_canonical}:
+            artifact_parts = _normalized_scope_parts(artifact_path)
+            result_inside_artifact = (
+                result_parts[: len(artifact_parts)] == artifact_parts
+            )
+            artifact_inside_result = artifact_parts[: len(result_parts)] == result_parts
+            if not result_inside_artifact and not artifact_inside_result:
+                continue
+            raise StoreSafetyError(
+                "result-file-not-external",
+                "Creator result file must be a separate path outside the "
+                f"published artifact: result={result_file}, artifact={artifact}",
+                details={
+                    "result_file": str(result_file),
+                    "artifact": str(artifact),
+                    "mutation_performed": False,
+                    "overlap_detection": (
+                        "normalized-lexical-result-inside-artifact"
+                        if result_inside_artifact
+                        else "normalized-lexical-artifact-inside-result"
+                    ),
+                },
+            )
+
+
+def _assert_creator_result_name_absent(
+    result_scope: _LiveDestinationScope,
+) -> None:
+    state, _ = _observe_bound_name(
+        result_scope.parent.fd,
+        result_scope.destination.name,
+    )
+    if state == "present":
+        raise StoreSafetyError(
+            "result-file-exists",
+            "Creator result file already exists; refusing to replace or truncate "
+            f"it: {result_scope.destination}",
+            details={"mutation_performed": False},
+        )
+    if state != "absent":
+        raise StoreSafetyError(
+            "result-file-scope-inconclusive",
+            "Cannot prove that the descriptor-bound creator result name is "
+            f"absent: {result_scope.destination}",
+            details={"mutation_performed": False},
+        )
+
+
+@contextmanager
+def _bind_creator_result_destination(
+    paths: NoteStorePaths,
+    result_file: Path | None,
+    artifact: Path,
+) -> Iterator[_LiveDestinationScope | None]:
+    if result_file is None:
+        yield None
+        return
+    requested_result = Path(os.path.abspath(os.fspath(result_file)))
+    requested_artifact = Path(os.path.abspath(os.fspath(artifact)))
+    _assert_creator_result_file_lexically_external(
+        requested_result,
+        requested_artifact,
+    )
+    with _bind_live_safe_destination_parent(
+        paths,
+        requested_result,
+    ) as result_scope:
+        result_scope.revalidate()
+        _assert_creator_result_name_absent(result_scope)
+        yield result_scope
+        result_scope.revalidate()
+
+
+def _write_creator_result_file(
+    result_scope: _LiveDestinationScope,
+    artifact: Path,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Atomically publish a 0600 creator result outside its artifact."""
+
+    requested_artifact = Path(os.path.abspath(os.fspath(artifact)))
+    publication_receipt: dict[str, Any] | None = None
+    try:
+        result_scope.revalidate()
+        _assert_creator_result_name_absent(result_scope)
+        with _bind_existing_directory_with_trusted_alias(
+            requested_artifact,
+            trusted_alias=result_scope.trusted_alias,
+        ) as artifact_root:
+            artifact_before = _verify_bound_directory_namespace(artifact_root)
+            _assert_output_ancestors_exclude_snapshot(
+                result_scope.parent.fd,
+                artifact_root.opened,
+                display_path=result_scope.destination.parent,
+            )
+            publication_receipt = _write_json_atomic(
+                result_scope.destination,
+                payload,
+                parent_binding=result_scope.parent,
+                ensure_ascii=True,
+            )
+            artifact_after = _verify_bound_directory_namespace(artifact_root)
+            if artifact_after["identity"] != artifact_before["identity"]:
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "Published artifact changed identity while its external "
+                    f"result file was created: {requested_artifact}",
+                )
+            if artifact_after["access_policy"] != artifact_before["access_policy"]:
+                raise StoreSafetyError(
+                    "prepared-directory-access-policy-mismatch",
+                    "Published artifact changed access policy while its external "
+                    f"result file was created: {requested_artifact}",
+                )
+            _assert_output_ancestors_exclude_snapshot(
+                result_scope.parent.fd,
+                artifact_root.opened,
+                display_path=result_scope.destination.parent,
+            )
+        result_scope.revalidate()
+        return publication_receipt
+    except Exception as exc:
+        details = dict(exc.details) if isinstance(exc, StoreSafetyError) else {}
+        details.update(
+            {
+                "artifact": str(requested_artifact),
+                "artifact_mutation_performed": True,
+                "result_file": str(result_scope.destination),
+                "result_file_publication_state": (
+                    "committed" if publication_receipt is not None else "uncertain"
+                ),
+                "retry_safe": False,
+                "underlying_error_code": (
+                    exc.code
+                    if isinstance(exc, StoreSafetyError)
+                    else "unexpected-error"
+                ),
+                "underlying_error_type": type(exc).__name__,
+            }
+        )
+        if publication_receipt is not None:
+            details["result_file_receipt"] = publication_receipt
+        raise StoreSafetyError(
+            "result-file-publication-failed",
+            "The artifact was created, but its external creator result file "
+            f"could not be terminally published: {result_scope.destination}: {exc}",
+            details=details,
+        ) from exc
+
+
 def _add_container_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--group-container",
@@ -14464,6 +14806,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_container_options(copy_parser)
     _add_directory_creator_supervisor_option(copy_parser)
     copy_parser.add_argument("--dest", type=Path, help="New snapshot directory.")
+    copy_parser.add_argument(
+        "--result-file",
+        type=Path,
+        help=(
+            "Atomically create a new owner-only JSON result file outside the "
+            "snapshot; existing names and symlinks are never replaced."
+        ),
+    )
     copy_parser.add_argument(
         "--require-notes-quit",
         action="store_true",
@@ -14516,6 +14866,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_directory_creator_supervisor_option(stage_parser)
     stage_parser.add_argument("--src", type=Path, required=True)
     stage_parser.add_argument("--dest", type=Path, required=True)
+    stage_parser.add_argument(
+        "--result-file",
+        type=Path,
+        help=(
+            "Atomically create a new owner-only JSON result file outside the "
+            "stage; existing names and symlinks are never replaced."
+        ),
+    )
 
     validate_stage_parser = subparsers.add_parser(
         "validate-patch-stage",
@@ -14596,13 +14954,25 @@ def main(argv: Iterable[str] | None = None) -> int:
         if args.command == "probe-db-access":
             emit_json(probe_db_access(_paths_from_args(args)))
         elif args.command == "copy-db":
-            emit_json(
-                copy_db(
-                    _paths_from_args(args),
-                    dest=args.dest,
+            paths = _paths_from_args(args)
+            copy_destination = args.dest or _timestamped_tmp_dir("apple-notes-probe")
+            with _bind_creator_result_destination(
+                paths,
+                args.result_file,
+                copy_destination,
+            ) as result_scope:
+                result = copy_db(
+                    paths,
+                    dest=copy_destination,
                     require_notes_quit=args.require_notes_quit,
                 )
-            )
+                if result_scope is not None:
+                    _write_creator_result_file(
+                        result_scope,
+                        Path(result["dest"]),
+                        result,
+                    )
+            emit_json(result)
         elif args.command == "merge-db":
             emit_json(
                 merge_db(
@@ -14632,13 +15002,24 @@ def main(argv: Iterable[str] | None = None) -> int:
                 )
             )
         elif args.command == "stage-patch":
-            emit_json(
-                stage_patch(
+            paths = _paths_from_args(args)
+            with _bind_creator_result_destination(
+                paths,
+                args.result_file,
+                args.dest,
+            ) as result_scope:
+                result = stage_patch(
                     args.src,
                     args.dest,
-                    paths=_paths_from_args(args),
+                    paths=paths,
                 )
-            )
+                if result_scope is not None:
+                    _write_creator_result_file(
+                        result_scope,
+                        Path(result["stage_dir"]),
+                        result,
+                    )
+            emit_json(result)
         elif args.command == "validate-patch-stage":
             emit_json(
                 validate_patch_stage(
