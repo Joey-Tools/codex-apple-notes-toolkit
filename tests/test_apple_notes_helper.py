@@ -438,6 +438,47 @@ raise SystemExit(2)
             conn.execute("INSERT INTO sample(value) VALUES (?)", (value,))
             conn.commit()
 
+    @contextmanager
+    def _bind_direct_main_only_source_store(
+        self,
+        main_path: Path,
+    ) -> Iterator[MODULE._BoundSourceStore]:
+        """Bind a test store without adding a context-exit store revalidation."""
+
+        parent_path = main_path.parent
+        parent_fd = os.open(parent_path.parent, MODULE._directory_open_flags())
+        directory_fd: int | None = None
+        try:
+            directory_fd = os.open(
+                parent_path.name,
+                MODULE._directory_open_flags(),
+                dir_fd=parent_fd,
+            )
+            directory = MODULE._BoundDirectory(
+                path=parent_path,
+                fd=directory_fd,
+                opened=os.fstat(directory_fd),
+                parent_opened=os.fstat(parent_fd),
+                parent_fd=parent_fd,
+                namespace_basename=parent_path.name,
+                canonical_path=parent_path,
+            )
+            with MODULE._bind_regular_file_at(
+                main_path,
+                directory,
+                MODULE.SOURCE_FILE_CODES,
+            ) as bound:
+                yield MODULE._BoundSourceStore(
+                    directory=directory,
+                    main_name=main_path.name,
+                    files={main_path.name: bound},
+                    membership=(main_path.name,),
+                )
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+            os.close(parent_fd)
+
     def _create_wal_db(self, path: Path) -> sqlite3.Connection:
         conn = sqlite3.connect(path)
         self.assertEqual(conn.execute("PRAGMA journal_mode = WAL").fetchone()[0], "wal")
@@ -4332,6 +4373,260 @@ raise SystemExit(2)
                     "source-revalidation-inconclusive",
                     raised,
                 )
+
+    def test_source_store_terminal_scan_rejects_sidecars_from_final_hash(
+        self,
+    ) -> None:
+        cases = (
+            (f"{MODULE.NOTE_STORE_MAIN}-wal", "store-file-set-mismatch"),
+            (MODULE.NOTE_STORE_ROLLBACK_JOURNAL, "rollback-journal-present"),
+        )
+        for sidecar_name, expected_code in cases:
+            with (
+                self.subTest(sidecar_name=sidecar_name),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                source = paths.group_container / MODULE.NOTE_STORE_MAIN
+                sidecar = paths.group_container / sidecar_name
+                self._create_db(source)
+                original_hash = MODULE._hash_fd
+                hash_calls = 0
+                injected = False
+
+                def inject_sidecar_after_final_hash(fd: int) -> str:
+                    nonlocal hash_calls, injected
+                    digest = original_hash(fd)
+                    hash_calls += 1
+                    if hash_calls == 2:
+                        sidecar.write_bytes(b"persistent late sidecar")
+                        injected = True
+                    return digest
+
+                with self._bind_direct_main_only_source_store(source) as store:
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_hash_fd",
+                            side_effect=inject_sidecar_after_final_hash,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        MODULE._verify_bound_source_store(store)
+
+                self.assertTrue(injected)
+                self.assertEqual(hash_calls, 2)
+                self.assertTrue(sidecar.exists())
+                self._assert_safety_code(expected_code, raised)
+
+    def test_source_store_terminal_scan_rejects_parent_replaced_during_final_hash(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            source = paths.group_container / MODULE.NOTE_STORE_MAIN
+            self._create_db(source, value="bound")
+            parked = root / "group-bound"
+            replacement = root / "group-replacement"
+            replacement.mkdir(mode=0o700)
+            self._create_db(
+                replacement / MODULE.NOTE_STORE_MAIN,
+                value="replacement",
+            )
+            original_hash = MODULE._hash_fd
+            hash_calls = 0
+            replaced = False
+
+            def replace_parent_after_final_hash(fd: int) -> str:
+                nonlocal hash_calls, replaced
+                digest = original_hash(fd)
+                hash_calls += 1
+                if hash_calls == 2:
+                    paths.group_container.rename(parked)
+                    replacement.rename(paths.group_container)
+                    replaced = True
+                return digest
+
+            try:
+                with self._bind_direct_main_only_source_store(source) as store:
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_hash_fd",
+                            side_effect=replace_parent_after_final_hash,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        MODULE._verify_bound_source_store(store)
+                self.assertTrue(replaced)
+                self.assertEqual(hash_calls, 2)
+                self._assert_safety_code("source-identity-mismatch", raised)
+            finally:
+                if parked.exists():
+                    if paths.group_container.exists():
+                        paths.group_container.rename(replacement)
+                    parked.rename(paths.group_container)
+
+    def test_source_store_terminal_scan_allows_unrelated_transient_churn(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            source = paths.group_container / MODULE.NOTE_STORE_MAIN
+            transient = paths.group_container / "unrelated-transient-entry"
+            self._create_db(source)
+            original_hash = MODULE._hash_fd
+            hash_calls = 0
+            churned = False
+
+            def churn_unrelated_entry_after_final_hash(fd: int) -> str:
+                nonlocal hash_calls, churned
+                digest = original_hash(fd)
+                hash_calls += 1
+                if hash_calls == 2:
+                    transient.write_bytes(b"transient")
+                    transient.unlink()
+                    churned = True
+                return digest
+
+            with self._bind_direct_main_only_source_store(source) as store:
+                with mock.patch.object(
+                    MODULE,
+                    "_hash_fd",
+                    side_effect=churn_unrelated_entry_after_final_hash,
+                ):
+                    receipt = MODULE._verify_bound_source_store(store)
+
+            self.assertTrue(churned)
+            self.assertEqual(hash_calls, 2)
+            self.assertFalse(transient.exists())
+            self.assertEqual(receipt["membership"], [MODULE.NOTE_STORE_MAIN])
+
+    def test_artifact_scan_preserves_caller_directory_error_taxonomy(
+        self,
+    ) -> None:
+        profiles = (
+            (
+                "snapshot",
+                "snapshot-missing",
+                "snapshot-directory-identity-mismatch",
+                "snapshot-directory-access-policy-mismatch",
+                MODULE.SNAPSHOT_FILE_CODES.inconclusive,
+                "snapshot-file-set-mismatch",
+            ),
+            (
+                "patch-stage",
+                "stage-missing",
+                "stage-directory-identity-mismatch",
+                "stage-directory-access-policy-mismatch",
+                MODULE.PATCH_FILE_CODES.inconclusive,
+                "patch-file-set-mismatch",
+            ),
+        )
+        for (
+            profile,
+            missing_code,
+            identity_code,
+            access_policy_code,
+            inconclusive_code,
+            mismatch_code,
+        ) in profiles:
+            for fault in ("identity", "access-policy", "io"):
+                with (
+                    self.subTest(profile=profile, fault=fault),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    root = Path(temp_dir)
+                    artifact = root / "artifact"
+                    artifact.mkdir(mode=0o700)
+                    (artifact / "member").write_bytes(b"member")
+                    replacement = root / "replacement"
+                    replacement.mkdir(mode=0o700)
+                    parent_fd = os.open(root, MODULE._directory_open_flags())
+                    artifact_fd = os.open(
+                        artifact.name,
+                        MODULE._directory_open_flags(),
+                        dir_fd=parent_fd,
+                    )
+                    original_mode = stat.S_IMODE(os.fstat(artifact_fd).st_mode)
+                    changed_mode = 0o750 if original_mode != 0o750 else 0o700
+                    binding = MODULE._BoundDirectory(
+                        path=artifact,
+                        fd=artifact_fd,
+                        opened=os.fstat(artifact_fd),
+                        parent_opened=os.fstat(parent_fd),
+                        parent_fd=parent_fd,
+                        namespace_basename=artifact.name,
+                        canonical_path=artifact,
+                    )
+                    original_fstat = MODULE.os.fstat
+                    original_scandir = MODULE.os.scandir
+                    scan_fault_triggered = False
+
+                    def fail_scan_fstat(fd: int) -> os.stat_result:
+                        nonlocal scan_fault_triggered
+                        if fd not in {parent_fd, artifact_fd}:
+                            if fault == "identity":
+                                scan_fault_triggered = True
+                                return replacement.stat()
+                            if fault == "access-policy":
+                                os.fchmod(fd, changed_mode)
+                                scan_fault_triggered = True
+                        return original_fstat(fd)
+
+                    def fail_scan_read(
+                        target: object,
+                    ) -> os.ScandirIterator[str]:
+                        nonlocal scan_fault_triggered
+                        if (
+                            fault == "io"
+                            and isinstance(target, int)
+                            and target not in {parent_fd, artifact_fd}
+                        ):
+                            scan_fault_triggered = True
+                            raise OSError(
+                                MODULE.errno.EIO,
+                                "simulated artifact scan EIO",
+                            )
+                        return original_scandir(target)
+
+                    expected_code = {
+                        "identity": identity_code,
+                        "access-policy": access_policy_code,
+                        "io": inconclusive_code,
+                    }[fault]
+                    try:
+                        with (
+                            mock.patch.object(
+                                MODULE.os,
+                                "fstat",
+                                side_effect=fail_scan_fstat,
+                            ),
+                            mock.patch.object(
+                                MODULE.os,
+                                "scandir",
+                                side_effect=fail_scan_read,
+                            ),
+                            self.assertRaises(MODULE.StoreSafetyError) as raised,
+                        ):
+                            MODULE._scan_exact_bound_directory_entries(
+                                binding,
+                                {"member": stat.S_IFREG},
+                                missing_code=missing_code,
+                                identity_code=identity_code,
+                                access_policy_code=access_policy_code,
+                                inconclusive_code=inconclusive_code,
+                                mismatch_code=mismatch_code,
+                            )
+                        self.assertTrue(scan_fault_triggered)
+                        self._assert_safety_code(expected_code, raised)
+                    finally:
+                        os.fchmod(artifact_fd, original_mode)
+                        os.close(artifact_fd)
+                        os.close(parent_fd)
 
     def test_copy_db_does_not_use_path_reopening_validation_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -10332,7 +10627,11 @@ raise SystemExit(2)
 
                     self.assertTrue(attacked)
                     self._assert_safety_code(
-                        "directory-identity-mismatch",
+                        (
+                            "snapshot-directory-identity-mismatch"
+                            if artifact_kind == "snapshot"
+                            else "stage-directory-identity-mismatch"
+                        ),
                         raised,
                     )
                     self.assertTrue(parked.is_dir())
@@ -10725,7 +11024,7 @@ raise SystemExit(2)
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
                 self._validate_patch_stage(stage)
-        self._assert_safety_code("directory-identity-mismatch", raised)
+        self._assert_safety_code("stage-directory-identity-mismatch", raised)
 
     def test_patch_validation_detects_directory_access_policy_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -10753,7 +11052,10 @@ raise SystemExit(2)
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
                 self._validate_patch_stage(stage)
-        self._assert_safety_code("directory-access-policy-mismatch", raised)
+        self._assert_safety_code(
+            "stage-directory-access-policy-mismatch",
+            raised,
+        )
 
     def test_stage_patch_normalizes_and_validates_database(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -38,6 +38,10 @@ in the same way. Treat the complete no-follow entry name/type map as directory c
 directory, FIFO, socket, device, or symlink—including a broken symlink—is a file-set mismatch.
 Scan the directory twice through opened descriptors. Do not infer mutation from directory `mtime`
 alone when identity, access policy, and both name/type scans remain stable.
+At every point in those scans, translate lower prepared-directory identity, access-policy,
+membership, and revalidation failures into the exact snapshot or patch-stage codes selected by the
+caller. Generic `directory-*` or `prepared-directory-*` codes must not escape an artifact-specific
+validation boundary.
 
 Record `mtime`, `ctime`, and link-count transitions, but do not classify those transitions alone as
 content or access-policy mutation. A metadata-only transition is acceptable only when the
@@ -117,7 +121,13 @@ but do not fail on those metadata signals alone when identity, bytes, and access
 stable. The terminal pathname access-policy comparison is required even when the descriptor's
 policy still matches an earlier observation.
 
-Recheck the main/WAL/SHM/rollback-journal membership after all files have been processed.
+Recheck the main/WAL/SHM/rollback-journal membership only after every bound file has completed its
+terminal double hash. Bracket that reserved-name scan with complete held-parent directory-chain
+revalidation, compare the result with the binding-time baseline, and use the post-scan directory
+receipt as the terminal authority. A persistent late WAL or rollback journal, or a parent
+replacement that persists through this boundary, fails closed. Transient unrelated child-entry
+churn and its directory timestamp effects remain benign when directory identity, access policy,
+reserved membership, and every bound file's identity, content, and access policy remain stable.
 A present `NoteStore.sqlite-journal` is not an ignorable sidecar. Open it without following links,
 bind and hash the same descriptor twice, then fail closed with `rollback-journal-present` before
 copy or recovery. A symlink, non-regular entry, unreadable journal, or unstable journal returns the

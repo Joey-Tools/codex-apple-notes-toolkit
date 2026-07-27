@@ -190,6 +190,12 @@ results instead of reopening the copied path. Each live source is terminally reh
 same held descriptor; descriptor and pathname identity/access policy are checked around that hash,
 while `mtime`, `ctime`, and link-count transitions remain recorded metadata rather than mutation
 signals. It never reopens a parent pathname for durability.
+Only after every bound live-source file completes that terminal double-hash check, the helper
+revalidates the held source-directory chain, rescans the reserved main/WAL/SHM/rollback-journal
+names through the held parent, compares them with the binding-time baseline, and revalidates the
+directory chain again. A persistent late WAL or rollback journal and a persistent parent
+replacement therefore fail closed. Transient unrelated child-entry churn remains benign when
+directory identity, access policy, reserved membership, and bound-file content stay unchanged.
 The access probe closes each successfully opened file descriptor, then performs one final
 source-aware held-parent revalidation inside that file's result boundary before marking it
 readable. Parent disappearance, unreadability, or another revalidation failure remains a
@@ -256,6 +262,9 @@ through recovery-payload construction, SQLite integrity checking, standalone bac
 revalidation. No named recovery-clone directory is created. Object replacement, byte mutation,
 and access-policy change have distinct failure codes; timestamp-only changes do not fail when the
 protected properties remain stable.
+Snapshot and patch-stage directory scans preserve their caller-specific missing, identity,
+access-policy, membership, and inconclusive codes even when the lower descriptor scanner detects
+the failure midway through a pass.
 
 ## Recover For Analysis
 

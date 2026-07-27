@@ -3296,16 +3296,16 @@ def _translated_bound_directory_error(
         "prepared-directory-identity-mismatch",
         "directory-identity-mismatch",
     }:
-        code = "directory-identity-mismatch"
+        code = identity_code
     elif error.code in {
         "prepared-directory-access-policy-mismatch",
         "directory-access-policy-mismatch",
     }:
-        code = "directory-access-policy-mismatch"
+        code = access_policy_code
     elif error.code == "prepared-file-set-mismatch":
         code = mismatch_code
     else:
-        code = "directory-scan-inconclusive"
+        code = inconclusive_code
     return StoreSafetyError(
         code,
         f"Cannot validate the descriptor-bound artifact directory {path}: {error}",
@@ -3375,12 +3375,12 @@ def _scan_exact_bound_directory_entries(
     )
     if before["identity"] != after["identity"]:
         raise StoreSafetyError(
-            "directory-identity-mismatch",
+            identity_code,
             f"Artifact directory identity changed during validation: {binding.path}",
         )
     if before["access_policy"] != after["access_policy"]:
         raise StoreSafetyError(
-            "directory-access-policy-mismatch",
+            access_policy_code,
             "Artifact directory access policy changed during validation: "
             f"{binding.path}",
         )
@@ -3701,7 +3701,7 @@ def _verify_bound_source_store(
 ) -> dict[str, Any]:
     """Revalidate only the reserved NoteStore namespace through the held FD."""
 
-    directory = _verify_bound_source_directory(store.directory)
+    _verify_bound_source_directory(store.directory)
     current_paths = _discover_database_files_at(
         store.directory.path / store.main_name,
         store.directory,
@@ -3722,10 +3722,28 @@ def _verify_bound_source_store(
         )
         for basename, bound in store.files.items()
     }
+    terminal_paths = _discover_database_files_at(
+        store.directory.path / store.main_name,
+        store.directory,
+    )
+    terminal_membership = tuple(path.name for path in terminal_paths)
+    _reject_new_rollback_journal_membership(
+        store.directory.path / store.main_name,
+        baseline_names=list(store.membership),
+        observed_names=list(terminal_membership),
+        phase="terminal-store-revalidation",
+    )
+    if terminal_membership != store.membership:
+        raise StoreSafetyError(
+            "store-file-set-mismatch",
+            "SQLite main/WAL/SHM/rollback-journal membership changed during "
+            "terminal descriptor-bound store revalidation",
+        )
+    directory = _verify_bound_source_directory(store.directory)
     return {
         "directory": directory,
         "files": files,
-        "membership": list(current_membership),
+        "membership": list(terminal_membership),
     }
 
 

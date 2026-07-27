@@ -26,6 +26,12 @@ superseded_by:
 - Closed the remaining bound-file, wrapped-directory, and post-close probe
   taxonomy gaps so causal OS failures remain missing, unreadable, or
   inconclusive while only proved property comparisons report mismatches.
+- Closed the terminal live-store boundary after all file hashes so persistent
+  late WAL/rollback-journal membership and held-parent replacement cannot
+  escape the writeback baseline.
+- Closed the artifact-directory translation gap so snapshot and patch-stage
+  scans retain their caller-specific identity, access-policy, and
+  revalidation codes.
 
 ## Current State
 
@@ -64,6 +70,15 @@ superseded_by:
   Held source-directory translation inspects wrapped OS causes before generic
   prepared-directory codes, and the probe's post-close parent check now stays
   inside the affected file result.
+- After all bound source files complete terminal double hashing, the helper
+  revalidates the held parent chain, rescans only the reserved
+  main/WAL/SHM/rollback-journal names, compares them with the binding baseline,
+  and returns a final post-scan directory receipt. Persistent late sidecars or
+  parent replacement fail closed; unrelated transient child churn remains
+  benign when the selected properties stay stable.
+- Snapshot and patch-stage directory validation now translates lower scan-time
+  identity, access-policy, membership, and I/O failures with the exact codes
+  supplied by the artifact caller instead of generic `directory-*` codes.
 
 ## Next Steps
 
@@ -119,6 +134,14 @@ superseded_by:
 - Final causal source-taxonomy full suites: Python `3.14.3` and `3.9.6` each
   passed all `249` tests outside the nested sandbox required by the fixed
   `/usr/bin/pgrep` probe.
+- Terminal live-store and artifact-directory regressions: Python `3.14.3` and
+  system Python `3.9.6` each passed nine focused tests covering persistent WAL,
+  persistent rollback journal, persistent held-parent replacement, benign
+  unrelated transient churn, and real scan-time identity/access-policy/EIO
+  translation for snapshot and patch-stage callers.
+- Terminal-boundary full suites: Python `3.14.3` and system Python `3.9.6`
+  each passed all `253` tests outside the nested sandbox required by the fixed
+  `/usr/bin/pgrep` probe.
 - Static checks: full-repository `ruff check`; changed-file `ruff format --check`; `python3 -m py_compile`; CI-scoped `bash -n` and `shellcheck`; and `git diff --check`
 - Formal follow-up static checks: full-repository `ruff check .`; changed-Python `ruff format --check`; Python `3.14.3` and `3.9.6` `py_compile`; `bash -n` and `shellcheck` over both shell scripts; and `git diff --check`
 - Final formal-review static checks: full-repository Ruff `0.13.2`; changed-Python format check; Python `3.14.3` and `3.9.6` bytecode compilation; `bash -n` and ShellCheck over both shell scripts; and `git diff --check`.
@@ -130,6 +153,10 @@ superseded_by:
   changed-Python format check; Python `3.14.3` and `3.9.6` bytecode
   compilation with task-scoped caches; `bash -n`; ShellCheck `0.11.0`; and
   `git diff --check`.
+- Terminal-boundary static checks: full-repository Ruff `0.13.2`; changed
+  Python format check; Python `3.14.3` and `3.9.6` bytecode compilation with
+  separate task-scoped caches; `bash -n`; ShellCheck `0.11.0`; skill and
+  project-journal validators; and `git diff --check`.
 - Skill validation: isolated `quick_validate.py` with `PyYAML` (`Skill is valid!`; direct local validation lacked that dependency)
 - Final skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)
 - Formal follow-up skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)
