@@ -31,9 +31,9 @@ Notes:
   - DB-heavy subcommands delegate to the helper packaged with apple-notes-db-guardrails.
   - Use copy-db/stage-patch --result-file to atomically create the successful
     JSON outside the artifact for every consuming command.
-  - Write-producing DB commands automatically launch the packaged identity-bound
-    directory-creation supervisor. An explicitly inherited supervisor FD remains
-    available for callers that already own a stronger platform authority.
+  - Write-producing DB commands automatically launch the packaged pre-creation
+    capability gate. It currently fails closed when directory creation is needed;
+    an explicitly inherited supervisor FD remains available to a stronger authority.
   - No subcommand mutates the live Notes store; writeback remains an explicit separate phase.
   - In Codex, prefer this wrapper under an approved/escalated prefix when Notes automation is needed.
 EOF

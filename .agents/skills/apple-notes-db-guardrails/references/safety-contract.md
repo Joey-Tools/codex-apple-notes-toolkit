@@ -449,18 +449,18 @@ commands may dispatch directly. For each creation, send one bounded
 `apple-notes-directory-creator-request/v1` datagram and the already-held parent descriptor with
 `SCM_RIGHTS`. Bind the request nonce, operation, prefix, mode, effective UID, parent identity, and
 parent access policy. Accept only one bounded `apple-notes-directory-creator-response/v1`
-datagram with the same nonce, status `created`, exactly one returned descriptor, canonical staging
-basename, and the normal creation attestation. The bundled service opens a randomized private
-source directory, validates it through its descriptor, then atomically publishes that already-open
-object under a separate randomized protocol-visible basename with the platform no-replace
-directory rename. It keeps the descriptor continuously held through response and revalidates the
-parent and directory identity/access policy around publication. A same-UID supervisor that merely
-calls `mkdir` and then reopens the returned protocol-visible name does not meet this contract.
-Because the service is a dedicated single-thread process, it may temporarily set `umask(0)` only
-around the `mkdir(0700)` call. It must first block every blockable signal, restore the inherited
-umask in `finally`, and only then restore the exact previous signal mask. This prevents either a
-strict inherited umask from creating a mode-`000` source or an inherited asynchronous handler from
-performing a side write while the process-wide umask is zero.
+datagram with the same nonce. A status `created` response requires exactly one returned descriptor,
+a canonical staging basename, and the normal creation attestation. Current macOS and Linux public
+interfaces provide no atomic directory-create-and-return-FD primitive, so the bundled service is a
+capability gate rather than a creation authority: after request validation it returns the exact
+closed `unavailable-before-create` response with null basename/proof, zero returned descriptors,
+`mutation_performed: false`, `cleanup_state: not-needed`, and the canonical unsupported-primitive
+receipt. The client accepts that no-mutation claim only through canonical typed JSON equality and
+locally reconstructs the details; bool-as-int, unknown keys, any descriptor, basename, proof, or
+other near-match is a conservative possible-mutation transport failure. The service must not call
+`mkdir`, `mkdirat`, `mkdtemp`, `mkdtempat_np`, or `open` on this route. A caller-supplied inherited
+channel may still represent a stronger platform or privileged authority. A same-UID supervisor
+that merely calls `mkdir` and then reopens any name does not meet this contract.
 Before forking the service or spawning the independent-session worker, the launcher blocks
 `SIGHUP`, `SIGINT`, and `SIGTERM` and installs non-raising first-signal latches. Worker creation
 uses `posix_spawn` with an explicit inherited-FD allowlist, child signal mask, and new session. If

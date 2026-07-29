@@ -96,14 +96,15 @@ object, parent, access policy, and exclusive namespace handoff. POSIX/Darwin `mk
 `mkdtemp`, and `mkdtempat_np` return no descriptor, so a later no-follow `open` is not creation
 proof and is never an implicit fallback. The packaged production launcher creates an inherited,
 already-connected `AF_UNIX`/`SOCK_DGRAM` channel, forks the bundled supervisor service, and starts
-the DB helper with `--directory-creator-fd`. For each request, the service opens a randomized
-private source directory before atomically publishing that held object under a distinct randomized
-protocol-visible name with the platform no-replace rename primitive. It keeps the descriptor open
-through the response and revalidates parent and object identity/access policy around publication.
-The dedicated single-thread service blocks every blockable signal, scopes `umask(0)` to the source
-`mkdir`, restores the exact inherited umask, and only then restores the signal mask, so neither a
-strict caller umask nor an inherited asynchronous handler can create an unsafe side effect. The
-launcher blocks termination signals before either child starts, atomically records the
+the DB helper with `--directory-creator-fd`. Current macOS and Linux public APIs expose no atomic
+directory-create-and-return-FD primitive, so the bundled service validates the request and returns
+the exact closed `unavailable-before-create` capability receipt without calling `mkdir`, `open`, or
+sending a directory descriptor through `SCM_RIGHTS`. The helper accepts that no-mutation result
+only when the response has the exact schema, nonce, null basename/proof, zero descriptors, and
+canonical typed details; every near-match remains a conservative possible-mutation transport
+failure. A caller may still supply an inherited channel for a genuinely stronger platform or
+privileged authority that returns the actual created-object FD and normal creation attestation.
+The launcher blocks termination signals before either child starts, atomically records the
 `posix_spawn` worker PID under that mask, relocates the child channel if its source FD collides with
 the preferred target, and temporarily normalizes `SIGCHLD` to a waitable default before either
 child exists. The worker receives a default `SIGCHLD`, while the launcher keeps it blocked until
@@ -113,11 +114,11 @@ also restores the original child masks and latches the first parent signal witho
 ignores later termination signals until the worker and service have both been killed, drained, and
 reaped, consumes only one bounded pending-signal snapshot, then restores the original handlers/mask
 and re-delivers the first signal.
-The helper sends the held parent descriptor and a request nonce with `SCM_RIGHTS`, then accepts
-exactly one directory descriptor plus the matching attestation. It never reconnects by socket
-pathname or accepts a direct `mkdir`-then-`open` of the returned name. Callers with a stronger
-platform authority may still pass its inherited channel explicitly. Without a usable channel, the
-packaged creator fails before request delivery and before mutation with
+The helper sends the held parent descriptor and a request nonce with `SCM_RIGHTS`. A `created`
+response must carry exactly one directory descriptor plus the matching attestation; the packaged
+capability refusal must carry none. It never reconnects by socket pathname or accepts a direct
+`mkdir`-then-`open` of the returned name. Without a stronger creator, creation fails after the
+packaged capability request but before any filesystem mutation with
 `directory-creation-identity-inconclusive`.
 If that creator fails after entering the creation boundary, it must raise the packaged structured
 create-then-fail exception and transfer the staging basename, already-open descriptor,
@@ -300,8 +301,7 @@ inconclusive, the original error remains primary and reports the separate receip
 Each retained-partial pass lazily enumerates through held directory descriptors,
 stops on the 65th entry before reading its metadata, and enforces a 4 KiB
 aggregate raw-name ceiling across the complete recursive pass. It collects and
-sorts only the already bounded names. The packaged supervisor's newly created
-directory emptiness check reads at most the first descriptor-relative entry.
+sorts only the already bounded names.
 An individual file writer also retains its failed output: it never follows a separate `stat` with
 an `unlink`, because the namespace leaf could be replaced between those syscalls. The error carries
 the held parent/file descriptor receipt, point-in-time namespace observations, `cleanup_state:
@@ -537,7 +537,9 @@ starting a process or mutating the filesystem at import time. When executed,
 its `copy-db`, `merge-db`, `recover-snapshot`, and `stage-patch` commands route
 through the packaged directory-creator supervisor unless the caller supplied
 an explicit `--directory-creator-fd`; read-only commands and explicit-FD
-commands dispatch directly to the DB helper.
+commands dispatch directly to the DB helper. The packaged route is a
+pre-creation capability gate and currently fails closed when directory creation
+is required; it is not itself a creation authority.
 
 ## Stage And Preflight A Patch
 

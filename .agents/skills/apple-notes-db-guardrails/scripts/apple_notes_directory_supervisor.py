@@ -9,7 +9,6 @@ import fcntl
 import importlib.util
 import json
 import os
-import secrets
 import signal
 import socket
 import stat
@@ -26,7 +25,6 @@ HELPER_PATH = Path(__file__).with_name("apple_notes_db.py")
 SUPERVISOR_SHUTDOWN_GRACE_SECONDS = 0.5
 WORKER_SHUTDOWN_GRACE_SECONDS = 0.5
 SUPERVISOR_POLL_SECONDS = 0.1
-SOURCE_PREFIX = ".apple-notes-create-supervisor-source-"
 DESTINATION_PREFIX = ".apple-notes-create-"
 WORKER_SUPERVISOR_FD = 9
 TERMINATION_SIGNALS = frozenset(
@@ -38,12 +36,6 @@ TERMINATION_SIGNALS = frozenset(
 )
 LAUNCH_BLOCKED_SIGNALS = TERMINATION_SIGNALS.union({signal.SIGCHLD})
 SPAWN_DEFAULT_SIGNALS = TERMINATION_SIGNALS.union({signal.SIGCHLD})
-BLOCKABLE_SIGNALS = frozenset(signal.valid_signals()).difference(
-    {
-        signal.SIGKILL,
-        signal.SIGSTOP,
-    }
-)
 WAIT_STATUS_UNAVAILABLE = -1
 WORKER_RETURN_CODE_UNAVAILABLE = 1
 
@@ -62,10 +54,6 @@ def _load_helper() -> ModuleType:
 
 
 HELPER = _load_helper()
-
-
-def _bounded_error(exc: BaseException) -> str:
-    return f"{type(exc).__name__}: {exc}"[:512]
 
 
 def _close_fds(descriptors: Iterable[int]) -> None:
@@ -122,13 +110,6 @@ def _send_response(
         raise RuntimeError("directory supervisor response was truncated")
 
 
-def _directory_has_any_entry(directory_fd: int) -> bool:
-    """Check one held directory for non-emptiness without materializing it."""
-
-    with os.scandir(directory_fd) as entries:
-        return next(entries, None) is not None
-
-
 def _validate_request(
     payload: bytes,
     parent_fd: int,
@@ -162,159 +143,53 @@ def _validate_request(
     return request, opened
 
 
-def _mkdir_owner_private_at(parent_fd: int, name: str) -> None:
-    """Create one 0700 directory without inheriting a caller's stricter umask."""
-
-    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, BLOCKABLE_SIGNALS)
-    previous_umask: int | None = None
-    try:
-        previous_umask = os.umask(0)
-        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
-    finally:
-        if previous_umask is not None:
-            os.umask(previous_umask)
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-
-
 def _serve_one_request(
     channel: socket.socket,
     payload: bytes,
     parent_descriptors: list[int],
 ) -> None:
     request_id: str | None = None
-    source_name: str | None = None
-    destination_name: str | None = None
-    directory_fd: int | None = None
-    published = False
     parent_fd: int | None = None
     try:
         if len(parent_descriptors) != 1:
             raise ValueError("directory supervisor expected exactly one parent FD")
         parent_fd = parent_descriptors.pop()
-        request, parent_opened = _validate_request(payload, parent_fd)
+        request, _ = _validate_request(payload, parent_fd)
         request_id = str(request["request_id"])
 
-        # The returned object is opened before it is atomically published under
-        # the protocol-visible staging name. The first randomized name remains
-        # private to this supervisor transaction.
-        source_name = f"{SOURCE_PREFIX}{secrets.token_hex(24)}"
-        destination_name = f"{DESTINATION_PREFIX}{secrets.token_hex(24)}"
-        _mkdir_owner_private_at(parent_fd, source_name)
-        directory_fd = os.open(
-            source_name,
-            HELPER._directory_open_flags(),
-            dir_fd=parent_fd,
-        )
-        os.set_inheritable(directory_fd, False)
-        os.fchmod(directory_fd, 0o700)
-        created = os.fstat(directory_fd)
-        source_named = os.stat(
-            source_name,
-            dir_fd=parent_fd,
-            follow_symlinks=False,
-        )
-        if (
-            not stat.S_ISDIR(created.st_mode)
-            or not HELPER._same_identity(created, source_named)
-            or stat.S_IMODE(created.st_mode) != 0o700
-            or created.st_uid != os.geteuid()
-            or _directory_has_any_entry(directory_fd)
-        ):
-            raise RuntimeError("created directory failed the private-source binding")
-
-        HELPER._rename_directory_no_replace_syscall_at(
-            parent_fd,
-            source_name,
-            destination_name,
-        )
-        published = True
-        named = os.stat(
-            destination_name,
-            dir_fd=parent_fd,
-            follow_symlinks=False,
-        )
-        opened_after = os.fstat(directory_fd)
-        parent_after = os.fstat(parent_fd)
-        if (
-            not HELPER._same_identity(created, named)
-            or not HELPER._same_identity(named, opened_after)
-            or HELPER._identity(parent_opened) != HELPER._identity(parent_after)
-            or HELPER._access_policy(parent_opened)
-            != HELPER._access_policy(parent_after)
-            or HELPER._access_policy(created) != HELPER._access_policy(opened_after)
-        ):
-            raise RuntimeError("published directory failed terminal binding")
-
+        # No supported platform API atomically creates a directory and returns
+        # the descriptor for that exact object.  Fail before mkdir rather than
+        # make a probabilistic same-UID exclusion claim.
         _send_response(
             channel,
             {
                 "schema": HELPER.DIRECTORY_CREATOR_RESPONSE_SCHEMA,
                 "request_id": request_id,
-                "status": "created",
-                "basename": destination_name,
-                "proof": {
-                    "schema": "apple-notes-identity-bound-directory-creation/v1",
-                    "creation_authority": (
-                        "packaged-supervisor-open-before-atomic-noreplace-publication"
-                    ),
-                    "actual_created_object_descriptor_returned": True,
-                    "namespace_exclusive_during_handoff": True,
-                    "parent_identity": HELPER._identity(parent_after),
-                    "parent_access_policy": HELPER._access_policy(parent_after),
-                    "directory_identity": HELPER._identity(opened_after),
-                    "directory_access_policy": HELPER._access_policy(opened_after),
-                    "publication_primitive": (
-                        "platform-atomic-directory-rename-no-replace"
-                    ),
-                },
+                "status": HELPER.DIRECTORY_CREATOR_UNAVAILABLE_STATUS,
+                "basename": None,
+                "proof": None,
+                "details": HELPER._packaged_directory_creator_unavailable_details(),
             },
-            directory_fd=directory_fd,
         )
-    except BaseException as exc:
-        failure_basename = destination_name if published else source_name
-        response: dict[str, object] = {
-            "schema": HELPER.DIRECTORY_CREATOR_RESPONSE_SCHEMA,
-            "request_id": request_id,
-            "status": "failed-after-create",
-            "basename": failure_basename,
-            "details": {
-                "mutation_performed": source_name is not None,
-                "retry_safe": False,
-                "cleanup_state": (
-                    "retained" if source_name is not None else "not-needed"
-                ),
-                "creation_authority": (
-                    "packaged-supervisor-open-before-atomic-noreplace-publication"
-                ),
-                "provider_install_state": (
-                    "published" if published else "prepublication"
-                ),
-                "provider_staging_basename": failure_basename,
-                "recovery_locators": {
-                    "packaged_directory_supervisor": {
-                        "stage": "serve-request",
-                        "error": _bounded_error(exc),
-                        "published": published,
-                        "basename": failure_basename,
-                    }
-                },
-            },
-        }
+    except BaseException:
         if request_id is not None:
             try:
                 _send_response(
                     channel,
-                    response,
-                    directory_fd=directory_fd,
+                    {
+                        "schema": HELPER.DIRECTORY_CREATOR_RESPONSE_SCHEMA,
+                        "request_id": request_id,
+                        "status": HELPER.DIRECTORY_CREATOR_UNAVAILABLE_STATUS,
+                        "basename": None,
+                        "proof": None,
+                        "details": (
+                            HELPER._packaged_directory_creator_unavailable_details()
+                        ),
+                    },
                 )
             except BaseException:
                 pass
     finally:
-        if directory_fd is not None:
-            try:
-                os.close(directory_fd)
-            except OSError:
-                pass
         if parent_fd is not None:
             try:
                 os.close(parent_fd)

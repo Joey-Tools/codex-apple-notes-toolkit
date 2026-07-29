@@ -62,6 +62,16 @@ NOTES_STATE_TIMEOUT_SECONDS = 2.0
 NOTES_STATE_TERMINATION_GRACE_SECONDS = 0.25
 DIRECTORY_CREATOR_REQUEST_SCHEMA = "apple-notes-directory-creator-request/v1"
 DIRECTORY_CREATOR_RESPONSE_SCHEMA = "apple-notes-directory-creator-response/v1"
+DIRECTORY_CREATOR_UNAVAILABLE_STATUS = "unavailable-before-create"
+PACKAGED_DIRECTORY_CREATOR_AUTHORITY = (
+    "packaged-supervisor-platform-primitive-unavailable"
+)
+PACKAGED_DIRECTORY_CREATOR_UNSUPPORTED_PRIMITIVES = (
+    "mkdir-then-open",
+    "mkdirat-then-openat",
+    "mkdtemp-then-open",
+    "mkdtempat_np-then-openat",
+)
 DIRECTORY_CREATOR_MAX_MESSAGE_BYTES = 64 * 1024
 DIRECTORY_CREATOR_MAX_RECEIVED_FDS = 8
 DIRECTORY_CREATOR_TIMEOUT_SECONDS = 5.0
@@ -361,7 +371,7 @@ class _IdentityBoundDirectoryCreationFailure(RuntimeError):
 
 
 class _IdentityBoundDirectoryCreatorUnavailable(RuntimeError):
-    """Report that no trusted supervisor request could be started."""
+    """Report that no trusted creation capability entered a mutation boundary."""
 
     def __init__(
         self,
@@ -436,12 +446,11 @@ SOURCE_FILE_CODES = _FileProtectionCodes(
 
 # POSIX mkdir(2), mkdirat(2), and Darwin mkdtempat_np(3) return no directory
 # descriptor.  A later open cannot prove that it names the object created by
-# the earlier call.  The packaged production integration therefore uses only
-# an inherited, already-connected AF_UNIX/SOCK_DGRAM supervisor channel.  The
-# helper transfers the held parent FD with SCM_RIGHTS and accepts only the
-# directory FD that the trusted supervisor held continuously from its own
-# identity-preserving creation boundary.  It never reconnects by socket path
-# or treats a local mkdir-then-open sequence as proof.
+# the earlier call.  The packaged supervisor therefore returns a closed
+# pre-creation capability receipt on currently supported platforms.  The
+# inherited AF_UNIX/SOCK_DGRAM channel remains available to a stronger external
+# authority that can return the actual created-object FD.  The helper never
+# reconnects by socket path or treats a local mkdir-then-open sequence as proof.
 # A provider that raises after entering its creation boundary must use
 # _IdentityBoundDirectoryCreationFailure and transfer any created name, open
 # descriptor, creation stat, proof, and recovery details.  Unstructured
@@ -969,6 +978,79 @@ def _normalize_directory_creator_response_evidence(
     )
 
 
+def _packaged_directory_creator_unavailable_details() -> dict[str, Any]:
+    """Return the exact no-mutation capability receipt shared with the launcher."""
+
+    return {
+        "mutation_performed": False,
+        "cleanup_state": "not-needed",
+        "retry_safe": False,
+        "creation_authority": PACKAGED_DIRECTORY_CREATOR_AUTHORITY,
+        "provider_install_state": "not-created",
+        "recovery_locators": {
+            "packaged_directory_supervisor": {
+                "schema": ("apple-notes-packaged-directory-supervisor-capability/v1"),
+                "protected_property": "exact-created-object-descriptor",
+                "stage": "platform-capability-preflight",
+                "platform": sys.platform,
+                "creation_boundary_entered": False,
+                "unsupported_primitives": list(
+                    PACKAGED_DIRECTORY_CREATOR_UNSUPPORTED_PRIMITIVES
+                ),
+            }
+        },
+    }
+
+
+def _validate_precreation_unavailable_response(
+    response: dict[str, Any],
+    *,
+    request_id: str,
+    received_descriptor_count: int,
+) -> dict[str, Any] | None:
+    """Accept only the packaged supervisor's exact closed no-mutation receipt."""
+
+    if response.get("status") != DIRECTORY_CREATOR_UNAVAILABLE_STATUS:
+        return None
+    expected_details = _packaged_directory_creator_unavailable_details()
+    try:
+        provider_details_json = json.dumps(
+            response.get("details"),
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        expected_details_json = json.dumps(
+            expected_details,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return None
+    if (
+        set(response)
+        != {
+            "schema",
+            "request_id",
+            "status",
+            "basename",
+            "proof",
+            "details",
+        }
+        or response.get("schema") != DIRECTORY_CREATOR_RESPONSE_SCHEMA
+        or response.get("request_id") != request_id
+        or response.get("basename") is not None
+        or response.get("proof") is not None
+        or received_descriptor_count != 0
+        or provider_details_json != expected_details_json
+    ):
+        return None
+    return expected_details
+
+
 def _directory_creator_transport_failure_base_details(
     *,
     request_id: str,
@@ -1260,6 +1342,24 @@ def _supervisor_identity_bound_directory_creator(
                     "The directory-creator supervisor response is not bound to "
                     "the current request.",
                     stage="response-validate",
+                )
+            if response.get("status") == DIRECTORY_CREATOR_UNAVAILABLE_STATUS:
+                unavailable_details = _validate_precreation_unavailable_response(
+                    response,
+                    request_id=request_id,
+                    received_descriptor_count=len(received_descriptors),
+                )
+                if unavailable_details is None:
+                    after_request_failure(
+                        "The directory-creator supervisor returned a malformed "
+                        "pre-creation capability receipt.",
+                        stage="response-validate",
+                    )
+                raise _IdentityBoundDirectoryCreatorUnavailable(
+                    "The packaged directory-creator supervisor has no platform "
+                    "primitive that can atomically return the exact newly "
+                    "created directory descriptor.",
+                    details=unavailable_details,
                 )
             if response.get("status") != "created":
                 after_request_failure(
@@ -5227,10 +5327,16 @@ def _create_identity_bound_directory_at(
             parent_fd=parent_fd,
         )
     except _IdentityBoundDirectoryCreatorUnavailable as exc:
+        reported_authority = exc.details.get("creation_authority")
+        creation_authority = (
+            reported_authority
+            if isinstance(reported_authority, str) and reported_authority
+            else "supervisor-channel-unavailable"
+        )
         raise StoreSafetyError(
             "directory-creation-identity-inconclusive",
-            "This runtime has no usable trusted directory-creator supervisor "
-            "channel; refusing mkdir-then-open: "
+            "This runtime has no usable trusted directory-creation capability; "
+            "refusing mkdir-then-open: "
             f"{display_path}: {exc}",
             details=_merge_recovery_details(
                 exc.details,
@@ -5238,13 +5344,10 @@ def _create_identity_bound_directory_at(
                     "mutation_performed": False,
                     "cleanup_state": "not-needed",
                     "retry_safe": False,
-                    "creation_authority": "supervisor-channel-unavailable",
-                    "unsupported_fallbacks": [
-                        "mkdir-then-open",
-                        "mkdirat-then-openat",
-                        "mkdtemp-then-open",
-                        "mkdtempat_np-then-openat",
-                    ],
+                    "creation_authority": creation_authority,
+                    "unsupported_fallbacks": list(
+                        PACKAGED_DIRECTORY_CREATOR_UNSUPPORTED_PRIMITIVES
+                    ),
                 },
             ),
         ) from exc

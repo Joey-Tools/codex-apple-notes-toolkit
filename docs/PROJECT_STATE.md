@@ -9,11 +9,11 @@
 - `merge-db` defaults copied-snapshot outputs outside the snapshot and rejects lexical, canonical-alias, or descriptor ancestry overlap.
 - Copy, validation, recovery, and writeback APIs/CLIs freeze each related artifact, receipt, output, and container path set from one entry CWD before probes or callbacks.
 - Prepared/artifact directory scans reject unexpected raw names before `stat` and enforce 64-entry and 4-KiB raw-name limits per pass.
-- Retained-partial inventory lazily stops at the 65th descriptor-relative entry or 4-KiB aggregate raw-name ceiling, and supervisor emptiness checks consume at most one entry.
+- Retained-partial inventory lazily stops at the 65th descriptor-relative entry or 4-KiB aggregate raw-name ceiling.
 - Darwin access policy tracks only immutable, append-only, Data Vault, restricted, and no-unlink flags; other raw file flags remain metadata evidence.
 - Manifest and external-receipt JSON parsing has fixed nesting and integer-digit limits with stable safety-error classifications.
 - File and directory publication use a monotonic commit latch before post-rename evidence work.
-- Write-producing wrapper commands automatically launch the packaged supervisor while retaining the inherited-FD interface for stronger external authorities.
+- Write-producing wrapper commands automatically launch a packaged pre-creation capability gate. It performs no directory mutation on current macOS/Linux runtimes; the inherited-FD interface remains available for stronger external authorities.
 - The legacy Python compatibility entrypoint is import-safe, retains its public exports, and routes every write-producing CLI command through that same supervisor.
 - Required-quit snapshots recheck Notes at the final pre-rename and immediate post-publication boundaries; a late restart quarantines the exact published object and cannot produce a writeback-grade receipt.
 - A visible quarantine rename is not reported as verified or retained until directory policy, parent durability, complete-tree, and terminal-alias proofs all succeed.

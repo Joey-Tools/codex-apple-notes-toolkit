@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import unittest
@@ -310,6 +311,109 @@ class AppleNotesHelperTests(unittest.TestCase):
             finally:
                 if directory_fd is not None:
                     os.close(directory_fd)
+                os.close(parent_fd)
+
+    @staticmethod
+    def _serve_packaged_directory_creator_once(server_fd: int) -> None:
+        """Serve one request through the real packaged capability gate."""
+
+        with socket.socket(fileno=server_fd) as supervisor:
+            supervisor.settimeout(10.0)
+            payload, ancillary, flags, _ = supervisor.recvmsg(
+                MODULE.DIRECTORY_CREATOR_MAX_MESSAGE_BYTES,
+                socket.CMSG_SPACE(
+                    array.array("i").itemsize
+                    * MODULE.DIRECTORY_CREATOR_MAX_RECEIVED_FDS
+                ),
+            )
+            if flags & (
+                getattr(socket, "MSG_TRUNC", 0) | getattr(socket, "MSG_CTRUNC", 0)
+            ):
+                raise RuntimeError("packaged supervisor test request was truncated")
+            parent_descriptors = MODULE._received_rights_descriptors(ancillary)
+            SUPERVISOR_MODULE._serve_one_request(
+                supervisor,
+                payload,
+                parent_descriptors,
+            )
+
+    @staticmethod
+    def _serve_malformed_precreation_unavailable_response(
+        server_fd: int,
+        *,
+        malformed_kind: str,
+    ) -> None:
+        """Return a near-match that must not inherit the no-mutation claim."""
+
+        with socket.socket(fileno=server_fd) as supervisor:
+            supervisor.settimeout(10.0)
+            payload, ancillary, flags, _ = supervisor.recvmsg(
+                MODULE.DIRECTORY_CREATOR_MAX_MESSAGE_BYTES,
+                socket.CMSG_SPACE(
+                    array.array("i").itemsize
+                    * MODULE.DIRECTORY_CREATOR_MAX_RECEIVED_FDS
+                ),
+            )
+            if flags & (
+                getattr(socket, "MSG_TRUNC", 0) | getattr(socket, "MSG_CTRUNC", 0)
+            ):
+                raise RuntimeError("malformed supervisor test request was truncated")
+            parent_descriptors = MODULE._received_rights_descriptors(ancillary)
+            if len(parent_descriptors) != 1:
+                MODULE._close_descriptors(parent_descriptors)
+                raise RuntimeError("malformed supervisor expected one parent FD")
+            parent_fd = parent_descriptors.pop()
+            returned_fd: int | None = None
+            try:
+                request = json.loads(payload.decode("utf-8"))
+                response: dict[str, object] = {
+                    "schema": MODULE.DIRECTORY_CREATOR_RESPONSE_SCHEMA,
+                    "request_id": request["request_id"],
+                    "status": MODULE.DIRECTORY_CREATOR_UNAVAILABLE_STATUS,
+                    "basename": None,
+                    "proof": None,
+                    "details": MODULE._packaged_directory_creator_unavailable_details(),
+                }
+                if malformed_kind == "returned-descriptor":
+                    returned_fd = os.dup(parent_fd)
+                elif malformed_kind == "basename":
+                    response["basename"] = ".apple-notes-create-unproved"
+                elif malformed_kind == "proof":
+                    response["proof"] = {
+                        "actual_created_object_descriptor_returned": False,
+                    }
+                elif malformed_kind in {"details", "details-bool-int"}:
+                    response_details = json.loads(json.dumps(response["details"]))
+                    if malformed_kind == "details":
+                        response_details["mutation_performed"] = True
+                    else:
+                        response_details["mutation_performed"] = 0
+                        response_details["recovery_locators"][
+                            "packaged_directory_supervisor"
+                        ]["creation_boundary_entered"] = 0
+                    response["details"] = response_details
+                elif malformed_kind == "extra-field":
+                    response["unexpected"] = True
+                else:
+                    raise AssertionError(
+                        f"unsupported malformed kind: {malformed_kind}"
+                    )
+                encoded = json.dumps(response, separators=(",", ":")).encode("utf-8")
+                ancillary_response = (
+                    [
+                        (
+                            socket.SOL_SOCKET,
+                            socket.SCM_RIGHTS,
+                            array.array("i", [returned_fd]),
+                        )
+                    ]
+                    if returned_fd is not None
+                    else []
+                )
+                supervisor.sendmsg([encoded], ancillary_response)
+            finally:
+                if returned_fd is not None:
+                    os.close(returned_fd)
                 os.close(parent_fd)
 
     def _copy_db(
@@ -713,7 +817,7 @@ raise SystemExit(2)
         self.assertTrue(manifest_exists)
         self.assertTrue(database_exists)
 
-    def test_shell_wrapper_launches_packaged_directory_supervisor(self) -> None:
+    def test_shell_wrapper_packaged_supervisor_fails_before_creation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             paths = self._make_paths(root)
@@ -756,18 +860,22 @@ raise SystemExit(2)
                 json.loads(stage_result.stdout) if stage_result.stdout else {}
             )
             stage_exists = (stage / MODULE.NOTE_STORE_MAIN).is_file()
-            supervisor_source_residue = list(
-                root.rglob(".apple-notes-create-supervisor-source-*")
-            )
+            supervisor_residue = list(root.rglob(".apple-notes-create-*"))
 
         self.assertEqual(
             stage_result.returncode,
-            0,
+            1,
             msg=stage_result.stdout + stage_result.stderr,
         )
-        self.assertEqual(Path(stage_payload["stage_dir"]), stage)
-        self.assertTrue(stage_exists)
-        self.assertEqual(supervisor_source_residue, [])
+        self.assertEqual(
+            stage_payload["error_code"],
+            "directory-creation-identity-inconclusive",
+        )
+        self.assertFalse(stage_exists)
+        self.assertFalse(stage.exists())
+        self.assertFalse(stage_payload["details"]["mutation_performed"])
+        self.assertEqual(stage_payload["details"]["cleanup_state"], "not-needed")
+        self.assertEqual(supervisor_residue, [])
 
         # The fixed pgrep probe is deliberately fail-closed. Exercise copy-db
         # through the same production launcher only when this test runtime can
@@ -812,11 +920,17 @@ raise SystemExit(2)
             ).is_file()
         self.assertEqual(
             copy_result.returncode,
-            0,
+            1,
             msg=copy_result.stdout + copy_result.stderr,
         )
-        self.assertEqual(Path(copy_payload["dest"]), snapshot)
-        self.assertTrue(snapshot_exists)
+        self.assertEqual(
+            copy_payload["error_code"],
+            "directory-creation-identity-inconclusive",
+        )
+        self.assertFalse(snapshot_exists)
+        self.assertFalse(snapshot.exists())
+        self.assertFalse(copy_payload["details"]["mutation_performed"])
+        self.assertEqual(copy_payload["details"]["cleanup_state"], "not-needed")
 
     def test_packaged_directory_supervisor_bounds_signal_teardown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1067,127 +1181,98 @@ raise SystemExit(2)
                 SUPERVISOR_MODULE.WAIT_STATUS_UNAVAILABLE,
             )
 
-    def test_supervisor_scopes_strict_umask_and_restores(self) -> None:
+    def test_packaged_supervisor_fails_before_same_uid_mkdir_open_replacement(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-            original_umask = os.umask(0o777)
-            try:
-                SUPERVISOR_MODULE._mkdir_owner_private_at(
-                    parent_fd,
-                    "created",
-                )
-                restored_umask = os.umask(original_umask)
-            finally:
-                os.umask(original_umask)
-                os.close(parent_fd)
-            created_mode = stat.S_IMODE(
-                os.stat(root / "created", follow_symlinks=False).st_mode
+            client, server = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_DGRAM,
             )
+            request_id = "same-uid-mkdir-open-replacement"
+            parent = os.fstat(parent_fd)
+            request = json.dumps(
+                {
+                    "schema": MODULE.DIRECTORY_CREATOR_REQUEST_SCHEMA,
+                    "request_id": request_id,
+                    "operation": "create-owner-private-directory",
+                    "prefix": ".apple-notes-create-",
+                    "mode": 0o700,
+                    "expected_uid": os.geteuid(),
+                    "parent_identity": MODULE._identity(parent),
+                    "parent_access_policy": MODULE._access_policy(parent),
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            original_mkdir = os.mkdir
+            original_open = os.open
 
-        self.assertEqual(restored_umask, 0o777)
-        self.assertEqual(created_mode, 0o700)
+            def replace_after_mkdir(
+                name: str,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> None:
+                assert dir_fd is not None
+                original_mkdir(name, mode=mode, dir_fd=dir_fd)
+                os.rename(
+                    name,
+                    "attacker-parked-created-object",
+                    src_dir_fd=dir_fd,
+                    dst_dir_fd=dir_fd,
+                )
+                original_mkdir(name, mode=0o700, dir_fd=dir_fd)
 
-        original_umask = os.umask(0o777)
-        try:
-            with (
-                mock.patch.object(
-                    SUPERVISOR_MODULE.os,
-                    "mkdir",
-                    side_effect=OSError(errno.EIO, "simulated mkdir failure"),
-                ),
-                self.assertRaises(OSError),
-            ):
-                SUPERVISOR_MODULE._mkdir_owner_private_at(-1, "failed")
-            restored_after_failure = os.umask(original_umask)
-        finally:
-            os.umask(original_umask)
-        self.assertEqual(restored_after_failure, 0o777)
-
-        observed_handler_masks: list[int] = []
-        original_handler = signal.getsignal(signal.SIGUSR1)
-        original_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGUSR1})
-        original_umask = os.umask(0o077)
-        original_mkdir = os.mkdir
-
-        def observe_umask(_signum: int, _frame: object) -> None:
-            observed = os.umask(0o077)
-            os.umask(observed)
-            observed_handler_masks.append(observed)
-
-        def mkdir_after_signal(*args: object, **kwargs: object) -> None:
-            os.kill(os.getpid(), signal.SIGUSR1)
-            original_mkdir(*args, **kwargs)
-
-        try:
-            signal.signal(signal.SIGUSR1, observe_umask)
-            with tempfile.TemporaryDirectory() as temp_dir:
-                parent_fd = os.open(temp_dir, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    with mock.patch.object(
+            try:
+                with (
+                    mock.patch.object(
                         SUPERVISOR_MODULE.os,
                         "mkdir",
-                        side_effect=mkdir_after_signal,
-                    ):
-                        SUPERVISOR_MODULE._mkdir_owner_private_at(
-                            parent_fd,
-                            "signal-safe",
-                        )
-                finally:
-                    os.close(parent_fd)
-        finally:
-            os.umask(original_umask)
-            signal.signal(signal.SIGUSR1, original_handler)
-            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+                        side_effect=replace_after_mkdir,
+                    ) as mkdir,
+                    mock.patch.object(
+                        SUPERVISOR_MODULE.os,
+                        "open",
+                        side_effect=original_open,
+                    ) as open_directory,
+                ):
+                    SUPERVISOR_MODULE._serve_one_request(
+                        server,
+                        request,
+                        [os.dup(parent_fd)],
+                    )
+                payload, ancillary, flags, _ = client.recvmsg(
+                    MODULE.DIRECTORY_CREATOR_MAX_MESSAGE_BYTES,
+                    socket.CMSG_SPACE(
+                        array.array("i").itemsize
+                        * MODULE.DIRECTORY_CREATOR_MAX_RECEIVED_FDS
+                    ),
+                )
+            finally:
+                client.close()
+                server.close()
+                os.close(parent_fd)
+            root_entries = list(root.iterdir())
 
-        self.assertEqual(observed_handler_masks, [0o077])
-
-    def test_supervisor_empty_check_consumes_only_the_first_entry(self) -> None:
-        class LazyEntries:
-            def __init__(self, total: int) -> None:
-                self.total = total
-                self.yielded = 0
-                self.closed = False
-
-            def __enter__(self) -> LazyEntries:
-                return self
-
-            def __exit__(
-                self,
-                exc_type: object,
-                exc: object,
-                traceback: object,
-            ) -> None:
-                self.closed = True
-
-            def __iter__(self) -> LazyEntries:
-                return self
-
-            def __next__(self) -> object:
-                if self.yielded >= self.total:
-                    raise StopIteration
-                self.yielded += 1
-                return object()
-
-        populated = LazyEntries(1_000_000)
-        with mock.patch.object(
-            SUPERVISOR_MODULE.os,
-            "scandir",
-            return_value=populated,
-        ):
-            self.assertTrue(SUPERVISOR_MODULE._directory_has_any_entry(123))
-        self.assertEqual(populated.yielded, 1)
-        self.assertTrue(populated.closed)
-
-        empty = LazyEntries(0)
-        with mock.patch.object(
-            SUPERVISOR_MODULE.os,
-            "scandir",
-            return_value=empty,
-        ):
-            self.assertFalse(SUPERVISOR_MODULE._directory_has_any_entry(123))
-        self.assertEqual(empty.yielded, 0)
-        self.assertTrue(empty.closed)
+        mkdir.assert_not_called()
+        open_directory.assert_not_called()
+        self.assertEqual(flags, 0)
+        self.assertEqual(MODULE._received_rights_descriptors(ancillary), [])
+        response = json.loads(payload.decode("utf-8"))
+        self.assertEqual(
+            response,
+            {
+                "schema": MODULE.DIRECTORY_CREATOR_RESPONSE_SCHEMA,
+                "request_id": request_id,
+                "status": MODULE.DIRECTORY_CREATOR_UNAVAILABLE_STATUS,
+                "basename": None,
+                "proof": None,
+                "details": MODULE._packaged_directory_creator_unavailable_details(),
+            },
+        )
+        self.assertEqual(root_entries, [])
 
     def test_creator_cli_safely_publishes_external_result_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2942,7 +3027,7 @@ raise SystemExit(2)
             MODULE.NoteStorePaths().note_store_files(),
         )
 
-    def test_compatibility_main_supervises_every_write_producing_command(
+    def test_compatibility_main_routes_writes_through_packaged_capability_gate(
         self,
     ) -> None:
         spec = importlib.util.spec_from_file_location(
@@ -3066,7 +3151,9 @@ raise SystemExit(2)
         self.assertEqual(Path(payload["merged_db"]), output)
         self.assertEqual(Path(payload["standalone_db"]), output)
 
-    def test_compatibility_copy_cli_launches_packaged_supervisor(self) -> None:
+    def test_compatibility_copy_cli_packaged_supervisor_fails_before_creation(
+        self,
+    ) -> None:
         process_probe = subprocess.run(
             [MODULE.NOTES_PGREP_PATH, "-x", "Notes"],
             check=False,
@@ -3108,11 +3195,17 @@ raise SystemExit(2)
 
         self.assertEqual(
             result.returncode,
-            0,
+            1,
             msg=result.stdout + result.stderr,
         )
-        self.assertEqual(Path(payload["dest"]), destination)
-        self.assertTrue(copied)
+        self.assertEqual(
+            payload["error_code"],
+            "directory-creation-identity-inconclusive",
+        )
+        self.assertFalse(copied)
+        self.assertFalse(destination.exists())
+        self.assertFalse(payload["details"]["mutation_performed"])
+        self.assertEqual(payload["details"]["cleanup_state"], "not-needed")
 
     def test_merge_default_output_is_external_to_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3922,6 +4015,192 @@ raise SystemExit(2)
                 "creation-identity-inconclusive",
             )
             self.assertIsNone(recovery["creation_proof"])
+
+    def test_packaged_supervisor_capability_failure_is_precreation_end_to_end(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, server = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_DGRAM,
+            )
+            service_errors: list[BaseException] = []
+
+            def serve_once() -> None:
+                try:
+                    self._serve_packaged_directory_creator_once(server.detach())
+                except BaseException as exc:
+                    service_errors.append(exc)
+
+            service = threading.Thread(target=serve_once, daemon=True)
+            service.start()
+            parent_fd = os.open(root, MODULE._directory_open_flags())
+            try:
+                with (
+                    MODULE.directory_creator_supervisor(client.fileno()),
+                    mock.patch.object(
+                        MODULE,
+                        "_IDENTITY_BOUND_DIRECTORY_CREATOR",
+                        MODULE._supervisor_identity_bound_directory_creator,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE._create_and_install_directory_at(
+                        parent_fd,
+                        os.fstat(parent_fd),
+                        "installed",
+                        display_path=root / "installed",
+                        revalidate_scope=None,
+                        identity_code="prepared-directory-identity-mismatch",
+                        access_policy_code=(
+                            "prepared-directory-access-policy-mismatch"
+                        ),
+                        inconclusive_code=(
+                            "prepared-directory-revalidation-inconclusive"
+                        ),
+                        collision_code="prepared-directory-identity-mismatch",
+                    )
+            finally:
+                os.close(parent_fd)
+                client.close()
+                service.join(timeout=10.0)
+
+            self.assertFalse(service.is_alive())
+            self.assertEqual(service_errors, [])
+            self._assert_safety_code(
+                "directory-creation-identity-inconclusive",
+                raised,
+            )
+            self.assertEqual(list(root.iterdir()), [])
+            details = raised.exception.details
+            self.assertFalse(details["mutation_performed"])
+            self.assertFalse(details["retry_safe"])
+            self.assertEqual(details["cleanup_state"], "not-needed")
+            self.assertEqual(
+                details["creation_authority"],
+                MODULE.PACKAGED_DIRECTORY_CREATOR_AUTHORITY,
+            )
+            self.assertEqual(details["provider_install_state"], "not-created")
+            capability = details["recovery_locators"]["packaged_directory_supervisor"]
+            self.assertEqual(
+                capability["protected_property"],
+                "exact-created-object-descriptor",
+            )
+            self.assertFalse(capability["creation_boundary_entered"])
+            install = details["recovery_locators"]["created_directory_install"]
+            self.assertEqual(install["install_state"], "not-created")
+            self.assertFalse(install["mutation_performed"])
+            self.assertIsNone(install["creation_proof"])
+
+    def test_malformed_precreation_unavailable_response_is_conservative(
+        self,
+    ) -> None:
+        malformed_kinds = (
+            "returned-descriptor",
+            "basename",
+            "proof",
+            "details",
+            "details-bool-int",
+            "extra-field",
+        )
+        for malformed_kind in malformed_kinds:
+            with (
+                self.subTest(malformed_kind=malformed_kind),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                client, server = socket.socketpair(
+                    socket.AF_UNIX,
+                    socket.SOCK_DGRAM,
+                )
+                service_errors: list[BaseException] = []
+                received_descriptors: list[int] = []
+                original_received_rights = MODULE._received_rights_descriptors
+
+                def capture_received_rights(
+                    ancillary: list[tuple[int, int, bytes]],
+                ) -> list[int]:
+                    descriptors = original_received_rights(ancillary)
+                    received_descriptors.extend(descriptors)
+                    return descriptors
+
+                def serve_once() -> None:
+                    try:
+                        self._serve_malformed_precreation_unavailable_response(
+                            server.detach(),
+                            malformed_kind=malformed_kind,
+                        )
+                    except BaseException as exc:
+                        service_errors.append(exc)
+
+                service = threading.Thread(target=serve_once, daemon=True)
+                parent_fd = os.open(root, MODULE._directory_open_flags())
+                try:
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_received_rights_descriptors",
+                            side_effect=capture_received_rights,
+                        ),
+                        MODULE.directory_creator_supervisor(client.fileno()),
+                        mock.patch.object(
+                            MODULE,
+                            "_IDENTITY_BOUND_DIRECTORY_CREATOR",
+                            MODULE._supervisor_identity_bound_directory_creator,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        service.start()
+                        MODULE._create_and_install_directory_at(
+                            parent_fd,
+                            os.fstat(parent_fd),
+                            "installed",
+                            display_path=root / "installed",
+                            revalidate_scope=None,
+                            identity_code=("prepared-directory-identity-mismatch"),
+                            access_policy_code=(
+                                "prepared-directory-access-policy-mismatch"
+                            ),
+                            inconclusive_code=(
+                                "prepared-directory-revalidation-inconclusive"
+                            ),
+                            collision_code=("prepared-directory-identity-mismatch"),
+                        )
+                finally:
+                    os.close(parent_fd)
+                    client.close()
+                    if service.ident is not None:
+                        service.join(timeout=10.0)
+
+                self.assertFalse(service.is_alive())
+                self.assertEqual(service_errors, [])
+                self._assert_safety_code(
+                    "directory-creation-identity-inconclusive",
+                    raised,
+                )
+                self.assertEqual(list(root.iterdir()), [])
+                details = raised.exception.details
+                self.assertTrue(details["mutation_performed"])
+                self.assertFalse(details["retry_safe"])
+                self.assertEqual(details["cleanup_state"], "inconclusive")
+                self.assertEqual(details["publication_state"], "uncertain")
+                self.assertEqual(
+                    details["creation_authority"],
+                    "inherited-supervisor-channel",
+                )
+                self.assertEqual(
+                    details["provider_install_state"],
+                    "supervisor-request-started",
+                )
+                self.assertIn(
+                    "directory_creator_supervisor",
+                    details["recovery_locators"],
+                )
+                for descriptor in received_descriptors:
+                    with self.assertRaises(OSError) as closed:
+                        os.fstat(descriptor)
+                    self.assertEqual(closed.exception.errno, errno.EBADF)
 
     def test_structured_creator_create_then_fail_retains_conservative_evidence(
         self,

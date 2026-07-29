@@ -34,10 +34,11 @@ returns the already-open object descriptor and an exclusive-handoff
 attestation. A later `open` after `mkdir` is never accepted as creation proof.
 The packaged launcher creates an inherited, already-connected
 `AF_UNIX`/`SOCK_DGRAM` supervisor channel and starts the DB helper with
-`--directory-creator-fd`. The service opens a randomized private source,
-atomically publishes that held object under the randomized returned name with
-the platform no-replace primitive, and holds its FD through the response. The
-shell wrapper and the legacy-compatible `scripts/apple_notes_helper.py`
+`--directory-creator-fd`. Current macOS and Linux public APIs provide no atomic
+directory-create-and-return-FD primitive, so the packaged service validates
+the request and returns a closed `unavailable-before-create` receipt without
+calling `mkdir`/`open` or sending a directory descriptor. The shell wrapper
+and the legacy-compatible `scripts/apple_notes_helper.py`
 entrypoint select this production launcher automatically for write-producing
 commands; callers may still provide a stronger inherited supervisor channel.
 Importing the Python compatibility module remains side-effect free.
@@ -48,18 +49,18 @@ owns raw-waitpid children, and keeps later signals from interrupting bounded
 worker/service reap. An unexpected `ECHILD` fails the launcher conservatively
 without bypassing cleanup or signaling a possibly reused PID. It consumes one
 pending-signal snapshot before restoring and re-delivering the first signal.
-Its dedicated service blocks every blockable signal, scopes `umask(0)` only to
-`mkdir(0700)`, restores the exact inherited umask, and only then restores the
-signal mask.
-It transfers the held parent FD with `SCM_RIGHTS` and accepts only the
-supervisor's continuously held directory FD plus a request-bound attestation;
-it never reconnects by socket path. Without that capability, creation fails
-before mutation with `directory-creation-identity-inconclusive`. The held
-object is installed at the target name with atomic no-replace rename. Identity
-and access policy are revalidated around carried scope checks; failed installs
-retain structured evidence instead of using a racy name-based directory
-cleanup. A trusted creator that fails after creation transfers the created
-name, descriptor, creation stat, proof, and recovery details through a
+It transfers the held parent FD with `SCM_RIGHTS`; a stronger external
+authority may return the actual created-object FD plus a request-bound
+attestation, while the packaged capability refusal returns none. The client
+accepts the packaged no-mutation receipt only in its exact typed closed form;
+malformed near-matches remain conservative possible-mutation failures. It
+never reconnects by socket path. Without a stronger authority, creation fails
+before filesystem mutation with `directory-creation-identity-inconclusive`.
+A held object is installed at the target name with atomic no-replace rename.
+Identity and access policy are revalidated around carried scope checks; failed
+installs retain structured evidence instead of using a racy name-based
+directory cleanup. A trusted creator that fails after creation transfers the
+created name, descriptor, creation stat, proof, and recovery details through a
 structured exception. A normal return of `None`, missing fields, or wrong
 field types is also treated as possibly post-mutation: recoverable FDs are
 captured and closed, cleanup stays worst-case, and recovery locators are

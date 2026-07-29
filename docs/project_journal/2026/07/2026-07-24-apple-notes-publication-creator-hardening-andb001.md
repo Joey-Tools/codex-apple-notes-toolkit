@@ -16,6 +16,9 @@ superseded_by:
 
 - Closed three fail-closed gaps in untrusted leaf opening, post-rename publication classification, and identity-bound directory creation failure recovery.
 - Closed the follow-up production gap by adding a packaged inherited-supervisor creator protocol and conservative malformed-result ownership handling.
+- Closed the packaged-supervisor same-UID replacement gap by turning the
+  bundled service into a strict pre-creation capability gate while retaining
+  the inherited-FD protocol for stronger external authorities.
 - Closed the final fresh-review gaps in anonymous recovered-image binding, exact SQLite header normalization, and structured native SQLite cleanup.
 - Closed the formal single-review gaps in shell-redirection receipt creation, post-write access-policy baselines, and ctypes row-callback exception propagation.
 - Closed the final formal follow-up gaps in cross-root creator-result alias binding, post-result-commit teardown classification, and standalone pre-write access-policy binding.
@@ -515,6 +518,44 @@ superseded_by:
   post-rename quarantine-proof failures.
 - Full regressions: Python `3.13.0` and system Python `3.9.6` each passed all
   `301` tests with two sandbox-scoped skips for the fixed `/usr/bin/pgrep`
+  process probe.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.
+- Packaged-supervisor creation-identity follow-up base:
+  `82983f1c071e8ce559a750624f175643759d79bb`.
+- A fresh named-single review proved that the old bundled service could not
+  attest the object returned by `mkdir`: a same-UID process could move that
+  object and install a same-owner mode-`0700` replacement before the service's
+  later `open`, after which every FD/name/stat check described only the
+  replacement.
+- Platform capability review found no public macOS or Linux primitive that
+  atomically creates a directory and returns the FD for that exact new object.
+  `mkdir`, `mkdirat`, `mkdtemp`, and `mkdtempat_np` all require a later
+  name-based open; file-creation primitives do not create directories.
+- The packaged service now validates the request and returns an exact typed
+  `unavailable-before-create` receipt without `mkdir`, `open`, or a returned
+  descriptor. The client accepts the no-mutation claim only for the closed
+  schema, request nonce, null basename/proof, zero FDs, and canonical JSON
+  details reconstructed locally. Every near-match remains
+  `mutation_performed: true`, `publication_state: uncertain`, and
+  `cleanup_state: inconclusive`.
+- Explicit `--directory-creator-fd` remains the success path for a genuinely
+  stronger platform or privileged authority. The default shell and
+  compatibility launchers remain lifecycle-safe capability gates and fail
+  before filesystem mutation when creation is required.
+- Deterministic regressions intercept the former mkdir boundary, park the
+  original object, install a same-UID replacement, and allow the subsequent
+  real open; the fixed service invokes neither operation. End-to-end tests
+  verify the pre-creation receipt and conservative handling of returned FDs,
+  basename/proof fields, changed details, bool-as-int details, and unknown
+  fields.
+- Focused regressions: Python `3.13.0` and system Python `3.9.6` each passed
+  all eight tests with two sandbox-scoped skips for the fixed `/usr/bin/pgrep`
+  process probe.
+- Full regressions: Python `3.13.0` and system Python `3.9.6` each passed all
+  `302` tests with two sandbox-scoped skips for the fixed `/usr/bin/pgrep`
   process probe.
 - Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
   Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
