@@ -430,3 +430,22 @@ superseded_by:
   Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
   `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
   `git diff --check`.
+- Retained-partial bounded-enumeration follow-up base:
+  `95938d7671fbe39760a33927904bc5b62dcbe263`.
+- Retained sensitive-partial inventories now enumerate lazily through held
+  directory descriptors, apply one 64-entry and 4-KiB aggregate raw-name
+  budget across each complete recursive pass, and stop on the 65th item before
+  metadata lookup. Oversized recovery evidence keeps the original failure
+  primary and returns only bounded structured namespace/parent locators.
+- The packaged creator supervisor's source-directory emptiness proof reads at
+  most one descriptor-relative entry instead of materializing the directory.
+- Focused regressions: Python `3.13.0` and system Python `3.9.6` each passed
+  seven tests covering lazy million-entry supervisor input, a simulated
+  65,536-entry retained inventory, raw-name byte overflow, and the existing
+  root/leaf replacement plus inventory-error classifications.
+- Full regressions: Python `3.13.0` and system Python `3.9.6` each passed all
+  `288` tests with the single sandbox-scoped fixed `/usr/bin/pgrep` skip.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.

@@ -6336,7 +6336,8 @@ def _inventory_file_type(mode: int) -> str:
 def _scan_sensitive_partial_inventory(
     binding: _BoundDirectory,
     *,
-    max_entries: int = 64,
+    max_entries: int = BOUND_DIRECTORY_SCAN_MAX_ENTRIES,
+    max_raw_name_bytes: int = BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES,
     max_depth: int = 4,
 ) -> list[dict[str, Any]]:
     """Inventory a retained partial without following any child links."""
@@ -6346,6 +6347,7 @@ def _scan_sensitive_partial_inventory(
         relative_parent: Path,
         depth: int,
         records: list[dict[str, Any]],
+        scan_state: dict[str, int],
     ) -> None:
         if depth > max_depth:
             raise StoreSafetyError(
@@ -6353,24 +6355,78 @@ def _scan_sensitive_partial_inventory(
                 "Retained partial exceeds the descriptor-safe inventory depth cap",
             )
         try:
-            names = sorted(os.fsdecode(name) for name in os.listdir(directory_fd))
+            bounded_names: list[tuple[bytes, str]] = []
+            raw_names: set[bytes] = set()
+            decoded_to_raw_name: dict[str, bytes] = {}
+            with os.scandir(directory_fd) as entries:
+                for entry in entries:
+                    scan_state["entry_count"] += 1
+                    if scan_state["entry_count"] > max_entries:
+                        raise StoreSafetyError(
+                            "prepared-directory-revalidation-inconclusive",
+                            "Retained partial exceeds the descriptor-safe inventory "
+                            f"entry cap ({max_entries})",
+                            details={
+                                "entry_limit": max_entries,
+                                "observed_entries": scan_state["entry_count"],
+                            },
+                        )
+                    try:
+                        raw_name = os.fsencode(entry.name)
+                        name = os.fsdecode(raw_name)
+                    except (TypeError, ValueError, UnicodeError) as exc:
+                        raise StoreSafetyError(
+                            "prepared-directory-revalidation-inconclusive",
+                            "Retained partial contains an invalid raw entry name",
+                        ) from exc
+                    if (
+                        not raw_name
+                        or b"\x00" in raw_name
+                        or b"/" in raw_name
+                        or raw_name in {b".", b".."}
+                    ):
+                        raise StoreSafetyError(
+                            "prepared-directory-revalidation-inconclusive",
+                            "Retained partial contains an invalid raw entry name",
+                        )
+                    scan_state["raw_name_bytes"] += len(raw_name)
+                    if scan_state["raw_name_bytes"] > max_raw_name_bytes:
+                        raise StoreSafetyError(
+                            "prepared-directory-revalidation-inconclusive",
+                            "Retained partial exceeds the descriptor-safe inventory "
+                            f"raw name-byte cap ({max_raw_name_bytes})",
+                            details={
+                                "raw_name_bytes_limit": max_raw_name_bytes,
+                                "observed_raw_name_bytes": (
+                                    scan_state["raw_name_bytes"]
+                                ),
+                            },
+                        )
+                    previous_raw_name = decoded_to_raw_name.get(name)
+                    if raw_name in raw_names or (
+                        previous_raw_name is not None and previous_raw_name != raw_name
+                    ):
+                        raise StoreSafetyError(
+                            "prepared-directory-revalidation-inconclusive",
+                            "Retained partial contains a duplicate raw name or "
+                            "decoded-name collision",
+                        )
+                    raw_names.add(raw_name)
+                    decoded_to_raw_name[name] = raw_name
+                    bounded_names.append((raw_name, name))
+        except StoreSafetyError:
+            raise
         except OSError as exc:
             raise StoreSafetyError(
                 "prepared-directory-revalidation-inconclusive",
                 "Cannot list retained partial through its bound descriptor: "
                 f"{binding.path}: {exc}",
             ) from exc
-        for name in names:
-            if len(records) >= max_entries:
-                raise StoreSafetyError(
-                    "prepared-directory-revalidation-inconclusive",
-                    "Retained partial exceeds the descriptor-safe inventory "
-                    f"entry cap ({max_entries})",
-                )
+        for raw_name, name in sorted(bounded_names, key=lambda item: item[0]):
             relative_path = relative_parent / name
             try:
                 entry_stat = os.stat(
-                    name,
+                    raw_name,
                     dir_fd=directory_fd,
                     follow_symlinks=False,
                 )
@@ -6394,7 +6450,7 @@ def _scan_sensitive_partial_inventory(
             child_fd: int | None = None
             try:
                 child_fd = os.open(
-                    name,
+                    raw_name,
                     _directory_open_flags(),
                     dir_fd=directory_fd,
                 )
@@ -6410,10 +6466,11 @@ def _scan_sensitive_partial_inventory(
                     relative_path,
                     depth + 1,
                     records,
+                    scan_state,
                 )
                 child_after = os.fstat(child_fd)
                 current_child = os.stat(
-                    name,
+                    raw_name,
                     dir_fd=directory_fd,
                     follow_symlinks=False,
                 )
@@ -6454,7 +6511,13 @@ def _scan_sensitive_partial_inventory(
                     f"creation-time object: {binding.path}",
                 )
             records: list[dict[str, Any]] = []
-            scan_directory(inventory_fd, Path(), 0, records)
+            scan_directory(
+                inventory_fd,
+                Path(),
+                0,
+                records,
+                {"entry_count": 0, "raw_name_bytes": 0},
+            )
             inventories.append(records)
         finally:
             if inventory_fd is not None:

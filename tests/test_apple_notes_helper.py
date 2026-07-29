@@ -1142,6 +1142,53 @@ raise SystemExit(2)
 
         self.assertEqual(observed_handler_masks, [0o077])
 
+    def test_supervisor_empty_check_consumes_only_the_first_entry(self) -> None:
+        class LazyEntries:
+            def __init__(self, total: int) -> None:
+                self.total = total
+                self.yielded = 0
+                self.closed = False
+
+            def __enter__(self) -> LazyEntries:
+                return self
+
+            def __exit__(
+                self,
+                exc_type: object,
+                exc: object,
+                traceback: object,
+            ) -> None:
+                self.closed = True
+
+            def __iter__(self) -> LazyEntries:
+                return self
+
+            def __next__(self) -> object:
+                if self.yielded >= self.total:
+                    raise StopIteration
+                self.yielded += 1
+                return object()
+
+        populated = LazyEntries(1_000_000)
+        with mock.patch.object(
+            SUPERVISOR_MODULE.os,
+            "scandir",
+            return_value=populated,
+        ):
+            self.assertTrue(SUPERVISOR_MODULE._directory_has_any_entry(123))
+        self.assertEqual(populated.yielded, 1)
+        self.assertTrue(populated.closed)
+
+        empty = LazyEntries(0)
+        with mock.patch.object(
+            SUPERVISOR_MODULE.os,
+            "scandir",
+            return_value=empty,
+        ):
+            self.assertFalse(SUPERVISOR_MODULE._directory_has_any_entry(123))
+        self.assertEqual(empty.yielded, 0)
+        self.assertTrue(empty.closed)
+
     def test_creator_cli_safely_publishes_external_result_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -14821,14 +14868,160 @@ raise SystemExit(2)
             self.assertTrue(replacement_root.is_dir())
             self.assertFalse(destination.exists())
 
+    def test_retained_partial_inventory_stops_at_bounded_entry_cap(
+        self,
+    ) -> None:
+        class LazyEntry:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        class LazyEntries:
+            def __init__(self, total: int) -> None:
+                self.total = total
+                self.yielded = 0
+                self.closed = False
+
+            def __enter__(self) -> LazyEntries:
+                return self
+
+            def __exit__(
+                self,
+                exc_type: object,
+                exc: object,
+                traceback: object,
+            ) -> None:
+                self.closed = True
+
+            def __iter__(self) -> LazyEntries:
+                return self
+
+            def __next__(self) -> LazyEntry:
+                if self.yielded >= self.total:
+                    raise StopIteration
+                entry = LazyEntry(f"retained-{self.yielded:08d}")
+                self.yielded += 1
+                return entry
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            partial = Path(temp_dir) / "retained"
+            partial.mkdir(mode=0o700)
+            simulated = LazyEntries(MODULE.BOUND_DIRECTORY_SCAN_MAX_ENTRIES * 1024)
+            with (
+                MODULE._bind_existing_directory_with_trusted_alias(partial) as binding,
+                mock.patch.object(
+                    MODULE.os,
+                    "scandir",
+                    return_value=simulated,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._retained_bound_directory_receipt(binding, partial)
+
+        self._assert_safety_code(
+            "prepared-directory-revalidation-inconclusive",
+            raised,
+        )
+        self.assertEqual(
+            simulated.yielded,
+            MODULE.BOUND_DIRECTORY_SCAN_MAX_ENTRIES + 1,
+        )
+        self.assertTrue(simulated.closed)
+        self.assertEqual(
+            raised.exception.details["entry_limit"],
+            MODULE.BOUND_DIRECTORY_SCAN_MAX_ENTRIES,
+        )
+        self.assertEqual(
+            raised.exception.details["observed_entries"],
+            MODULE.BOUND_DIRECTORY_SCAN_MAX_ENTRIES + 1,
+        )
+        self.assertEqual(
+            raised.exception.details["recovery_locators"],
+            {
+                "prepared_namespace": str(partial),
+                "prepared_parent": str(partial.parent),
+            },
+        )
+        encoded_details = json.dumps(
+            raised.exception.details,
+            ensure_ascii=True,
+            sort_keys=True,
+        ).encode("utf-8")
+        self.assertLess(len(encoded_details), 2048)
+        self.assertNotIn(
+            "sensitive_partial_inventory",
+            raised.exception.details,
+        )
+
+    def test_retained_partial_inventory_stops_at_raw_name_byte_cap(
+        self,
+    ) -> None:
+        class LongNameEntry:
+            name = "x" * (MODULE.BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES + 1)
+
+        class LazyEntries:
+            def __init__(self) -> None:
+                self.yielded = 0
+
+            def __enter__(self) -> LazyEntries:
+                return self
+
+            def __exit__(
+                self,
+                exc_type: object,
+                exc: object,
+                traceback: object,
+            ) -> None:
+                return None
+
+            def __iter__(self) -> LazyEntries:
+                return self
+
+            def __next__(self) -> LongNameEntry:
+                self.yielded += 1
+                return LongNameEntry()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            partial = Path(temp_dir) / "retained"
+            partial.mkdir(mode=0o700)
+            simulated = LazyEntries()
+            with (
+                MODULE._bind_existing_directory_with_trusted_alias(partial) as binding,
+                mock.patch.object(
+                    MODULE.os,
+                    "scandir",
+                    return_value=simulated,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._retained_bound_directory_receipt(binding, partial)
+
+        self._assert_safety_code(
+            "prepared-directory-revalidation-inconclusive",
+            raised,
+        )
+        self.assertEqual(simulated.yielded, 1)
+        self.assertEqual(
+            raised.exception.details["raw_name_bytes_limit"],
+            MODULE.BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES,
+        )
+        self.assertEqual(
+            raised.exception.details["observed_raw_name_bytes"],
+            MODULE.BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES + 1,
+        )
+        self.assertEqual(
+            raised.exception.details["recovery_locators"]["prepared_namespace"],
+            str(partial),
+        )
+
     def test_cleanup_preserves_root_swapped_before_recursive_delete(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             edited = root / "edited.sqlite"
             self._create_db(edited)
             destination = root / "stage"
-            original_listdir = MODULE.os.listdir
+            original_scandir = MODULE.os.scandir
             attacked = False
+            publication_rejected = False
             moved_root: Path | None = None
             replacement_root: Path | None = None
 
@@ -14837,6 +15030,8 @@ raise SystemExit(2)
                 target: Path,
                 **kwargs: object,
             ) -> None:
+                nonlocal publication_rejected
+                publication_rejected = True
                 raise MODULE.StoreSafetyError(
                     "destination-exists",
                     f"simulated publication failure: {source} -> {target}",
@@ -14844,9 +15039,9 @@ raise SystemExit(2)
 
             def swap_after_identity_observation(
                 directory: object,
-            ) -> list[str]:
+            ) -> os.ScandirIterator[str]:
                 nonlocal attacked, moved_root, replacement_root
-                if not attacked and isinstance(directory, int):
+                if publication_rejected and not attacked and isinstance(directory, int):
                     attacked = True
                     display_path = next(root.glob(".stage.partial-*"))
                     moved_root = display_path.with_name(f"{display_path.name}.owned")
@@ -14857,7 +15052,7 @@ raise SystemExit(2)
                         "replacement",
                         encoding="utf-8",
                     )
-                return original_listdir(directory)
+                return original_scandir(directory)
 
             with (
                 mock.patch.object(
@@ -14867,7 +15062,7 @@ raise SystemExit(2)
                 ),
                 mock.patch.object(
                     MODULE.os,
-                    "listdir",
+                    "scandir",
                     side_effect=swap_after_identity_observation,
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
@@ -14948,16 +15143,30 @@ raise SystemExit(2)
             edited = root / "edited.sqlite"
             self._create_db(edited)
             destination = root / "stage"
+            original_scandir = MODULE.os.scandir
+            publication_rejected = False
 
             def reject_publication(
                 source: Path,
                 target: Path,
                 **kwargs: object,
             ) -> None:
+                nonlocal publication_rejected
+                publication_rejected = True
                 raise MODULE.StoreSafetyError(
                     "destination-exists",
                     f"simulated publication failure: {source} -> {target}",
                 )
+
+            def fail_retained_inventory(
+                directory: object,
+            ) -> os.ScandirIterator[str]:
+                if publication_rejected and isinstance(directory, int):
+                    raise OSError(
+                        MODULE.errno.EIO,
+                        "simulated inventory failure",
+                    )
+                return original_scandir(directory)
 
             with (
                 mock.patch.object(
@@ -14967,11 +15176,8 @@ raise SystemExit(2)
                 ),
                 mock.patch.object(
                     MODULE.os,
-                    "listdir",
-                    side_effect=OSError(
-                        MODULE.errno.EIO,
-                        "simulated inventory failure",
-                    ),
+                    "scandir",
+                    side_effect=fail_retained_inventory,
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
@@ -15000,8 +15206,9 @@ raise SystemExit(2)
             edited = root / "edited.sqlite"
             self._create_db(edited, value="validated")
             destination = root / "stage"
-            original_listdir = MODULE.os.listdir
+            original_scandir = MODULE.os.scandir
             attacked = False
+            publication_rejected = False
             moved_prepared: Path | None = None
             replacement: Path | None = None
 
@@ -15010,6 +15217,8 @@ raise SystemExit(2)
                 target: Path,
                 **kwargs: object,
             ) -> None:
+                nonlocal publication_rejected
+                publication_rejected = True
                 raise MODULE.StoreSafetyError(
                     "destination-exists",
                     f"simulated publication failure: {source} -> {target}",
@@ -15017,9 +15226,9 @@ raise SystemExit(2)
 
             def replace_leaf_after_root_binding(
                 directory: object,
-            ) -> list[str]:
+            ) -> os.ScandirIterator[str]:
                 nonlocal attacked, moved_prepared, replacement
-                if not attacked and isinstance(directory, int):
+                if publication_rejected and not attacked and isinstance(directory, int):
                     attacked = True
                     partial = next(root.glob(".stage.partial-*"))
                     prepared = partial / MODULE.NOTE_STORE_MAIN
@@ -15027,7 +15236,7 @@ raise SystemExit(2)
                     prepared.rename(moved_prepared)
                     prepared.write_text("replacement", encoding="utf-8")
                     replacement = prepared
-                return original_listdir(directory)
+                return original_scandir(directory)
 
             with (
                 mock.patch.object(
@@ -15037,7 +15246,7 @@ raise SystemExit(2)
                 ),
                 mock.patch.object(
                     MODULE.os,
-                    "listdir",
+                    "scandir",
                     side_effect=replace_leaf_after_root_binding,
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,

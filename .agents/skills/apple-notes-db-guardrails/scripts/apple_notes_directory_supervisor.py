@@ -122,6 +122,13 @@ def _send_response(
         raise RuntimeError("directory supervisor response was truncated")
 
 
+def _directory_has_any_entry(directory_fd: int) -> bool:
+    """Check one held directory for non-emptiness without materializing it."""
+
+    with os.scandir(directory_fd) as entries:
+        return next(entries, None) is not None
+
+
 def _validate_request(
     payload: bytes,
     parent_fd: int,
@@ -211,7 +218,7 @@ def _serve_one_request(
             or not HELPER._same_identity(created, source_named)
             or stat.S_IMODE(created.st_mode) != 0o700
             or created.st_uid != os.geteuid()
-            or list(os.listdir(directory_fd))
+            or _directory_has_any_entry(directory_fd)
         ):
             raise RuntimeError("created directory failed the private-source binding")
 

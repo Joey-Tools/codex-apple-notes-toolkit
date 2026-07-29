@@ -760,12 +760,16 @@ moved.
 Pre-publication failure handling protects deletion target identity by deleting nothing through a
 mutable pathname. While the creation-time root and parent descriptors are still open, revalidate
 the exact root relative to the held parent and scan a bounded sensitive-file inventory twice
-without following child links. Preserve the complete partial tree and attach `cleanup_state:
-retained`, the verified root/parent identities, exact namespace, and inventory to the original
-error. If the root is missing, replaced, over the inventory bounds, or cannot be revalidated,
-preserve the current namespace, keep the original error primary, and attach a separate
-`cleanup_error_code` plus recovery locators. Access-policy changes remain distinct validation
-failures; mtime, ctime, and directory link-count behavior are not deletion-identity signals.
+without following child links. Enumerate lazily through held descriptors, stop
+before metadata lookup for the 65th entry, and apply a 4 KiB aggregate raw-name
+ceiling across the complete recursive pass; sort only the at-most-64 admitted
+names. Preserve the complete partial tree and attach `cleanup_state: retained`,
+the verified root/parent identities, exact namespace, and inventory to the
+original error. If the root is missing, replaced, over the inventory bounds,
+or cannot be revalidated, preserve the current namespace, keep the original
+error primary, and attach a separate `cleanup_error_code` plus bounded recovery
+locators. Access-policy changes remain distinct validation failures; mtime,
+ctime, and directory link-count behavior are not deletion-identity signals.
 Wrap an unclassified ordinary runtime failure as `prepared-operation-failed`, preserve the
 underlying exception as `__cause__`, and include its type/errno with the retained-partial receipt.
 

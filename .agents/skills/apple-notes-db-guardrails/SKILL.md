@@ -267,6 +267,11 @@ On an ordinary pre-publication failure, the helper
 preserves the partial tree and attaches a creation-receipt-matched namespace locator plus a bounded
 no-follow sensitive-file inventory to the original error. If the root is replaced or inventory is
 inconclusive, the original error remains primary and reports the separate receipt failure.
+Each retained-partial pass lazily enumerates through held directory descriptors,
+stops on the 65th entry before reading its metadata, and enforces a 4 KiB
+aggregate raw-name ceiling across the complete recursive pass. It collects and
+sorts only the already bounded names. The packaged supervisor's newly created
+directory emptiness check reads at most the first descriptor-relative entry.
 An individual file writer also retains its failed output: it never follows a separate `stat` with
 an `unlink`, because the namespace leaf could be replaced between those syscalls. The error carries
 the held parent/file descriptor receipt, point-in-time namespace observations, `cleanup_state:
