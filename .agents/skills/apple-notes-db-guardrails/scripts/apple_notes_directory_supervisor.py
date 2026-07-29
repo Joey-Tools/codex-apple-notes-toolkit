@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import array
+import fcntl
 import importlib.util
 import json
 import os
@@ -13,12 +14,12 @@ import signal
 import socket
 import stat
 import subprocess
+import shutil
 import sys
 import time
-from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
-from typing import Iterable, Iterator
+from typing import Iterable
 
 
 HELPER_PATH = Path(__file__).with_name("apple_notes_db.py")
@@ -27,6 +28,24 @@ WORKER_SHUTDOWN_GRACE_SECONDS = 0.5
 SUPERVISOR_POLL_SECONDS = 0.1
 SOURCE_PREFIX = ".apple-notes-create-supervisor-source-"
 DESTINATION_PREFIX = ".apple-notes-create-"
+WORKER_SUPERVISOR_FD = 9
+TERMINATION_SIGNALS = frozenset(
+    {
+        signal.SIGHUP,
+        signal.SIGINT,
+        signal.SIGTERM,
+    }
+)
+LAUNCH_BLOCKED_SIGNALS = TERMINATION_SIGNALS.union({signal.SIGCHLD})
+SPAWN_DEFAULT_SIGNALS = TERMINATION_SIGNALS.union({signal.SIGCHLD})
+BLOCKABLE_SIGNALS = frozenset(signal.valid_signals()).difference(
+    {
+        signal.SIGKILL,
+        signal.SIGSTOP,
+    }
+)
+WAIT_STATUS_UNAVAILABLE = -1
+WORKER_RETURN_CODE_UNAVAILABLE = 1
 
 
 def _load_helper() -> ModuleType:
@@ -43,31 +62,6 @@ def _load_helper() -> ModuleType:
 
 
 HELPER = _load_helper()
-
-
-class _SupervisorSignal(BaseException):
-    """Convert launcher termination signals into cleanup-owning control flow."""
-
-    def __init__(self, signum: int) -> None:
-        super().__init__(signum)
-        self.signum = signum
-
-
-@contextmanager
-def _bounded_signal_scope() -> Iterator[None]:
-    previous_handlers: dict[int, object] = {}
-
-    def raise_signal(signum: int, _frame: object) -> None:
-        raise _SupervisorSignal(signum)
-
-    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
-        previous_handlers[signum] = signal.getsignal(signum)
-        signal.signal(signum, raise_signal)
-    try:
-        yield
-    finally:
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
 
 
 def _bounded_error(exc: BaseException) -> str:
@@ -161,6 +155,20 @@ def _validate_request(
     return request, opened
 
 
+def _mkdir_owner_private_at(parent_fd: int, name: str) -> None:
+    """Create one 0700 directory without inheriting a caller's stricter umask."""
+
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, BLOCKABLE_SIGNALS)
+    previous_umask: int | None = None
+    try:
+        previous_umask = os.umask(0)
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+    finally:
+        if previous_umask is not None:
+            os.umask(previous_umask)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
 def _serve_one_request(
     channel: socket.socket,
     payload: bytes,
@@ -184,7 +192,7 @@ def _serve_one_request(
         # private to this supervisor transaction.
         source_name = f"{SOURCE_PREFIX}{secrets.token_hex(24)}"
         destination_name = f"{DESTINATION_PREFIX}{secrets.token_hex(24)}"
-        os.mkdir(source_name, mode=0o700, dir_fd=parent_fd)
+        _mkdir_owner_private_at(parent_fd, source_name)
         directory_fd = os.open(
             source_name,
             HELPER._directory_open_flags(),
@@ -344,12 +352,16 @@ def _serve(supervisor_fd: int) -> int:
 
 
 def _wait_pid(pid: int, deadline: float) -> int | None:
-    while time.monotonic() < deadline:
-        waited, status = os.waitpid(pid, os.WNOHANG)
+    while True:
+        try:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return WAIT_STATUS_UNAVAILABLE
         if waited == pid:
             return status
+        if time.monotonic() >= deadline:
+            return None
         time.sleep(0.01)
-    return None
 
 
 def _terminate_pid(pid: int, grace_seconds: float) -> int | None:
@@ -376,8 +388,135 @@ def _terminate_pid(pid: int, grace_seconds: float) -> int | None:
     return _wait_pid(pid, time.monotonic() + grace_seconds)
 
 
+def _returncode_from_wait_status(status: int) -> int:
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return -os.WTERMSIG(status)
+    raise RuntimeError(f"worker entered unsupported wait status: {status}")
+
+
+class _SpawnedWorker:
+    """Small wait/kill handle for one posix_spawn-owned worker PID."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        try:
+            waited, status = os.waitpid(self.pid, os.WNOHANG)
+        except ChildProcessError:
+            self.returncode = WORKER_RETURN_CODE_UNAVAILABLE
+            return self.returncode
+        if waited == 0:
+            return None
+        self.returncode = _returncode_from_wait_status(status)
+        return self.returncode
+
+    def wait(self, *, timeout: float | None = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            returncode = self.poll()
+            if returncode is not None:
+                return returncode
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(
+                    cmd="apple-notes-supervised-worker",
+                    timeout=timeout,
+                )
+            time.sleep(0.01)
+
+
+def _open_descriptor_inventory() -> list[int]:
+    try:
+        candidates: Iterable[int] = sorted(
+            int(name)
+            for name in os.listdir("/dev/fd")
+            if name.isascii() and name.isdigit()
+        )
+    except OSError:
+        soft_limit = int(os.sysconf("SC_OPEN_MAX"))
+        if soft_limit <= 0:
+            soft_limit = 1024
+        candidates = range(3, min(soft_limit, 1_048_576))
+    opened: list[int] = []
+    for descriptor in candidates:
+        try:
+            fcntl.fcntl(descriptor, fcntl.F_GETFD)
+        except OSError:
+            continue
+        opened.append(descriptor)
+    return opened
+
+
+def _spawn_worker(
+    helper_path: Path,
+    command: list[str],
+    *,
+    python_bin: str,
+    client_fd: int,
+    child_signal_mask: set[signal.Signals],
+) -> _SpawnedWorker:
+    resolved_python = shutil.which(python_bin)
+    if resolved_python is None:
+        raise OSError(f"Cannot resolve Python executable: {python_bin}")
+    worker_supervisor_fd = (
+        WORKER_SUPERVISOR_FD + 1
+        if client_fd == WORKER_SUPERVISOR_FD
+        else WORKER_SUPERVISOR_FD
+    )
+    argv = [
+        resolved_python,
+        "-B",
+        os.fspath(helper_path),
+        *command,
+        "--directory-creator-fd",
+        str(worker_supervisor_fd),
+    ]
+    file_actions: list[tuple[int, ...]] = [
+        (
+            os.POSIX_SPAWN_DUP2,
+            client_fd,
+            worker_supervisor_fd,
+        )
+    ]
+    file_actions.extend(
+        (os.POSIX_SPAWN_CLOSE, descriptor)
+        for descriptor in _open_descriptor_inventory()
+        if descriptor > 2 and descriptor != worker_supervisor_fd
+    )
+    pid = os.posix_spawn(
+        resolved_python,
+        argv,
+        {
+            **os.environ,
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        file_actions=file_actions,
+        setsid=True,
+        setsigmask=child_signal_mask,
+        setsigdef=SPAWN_DEFAULT_SIGNALS,
+    )
+    return _SpawnedWorker(pid)
+
+
+def _drain_pending_termination_signals(
+    managed_signals: set[signal.Signals],
+    first_signal: int | None,
+) -> int | None:
+    pending = set(signal.sigpending()).intersection(managed_signals)
+    for pending_signal in sorted(pending):
+        signum = int(signal.sigwait({pending_signal}))
+        if first_signal is None:
+            first_signal = signum
+    return first_signal
+
+
 def _terminate_worker(
-    worker: subprocess.Popen[bytes],
+    worker: _SpawnedWorker,
     grace_seconds: float,
 ) -> None:
     if worker.poll() is not None:
@@ -398,7 +537,7 @@ def _terminate_worker(
     try:
         worker.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
-        pass
+        raise RuntimeError("supervised worker did not reap after SIGKILL")
 
 
 def run_supervised(
@@ -421,55 +560,122 @@ def run_supervised(
     if not hasattr(os, "fork"):
         raise RuntimeError("the packaged directory supervisor requires POSIX")
 
-    client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
-    client.set_inheritable(False)
-    server.set_inheritable(False)
-    service_pid = os.fork()
-    if service_pid == 0:
-        client.close()
-        server_fd = server.detach()
-        _close_unrelated_fds({0, 1, 2, server_fd})
-        try:
-            status = _serve(server_fd)
-        except BaseException:
-            status = 73
-        os._exit(status)
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, LAUNCH_BLOCKED_SIGNALS)
+    managed_signals = {
+        signum for signum in TERMINATION_SIGNALS if signum not in previous_mask
+    }
+    previous_handlers = {signum: signal.getsignal(signum) for signum in managed_signals}
+    previous_sigchld_handler = signal.getsignal(signal.SIGCHLD)
+    first_signal: int | None = None
+    primary_error: BaseException | None = None
+    cleanup_error: BaseException | None = None
+    return_code: int | None = None
+    client: socket.socket | None = None
+    server: socket.socket | None = None
+    service_pid: int | None = None
+    worker: _SpawnedWorker | None = None
 
-    server.close()
-    worker: subprocess.Popen[bytes] | None = None
+    def latch_termination_signal(signum: int, _frame: object) -> None:
+        nonlocal first_signal
+        if first_signal is None:
+            first_signal = signum
+
     try:
-        with _bounded_signal_scope():
-            worker = subprocess.Popen(
-                [
-                    python_bin,
-                    "-B",
-                    os.fspath(helper_path),
-                    *command,
-                    "--directory-creator-fd",
-                    str(client.fileno()),
-                ],
-                stdin=None,
-                stdout=None,
-                stderr=None,
-                close_fds=True,
-                pass_fds=(client.fileno(),),
-                start_new_session=True,
-            )
-            return_code = worker.wait()
-        return return_code if return_code >= 0 else 128 + abs(return_code)
-    except BaseException:
-        if worker is not None:
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        for signum in managed_signals:
+            signal.signal(signum, latch_termination_signal)
+        client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        client.set_inheritable(False)
+        server.set_inheritable(False)
+        service_pid = os.fork()
+        if service_pid == 0:
+            service_status = 73
             try:
-                _terminate_worker(worker, WORKER_SHUTDOWN_GRACE_SECONDS)
+                client.close()
+                server_fd = server.detach()
+                signal.signal(signal.SIGCHLD, previous_sigchld_handler)
+                for signum, handler in previous_handlers.items():
+                    signal.signal(signum, handler)
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                _close_unrelated_fds({0, 1, 2, server_fd})
+                service_status = _serve(server_fd)
             except BaseException:
                 pass
-        raise
+            os._exit(service_status)
+
+        server.close()
+        server = None
+        worker = _spawn_worker(
+            helper_path,
+            command,
+            python_bin=python_bin,
+            client_fd=client.fileno(),
+            child_signal_mask=set(previous_mask),
+        )
+        signal.pthread_sigmask(
+            signal.SIG_SETMASK,
+            set(previous_mask).union({signal.SIGCHLD}),
+        )
+        while True:
+            return_code = worker.poll()
+            if first_signal is not None or return_code is not None:
+                break
+            time.sleep(SUPERVISOR_POLL_SECONDS)
+    except BaseException as exc:
+        primary_error = exc
     finally:
-        client.close()
+        if worker is not None and worker.poll() is None:
+            try:
+                _terminate_worker(worker, WORKER_SHUTDOWN_GRACE_SECONDS)
+            except BaseException as exc:
+                cleanup_error = exc
+        if client is not None:
+            try:
+                client.close()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if server is not None:
+            try:
+                server.close()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if service_pid is not None:
+            try:
+                service_status = _terminate_pid(
+                    service_pid,
+                    SUPERVISOR_SHUTDOWN_GRACE_SECONDS,
+                )
+                if service_status is None:
+                    raise RuntimeError("directory supervisor service did not reap")
+                if service_status == WAIT_STATUS_UNAVAILABLE:
+                    raise RuntimeError(
+                        "directory supervisor service status is unavailable "
+                        "after ECHILD"
+                    )
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        signal.pthread_sigmask(signal.SIG_BLOCK, managed_signals)
+        first_signal = _drain_pending_termination_signals(managed_signals, first_signal)
         try:
-            _terminate_pid(service_pid, SUPERVISOR_SHUTDOWN_GRACE_SECONDS)
-        except BaseException:
-            pass
+            signal.signal(signal.SIGCHLD, previous_sigchld_handler)
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+    if first_signal is not None:
+        os.kill(os.getpid(), first_signal)
+        return 128 + first_signal
+    if primary_error is not None:
+        raise primary_error
+    if cleanup_error is not None:
+        raise cleanup_error
+    if return_code is None:
+        raise RuntimeError("supervised worker produced no terminal status")
+    return return_code if return_code >= 0 else 128 + abs(return_code)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -487,8 +693,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         command = command[1:]
     try:
         return run_supervised(args.helper, command, python_bin=args.python)
-    except _SupervisorSignal as exc:
-        return 128 + exc.signum
     except (OSError, RuntimeError, ValueError) as exc:
         print(
             json.dumps(

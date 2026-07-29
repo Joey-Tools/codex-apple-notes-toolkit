@@ -326,3 +326,49 @@ superseded_by:
   check, Python `3.13.0` and `3.9.6` bytecode compilation, `bash -n` and
   ShellCheck over both shell scripts, skill and project-journal validators, and
   `git diff --check`.
+- Supervisor launch-window follow-up base:
+  `5d03a9607e14bb6c9f473863aa96897a2c207a26`.
+- The launcher now blocks termination signals before either child starts,
+  installs non-raising first-signal latches, and creates the worker with
+  `posix_spawn`, an explicit descriptor allowlist, a restored child signal
+  mask, and a new session. A source channel already occupying the preferred
+  child FD is relocated so a no-op self-dup cannot preserve `FD_CLOEXEC`. The
+  parent owns the returned PID before unblocking. Latches remain installed
+  through bounded worker/service kill, drain, and reap; repeated signals are
+  ignored until cleanup completes. The terminal boundary consumes only one
+  pending-signal snapshot before restoring the original handlers/mask and
+  re-delivering the first signal, so a signal storm cannot make teardown
+  unbounded.
+- Before either raw-waitpid child exists, the launcher blocks `SIGCHLD` and
+  temporarily normalizes its disposition to `SIG_DFL`; the worker also
+  receives default `SIGCHLD`. This prevents an inherited `SIGCHLD=SIG_IGN`
+  from auto-reaping worker or service, while terminal cleanup restores the
+  caller's exact disposition and mask. A residual `ECHILD` maps the worker to
+  conservative exit code `1`; it treats the service as already terminal but
+  fails the launcher because the service status is unavailable. Neither path
+  can escape `finally`, skip signal restoration, or authorize a signal against
+  a possibly reused PID.
+- Service-child setup is wholly child-owned and exits with the bounded service
+  failure code, so an initialization exception cannot fall into parent cleanup
+  with PID `0`. A zero-duration reap probe now performs one real `waitpid`
+  before any process-group signal, avoiding teardown signals against an
+  already-exited child.
+- The dedicated service now blocks every blockable signal, scopes `umask(0)`
+  only around `mkdir(0700)`, restores the exact inherited umask in `finally`,
+  and only then restores the prior signal mask. A production wrapper smoke
+  runs under inherited umask `0777`, proves the stage succeeds with mode
+  `0700`, and proves no private supervisor source residue remains. Direct
+  success/failure tests prove exact umask restoration, while an asynchronous
+  handler regression proves no handler can observe the zero-umask window.
+- Python `3.13.0` and system Python `3.9.6` each passed eight focused supervisor
+  regressions covering strict-umask production creation, exact residue
+  cleanup, launch-window signal arrival, repeated cleanup-time signals,
+  snapshot-bounded pending-signal consumption, worker reap, original signal
+  re-delivery, colliding-FD relocation across exec, direct success/failure
+  umask restore, asynchronous-handler isolation, inherited
+  `SIGCHLD=SIG_IGN`, exact signal-state restoration, and defensive `ECHILD`
+  classification.
+- Supervisor launch-window full validation: Python `3.13.0` and system Python
+  `3.9.6` each passed all `274` tests with the single sandbox-scoped fixed
+  `/usr/bin/pgrep` skip, including the final child-setup and immediate-reap
+  hardening.

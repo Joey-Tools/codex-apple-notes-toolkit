@@ -31,6 +31,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_DIR = REPO_ROOT / ".agents/skills/apple-notes-db-guardrails"
 SCRIPT_PATH = SKILL_DIR / "scripts/apple_notes_db.py"
 DIRECTORY_SUPERVISOR_PATH = SKILL_DIR / "scripts/apple_notes_directory_supervisor.py"
+SUPERVISOR_SPEC = importlib.util.spec_from_file_location(
+    "apple_notes_directory_supervisor",
+    DIRECTORY_SUPERVISOR_PATH,
+)
+assert SUPERVISOR_SPEC is not None
+assert SUPERVISOR_SPEC.loader is not None
+SUPERVISOR_MODULE = importlib.util.module_from_spec(SUPERVISOR_SPEC)
+sys.modules[SUPERVISOR_SPEC.name] = SUPERVISOR_MODULE
+SUPERVISOR_SPEC.loader.exec_module(SUPERVISOR_MODULE)
 SPEC = importlib.util.spec_from_file_location("apple_notes_db", SCRIPT_PATH)
 assert SPEC is not None
 assert SPEC.loader is not None
@@ -705,35 +714,42 @@ raise SystemExit(2)
             self._create_db(edited_source)
             snapshot = root / "snapshot"
             stage = root / "stage"
-            stage_result = subprocess.run(
-                [
-                    "bash",
-                    str(WRAPPER_PATH),
-                    "stage-patch",
-                    "--group-container",
-                    str(paths.group_container),
-                    "--app-container",
-                    str(paths.app_container),
-                    "--src",
-                    str(edited_source),
-                    "--dest",
-                    str(stage),
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=30.0,
-                env={
-                    **os.environ,
-                    "PYTHON_BIN": sys.executable,
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                },
-            )
+            previous_umask = os.umask(0o777)
+            try:
+                stage_result = subprocess.run(
+                    [
+                        "bash",
+                        str(WRAPPER_PATH),
+                        "stage-patch",
+                        "--group-container",
+                        str(paths.group_container),
+                        "--app-container",
+                        str(paths.app_container),
+                        "--src",
+                        str(edited_source),
+                        "--dest",
+                        str(stage),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=30.0,
+                    env={
+                        **os.environ,
+                        "PYTHON_BIN": sys.executable,
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                )
+            finally:
+                os.umask(previous_umask)
 
             stage_payload = (
                 json.loads(stage_result.stdout) if stage_result.stdout else {}
             )
             stage_exists = (stage / MODULE.NOTE_STORE_MAIN).is_file()
+            supervisor_source_residue = list(
+                root.rglob(".apple-notes-create-supervisor-source-*")
+            )
 
         self.assertEqual(
             stage_result.returncode,
@@ -742,6 +758,7 @@ raise SystemExit(2)
         )
         self.assertEqual(Path(stage_payload["stage_dir"]), stage)
         self.assertTrue(stage_exists)
+        self.assertEqual(supervisor_source_residue, [])
 
         # The fixed pgrep probe is deliberately fail-closed. Exercise copy-db
         # through the same production launcher only when this test runtime can
@@ -844,8 +861,277 @@ raise SystemExit(2)
             else:
                 self.fail(f"supervised worker {worker_pid} survived teardown")
 
-        self.assertEqual(launcher.returncode, 128 + signal.SIGTERM, stderr)
+        self.assertEqual(launcher.returncode, -signal.SIGTERM, stderr)
         self.assertEqual(stdout, "")
+
+    def test_supervisor_latches_launch_window_and_repeated_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            worker_script = root / "worker.py"
+            worker_script.write_text(
+                "import time\nwhile True:\n    time.sleep(0.1)\n",
+                encoding="utf-8",
+            )
+            spawned_pids: list[int] = []
+            delivered_signals: list[int] = []
+            original_spawn = SUPERVISOR_MODULE.os.posix_spawn
+            original_terminate = SUPERVISOR_MODULE._terminate_worker
+            original_handler = signal.getsignal(signal.SIGTERM)
+            original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+            def spawn_then_signal(*args: object, **kwargs: object) -> int:
+                pid = original_spawn(*args, **kwargs)
+                spawned_pids.append(pid)
+                os.kill(os.getpid(), signal.SIGTERM)
+                return pid
+
+            def repeat_signal_during_cleanup(
+                worker: object,
+                grace_seconds: float,
+            ) -> None:
+                os.kill(os.getpid(), signal.SIGTERM)
+                original_terminate(worker, grace_seconds)
+
+            signal.signal(
+                signal.SIGTERM,
+                lambda signum, _frame: delivered_signals.append(signum),
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        SUPERVISOR_MODULE.os,
+                        "posix_spawn",
+                        side_effect=spawn_then_signal,
+                    ),
+                    mock.patch.object(
+                        SUPERVISOR_MODULE,
+                        "_terminate_worker",
+                        side_effect=repeat_signal_during_cleanup,
+                    ),
+                ):
+                    return_code = SUPERVISOR_MODULE.run_supervised(
+                        worker_script,
+                        ["ignored"],
+                        python_bin=sys.executable,
+                    )
+            finally:
+                signal.signal(signal.SIGTERM, original_handler)
+
+            restored_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            self.assertEqual(restored_mask, original_mask)
+            self.assertEqual(return_code, 128 + signal.SIGTERM)
+            self.assertEqual(delivered_signals, [signal.SIGTERM])
+            self.assertEqual(len(spawned_pids), 1)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(spawned_pids[0], 0)
+
+    def test_spawn_worker_relocates_colliding_supervisor_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            worker_script = root / "worker.py"
+            observed_fd_file = root / "observed-fd"
+            worker_script.write_text(
+                "import os\n"
+                "import sys\n"
+                "if sys.argv[2] != '--directory-creator-fd':\n"
+                "    raise SystemExit(2)\n"
+                "descriptor = int(sys.argv[3])\n"
+                "os.fstat(descriptor)\n"
+                "with open(sys.argv[1], 'w', encoding='ascii') as stream:\n"
+                "    stream.write(str(descriptor))\n",
+                encoding="utf-8",
+            )
+            client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+            worker = None
+            collision_fd = client.fileno()
+            try:
+                with mock.patch.object(
+                    SUPERVISOR_MODULE,
+                    "WORKER_SUPERVISOR_FD",
+                    collision_fd,
+                ):
+                    worker = SUPERVISOR_MODULE._spawn_worker(
+                        worker_script,
+                        [str(observed_fd_file)],
+                        python_bin=sys.executable,
+                        client_fd=collision_fd,
+                        child_signal_mask=set(
+                            signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                        ),
+                    )
+                    return_code = worker.wait(timeout=5.0)
+            finally:
+                if worker is not None and worker.poll() is None:
+                    SUPERVISOR_MODULE._terminate_worker(worker, 0.5)
+                client.close()
+                server.close()
+
+            self.assertEqual(return_code, 0)
+            self.assertEqual(
+                int(observed_fd_file.read_text(encoding="ascii")),
+                collision_fd + 1,
+            )
+
+    def test_pending_signal_drain_is_snapshot_bounded(self) -> None:
+        with (
+            mock.patch.object(
+                SUPERVISOR_MODULE.signal,
+                "sigpending",
+                return_value={signal.SIGTERM},
+            ) as pending,
+            mock.patch.object(
+                SUPERVISOR_MODULE.signal,
+                "sigwait",
+                return_value=signal.SIGTERM,
+            ) as wait,
+        ):
+            first_signal = SUPERVISOR_MODULE._drain_pending_termination_signals(
+                {signal.SIGTERM},
+                None,
+            )
+
+        self.assertEqual(first_signal, signal.SIGTERM)
+        pending.assert_called_once_with()
+        wait.assert_called_once_with({signal.SIGTERM})
+
+    def test_supervisor_normalizes_ignored_sigchld_and_restores(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker_script = Path(temp_dir) / "worker.py"
+            worker_script.write_text("raise SystemExit(0)\n", encoding="utf-8")
+            original_sigchld_handler = signal.getsignal(signal.SIGCHLD)
+            original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+            original_mask = signal.pthread_sigmask(
+                signal.SIG_UNBLOCK,
+                {signal.SIGCHLD},
+            )
+            expected_mask = set(original_mask).difference({signal.SIGCHLD})
+
+            def retained_sigterm_handler(_signum: int, _frame: object) -> None:
+                pass
+
+            signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, retained_sigterm_handler)
+            try:
+                return_code = SUPERVISOR_MODULE.run_supervised(
+                    worker_script,
+                    ["ignored"],
+                    python_bin=sys.executable,
+                )
+                restored_sigchld_handler = signal.getsignal(signal.SIGCHLD)
+                restored_sigterm_handler = signal.getsignal(signal.SIGTERM)
+                restored_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            finally:
+                signal.signal(signal.SIGCHLD, original_sigchld_handler)
+                signal.signal(signal.SIGTERM, original_sigterm_handler)
+                signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+
+        self.assertEqual(return_code, 0)
+        self.assertEqual(restored_sigchld_handler, signal.SIG_IGN)
+        self.assertIs(restored_sigterm_handler, retained_sigterm_handler)
+        self.assertEqual(restored_mask, expected_mask)
+
+    def test_supervisor_echild_status_is_conservative_and_terminal(self) -> None:
+        worker = SUPERVISOR_MODULE._SpawnedWorker(12345)
+        no_child = ChildProcessError(errno.ECHILD, "simulated external reap")
+        with mock.patch.object(
+            SUPERVISOR_MODULE.os,
+            "waitpid",
+            side_effect=no_child,
+        ) as waitpid:
+            self.assertEqual(
+                worker.poll(),
+                SUPERVISOR_MODULE.WORKER_RETURN_CODE_UNAVAILABLE,
+            )
+            self.assertEqual(
+                worker.poll(),
+                SUPERVISOR_MODULE.WORKER_RETURN_CODE_UNAVAILABLE,
+            )
+        waitpid.assert_called_once_with(12345, os.WNOHANG)
+
+        with mock.patch.object(
+            SUPERVISOR_MODULE.os,
+            "waitpid",
+            side_effect=no_child,
+        ):
+            self.assertEqual(
+                SUPERVISOR_MODULE._wait_pid(12345, time.monotonic()),
+                SUPERVISOR_MODULE.WAIT_STATUS_UNAVAILABLE,
+            )
+
+    def test_supervisor_scopes_strict_umask_and_restores(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            original_umask = os.umask(0o777)
+            try:
+                SUPERVISOR_MODULE._mkdir_owner_private_at(
+                    parent_fd,
+                    "created",
+                )
+                restored_umask = os.umask(original_umask)
+            finally:
+                os.umask(original_umask)
+                os.close(parent_fd)
+            created_mode = stat.S_IMODE(
+                os.stat(root / "created", follow_symlinks=False).st_mode
+            )
+
+        self.assertEqual(restored_umask, 0o777)
+        self.assertEqual(created_mode, 0o700)
+
+        original_umask = os.umask(0o777)
+        try:
+            with (
+                mock.patch.object(
+                    SUPERVISOR_MODULE.os,
+                    "mkdir",
+                    side_effect=OSError(errno.EIO, "simulated mkdir failure"),
+                ),
+                self.assertRaises(OSError),
+            ):
+                SUPERVISOR_MODULE._mkdir_owner_private_at(-1, "failed")
+            restored_after_failure = os.umask(original_umask)
+        finally:
+            os.umask(original_umask)
+        self.assertEqual(restored_after_failure, 0o777)
+
+        observed_handler_masks: list[int] = []
+        original_handler = signal.getsignal(signal.SIGUSR1)
+        original_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGUSR1})
+        original_umask = os.umask(0o077)
+        original_mkdir = os.mkdir
+
+        def observe_umask(_signum: int, _frame: object) -> None:
+            observed = os.umask(0o077)
+            os.umask(observed)
+            observed_handler_masks.append(observed)
+
+        def mkdir_after_signal(*args: object, **kwargs: object) -> None:
+            os.kill(os.getpid(), signal.SIGUSR1)
+            original_mkdir(*args, **kwargs)
+
+        try:
+            signal.signal(signal.SIGUSR1, observe_umask)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                parent_fd = os.open(temp_dir, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    with mock.patch.object(
+                        SUPERVISOR_MODULE.os,
+                        "mkdir",
+                        side_effect=mkdir_after_signal,
+                    ):
+                        SUPERVISOR_MODULE._mkdir_owner_private_at(
+                            parent_fd,
+                            "signal-safe",
+                        )
+                finally:
+                    os.close(parent_fd)
+        finally:
+            os.umask(original_umask)
+            signal.signal(signal.SIGUSR1, original_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+
+        self.assertEqual(observed_handler_masks, [0o077])
 
     def test_creator_cli_safely_publishes_external_result_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

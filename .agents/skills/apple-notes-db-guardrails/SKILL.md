@@ -82,6 +82,19 @@ the DB helper with `--directory-creator-fd`. For each request, the service opens
 private source directory before atomically publishing that held object under a distinct randomized
 protocol-visible name with the platform no-replace rename primitive. It keeps the descriptor open
 through the response and revalidates parent and object identity/access policy around publication.
+The dedicated single-thread service blocks every blockable signal, scopes `umask(0)` to the source
+`mkdir`, restores the exact inherited umask, and only then restores the signal mask, so neither a
+strict caller umask nor an inherited asynchronous handler can create an unsafe side effect. The
+launcher blocks termination signals before either child starts, atomically records the
+`posix_spawn` worker PID under that mask, relocates the child channel if its source FD collides with
+the preferred target, and temporarily normalizes `SIGCHLD` to a waitable default before either
+child exists. The worker receives a default `SIGCHLD`, while the launcher keeps it blocked until
+both owned children are reaped and then restores the caller's exact disposition/mask. An unexpected
+`ECHILD` is a conservative worker failure, never an exception that can skip cleanup. The launcher
+also restores the original child masks and latches the first parent signal without raising. It
+ignores later termination signals until the worker and service have both been killed, drained, and
+reaped, consumes only one bounded pending-signal snapshot, then restores the original handlers/mask
+and re-delivers the first signal.
 The helper sends the held parent descriptor and a request nonce with `SCM_RIGHTS`, then accepts
 exactly one directory descriptor plus the matching attestation. It never reconnects by socket
 pathname or accepts a direct `mkdir`-then-`open` of the returned name. Callers with a stronger

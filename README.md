@@ -39,6 +39,16 @@ atomically publishes that held object under the randomized returned name with
 the platform no-replace primitive, and holds its FD through the response. The
 wrapper selects this production launcher automatically for write-producing
 commands; callers may still provide a stronger inherited supervisor channel.
+The launcher blocks and latches termination signals before child creation,
+publishes the worker PID atomically with `posix_spawn`, relocates a colliding
+non-inheritable channel FD, normalizes inherited `SIGCHLD=SIG_IGN` while it
+owns raw-waitpid children, and keeps later signals from interrupting bounded
+worker/service reap. An unexpected `ECHILD` fails the launcher conservatively
+without bypassing cleanup or signaling a possibly reused PID. It consumes one
+pending-signal snapshot before restoring and re-delivering the first signal.
+Its dedicated service blocks every blockable signal, scopes `umask(0)` only to
+`mkdir(0700)`, restores the exact inherited umask, and only then restores the
+signal mask.
 It transfers the held parent FD with `SCM_RIGHTS` and accepts only the
 supervisor's continuously held directory FD plus a request-bound attestation;
 it never reconnects by socket path. Without that capability, creation fails

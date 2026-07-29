@@ -413,6 +413,30 @@ object under a separate randomized protocol-visible basename with the platform n
 directory rename. It keeps the descriptor continuously held through response and revalidates the
 parent and directory identity/access policy around publication. A same-UID supervisor that merely
 calls `mkdir` and then reopens the returned protocol-visible name does not meet this contract.
+Because the service is a dedicated single-thread process, it may temporarily set `umask(0)` only
+around the `mkdir(0700)` call. It must first block every blockable signal, restore the inherited
+umask in `finally`, and only then restore the exact previous signal mask. This prevents either a
+strict inherited umask from creating a mode-`000` source or an inherited asynchronous handler from
+performing a side write while the process-wide umask is zero.
+Before forking the service or spawning the independent-session worker, the launcher blocks
+`SIGHUP`, `SIGINT`, and `SIGTERM` and installs non-raising first-signal latches. Worker creation
+uses `posix_spawn` with an explicit inherited-FD allowlist, child signal mask, and new session. If
+the non-inheritable source channel already occupies the preferred target FD, select a distinct
+target before the `dup2` action; never rely on a self-dup to clear `FD_CLOEXEC`. The PID becomes
+parent-owned while the parent mask is still closed. Also block `SIGCHLD` and temporarily replace
+its parent disposition with `SIG_DFL` before either child exists, so inherited `SIG_IGN` cannot
+auto-reap the raw-waitpid children. The worker must receive default `SIGCHLD`; keep parent
+`SIGCHLD` blocked until worker and service status collection finishes, then restore the caller's
+exact disposition and mask. If `waitpid` still reports `ECHILD`, treat the service as already
+terminal but fail the launcher because its status is unavailable; map unavailable worker status to
+conservative exit code `1`. Neither condition may escape the cleanup boundary or authorize
+signaling a possibly reused PID. The service restores its original handlers/mask after fork. The
+parent may then restore its termination-signal mask, but it retains the non-raising latches through
+bounded worker/service kill, drain, and reap. Later
+termination signals cannot replace the first signal or interrupt cleanup. At the terminal
+boundary, block again, consume at most one snapshot of pending managed signals, restore the
+original handlers/mask, and re-deliver the first signal so teardown remains bounded even under a
+signal storm.
 Validate the returned descriptor/name/proof again inside the helper. No configured channel or a
 non-socket/wrong socket type detected before the first send attempt is a proved no-mutation
 `directory-creation-identity-inconclusive`; after entering the request-send boundary, send or
