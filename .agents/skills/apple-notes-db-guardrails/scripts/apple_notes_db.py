@@ -227,13 +227,33 @@ class _LiveDestinationScope:
     parent: _BoundDirectory
     revalidate: Callable[[], dict[str, Any]]
     trusted_alias: _TrustedDirectoryAlias | None
+    parent_creation_mutation_performed: bool = False
 
 
 @dataclass
 class _CreatorResultDestination:
-    scope: _LiveDestinationScope
     artifact: Path
+    result_file: Path
+    scope: _LiveDestinationScope | None = None
     publication_receipt: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _LiveDestinationPreflight:
+    requested_destination: Path
+    canonical_destination: Path
+    ancestor: _BoundDirectory
+    missing_parent_components: tuple[str, ...]
+    live_bindings: list[dict[str, Any]]
+    live_containers: tuple[Path, ...]
+    trusted_alias: _TrustedDirectoryAlias | None
+    revalidate: Callable[[], dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class _CreatorDestinationPreflights:
+    artifact: _LiveDestinationPreflight
+    result: _LiveDestinationPreflight | None
 
 
 @dataclass(frozen=True)
@@ -8915,11 +8935,13 @@ def _create_bound_snapshot_destination_parent_components(
 
 
 @contextmanager
-def _bind_live_safe_destination_parent(
+def _preflight_live_safe_destination_parent_raw(
     paths: NoteStorePaths,
     destination: Path,
-) -> Iterator[_LiveDestinationScope]:
-    """Bind one destination parent after a zero-write live-container proof."""
+    *,
+    trusted_alias: _TrustedDirectoryAlias | None = None,
+) -> Iterator[_LiveDestinationPreflight]:
+    """Hold a zero-write destination-scope proof without creating parents."""
 
     requested_destination, canonical_destination, alias_spec = _trusted_alias_paths(
         destination
@@ -8930,17 +8952,28 @@ def _bind_live_safe_destination_parent(
         live_containers,
     )
     with ExitStack() as stack:
-        trusted_alias: _TrustedDirectoryAlias | None = None
         if alias_spec is not None:
-            trusted_alias = stack.enter_context(
-                _bind_trusted_directory_alias(
-                    alias_spec[0],
-                    alias_spec[1],
-                    destination=requested_destination,
+            if trusted_alias is None:
+                trusted_alias = stack.enter_context(
+                    _bind_trusted_directory_alias(
+                        alias_spec[0],
+                        alias_spec[1],
+                        destination=requested_destination,
+                    )
                 )
+            _assert_trusted_alias_matches_path(
+                trusted_alias,
+                requested_destination,
             )
             _verify_trusted_directory_alias(
                 trusted_alias,
+                destination=requested_destination,
+            )
+        elif trusted_alias is not None:
+            raise _raise_snapshot_destination_scope_inconclusive(
+                "A zero-write destination preflight escaped its carried "
+                "platform-trusted alias object: "
+                f"path={requested_destination}, held_alias={trusted_alias.alias}",
                 destination=requested_destination,
             )
         live_bindings = _bind_snapshot_live_containers(
@@ -8996,16 +9029,6 @@ def _bind_live_safe_destination_parent(
                 destination=requested_destination,
                 display_path=ancestor_binding.path,
             )
-            output_parent = stack.enter_context(
-                _create_bound_snapshot_destination_parent_components(
-                    ancestor_binding,
-                    missing_components,
-                    live_bindings=live_bindings,
-                    trusted_alias=trusted_alias,
-                    destination=requested_destination,
-                    display_path=requested_destination.parent,
-                )
-            )
         except StoreSafetyError as exc:
             if exc.code in {
                 "snapshot-destination-inside-live-container",
@@ -9014,7 +9037,7 @@ def _bind_live_safe_destination_parent(
             }:
                 raise
             raise _raise_snapshot_destination_scope_inconclusive(
-                "Cannot bind or create a safe destination parent: "
+                "Cannot preflight a safe destination parent: "
                 f"{canonical_destination.parent}: {exc}",
                 destination=requested_destination,
                 cause=exc,
@@ -9038,32 +9061,46 @@ def _bind_live_safe_destination_parent(
                 destination=requested_destination,
             )
             try:
-                parent_receipt = _verify_bound_directory_namespace(output_parent)
+                ancestor_receipt = _verify_bound_directory_namespace(ancestor_binding)
             except StoreSafetyError as exc:
-                if exc.code in {
-                    "prepared-directory-identity-mismatch",
-                    "prepared-directory-access-policy-mismatch",
-                }:
-                    raise
                 raise _raise_snapshot_destination_scope_inconclusive(
-                    "Cannot revalidate the descriptor-bound destination parent: "
-                    f"{requested_destination.parent}: {exc}",
+                    "Cannot revalidate the descriptor-bound destination "
+                    f"ancestor: {ancestor_binding.path}: {exc}",
                     destination=requested_destination,
                     cause=exc,
                 ) from exc
+            missing_component_receipt: dict[str, Any] | None = None
+            if missing_components:
+                state, _ = _observe_bound_name(
+                    ancestor_binding.fd,
+                    missing_components[0],
+                )
+                if state != "absent":
+                    raise _raise_snapshot_destination_scope_inconclusive(
+                        "The first missing destination-parent component no "
+                        "longer has a stable absent namespace state: "
+                        f"{requested_destination.parent}",
+                        destination=requested_destination,
+                    )
+                missing_component_receipt = {
+                    "nearest_existing_ancestor": str(ancestor_binding.path),
+                    "missing_components": list(missing_components),
+                    "first_missing_component_state": state,
+                }
             ancestor_chain = (
                 _assert_snapshot_destination_ancestors_exclude_live_containers(
-                    output_parent.fd,
+                    ancestor_binding.fd,
                     live_bindings,
                     destination=requested_destination,
-                    display_path=requested_destination.parent,
+                    display_path=ancestor_binding.path,
                 )
             )
             return {
-                "schema": "apple-notes-live-destination-scope/v2",
+                "schema": "apple-notes-live-destination-preflight/v1",
                 "requested_destination": str(requested_destination),
                 "canonical_destination": str(canonical_destination),
-                "parent": parent_receipt,
+                "ancestor": ancestor_receipt,
+                "missing_parent": missing_component_receipt,
                 "live_containers": live_receipts,
                 "trusted_alias": alias_receipt,
                 "ancestor_chain": ancestor_chain,
@@ -9081,14 +9118,220 @@ def _bind_live_safe_destination_parent(
             }
 
         revalidate()
-        output_parent.before_write = revalidate
-        yield _LiveDestinationScope(
+        yield _LiveDestinationPreflight(
             requested_destination=requested_destination,
-            destination=requested_destination,
-            parent=output_parent,
-            revalidate=revalidate,
+            canonical_destination=canonical_destination,
+            ancestor=ancestor_binding,
+            missing_parent_components=missing_components,
+            live_bindings=live_bindings,
+            live_containers=live_containers,
             trusted_alias=trusted_alias,
+            revalidate=revalidate,
         )
+
+
+@contextmanager
+def _preflight_live_safe_destination_parent(
+    paths: NoteStorePaths,
+    destination: Path,
+    *,
+    trusted_alias: _TrustedDirectoryAlias | None = None,
+) -> Iterator[_LiveDestinationPreflight]:
+    """Normalize every zero-write preflight failure as non-mutating."""
+
+    try:
+        with _preflight_live_safe_destination_parent_raw(
+            paths,
+            destination,
+            trusted_alias=trusted_alias,
+        ) as preflight:
+            yield preflight
+    except StoreSafetyError as exc:
+        exc.details = _merge_recovery_details(
+            exc.details,
+            {"mutation_performed": False},
+        )
+        raise
+
+
+def _assert_destination_preflight_name_absent(
+    preflight: _LiveDestinationPreflight,
+    *,
+    exists_code: str,
+    inconclusive_code: str,
+    label: str,
+) -> None:
+    preflight.revalidate()
+    if preflight.missing_parent_components:
+        return
+    state, _ = _observe_bound_name(
+        preflight.ancestor.fd,
+        preflight.requested_destination.name,
+    )
+    if state == "present":
+        raise StoreSafetyError(
+            exists_code,
+            f"{label} already exists: {preflight.requested_destination}",
+            details={
+                "destination": str(preflight.requested_destination),
+                "mutation_performed": False,
+            },
+        )
+    if state != "absent":
+        raise StoreSafetyError(
+            inconclusive_code,
+            f"Cannot prove that the descriptor-bound {label.lower()} name is "
+            f"absent: {preflight.requested_destination}",
+            details={
+                "destination": str(preflight.requested_destination),
+                "mutation_performed": False,
+            },
+        )
+
+
+@contextmanager
+def _commit_live_safe_destination_parent(
+    preflight: _LiveDestinationPreflight,
+) -> Iterator[_LiveDestinationScope]:
+    """Create a preflighted parent and expose its held write scope."""
+
+    requested_destination = preflight.requested_destination
+    canonical_destination = preflight.canonical_destination
+    live_containers = preflight.live_containers
+    live_bindings = preflight.live_bindings
+    trusted_alias = preflight.trusted_alias
+    missing_components = preflight.missing_parent_components
+    ancestor_binding = preflight.ancestor
+    parent_creation_mutation_performed = False
+    entered_scope = False
+    preflight.revalidate()
+    try:
+        with _create_bound_snapshot_destination_parent_components(
+            ancestor_binding,
+            missing_components,
+            live_bindings=live_bindings,
+            trusted_alias=trusted_alias,
+            destination=requested_destination,
+            display_path=requested_destination.parent,
+        ) as output_parent:
+            parent_creation_mutation_performed = bool(missing_components)
+
+            def revalidate() -> dict[str, Any]:
+                _assert_snapshot_destination_lexically_outside_live_containers(
+                    requested_destination,
+                    live_containers,
+                )
+                alias_receipt = (
+                    _verify_trusted_directory_alias(
+                        trusted_alias,
+                        destination=requested_destination,
+                    )
+                    if trusted_alias is not None
+                    else None
+                )
+                live_receipts = _verify_snapshot_live_container_bindings(
+                    live_bindings,
+                    destination=requested_destination,
+                )
+                try:
+                    parent_receipt = _verify_bound_directory_namespace(output_parent)
+                except StoreSafetyError as exc:
+                    if exc.code in {
+                        "prepared-directory-identity-mismatch",
+                        "prepared-directory-access-policy-mismatch",
+                    }:
+                        raise
+                    raise _raise_snapshot_destination_scope_inconclusive(
+                        "Cannot revalidate the descriptor-bound destination "
+                        f"parent: {requested_destination.parent}: {exc}",
+                        destination=requested_destination,
+                        cause=exc,
+                        mutation_performed=(
+                            parent_creation_mutation_performed
+                            or bool(exc.details.get("mutation_performed"))
+                        ),
+                    ) from exc
+                ancestor_chain = (
+                    _assert_snapshot_destination_ancestors_exclude_live_containers(
+                        output_parent.fd,
+                        live_bindings,
+                        destination=requested_destination,
+                        display_path=requested_destination.parent,
+                    )
+                )
+                return {
+                    "schema": "apple-notes-live-destination-scope/v2",
+                    "requested_destination": str(requested_destination),
+                    "canonical_destination": str(canonical_destination),
+                    "parent": parent_receipt,
+                    "live_containers": live_receipts,
+                    "trusted_alias": alias_receipt,
+                    "ancestor_chain": ancestor_chain,
+                    "protected_properties": {
+                        "object_identity": ["device", "inode", "file_type"],
+                        "location_scope": (
+                            "normalized-requested-and-canonical-alias-forms-"
+                            "bidirectional-and-descriptor-ancestor-exclusion"
+                        ),
+                        "access_policy": ["mode", "uid", "gid", "flags"],
+                        "trusted_alias": (
+                            "exact-registry-entry-parent-target-and-retarget-binding"
+                        ),
+                    },
+                }
+
+            revalidate()
+            output_parent.before_write = revalidate
+            entered_scope = True
+            yield _LiveDestinationScope(
+                requested_destination=requested_destination,
+                destination=requested_destination,
+                parent=output_parent,
+                revalidate=revalidate,
+                trusted_alias=trusted_alias,
+                parent_creation_mutation_performed=(parent_creation_mutation_performed),
+            )
+    except StoreSafetyError as exc:
+        mutation_performed = parent_creation_mutation_performed or bool(
+            exc.details.get("mutation_performed")
+        )
+        if mutation_performed:
+            exc.details = _merge_recovery_details(
+                exc.details,
+                {"mutation_performed": True},
+            )
+        if entered_scope or exc.code in {
+            "snapshot-destination-inside-live-container",
+            "snapshot-destination-reserved-store-path",
+            "snapshot-destination-scope-inconclusive",
+        }:
+            raise
+        error = _raise_snapshot_destination_scope_inconclusive(
+            "Cannot bind or create a safe destination parent: "
+            f"{canonical_destination.parent}: {exc}",
+            destination=requested_destination,
+            cause=exc,
+            mutation_performed=mutation_performed,
+        )
+        error.details = _merge_recovery_details(error.details, exc.details)
+        raise error from exc
+
+
+@contextmanager
+def _bind_live_safe_destination_parent(
+    paths: NoteStorePaths,
+    destination: Path,
+) -> Iterator[_LiveDestinationScope]:
+    """Preflight and then bind one live-safe destination parent."""
+
+    with (
+        _preflight_live_safe_destination_parent(
+            paths,
+            destination,
+        ) as preflight,
+        _commit_live_safe_destination_parent(preflight) as destination_scope,
+    ):
+        yield destination_scope
 
 
 def probe_db_access(paths: NoteStorePaths) -> dict[str, Any]:
@@ -12623,17 +12866,42 @@ def _recover_to_standalone(
     return recovered
 
 
+def _preflight_copy_notes_state(*, require_notes_quit: bool) -> bool:
+    try:
+        notes_running = notes_is_running()
+    except StoreSafetyError as exc:
+        exc.details = _merge_recovery_details(
+            exc.details,
+            {"mutation_performed": False},
+        )
+        raise
+    if require_notes_quit and notes_running:
+        raise StoreSafetyError(
+            "notes-running",
+            "Notes.app is running; quit it before using --require-notes-quit",
+            details={"mutation_performed": False},
+        )
+    return notes_running
+
+
 def copy_db(
     paths: NoteStorePaths,
     *,
     dest: Path | None,
     require_notes_quit: bool,
+    _destination_preflight: _LiveDestinationPreflight | None = None,
+    _notes_running: bool | None = None,
 ) -> dict[str, Any]:
-    notes_running = notes_is_running()
+    notes_running = (
+        _preflight_copy_notes_state(require_notes_quit=require_notes_quit)
+        if _notes_running is None
+        else _notes_running
+    )
     if require_notes_quit and notes_running:
         raise StoreSafetyError(
             "notes-running",
             "Notes.app is running; quit it before using --require-notes-quit",
+            details={"mutation_performed": False},
         )
 
     requested_destination = Path(
@@ -12643,6 +12911,35 @@ def copy_db(
         raise StoreSafetyError(
             "destination-exists",
             f"Destination already exists: {requested_destination}",
+            details={"mutation_performed": False},
+        )
+    if _destination_preflight is not None:
+        if _destination_preflight.requested_destination != requested_destination:
+            raise StoreSafetyError(
+                "snapshot-destination-scope-inconclusive",
+                "The held zero-write destination preflight names a different "
+                "snapshot artifact",
+                details={
+                    "destination": str(requested_destination),
+                    "preflight_destination": str(
+                        _destination_preflight.requested_destination
+                    ),
+                    "mutation_performed": False,
+                },
+            )
+        _assert_destination_preflight_name_absent(
+            _destination_preflight,
+            exists_code="destination-exists",
+            inconclusive_code="snapshot-destination-scope-inconclusive",
+            label="Destination",
+        )
+        destination_parent_context = _commit_live_safe_destination_parent(
+            _destination_preflight
+        )
+    else:
+        destination_parent_context = _bind_live_safe_destination_parent(
+            paths,
+            requested_destination,
         )
     publication_guard: dict[str, Any] = {}
     try:
@@ -12656,10 +12953,7 @@ def copy_db(
                     "revalidation or teardown failed"
                 ),
             ),
-            _bind_live_safe_destination_parent(
-                paths,
-                requested_destination,
-            ) as destination_scope,
+            destination_parent_context as destination_scope,
             _create_bound_directory(
                 destination_scope.destination.parent
                 / (f".{destination_scope.destination.name}.partial-{uuid.uuid4().hex}"),
@@ -14077,11 +14371,42 @@ def stage_patch(
     dest: Path,
     *,
     paths: NoteStorePaths | None = None,
+    _destination_preflight: _LiveDestinationPreflight | None = None,
 ) -> dict[str, Any]:
     requested_dest = Path(os.path.abspath(os.fspath(dest)))
     if _lexists(requested_dest):
         raise StoreSafetyError(
-            "destination-exists", f"Patch stage already exists: {requested_dest}"
+            "destination-exists",
+            f"Patch stage already exists: {requested_dest}",
+            details={"mutation_performed": False},
+        )
+    if _destination_preflight is not None:
+        if _destination_preflight.requested_destination != requested_dest:
+            raise StoreSafetyError(
+                "snapshot-destination-scope-inconclusive",
+                "The held zero-write destination preflight names a different "
+                "patch-stage artifact",
+                details={
+                    "destination": str(requested_dest),
+                    "preflight_destination": str(
+                        _destination_preflight.requested_destination
+                    ),
+                    "mutation_performed": False,
+                },
+            )
+        _assert_destination_preflight_name_absent(
+            _destination_preflight,
+            exists_code="destination-exists",
+            inconclusive_code="snapshot-destination-scope-inconclusive",
+            label="Patch stage",
+        )
+        destination_parent_context = _commit_live_safe_destination_parent(
+            _destination_preflight
+        )
+    else:
+        destination_parent_context = _bind_live_safe_destination_parent(
+            paths or NoteStorePaths(),
+            requested_dest,
         )
     publication_guard: dict[str, Any] = {}
     try:
@@ -14095,10 +14420,7 @@ def stage_patch(
                     "revalidation or teardown failed"
                 ),
             ),
-            _bind_live_safe_destination_parent(
-                paths or NoteStorePaths(),
-                requested_dest,
-            ) as destination_scope,
+            destination_parent_context as destination_scope,
             _create_bound_directory(
                 destination_scope.destination.parent
                 / (f".{destination_scope.destination.name}.partial-{uuid.uuid4().hex}"),
@@ -14840,12 +15162,269 @@ def _assert_creator_result_name_absent(
 
 
 @contextmanager
+def _preflight_creator_destinations(
+    paths: NoteStorePaths,
+    result_file: Path | None,
+    artifact: Path,
+) -> Iterator[_CreatorDestinationPreflights]:
+    """Hold both creator destinations without invoking a directory creator."""
+
+    requested_artifact = Path(os.path.abspath(os.fspath(artifact)))
+    requested_result = (
+        Path(os.path.abspath(os.fspath(result_file)))
+        if result_file is not None
+        else None
+    )
+    if _lexists(requested_artifact):
+        raise StoreSafetyError(
+            "destination-exists",
+            f"Creator artifact already exists: {requested_artifact}",
+            details={
+                "destination": str(requested_artifact),
+                "mutation_performed": False,
+            },
+        )
+    if requested_result is not None:
+        _assert_creator_result_file_lexically_external(
+            requested_result,
+            requested_artifact,
+        )
+    with ExitStack() as stack:
+        artifact_preflight = stack.enter_context(
+            _preflight_live_safe_destination_parent(
+                paths,
+                requested_artifact,
+            )
+        )
+        _assert_destination_preflight_name_absent(
+            artifact_preflight,
+            exists_code="destination-exists",
+            inconclusive_code="snapshot-destination-scope-inconclusive",
+            label="Creator artifact",
+        )
+        result_preflight: _LiveDestinationPreflight | None = None
+        if requested_result is not None:
+            result_preflight = stack.enter_context(
+                _preflight_live_safe_destination_parent(
+                    paths,
+                    requested_result,
+                )
+            )
+            _assert_destination_preflight_name_absent(
+                result_preflight,
+                exists_code="result-file-exists",
+                inconclusive_code="result-file-scope-inconclusive",
+                label="Creator result file",
+            )
+
+        # Revalidate the first proof only after the second proof is complete.
+        # This makes replacement between the two read-only windows fail before
+        # either destination is allowed to cross the creator boundary.
+        _assert_destination_preflight_name_absent(
+            artifact_preflight,
+            exists_code="destination-exists",
+            inconclusive_code="snapshot-destination-scope-inconclusive",
+            label="Creator artifact",
+        )
+        if result_preflight is not None:
+            _assert_creator_result_file_lexically_external(
+                result_preflight.requested_destination,
+                artifact_preflight.requested_destination,
+            )
+            _assert_destination_preflight_name_absent(
+                result_preflight,
+                exists_code="result-file-exists",
+                inconclusive_code="result-file-scope-inconclusive",
+                label="Creator result file",
+            )
+        yield _CreatorDestinationPreflights(
+            artifact=artifact_preflight,
+            result=result_preflight,
+        )
+
+
+def _creator_artifact_parent_component_receipts(
+    payload: dict[str, Any],
+) -> dict[Path, dict[str, Any]]:
+    try:
+        terminal_scope = payload["terminal_destination_scope"]
+        parent = terminal_scope["parent"]
+        component_path = parent["component_path_binding"]
+        created_components = component_path["created_components"]["components"]
+    except (KeyError, TypeError) as exc:
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator artifact result has no complete parent-creation receipt",
+        ) from exc
+    if not isinstance(created_components, list):
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator artifact parent-creation component list is malformed",
+        )
+    receipts: dict[Path, dict[str, Any]] = {}
+    for index, row in enumerate(created_components):
+        if not isinstance(row, dict):
+            raise StoreSafetyError(
+                "prepared-tree-receipt-invalid",
+                "Creator artifact parent-creation component receipt is malformed",
+            )
+        try:
+            path = _absolute_path(Path(os.fspath(row["path"])))
+        except (KeyError, TypeError, ValueError, OSError) as exc:
+            raise StoreSafetyError(
+                "prepared-tree-receipt-invalid",
+                "Creator artifact parent-creation path is malformed",
+            ) from exc
+        protection = _normalized_creator_artifact_protection_receipt(
+            row,
+            label=f"artifact parent component {index}",
+        )
+        if not isinstance(row.get("creation_install_receipt"), dict):
+            raise StoreSafetyError(
+                "prepared-tree-receipt-invalid",
+                "Creator artifact parent component lacks its no-replace "
+                "creation receipt",
+            )
+        if path in receipts:
+            raise StoreSafetyError(
+                "prepared-tree-receipt-invalid",
+                "Creator artifact parent-creation receipt repeats a component "
+                f"path: {path}",
+            )
+        receipts[path] = {
+            **protection,
+            "creation_install_receipt": row["creation_install_receipt"],
+        }
+    return receipts
+
+
+@contextmanager
+def _refresh_result_preflight_after_artifact_commit(
+    paths: NoteStorePaths,
+    preflight: _LiveDestinationPreflight,
+    artifact_payload: dict[str, Any] | None,
+) -> Iterator[_LiveDestinationPreflight]:
+    """Advance only across parent components proved created by the artifact."""
+
+    try:
+        _assert_destination_preflight_name_absent(
+            preflight,
+            exists_code="result-file-exists",
+            inconclusive_code="result-file-scope-inconclusive",
+            label="Creator result file",
+        )
+    except StoreSafetyError:
+        if not preflight.missing_parent_components or artifact_payload is None:
+            raise
+        state, _ = _observe_bound_name(
+            preflight.ancestor.fd,
+            preflight.missing_parent_components[0],
+        )
+        if state != "present":
+            raise
+    else:
+        yield preflight
+        return
+
+    creation_receipts = _creator_artifact_parent_component_receipts(artifact_payload)
+    old_requested_ancestor = preflight.ancestor.path
+    old_canonical_ancestor = _bound_directory_canonical_path(preflight.ancestor)
+    _verify_bound_directory_namespace(preflight.ancestor)
+    with (
+        _preflight_live_safe_destination_parent(
+            paths,
+            preflight.requested_destination,
+            trusted_alias=preflight.trusted_alias,
+        ) as refreshed,
+        ExitStack() as stack,
+    ):
+        new_canonical_ancestor = _bound_directory_canonical_path(refreshed.ancestor)
+        try:
+            newly_existing = new_canonical_ancestor.relative_to(
+                old_canonical_ancestor
+            ).parts
+        except ValueError as exc:
+            raise StoreSafetyError(
+                "result-file-scope-inconclusive",
+                "The result destination escaped its held ancestor after artifact "
+                "parent creation",
+                details={"mutation_performed": True},
+            ) from exc
+        expected_prefix = preflight.missing_parent_components[: len(newly_existing)]
+        if (
+            not newly_existing
+            or newly_existing != expected_prefix
+            or len(newly_existing) > len(preflight.missing_parent_components)
+        ):
+            raise StoreSafetyError(
+                "result-file-scope-inconclusive",
+                "The result destination acquired an unproved parent-component "
+                "path after artifact creation",
+                details={"mutation_performed": True},
+            )
+        for index in range(1, len(newly_existing) + 1):
+            requested_component = old_requested_ancestor.joinpath(
+                *newly_existing[:index]
+            )
+            canonical_component = old_canonical_ancestor.joinpath(
+                *newly_existing[:index]
+            )
+            receipt = creation_receipts.get(canonical_component)
+            if receipt is None:
+                raise StoreSafetyError(
+                    "result-file-scope-inconclusive",
+                    "A newly present result-parent component has no matching "
+                    "artifact creator receipt: "
+                    f"{requested_component}",
+                    details={"mutation_performed": True},
+                )
+            binding = stack.enter_context(
+                _bind_existing_directory_with_trusted_alias(
+                    requested_component,
+                    trusted_alias=preflight.trusted_alias,
+                )
+            )
+            current = _verify_bound_directory_namespace(binding)
+            if current["identity"] != receipt["identity"]:
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "A shared result-parent component differs from the artifact "
+                    f"creation receipt: {requested_component}",
+                    details={"mutation_performed": True},
+                )
+            if current["access_policy"] != receipt["access_policy"]:
+                raise StoreSafetyError(
+                    "prepared-directory-access-policy-mismatch",
+                    "A shared result-parent component access policy differs "
+                    f"from the artifact creation receipt: {requested_component}",
+                    details={"mutation_performed": True},
+                )
+        _assert_destination_preflight_name_absent(
+            refreshed,
+            exists_code="result-file-exists",
+            inconclusive_code="result-file-scope-inconclusive",
+            label="Creator result file",
+        )
+        yield refreshed
+
+
+@contextmanager
 def _bind_creator_result_destination(
     paths: NoteStorePaths,
     result_file: Path | None,
     artifact: Path,
+    *,
+    preflight: _LiveDestinationPreflight | None = None,
+    artifact_mutation_performed: bool = False,
+    artifact_payload: dict[str, Any] | None = None,
 ) -> Iterator[_CreatorResultDestination | None]:
     if result_file is None:
+        if preflight is not None:
+            raise StoreSafetyError(
+                "result-file-scope-inconclusive",
+                "A creator result preflight was supplied without a result file",
+                details={"mutation_performed": artifact_mutation_performed},
+            )
         yield None
         return
     requested_result = Path(os.path.abspath(os.fspath(result_file)))
@@ -14854,44 +15433,70 @@ def _bind_creator_result_destination(
         requested_result,
         requested_artifact,
     )
-    destination: _CreatorResultDestination | None = None
-    try:
-        with _bind_live_safe_destination_parent(
-            paths,
-            requested_result,
-        ) as result_scope:
-            destination = _CreatorResultDestination(
-                scope=result_scope,
-                artifact=requested_artifact,
+    destination = _CreatorResultDestination(
+        artifact=requested_artifact,
+        result_file=requested_result,
+    )
+    with ExitStack() as stack:
+        result_preflight = preflight
+        if result_preflight is None:
+            result_preflight = stack.enter_context(
+                _preflight_live_safe_destination_parent(
+                    paths,
+                    requested_result,
+                )
             )
-            result_scope.revalidate()
-            _assert_creator_result_name_absent(result_scope)
-            yield destination
-    except Exception as exc:
-        if (
-            destination is not None
-            and destination.publication_receipt is not None
-            and not (
+        elif result_preflight.requested_destination != requested_result:
+            raise StoreSafetyError(
+                "result-file-scope-inconclusive",
+                "The held zero-write result preflight names a different result file",
+                details={
+                    "result_file": str(requested_result),
+                    "preflight_destination": str(
+                        result_preflight.requested_destination
+                    ),
+                    "mutation_performed": artifact_mutation_performed,
+                },
+            )
+        try:
+            result_preflight = stack.enter_context(
+                _refresh_result_preflight_after_artifact_commit(
+                    paths,
+                    result_preflight,
+                    artifact_payload if artifact_mutation_performed else None,
+                )
+            )
+            with _commit_live_safe_destination_parent(result_preflight) as result_scope:
+                destination.scope = result_scope
+                result_scope.revalidate()
+                _assert_creator_result_name_absent(result_scope)
+                yield destination
+        except Exception as exc:
+            if artifact_mutation_performed and not (
                 isinstance(exc, StoreSafetyError)
                 and exc.code == "result-file-publication-failed"
-            )
-        ):
-            raise _creator_result_publication_failure(destination, exc) from exc
-        raise
+            ):
+                raise _creator_result_publication_failure(destination, exc) from exc
+            if destination.publication_receipt is not None and not (
+                isinstance(exc, StoreSafetyError)
+                and exc.code == "result-file-publication-failed"
+            ):
+                raise _creator_result_publication_failure(destination, exc) from exc
+            raise
 
 
 def _creator_result_publication_failure(
     destination: _CreatorResultDestination,
     exc: Exception,
 ) -> StoreSafetyError:
-    result_scope = destination.scope
     publication_receipt = destination.publication_receipt
     details = dict(exc.details) if isinstance(exc, StoreSafetyError) else {}
     details.update(
         {
             "artifact": str(destination.artifact),
             "artifact_mutation_performed": True,
-            "result_file": str(result_scope.destination),
+            "result_file": str(destination.result_file),
+            "mutation_performed": True,
             "result_file_publication_state": (
                 "committed" if publication_receipt is not None else "uncertain"
             ),
@@ -14907,7 +15512,7 @@ def _creator_result_publication_failure(
     return StoreSafetyError(
         "result-file-publication-failed",
         "The artifact was created, but its external creator result-file "
-        f"transaction could not complete safely: {result_scope.destination}: {exc}",
+        f"transaction could not complete safely: {destination.result_file}: {exc}",
         details=details,
     )
 
@@ -15355,6 +15960,11 @@ def _write_creator_result_file(
     requested_artifact = Path(os.path.abspath(os.fspath(artifact)))
     destination.artifact = requested_artifact
     try:
+        if result_scope is None:
+            raise StoreSafetyError(
+                "result-file-scope-inconclusive",
+                "Creator result publication has no committed destination scope",
+            )
         _assert_creator_result_file_lexically_external(
             result_scope.destination,
             requested_artifact,
@@ -15602,22 +16212,36 @@ def main(argv: Iterable[str] | None = None) -> int:
         elif args.command == "copy-db":
             paths = _paths_from_args(args)
             copy_destination = args.dest or _timestamped_tmp_dir("apple-notes-probe")
-            with _bind_creator_result_destination(
+            notes_running = _preflight_copy_notes_state(
+                require_notes_quit=args.require_notes_quit
+            )
+            with _preflight_creator_destinations(
                 paths,
                 args.result_file,
                 copy_destination,
-            ) as result_scope:
+            ) as destination_preflights:
                 result = copy_db(
                     paths,
                     dest=copy_destination,
                     require_notes_quit=args.require_notes_quit,
+                    _destination_preflight=destination_preflights.artifact,
+                    _notes_running=notes_running,
                 )
-                if result_scope is not None:
-                    _write_creator_result_file(
-                        result_scope,
-                        Path(result["dest"]),
-                        result,
-                    )
+                if destination_preflights.result is not None:
+                    with _bind_creator_result_destination(
+                        paths,
+                        args.result_file,
+                        copy_destination,
+                        preflight=destination_preflights.result,
+                        artifact_mutation_performed=True,
+                        artifact_payload=result,
+                    ) as result_destination:
+                        assert result_destination is not None
+                        _write_creator_result_file(
+                            result_destination,
+                            Path(result["dest"]),
+                            result,
+                        )
             emit_json(result)
         elif args.command == "merge-db":
             emit_json(
@@ -15649,22 +16273,32 @@ def main(argv: Iterable[str] | None = None) -> int:
             )
         elif args.command == "stage-patch":
             paths = _paths_from_args(args)
-            with _bind_creator_result_destination(
+            with _preflight_creator_destinations(
                 paths,
                 args.result_file,
                 args.dest,
-            ) as result_scope:
+            ) as destination_preflights:
                 result = stage_patch(
                     args.src,
                     args.dest,
                     paths=paths,
+                    _destination_preflight=destination_preflights.artifact,
                 )
-                if result_scope is not None:
-                    _write_creator_result_file(
-                        result_scope,
-                        Path(result["stage_dir"]),
-                        result,
-                    )
+                if destination_preflights.result is not None:
+                    with _bind_creator_result_destination(
+                        paths,
+                        args.result_file,
+                        args.dest,
+                        preflight=destination_preflights.result,
+                        artifact_mutation_performed=True,
+                        artifact_payload=result,
+                    ) as result_destination:
+                        assert result_destination is not None
+                        _write_creator_result_file(
+                            result_destination,
+                            Path(result["stage_dir"]),
+                            result,
+                        )
             emit_json(result)
         elif args.command == "validate-patch-stage":
             emit_json(

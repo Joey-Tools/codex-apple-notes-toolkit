@@ -35,6 +35,10 @@ superseded_by:
 - Closed the absent-live Darwin root-alias overlap gap so `/tmp` and
   `/private/tmp` forms are compared in both directions before any component
   binding or creation.
+- Closed the creator-result ordering gap so `copy-db` and `stage-patch`
+  complete independent zero-write artifact/result destination preflights
+  before any parent creator, then defer result-parent creation until artifact
+  publication succeeds.
 
 ## Current State
 
@@ -88,6 +92,20 @@ superseded_by:
   leaf therefore remains protected across `/tmp` and `/private/tmp`, while
   alias retargeting or same-target replacement still fails closed through the
   held alias identity and access-policy proof before the creator can run.
+- Creator commands now hold separate artifact and result nearest-ancestor,
+  missing-suffix, absent-leaf, live-container, and trusted-alias proofs. The
+  artifact proof is revalidated after the result proof completes, so
+  replacement between the two read-only windows fails with zero creator
+  calls.
+- Result-parent creation is a post-artifact commit phase. A shared missing
+  parent prefix may advance only through exact object-identity and
+  access-policy matches against the artifact's retained no-replace component
+  creation receipts; the original trusted-alias object remains the
+  authorization boundary.
+- Pre-creator failures report `mutation_performed: false`. Failures after
+  artifact or result-parent creation conservatively retain both
+  `mutation_performed: true` and `artifact_mutation_performed: true` where
+  applicable.
 
 ## Next Steps
 
@@ -183,6 +201,20 @@ superseded_by:
 - Root-alias skill validation: the installed wrapper could not import local
   `PyYAML`; the documented isolated `uv run --with pyyaml` fallback returned
   `Skill is valid!`. Project-journal validation also passed.
+- Zero-write creator-destination follow-up base:
+  `169a164d8d03563699728effc1ce68cc13e41307`.
+- Zero-write creator-destination regressions cover copy/stage artifact
+  existence, Notes-running, live overlap, result/artifact containment,
+  replacement between the two preflights, missing result-parent preservation,
+  shared artifact-created parent prefixes, and post-artifact result-commit
+  mutation evidence.
+- Zero-write creator-destination full suites: Homebrew Python `3.14.3` and
+  system Python `3.9.6` each passed all `259` tests outside the nested sandbox
+  required by the fixed `/usr/bin/pgrep` process-state probe.
+- Zero-write creator-destination static gates: full-repository Ruff `0.13.2`;
+  changed-Python format check; Python `3.14.3` and `3.9.6` bytecode
+  compilation with separate task-scoped caches; `bash -n`; ShellCheck
+  `0.11.0`; skill and project-journal validators; and `git diff --check`.
 - Skill validation: isolated `quick_validate.py` with `PyYAML` (`Skill is valid!`; direct local validation lacked that dependency)
 - Final skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)
 - Formal follow-up skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)

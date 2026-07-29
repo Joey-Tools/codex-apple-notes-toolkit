@@ -353,6 +353,34 @@ parent creation, creator receipts, publication, and terminal revalidation; an un
 `FileExistsError` for a formerly missing component is a race, not permission to adopt it.
 Directory child-entry churn is not itself content mutation outside those reserved names.
 
+`copy-db` and `stage-patch` have two coordinated destinations when
+`--result-file` is present. Before any identity-bound directory creator,
+`mkdir`, partial, or output creation, complete a zero-write command preflight:
+run the Notes-state gate where applicable; prove that the artifact leaf is
+absent and outside the live containers; prove normalized requested/canonical
+artifact-result separation in both directions; and independently bind the
+result's live-container scope, trusted alias, nearest existing ancestor,
+missing suffix, and absent leaf. Hold both proofs concurrently and revalidate
+the artifact proof only after the result proof has completed. Replacement,
+alias retargeting, access-policy drift, a newly present unproved component, or
+unavailable evidence between those two proofs fails before either creator may
+run.
+
+After both proofs succeed, commit the artifact destination first. A missing
+result parent remains absent until artifact publication succeeds. Artifact
+parent creation may legitimately create a prefix shared with the result
+parent; advance the held result proof across that prefix only when every newly
+present component exactly matches the artifact's retained no-replace creation
+receipt for object identity and access policy. Never adopt a newly observed
+component as a fresh baseline. Only then may the result-parent commit invoke a
+creator. Before each creator boundary, revalidate the corresponding held
+ancestor, live-container, alias, missing-component, and containment evidence.
+A pre-creator failure reports `mutation_performed: false`. Once either commit
+crosses a creator boundary, merge errors conservatively so no successful or
+uncertain parent/artifact mutation is omitted; a result transaction attempted
+after artifact publication also reports `artifact_mutation_performed: true`
+and `mutation_performed: true`.
+
 Never `mkdir` a missing destination component or private-partial target name directly. Under the
 already-held parent, require a trusted platform or supervisor creator to allocate an unpredictable
 `.apple-notes-create-<random>` directory with mode `0700` and return the already-open descriptor
@@ -483,12 +511,15 @@ A post-write stat is never allowed to establish a new access-policy baseline.
 After the manifest is durably written, return its exact creation receipt in the successful
 `copy-db` or `stage-patch` result. The result file is a separate caller-owned authority and must be
 stored outside the published artifact. Use the packaged `--result-file` interface rather than
-shell redirection: it binds the external parent and live-container scope before artifact creation,
-rejects every pre-existing leaf including symlinks, creates an unpredictable descriptor-relative
-temporary regular file with `O_NOFOLLOW|O_CREAT|O_EXCL`, enforces exact effective owner/group and
-mode `0600` before writing, performs stable content readback, fsyncs the file, publishes with an
-atomic no-replace rename, fsyncs the held parent, and terminally revalidates the external name and
-artifact separation. Before the result write begins, bind the reopened artifact to the successful
+shell redirection: before artifact creation it performs only the zero-write external-parent,
+missing-suffix, live-container, alias, absent-leaf, and artifact-containment proof described
+above. It creates no missing result parent at that stage. After artifact publication succeeds, it
+commits the held result-parent scope, rejects every pre-existing leaf including symlinks, creates
+an unpredictable descriptor-relative temporary regular file with
+`O_NOFOLLOW|O_CREAT|O_EXCL`, enforces exact effective owner/group and mode `0600` before writing,
+performs stable content readback, fsyncs the file, publishes with an atomic no-replace rename,
+fsyncs the held parent, and terminally revalidates the external name and artifact separation.
+Before the result write begins, bind the reopened artifact to the successful
 creator payload's `descriptor_bound_destination` and exact prepared-tree creation receipt rather
 than accepting the reopened object as a new baseline. Require the held parent and artifact root
 identity/access policy, every exact directory membership, and every file identity/access

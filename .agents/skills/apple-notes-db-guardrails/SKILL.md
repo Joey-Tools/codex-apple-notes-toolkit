@@ -136,6 +136,22 @@ Successful creator output records the alias-aware
 `manifest_creation_destination_scope`, `terminal_destination_scope`, and
 `descriptor_bound_destination` receipts.
 
+For `copy-db` and `stage-patch`, artifact and `--result-file` destinations use
+two explicit phases. The zero-write phase runs the Notes gate where applicable,
+rejects an existing or live-overlapping artifact, proves normalized
+requested/canonical artifact-result separation, and independently holds each
+destination's live-container, trusted-alias, nearest-existing-ancestor, missing
+suffix, and absent-leaf evidence. It revalidates the artifact proof after the
+result proof completes. No identity-bound directory creator or `mkdir` may run
+until both proofs succeed. The commit phase creates the artifact parent first
+and does not create a missing result parent until artifact publication
+succeeds. If artifact creation also creates a parent-prefix needed by the
+result, the result phase may advance across only the exact component identities
+and access policies carried by the artifact's no-replace creator receipts;
+every other appeared component is a scope failure. Any error after a creator
+boundary conservatively retains `mutation_performed: true`; an artifact-created
+result transaction also retains `artifact_mutation_performed: true`.
+
 The Notes-running gate executes only `/usr/bin/pgrep -x Notes` with a minimal fixed environment,
 a hard deadline, and process-group cleanup. Only exit `0` plus one or more decimal PIDs means
 running; only exit `1` with empty stdout/stderr means quit. Timeout, exec failure, diagnostics,
@@ -156,12 +172,14 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" copy-db \
 ```
 
 Keep `snapshot-manifest.json` with the copied file set, and separately preserve the successful
-creation-result JSON outside the snapshot. `--result-file` binds the external parent and live
-container scope before artifact creation, rejects pre-existing regular files and symlinks, creates
-an unpredictable descriptor-relative temporary regular file with `O_NOFOLLOW|O_CREAT|O_EXCL`,
-enforces the current effective owner/group and mode `0600` before writing, fsyncs the file, and
-publishes it with an atomic no-replace rename plus held-parent fsync. It revalidates identity,
-content, and the complete access policy before and after publication. Its
+creation-result JSON outside the snapshot. Before artifact creation, `--result-file` only binds
+and retains the external destination's nearest existing ancestor, missing suffix, live-container
+scope, trusted alias, containment proof, and absent leaf; it does not create a missing parent.
+After artifact publication succeeds, it commits that held parent scope, rejects pre-existing
+regular files and symlinks, creates an unpredictable descriptor-relative temporary regular file
+with `O_NOFOLLOW|O_CREAT|O_EXCL`, enforces the current effective owner/group and mode `0600` before
+writing, fsyncs the file, and publishes it with an atomic no-replace rename plus held-parent fsync.
+It revalidates identity, content, and the complete access policy before and after publication. Its
 `manifest_creation_receipt` anchors the exact creation-time manifest SHA-256, size, identity, and
 access policy. Before writing the result, the helper binds the reopened artifact's parent, root,
 exact nested directory memberships, and every file's identity/access policy/SHA-256/size to the

@@ -931,17 +931,13 @@ raise SystemExit(2)
             destination = root / "snapshot"
             result_file = root / "snapshot-creation-result.json"
             expected_result = Path(os.path.abspath(result_file))
-            original_bind = MODULE._bind_live_safe_destination_parent
+            original_commit = MODULE._commit_live_safe_destination_parent
 
             @contextmanager
             def fail_result_scope_after_yield(
-                bound_paths: MODULE.NoteStorePaths,
-                bound_destination: Path,
+                preflight: MODULE._LiveDestinationPreflight,
             ) -> Iterator[MODULE._LiveDestinationScope]:
-                with original_bind(
-                    bound_paths,
-                    bound_destination,
-                ) as result_scope:
+                with original_commit(preflight) as result_scope:
                     yield result_scope
                     if result_scope.destination == expected_result:
                         raise MODULE.StoreSafetyError(
@@ -954,7 +950,7 @@ raise SystemExit(2)
                 mock.patch.object(MODULE, "notes_is_running", return_value=False),
                 mock.patch.object(
                     MODULE,
-                    "_bind_live_safe_destination_parent",
+                    "_commit_live_safe_destination_parent",
                     side_effect=fail_result_scope_after_yield,
                 ),
                 redirect_stdout(stdout),
@@ -1192,6 +1188,362 @@ raise SystemExit(2)
                         result_file.read_text(encoding="utf-8"),
                         "existing-result",
                     )
+
+    def test_creator_cli_preflight_failures_leave_missing_result_parent_absent(
+        self,
+    ) -> None:
+        cases = (
+            ("copy-db", "artifact-exists", "destination-exists"),
+            ("copy-db", "notes-running", "notes-running"),
+            (
+                "copy-db",
+                "live-overlap",
+                "snapshot-destination-inside-live-container",
+            ),
+            ("copy-db", "result-overlap", "result-file-not-external"),
+            ("stage-patch", "artifact-exists", "destination-exists"),
+            (
+                "stage-patch",
+                "live-overlap",
+                "snapshot-destination-inside-live-container",
+            ),
+            ("stage-patch", "result-overlap", "result-file-not-external"),
+        )
+        for command, failure, expected_code in cases:
+            with (
+                self.subTest(command=command, failure=failure),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+                edited = root / "edited.sqlite"
+                self._create_db(edited)
+                destination = root / f"{command}-{failure}-artifact"
+                if failure == "artifact-exists":
+                    destination.mkdir()
+                elif failure == "live-overlap":
+                    destination = paths.group_container / "artifact"
+                result_parent = root / f"{command}-{failure}-result-parent"
+                result_file = result_parent / "result.json"
+                if failure == "result-overlap":
+                    result_parent = destination / "result-parent"
+                    result_file = result_parent / "result.json"
+
+                argv = [
+                    command,
+                    "--group-container",
+                    str(paths.group_container),
+                    "--app-container",
+                    str(paths.app_container),
+                ]
+                if command == "copy-db":
+                    argv.extend(["--dest", str(destination)])
+                    if failure == "notes-running":
+                        argv.append("--require-notes-quit")
+                else:
+                    argv.extend(
+                        [
+                            "--src",
+                            str(edited),
+                            "--dest",
+                            str(destination),
+                        ]
+                    )
+                argv.extend(["--result-file", str(result_file)])
+
+                creator = mock.Mock(
+                    side_effect=AssertionError(
+                        "read-only creator preflight must not invoke a creator"
+                    )
+                )
+                commit = mock.Mock(
+                    side_effect=AssertionError(
+                        "read-only creator preflight must not enter commit"
+                    )
+                )
+                bind_result = mock.Mock(
+                    side_effect=AssertionError(
+                        "read-only creator preflight must not bind result commit"
+                    )
+                )
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=(failure == "notes-running"),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_IDENTITY_BOUND_DIRECTORY_CREATOR",
+                        creator,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_commit_live_safe_destination_parent",
+                        commit,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_bind_creator_result_destination",
+                        bind_result,
+                    ),
+                    mock.patch.object(MODULE.os, "mkdir") as mkdir,
+                    redirect_stdout(stdout),
+                ):
+                    return_code = MODULE.main(argv)
+
+                payload = json.loads(stdout.getvalue())
+                self.assertEqual(return_code, 1)
+                self.assertEqual(payload["error_code"], expected_code)
+                self.assertFalse(payload["details"]["mutation_performed"])
+                creator.assert_not_called()
+                commit.assert_not_called()
+                bind_result.assert_not_called()
+                mkdir.assert_not_called()
+                self.assertFalse(result_parent.exists())
+                if failure != "artifact-exists":
+                    self.assertFalse(destination.exists())
+
+    def test_creator_cli_rejects_replacement_between_destination_preflights(
+        self,
+    ) -> None:
+        for command in ("copy-db", "stage-patch"):
+            with (
+                self.subTest(command=command),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+                edited = root / "edited.sqlite"
+                self._create_db(edited)
+                artifact_parent = root / f"{command}-artifact-parent"
+                artifact_parent.mkdir()
+                parked_parent = root / f"{command}-artifact-parent-original"
+                destination = artifact_parent / "artifact"
+                result_parent = root / f"{command}-result-parent"
+                result_file = result_parent / "result.json"
+                original_preflight = MODULE._preflight_live_safe_destination_parent
+                preflight_count = 0
+
+                @contextmanager
+                def replace_after_second_preflight(
+                    bound_paths: MODULE.NoteStorePaths,
+                    bound_destination: Path,
+                ) -> Iterator[MODULE._LiveDestinationPreflight]:
+                    nonlocal preflight_count
+                    with original_preflight(
+                        bound_paths,
+                        bound_destination,
+                    ) as preflight:
+                        preflight_count += 1
+                        if preflight_count == 2:
+                            artifact_parent.rename(parked_parent)
+                            artifact_parent.mkdir()
+                        yield preflight
+
+                argv = [
+                    command,
+                    "--group-container",
+                    str(paths.group_container),
+                    "--app-container",
+                    str(paths.app_container),
+                ]
+                if command == "copy-db":
+                    argv.extend(["--dest", str(destination)])
+                else:
+                    argv.extend(
+                        [
+                            "--src",
+                            str(edited),
+                            "--dest",
+                            str(destination),
+                        ]
+                    )
+                argv.extend(["--result-file", str(result_file)])
+                creator = mock.Mock(
+                    side_effect=AssertionError(
+                        "replacement must fail before creator commit"
+                    )
+                )
+                commit = mock.Mock(
+                    side_effect=AssertionError(
+                        "replacement must fail before commit phase"
+                    )
+                )
+                bind_result = mock.Mock(
+                    side_effect=AssertionError(
+                        "replacement must fail before result commit binding"
+                    )
+                )
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_IDENTITY_BOUND_DIRECTORY_CREATOR",
+                        creator,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_commit_live_safe_destination_parent",
+                        commit,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_bind_creator_result_destination",
+                        bind_result,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_preflight_live_safe_destination_parent",
+                        side_effect=replace_after_second_preflight,
+                    ),
+                    redirect_stdout(stdout),
+                ):
+                    return_code = MODULE.main(argv)
+
+                payload = json.loads(stdout.getvalue())
+                self.assertEqual(preflight_count, 2)
+                self.assertEqual(return_code, 1)
+                self.assertFalse(payload["details"]["mutation_performed"])
+                creator.assert_not_called()
+                commit.assert_not_called()
+                bind_result.assert_not_called()
+                self.assertFalse(destination.exists())
+                self.assertFalse(result_parent.exists())
+
+    def test_creator_cli_accepts_artifact_created_shared_parent_prefix(
+        self,
+    ) -> None:
+        for command in ("copy-db", "stage-patch"):
+            with (
+                self.subTest(command=command),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+                edited = root / "edited.sqlite"
+                self._create_db(edited)
+                shared_parent = root / f"{command}-shared-parent"
+                destination = shared_parent / "artifacts" / "artifact"
+                result_parent = shared_parent / "results"
+                result_file = result_parent / "result.json"
+                argv = [
+                    command,
+                    "--group-container",
+                    str(paths.group_container),
+                    "--app-container",
+                    str(paths.app_container),
+                ]
+                if command == "copy-db":
+                    argv.extend(["--dest", str(destination)])
+                else:
+                    argv.extend(
+                        [
+                            "--src",
+                            str(edited),
+                            "--dest",
+                            str(destination),
+                        ]
+                    )
+                argv.extend(["--result-file", str(result_file)])
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ),
+                    redirect_stdout(stdout),
+                ):
+                    return_code = MODULE.main(argv)
+
+                self.assertEqual(return_code, 0, stdout.getvalue())
+                self.assertTrue(destination.is_dir())
+                self.assertTrue(result_file.is_file())
+                self.assertEqual(
+                    json.loads(result_file.read_text(encoding="utf-8")),
+                    json.loads(stdout.getvalue()),
+                )
+
+    def test_creator_result_commit_failure_retains_all_mutation_evidence(
+        self,
+    ) -> None:
+        for command in ("copy-db", "stage-patch"):
+            with (
+                self.subTest(command=command),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+                edited = root / "edited.sqlite"
+                self._create_db(edited)
+                destination = root / f"{command}-artifact"
+                result_parent = root / f"{command}-result-parent"
+                result_file = result_parent / "result.json"
+                argv = [
+                    command,
+                    "--group-container",
+                    str(paths.group_container),
+                    "--app-container",
+                    str(paths.app_container),
+                ]
+                if command == "copy-db":
+                    argv.extend(["--dest", str(destination)])
+                else:
+                    argv.extend(
+                        [
+                            "--src",
+                            str(edited),
+                            "--dest",
+                            str(destination),
+                        ]
+                    )
+                argv.extend(["--result-file", str(result_file)])
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_assert_creator_result_name_absent",
+                        side_effect=MODULE.StoreSafetyError(
+                            "simulated-result-commit-failure",
+                            "simulated result commit failure",
+                        ),
+                    ),
+                    redirect_stdout(stdout),
+                ):
+                    return_code = MODULE.main(argv)
+
+                payload = json.loads(stdout.getvalue())
+                details = payload["details"]
+                self.assertEqual(return_code, 1)
+                self.assertEqual(
+                    payload["error_code"],
+                    "result-file-publication-failed",
+                )
+                self.assertEqual(
+                    details["underlying_error_code"],
+                    "simulated-result-commit-failure",
+                )
+                self.assertTrue(details["artifact_mutation_performed"])
+                self.assertTrue(details["mutation_performed"])
+                self.assertTrue(destination.is_dir())
+                self.assertTrue(result_parent.is_dir())
+                self.assertFalse(result_file.exists())
 
     def test_supervisor_malformed_provider_locators_never_leak_received_fd(
         self,
