@@ -997,6 +997,260 @@ raise SystemExit(2)
             hashlib.sha256(committed_bytes).hexdigest(),
         )
 
+    def test_creator_artifact_preflight_teardown_failure_retains_receipt(
+        self,
+    ) -> None:
+        for command in ("copy-db", "stage-patch"):
+            with (
+                self.subTest(command=command),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+                edited = root / "edited.sqlite"
+                self._create_db(edited)
+                destination = root / f"{command}-artifact"
+                expected_artifact = Path(os.path.abspath(destination))
+                original_raw_preflight = (
+                    MODULE._preflight_live_safe_destination_parent_raw
+                )
+                original_post_publication_error = (
+                    MODULE._post_publication_uncertain_error
+                )
+                teardown_error_details: list[dict[str, object]] = []
+
+                @contextmanager
+                def fail_artifact_preflight_after_yield(
+                    preflight_paths: MODULE.NoteStorePaths,
+                    preflight_destination: Path,
+                    *,
+                    trusted_alias: MODULE._TrustedDirectoryAlias | None = None,
+                ) -> Iterator[MODULE._LiveDestinationPreflight]:
+                    with original_raw_preflight(
+                        preflight_paths,
+                        preflight_destination,
+                        trusted_alias=trusted_alias,
+                    ) as preflight:
+                        yield preflight
+                    if preflight.requested_destination == expected_artifact:
+                        raise MODULE.StoreSafetyError(
+                            "prepared-directory-identity-mismatch",
+                            "simulated original preflight teardown failure",
+                            details={"mutation_performed": False},
+                        )
+
+                def capture_post_publication_error(
+                    exc: BaseException,
+                    **kwargs: object,
+                ) -> MODULE.StoreSafetyError:
+                    if isinstance(exc, MODULE.StoreSafetyError):
+                        teardown_error_details.append(dict(exc.details))
+                    return original_post_publication_error(exc, **kwargs)
+
+                argv = [
+                    command,
+                    "--group-container",
+                    str(paths.group_container),
+                    "--app-container",
+                    str(paths.app_container),
+                ]
+                if command == "copy-db":
+                    argv.extend(["--dest", str(destination)])
+                else:
+                    argv.extend(
+                        [
+                            "--src",
+                            str(edited),
+                            "--dest",
+                            str(destination),
+                        ]
+                    )
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_preflight_live_safe_destination_parent_raw",
+                        side_effect=fail_artifact_preflight_after_yield,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_post_publication_uncertain_error",
+                        side_effect=capture_post_publication_error,
+                    ),
+                    redirect_stdout(stdout),
+                ):
+                    return_code = MODULE.main(argv)
+
+                error_payload = json.loads(stdout.getvalue())
+                details = error_payload["details"]
+                recovery = details["recovery_locators"]["descriptor_bound_destination"]
+
+                self.assertEqual(return_code, 1)
+                self.assertEqual(
+                    error_payload["error_code"],
+                    "destination-install-uncertain",
+                )
+                self.assertTrue(destination.is_dir())
+                self.assertTrue(details["mutation_performed"])
+                self.assertTrue(details["artifact_mutation_performed"])
+                self.assertEqual(len(teardown_error_details), 1)
+                self.assertNotIn(
+                    "mutation_performed",
+                    teardown_error_details[0],
+                )
+                self.assertEqual(
+                    details["artifact_publication_state"],
+                    "committed",
+                )
+                self.assertEqual(details["publication_state"], "uncertain")
+                self.assertFalse(details["retry_safe"])
+                self.assertEqual(
+                    details["post_publication_phase"],
+                    "creator-destination-preflight-teardown",
+                )
+                self.assertEqual(
+                    details["post_publication_error_code"],
+                    "prepared-directory-identity-mismatch",
+                )
+                self.assertEqual(
+                    Path(recovery["display_path"]),
+                    expected_artifact,
+                )
+
+    def test_creator_committed_result_survives_artifact_preflight_teardown(
+        self,
+    ) -> None:
+        for command in ("copy-db", "stage-patch"):
+            with (
+                self.subTest(command=command),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+                edited = root / "edited.sqlite"
+                self._create_db(edited)
+                destination = root / f"{command}-artifact"
+                result_file = root / f"{command}-creation-result.json"
+                expected_artifact = Path(os.path.abspath(destination))
+                original_raw_preflight = (
+                    MODULE._preflight_live_safe_destination_parent_raw
+                )
+
+                @contextmanager
+                def fail_artifact_preflight_after_yield(
+                    preflight_paths: MODULE.NoteStorePaths,
+                    preflight_destination: Path,
+                    *,
+                    trusted_alias: MODULE._TrustedDirectoryAlias | None = None,
+                ) -> Iterator[MODULE._LiveDestinationPreflight]:
+                    with original_raw_preflight(
+                        preflight_paths,
+                        preflight_destination,
+                        trusted_alias=trusted_alias,
+                    ) as preflight:
+                        yield preflight
+                    if preflight.requested_destination == expected_artifact:
+                        raise MODULE.StoreSafetyError(
+                            "prepared-directory-identity-mismatch",
+                            "simulated original preflight teardown failure",
+                            details={"mutation_performed": False},
+                        )
+
+                argv = [
+                    command,
+                    "--group-container",
+                    str(paths.group_container),
+                    "--app-container",
+                    str(paths.app_container),
+                ]
+                if command == "copy-db":
+                    argv.extend(["--dest", str(destination)])
+                else:
+                    argv.extend(
+                        [
+                            "--src",
+                            str(edited),
+                            "--dest",
+                            str(destination),
+                        ]
+                    )
+                argv.extend(["--result-file", str(result_file)])
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_preflight_live_safe_destination_parent_raw",
+                        side_effect=fail_artifact_preflight_after_yield,
+                    ),
+                    redirect_stdout(stdout),
+                ):
+                    return_code = MODULE.main(argv)
+
+                error_payload = json.loads(stdout.getvalue())
+                details = error_payload["details"]
+                committed_payload = json.loads(result_file.read_text(encoding="utf-8"))
+                committed_bytes = result_file.read_bytes()
+                artifact_recovery = details["recovery_locators"][
+                    "artifact_descriptor_bound_destination"
+                ]
+                result_recovery = details["recovery_locators"]["result_file_receipt"]
+                expected_result_sha256 = hashlib.sha256(committed_bytes).hexdigest()
+
+                self.assertEqual(return_code, 1)
+                self.assertEqual(
+                    error_payload["error_code"],
+                    "result-file-publication-failed",
+                )
+                self.assertTrue(destination.is_dir())
+                self.assertEqual(
+                    Path(
+                        committed_payload.get(
+                            "dest",
+                            committed_payload.get("stage_dir"),
+                        )
+                    ),
+                    destination,
+                )
+                self.assertTrue(details["mutation_performed"])
+                self.assertTrue(details["artifact_mutation_performed"])
+                self.assertEqual(
+                    details["artifact_publication_state"],
+                    "committed",
+                )
+                self.assertEqual(
+                    details["result_file_publication_state"],
+                    "committed",
+                )
+                self.assertFalse(details["retry_safe"])
+                self.assertEqual(
+                    details["underlying_error_code"],
+                    "prepared-directory-identity-mismatch",
+                )
+                self.assertEqual(
+                    Path(artifact_recovery["display_path"]),
+                    expected_artifact,
+                )
+                self.assertEqual(
+                    details["result_file_receipt"]["sha256"],
+                    expected_result_sha256,
+                )
+                self.assertEqual(
+                    result_recovery["sha256"],
+                    expected_result_sha256,
+                )
+
     def test_stage_cli_safely_publishes_external_result_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

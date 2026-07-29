@@ -535,6 +535,17 @@ validation. Every later ordinary failure remains
 receipt. Do not let a late scope error erase or downgrade that committed evidence. A consumer may
 supply either that complete creator result or the nested
 `manifest_creation_receipt`; it may not self-bootstrap a receipt from the current manifest.
+The creator command also holds its original zero-write artifact/result destination preflights
+until all requested publication work completes. The preflight wrapper may add
+`mutation_performed: false` only when its raw context fails before returning the first held
+proof. A later teardown failure is failed revalidation of the selected object-identity,
+access-policy, alias, or live-containment properties; it is not evidence that publication did
+not occur. After the artifact payload latches its successful no-replace receipt, an
+artifact-only teardown failure is `destination-install-uncertain` with
+`artifact_publication_state: committed`, `mutation_performed: true`, `retry_safe: false`, and
+the descriptor-bound artifact recovery locator. If the external result receipt was also
+latched, the same teardown failure remains `result-file-publication-failed` with both the
+artifact recovery identity and exact committed result-file receipt.
 Before loading a CLI receipt file, bind its parent and the artifact root and traverse descriptor
 ancestors to prove the receipt is outside the artifact. Bind the receipt as a no-follow regular
 file, enforce the manifest-size bound, and require stable descriptor reads. Keep that exact

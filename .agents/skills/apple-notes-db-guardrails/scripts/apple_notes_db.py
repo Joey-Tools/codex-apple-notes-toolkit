@@ -234,6 +234,7 @@ class _LiveDestinationScope:
 class _CreatorResultDestination:
     artifact: Path
     result_file: Path
+    artifact_payload: dict[str, Any] | None = None
     scope: _LiveDestinationScope | None = None
     publication_receipt: dict[str, Any] | None = None
 
@@ -250,10 +251,12 @@ class _LiveDestinationPreflight:
     revalidate: Callable[[], dict[str, Any]]
 
 
-@dataclass(frozen=True)
+@dataclass
 class _CreatorDestinationPreflights:
     artifact: _LiveDestinationPreflight
     result: _LiveDestinationPreflight | None
+    published_artifact_payload: dict[str, Any] | None = None
+    result_destination: _CreatorResultDestination | None = None
 
 
 @dataclass(frozen=True)
@@ -9137,20 +9140,31 @@ def _preflight_live_safe_destination_parent(
     *,
     trusted_alias: _TrustedDirectoryAlias | None = None,
 ) -> Iterator[_LiveDestinationPreflight]:
-    """Normalize every zero-write preflight failure as non-mutating."""
+    """Mark only failures before the first held proof as non-mutating."""
 
+    initial_proof_complete = False
+    body_error: BaseException | None = None
     try:
         with _preflight_live_safe_destination_parent_raw(
             paths,
             destination,
             trusted_alias=trusted_alias,
         ) as preflight:
-            yield preflight
+            initial_proof_complete = True
+            try:
+                yield preflight
+            except BaseException as exc:
+                body_error = exc
+                raise
     except StoreSafetyError as exc:
-        exc.details = _merge_recovery_details(
-            exc.details,
-            {"mutation_performed": False},
-        )
+        if not initial_proof_complete:
+            exc.details = _merge_recovery_details(
+                exc.details,
+                {"mutation_performed": False},
+            )
+        elif exc is not body_error and exc.details.get("mutation_performed") is False:
+            exc.details = dict(exc.details)
+            del exc.details["mutation_performed"]
         raise
 
 
@@ -15162,12 +15176,12 @@ def _assert_creator_result_name_absent(
 
 
 @contextmanager
-def _preflight_creator_destinations(
+def _preflight_creator_destinations_raw(
     paths: NoteStorePaths,
     result_file: Path | None,
     artifact: Path,
 ) -> Iterator[_CreatorDestinationPreflights]:
-    """Hold both creator destinations without invoking a directory creator."""
+    """Acquire both zero-write creator destination proofs."""
 
     requested_artifact = Path(os.path.abspath(os.fspath(artifact)))
     requested_result = (
@@ -15241,6 +15255,109 @@ def _preflight_creator_destinations(
             artifact=artifact_preflight,
             result=result_preflight,
         )
+
+
+@contextmanager
+def _preflight_creator_destinations(
+    paths: NoteStorePaths,
+    result_file: Path | None,
+    artifact: Path,
+) -> Iterator[_CreatorDestinationPreflights]:
+    """Carry publication latches across held destination-proof teardown."""
+
+    requested_artifact = Path(os.path.abspath(os.fspath(artifact)))
+    requested_result = (
+        Path(os.path.abspath(os.fspath(result_file)))
+        if result_file is not None
+        else None
+    )
+    destination_preflights: _CreatorDestinationPreflights | None = None
+    try:
+        with _preflight_creator_destinations_raw(
+            paths,
+            requested_result,
+            requested_artifact,
+        ) as destination_preflights:
+            yield destination_preflights
+    except Exception as exc:
+        if (
+            destination_preflights is None
+            or destination_preflights.published_artifact_payload is None
+        ):
+            raise
+        if requested_result is not None:
+            destination = destination_preflights.result_destination
+            if destination is None:
+                destination = _CreatorResultDestination(
+                    artifact=requested_artifact,
+                    result_file=requested_result,
+                    artifact_payload=(
+                        destination_preflights.published_artifact_payload
+                    ),
+                )
+            error = _creator_result_publication_failure(destination, exc)
+            if (
+                isinstance(exc, StoreSafetyError)
+                and exc.code == "result-file-publication-failed"
+            ):
+                exc.details = error.details
+                raise
+            raise error from exc
+
+        payload = destination_preflights.published_artifact_payload
+        descriptor = payload.get("descriptor_bound_destination")
+        evidence = _creator_artifact_publication_evidence(
+            requested_artifact,
+            payload,
+        )
+        error = _post_publication_uncertain_error(
+            exc,
+            destination=requested_artifact,
+            descriptor_bound_destination=(
+                descriptor if isinstance(descriptor, dict) else None
+            ),
+            phase="creator-destination-preflight-teardown",
+            message=(
+                "Creator artifact publication committed, but its retained "
+                "destination preflight could not close safely"
+            ),
+            additional_details=evidence,
+        )
+        if (
+            isinstance(exc, StoreSafetyError)
+            and exc.code == "destination-install-uncertain"
+        ):
+            exc.details = error.details
+            raise
+        raise error from exc
+
+
+def _creator_artifact_publication_evidence(
+    artifact: Path,
+    payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return latched creator-artifact publication and recovery evidence."""
+
+    details: dict[str, Any] = {
+        "artifact": str(artifact),
+        "artifact_mutation_performed": True,
+        "artifact_publication_state": "committed",
+        "mutation_performed": True,
+        "retry_safe": False,
+        "recovery_locators": {"destination": str(artifact)},
+    }
+    if payload is None:
+        return details
+    descriptor = payload.get("descriptor_bound_destination")
+    if isinstance(descriptor, dict):
+        details["recovery_locators"]["descriptor_bound_destination"] = descriptor
+        details["recovery_locators"]["artifact_descriptor_bound_destination"] = (
+            descriptor
+        )
+    terminal_scope = payload.get("terminal_destination_scope")
+    if isinstance(terminal_scope, dict):
+        details["artifact_terminal_destination_scope"] = terminal_scope
+    return details
 
 
 def _creator_artifact_parent_component_receipts(
@@ -15436,6 +15553,7 @@ def _bind_creator_result_destination(
     destination = _CreatorResultDestination(
         artifact=requested_artifact,
         result_file=requested_result,
+        artifact_payload=artifact_payload,
     )
     with ExitStack() as stack:
         result_preflight = preflight
@@ -15490,7 +15608,34 @@ def _creator_result_publication_failure(
     exc: Exception,
 ) -> StoreSafetyError:
     publication_receipt = destination.publication_receipt
-    details = dict(exc.details) if isinstance(exc, StoreSafetyError) else {}
+    if (
+        publication_receipt is None
+        and isinstance(exc, StoreSafetyError)
+        and exc.code == "result-file-publication-failed"
+        and isinstance(exc.details.get("result_file_receipt"), dict)
+    ):
+        publication_receipt = exc.details["result_file_receipt"]
+    details = _creator_artifact_publication_evidence(
+        destination.artifact,
+        destination.artifact_payload,
+    )
+    if isinstance(exc, StoreSafetyError):
+        details = _merge_recovery_details(details, exc.details)
+    if (
+        isinstance(exc, StoreSafetyError)
+        and exc.code == "result-file-publication-failed"
+    ):
+        underlying_error_code = str(
+            exc.details.get("underlying_error_code", "unexpected-error")
+        )
+        underlying_error_type = str(
+            exc.details.get("underlying_error_type", type(exc).__name__)
+        )
+    else:
+        underlying_error_code = (
+            exc.code if isinstance(exc, StoreSafetyError) else "unexpected-error"
+        )
+        underlying_error_type = type(exc).__name__
     details.update(
         {
             "artifact": str(destination.artifact),
@@ -15501,14 +15646,18 @@ def _creator_result_publication_failure(
                 "committed" if publication_receipt is not None else "uncertain"
             ),
             "retry_safe": False,
-            "underlying_error_code": (
-                exc.code if isinstance(exc, StoreSafetyError) else "unexpected-error"
-            ),
-            "underlying_error_type": type(exc).__name__,
+            "underlying_error_code": underlying_error_code,
+            "underlying_error_type": underlying_error_type,
         }
     )
+    recovery_locators = dict(details.get("recovery_locators", {}))
+    recovery_locators["result_file"] = str(destination.result_file)
     if publication_receipt is not None:
         details["result_file_receipt"] = publication_receipt
+        recovery_locators["result_file_receipt"] = publication_receipt
+    details["recovery_locators"] = recovery_locators
+    details["mutation_performed"] = True
+    details["retry_safe"] = False
     return StoreSafetyError(
         "result-file-publication-failed",
         "The artifact was created, but its external creator result-file "
@@ -16227,6 +16376,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                     _destination_preflight=destination_preflights.artifact,
                     _notes_running=notes_running,
                 )
+                destination_preflights.published_artifact_payload = result
                 if destination_preflights.result is not None:
                     with _bind_creator_result_destination(
                         paths,
@@ -16237,6 +16387,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                         artifact_payload=result,
                     ) as result_destination:
                         assert result_destination is not None
+                        destination_preflights.result_destination = result_destination
                         _write_creator_result_file(
                             result_destination,
                             Path(result["dest"]),
@@ -16284,6 +16435,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                     paths=paths,
                     _destination_preflight=destination_preflights.artifact,
                 )
+                destination_preflights.published_artifact_payload = result
                 if destination_preflights.result is not None:
                     with _bind_creator_result_destination(
                         paths,
@@ -16294,6 +16446,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                         artifact_payload=result,
                     ) as result_destination:
                         assert result_destination is not None
+                        destination_preflights.result_destination = result_destination
                         _write_creator_result_file(
                             result_destination,
                             Path(result["stage_dir"]),

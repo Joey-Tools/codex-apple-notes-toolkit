@@ -39,6 +39,9 @@ superseded_by:
   complete independent zero-write artifact/result destination preflights
   before any parent creator, then defer result-parent creation until artifact
   publication succeeds.
+- Closed the retained-preflight teardown gap so a late artifact/result
+  destination-scope failure cannot overwrite already committed publication
+  receipts with a false zero-write claim.
 
 ## Current State
 
@@ -106,6 +109,12 @@ superseded_by:
   artifact or result-parent creation conservatively retain both
   `mutation_performed: true` and `artifact_mutation_performed: true` where
   applicable.
+- The zero-write preflight wrapper now marks only failures before its first
+  held proof as non-mutating. Creator commands latch the successful artifact
+  payload and result destination across the original preflight contexts:
+  artifact-only teardown failures retain the descriptor-bound artifact
+  recovery locator, while result-committed failures retain both that artifact
+  identity and the exact result-file SHA-256/size/identity receipt.
 
 ## Next Steps
 
@@ -212,6 +221,19 @@ superseded_by:
   system Python `3.9.6` each passed all `259` tests outside the nested sandbox
   required by the fixed `/usr/bin/pgrep` process-state probe.
 - Zero-write creator-destination static gates: full-repository Ruff `0.13.2`;
+  changed-Python format check; Python `3.14.3` and `3.9.6` bytecode
+  compilation with separate task-scoped caches; `bash -n`; ShellCheck
+  `0.11.0`; skill and project-journal validators; and `git diff --check`.
+- Retained-preflight teardown follow-up base:
+  `6fc7bd89d08205f6c66786374645a8d38ca640e4`.
+- Retained-preflight teardown regressions: Homebrew Python `3.14.3` and
+  system Python `3.9.6` each passed four focused tests covering artifact-only
+  and result-committed original-preflight exit failures plus the existing
+  result-scope teardown and pre-result-commit mutation paths.
+- Retained-preflight teardown full suites: Homebrew Python `3.14.3` and
+  system Python `3.9.6` each passed all `261` tests outside the nested sandbox
+  required by the fixed `/usr/bin/pgrep` process-state probe.
+- Retained-preflight teardown static gates: full-repository Ruff `0.13.2`;
   changed-Python format check; Python `3.14.3` and `3.9.6` bytecode
   compilation with separate task-scoped caches; `bash -n`; ShellCheck
   `0.11.0`; skill and project-journal validators; and `git diff --check`.

@@ -192,7 +192,13 @@ error result is not. Once result-file publication returns its terminal receipt, 
 monotonic commit latch: any later result-scope teardown or post-yield revalidation failure remains
 `result-file-publication-failed` with
 `artifact_mutation_performed: true`, `result_file_publication_state: committed`,
-`retry_safe: false`, and the exact result-file receipt.
+`retry_safe: false`, the artifact's descriptor-bound recovery identity, and the exact
+result-file receipt. The original zero-write destination preflights remain held through
+artifact and result publication. If one of those original contexts fails while closing,
+only a failure before its first held proof may claim `mutation_performed: false`; an
+artifact-only committed transaction instead returns `destination-install-uncertain` with
+`artifact_publication_state: committed`, `mutation_performed: true`, `retry_safe: false`,
+and the descriptor-bound artifact receipt.
 Snapshot publication is atomic and no-replace on supported macOS/Linux filesystems.
 The live NoteStore is one descriptor transaction: bind the complete group-container path once,
 one no-follow component at a time, then perform main/WAL/SHM/rollback-journal discovery, every
