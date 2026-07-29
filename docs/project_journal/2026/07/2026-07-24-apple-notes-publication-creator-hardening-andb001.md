@@ -288,3 +288,41 @@ superseded_by:
 - Final causal source-taxonomy journal validation:
   `project_journal.py validate --repo <worktree>`
   (`Project journal validation passed.`).
+- Packaged-supervisor follow-up base:
+  `aa44c7c4205ea92d1d8e2df536b8d44ed56a16f6`.
+- The shell wrapper now launches a skill-relative supervisor automatically for
+  `copy-db`, `merge-db`, `recover-snapshot`, and `stage-patch` when the caller
+  did not supply a stronger inherited supervisor channel. The launcher creates
+  a private datagram socketpair, keeps a separate service process alive for the
+  command, passes only the connected client FD to the DB helper, and performs
+  bounded process-group teardown on every launcher terminal path. The service
+  child closes inherited descriptors outside the fixed standard-stream plus
+  supervisor-channel allowlist before it serves a request.
+- The packaged service opens a randomized private source directory before
+  atomically publishing that held object under the distinct protocol-visible
+  staging name with the platform no-replace directory rename. It binds parent
+  and directory identity/access policy before and after publication and keeps
+  the exact directory FD open through the response.
+- Notes process-state collection now treats `KeyboardInterrupt` and
+  `SystemExit` as process-control failures: it first performs bounded
+  process-group termination/reaping and closes both pipes, then re-raises the
+  original exception object unchanged.
+- Packaged-supervisor focused validation: Python `3.13.0` and system Python
+  `3.9.6` each passed five focused tests covering skill packaging, a
+  fixture-free real `stage-patch` wrapper invocation, both process-control
+  exceptions, timeout/exec failure cleanup, and the closed Notes probe matrix.
+  The existing inherited-supervisor `copy-db` smoke is skipped only when the
+  fixed `/usr/bin/pgrep` probe is unavailable in the current sandbox.
+- Packaged-supervisor signal teardown validation: Python `3.13.0` and system
+  Python `3.9.6` each proved that `SIGTERM` becomes cleanup-owning control
+  flow, returns `143`, and reaps the independently sessioned helper process
+  within the bounded deadline.
+- Packaged-supervisor full validation: Python `3.13.0` and system Python
+  `3.9.6` each passed all `268` tests with the single sandbox-scoped fixed
+  `/usr/bin/pgrep` skip. Both runtimes also compiled the DB helper,
+  supervisor, and compatibility launcher successfully; Python `3.9.6`
+  compilation used a separate task-scoped cache.
+- Packaged-supervisor static gates: full-repository Ruff, changed-Python format
+  check, Python `3.13.0` and `3.9.6` bytecode compilation, `bash -n` and
+  ShellCheck over both shell scripts, skill and project-journal validators, and
+  `git diff --check`.

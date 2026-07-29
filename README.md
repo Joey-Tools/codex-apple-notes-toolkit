@@ -31,13 +31,17 @@ existing ancestor and missing suffix through creation and terminal checks.
 Missing destination components and private partials are first created at
 randomized owner-private staging names only through a trusted creator that
 returns the already-open object descriptor and an exclusive-handoff
-attestation. A later `open` after `mkdir` is never accepted as creation proof;
-the packaged production client instead accepts an inherited, already-connected
-`AF_UNIX`/`SOCK_DGRAM` supervisor channel through
-`--directory-creator-fd`. It transfers the held parent FD with `SCM_RIGHTS`
-and accepts only the supervisor's continuously held created-directory FD plus
-a request-bound attestation; it never reconnects by socket path or performs a
-local create-then-open fallback. Without that capability, creation fails
+attestation. A later `open` after `mkdir` is never accepted as creation proof.
+The packaged launcher creates an inherited, already-connected
+`AF_UNIX`/`SOCK_DGRAM` supervisor channel and starts the DB helper with
+`--directory-creator-fd`. The service opens a randomized private source,
+atomically publishes that held object under the randomized returned name with
+the platform no-replace primitive, and holds its FD through the response. The
+wrapper selects this production launcher automatically for write-producing
+commands; callers may still provide a stronger inherited supervisor channel.
+It transfers the held parent FD with `SCM_RIGHTS` and accepts only the
+supervisor's continuously held directory FD plus a request-bound attestation;
+it never reconnects by socket path. Without that capability, creation fails
 before mutation with `directory-creation-identity-inconclusive`. The held
 object is installed at the target name with atomic no-replace rename. Identity
 and access policy are revalidated around carried scope checks; failed installs

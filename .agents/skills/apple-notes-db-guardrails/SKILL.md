@@ -48,9 +48,9 @@ Record whether the authoritative source is the live container or a Joey-provided
 Use a unique task-scoped destination:
 
 ```bash
-python3 "$SKILL_DIR/scripts/apple_notes_db.py" copy-db \
+python3 "$SKILL_DIR/scripts/apple_notes_directory_supervisor.py" \
+  --helper "$SKILL_DIR/scripts/apple_notes_db.py" -- copy-db \
   --dest /tmp/<task-snapshot> \
-  --directory-creator-fd <inherited-supervisor-fd> \
   --result-file /tmp/<task-snapshot>.creation-result.json
 ```
 
@@ -76,15 +76,18 @@ owner-private staging directory under the held parent and return the already-ope
 an `apple-notes-identity-bound-directory-creation/v1` attestation that binds the actual created
 object, parent, access policy, and exclusive namespace handoff. POSIX/Darwin `mkdir`, `mkdirat`,
 `mkdtemp`, and `mkdtempat_np` return no descriptor, so a later no-follow `open` is not creation
-proof and is never an implicit fallback. The packaged production integration is an inherited,
-already-connected `AF_UNIX`/`SOCK_DGRAM` supervisor channel selected explicitly with
-`--directory-creator-fd`. The helper sends the held parent descriptor and a request nonce with
-`SCM_RIGHTS`, then accepts exactly one directory descriptor plus the matching attestation. It
-never reconnects by socket pathname or creates and reopens the directory locally. The invoking
-macOS supervisor must enforce an identity-preserving creation boundary, hold that exact descriptor
-continuously, and attest exclusive namespace handoff; a same-UID `mkdir`-then-`open` shim does not
-satisfy the contract. Without a usable inherited channel, the packaged creator fails before
-request delivery and before mutation with `directory-creation-identity-inconclusive`.
+proof and is never an implicit fallback. The packaged production launcher creates an inherited,
+already-connected `AF_UNIX`/`SOCK_DGRAM` channel, forks the bundled supervisor service, and starts
+the DB helper with `--directory-creator-fd`. For each request, the service opens a randomized
+private source directory before atomically publishing that held object under a distinct randomized
+protocol-visible name with the platform no-replace rename primitive. It keeps the descriptor open
+through the response and revalidates parent and object identity/access policy around publication.
+The helper sends the held parent descriptor and a request nonce with `SCM_RIGHTS`, then accepts
+exactly one directory descriptor plus the matching attestation. It never reconnects by socket
+pathname or accepts a direct `mkdir`-then-`open` of the returned name. Callers with a stronger
+platform authority may still pass its inherited channel explicitly. Without a usable channel, the
+packaged creator fails before request delivery and before mutation with
+`directory-creation-identity-inconclusive`.
 If that creator fails after entering the creation boundary, it must raise the packaged structured
 create-then-fail exception and transfer the staging basename, already-open descriptor,
 creation-time stat, proof, and recovery details to the helper. The helper records the handoff as
@@ -169,10 +172,10 @@ Do not use it for absence claims, exact counts, patch planning, or writeback.
 For critical analysis or a writeback baseline, quit Notes first and run:
 
 ```bash
-python3 "$SKILL_DIR/scripts/apple_notes_db.py" copy-db \
+python3 "$SKILL_DIR/scripts/apple_notes_directory_supervisor.py" \
+  --helper "$SKILL_DIR/scripts/apple_notes_db.py" -- copy-db \
   --dest /tmp/<task-backup> \
   --require-notes-quit \
-  --directory-creator-fd <inherited-supervisor-fd> \
   --result-file /tmp/<task-backup>.creation-result.json
 ```
 
@@ -309,10 +312,10 @@ the failure midway through a pass.
 Prefer `recover-snapshot` when a manifest is available:
 
 ```bash
-python3 "$SKILL_DIR/scripts/apple_notes_db.py" recover-snapshot \
+python3 "$SKILL_DIR/scripts/apple_notes_directory_supervisor.py" \
+  --helper "$SKILL_DIR/scripts/apple_notes_db.py" -- recover-snapshot \
   --snapshot-dir /tmp/<task-snapshot> \
   --out /tmp/<task-snapshot>-analysis.sqlite \
-  --directory-creator-fd <inherited-supervisor-fd> \
   --manifest-creation-receipt-file \
     /tmp/<task-snapshot>.creation-result.json
 ```
@@ -396,10 +399,10 @@ cross-file snapshot transactional; authoritative recovery still requires Notes t
 Use `merge-db` only for a copied database file without a snapshot manifest:
 
 ```bash
-python3 "$SKILL_DIR/scripts/apple_notes_db.py" merge-db \
+python3 "$SKILL_DIR/scripts/apple_notes_directory_supervisor.py" \
+  --helper "$SKILL_DIR/scripts/apple_notes_db.py" -- merge-db \
   --src /tmp/<copy>/NoteStore.sqlite \
-  --out /tmp/<copy>/NoteStore-analysis.sqlite \
-  --directory-creator-fd <inherited-supervisor-fd>
+  --out /tmp/<copy>/NoteStore-analysis.sqlite
 ```
 
 `merge-db` JSON and the compatibility Python launcher expose both `standalone_db` and the legacy
@@ -454,10 +457,10 @@ Prepare edits only on a copied or recovered database.
 Normalize the edited database into a new patch stage:
 
 ```bash
-python3 "$SKILL_DIR/scripts/apple_notes_db.py" stage-patch \
+python3 "$SKILL_DIR/scripts/apple_notes_directory_supervisor.py" \
+  --helper "$SKILL_DIR/scripts/apple_notes_db.py" -- stage-patch \
   --src /tmp/<edited>/NoteStore-edited.sqlite \
   --dest /tmp/<task-patch-stage> \
-  --directory-creator-fd <inherited-supervisor-fd> \
   --result-file /tmp/<task-patch-stage>.creation-result.json
 ```
 

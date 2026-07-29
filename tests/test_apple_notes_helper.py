@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 import unittest
 from collections.abc import Iterator
@@ -29,6 +30,7 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_DIR = REPO_ROOT / ".agents/skills/apple-notes-db-guardrails"
 SCRIPT_PATH = SKILL_DIR / "scripts/apple_notes_db.py"
+DIRECTORY_SUPERVISOR_PATH = SKILL_DIR / "scripts/apple_notes_directory_supervisor.py"
 SPEC = importlib.util.spec_from_file_location("apple_notes_db", SCRIPT_PATH)
 assert SPEC is not None
 assert SPEC.loader is not None
@@ -577,6 +579,9 @@ raise SystemExit(2)
         self.assertTrue((SKILL_DIR / "SKILL.md").is_file())
         self.assertTrue((SKILL_DIR / "agents/openai.yaml").is_file())
         self.assertTrue((SKILL_DIR / "references/safety-contract.md").is_file())
+        self.assertTrue(
+            (SKILL_DIR / "scripts/apple_notes_directory_supervisor.py").is_file()
+        )
         with tempfile.TemporaryDirectory() as temp_dir:
             copied_skill = Path(temp_dir) / "apple-notes-db-guardrails"
             shutil.copytree(SKILL_DIR, copied_skill)
@@ -613,6 +618,13 @@ raise SystemExit(2)
     ) -> None:
         if not hasattr(os, "fork"):
             self.skipTest("inherited-FD supervisor integration requires POSIX")
+        process_probe = subprocess.run(
+            [MODULE.NOTES_PGREP_PATH, "-x", "Notes"],
+            check=False,
+            capture_output=True,
+        )
+        if process_probe.returncode not in {0, 1} or process_probe.stderr:
+            self.skipTest("fixed Notes process probe is unavailable in this sandbox")
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             paths = self._make_paths(root)
@@ -682,6 +694,158 @@ raise SystemExit(2)
         self.assertEqual(Path(payload["dest"]), destination)
         self.assertTrue(manifest_exists)
         self.assertTrue(database_exists)
+
+    def test_shell_wrapper_launches_packaged_directory_supervisor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            live_source = paths.group_container / MODULE.NOTE_STORE_MAIN
+            edited_source = root / "edited.sqlite"
+            self._create_db(live_source)
+            self._create_db(edited_source)
+            snapshot = root / "snapshot"
+            stage = root / "stage"
+            stage_result = subprocess.run(
+                [
+                    "bash",
+                    str(WRAPPER_PATH),
+                    "stage-patch",
+                    "--group-container",
+                    str(paths.group_container),
+                    "--app-container",
+                    str(paths.app_container),
+                    "--src",
+                    str(edited_source),
+                    "--dest",
+                    str(stage),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30.0,
+                env={
+                    **os.environ,
+                    "PYTHON_BIN": sys.executable,
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+            )
+
+            stage_payload = (
+                json.loads(stage_result.stdout) if stage_result.stdout else {}
+            )
+            stage_exists = (stage / MODULE.NOTE_STORE_MAIN).is_file()
+
+        self.assertEqual(
+            stage_result.returncode,
+            0,
+            msg=stage_result.stdout + stage_result.stderr,
+        )
+        self.assertEqual(Path(stage_payload["stage_dir"]), stage)
+        self.assertTrue(stage_exists)
+
+        # The fixed pgrep probe is deliberately fail-closed. Exercise copy-db
+        # through the same production launcher only when this test runtime can
+        # obtain unambiguous process-list evidence.
+        process_probe = subprocess.run(
+            [MODULE.NOTES_PGREP_PATH, "-x", "Notes"],
+            check=False,
+            capture_output=True,
+        )
+        if process_probe.returncode not in {0, 1} or process_probe.stderr:
+            return
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            snapshot = root / "snapshot"
+            copy_result = subprocess.run(
+                [
+                    "bash",
+                    str(WRAPPER_PATH),
+                    "copy-db",
+                    "--group-container",
+                    str(paths.group_container),
+                    "--app-container",
+                    str(paths.app_container),
+                    "--dest",
+                    str(snapshot),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30.0,
+                env={
+                    **os.environ,
+                    "PYTHON_BIN": sys.executable,
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+            )
+            copy_payload = json.loads(copy_result.stdout) if copy_result.stdout else {}
+            snapshot_exists = (
+                snapshot / "group.com.apple.notes" / MODULE.NOTE_STORE_MAIN
+            ).is_file()
+        self.assertEqual(
+            copy_result.returncode,
+            0,
+            msg=copy_result.stdout + copy_result.stderr,
+        )
+        self.assertEqual(Path(copy_payload["dest"]), snapshot)
+        self.assertTrue(snapshot_exists)
+
+    def test_packaged_directory_supervisor_bounds_signal_teardown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            worker_script = root / "worker.py"
+            worker_pid_file = root / "worker.pid"
+            worker_script.write_text(
+                "import os\n"
+                "import sys\n"
+                "import time\n"
+                "with open(sys.argv[1], 'w', encoding='ascii') as stream:\n"
+                "    stream.write(str(os.getpid()))\n"
+                "while True:\n"
+                "    time.sleep(0.1)\n",
+                encoding="utf-8",
+            )
+            launcher = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-B",
+                    str(DIRECTORY_SUPERVISOR_PATH),
+                    "--helper",
+                    str(worker_script),
+                    "--python",
+                    sys.executable,
+                    "--",
+                    str(worker_pid_file),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + 5.0
+            while not worker_pid_file.is_file() and time.monotonic() < deadline:
+                if launcher.poll() is not None:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(worker_pid_file.is_file())
+            worker_pid = int(worker_pid_file.read_text(encoding="ascii"))
+            os.kill(launcher.pid, signal.SIGTERM)
+            stdout, stderr = launcher.communicate(timeout=5.0)
+            worker_deadline = time.monotonic() + 2.0
+            while time.monotonic() < worker_deadline:
+                try:
+                    os.kill(worker_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail(f"supervised worker {worker_pid} survived teardown")
+
+        self.assertEqual(launcher.returncode, 128 + signal.SIGTERM, stderr)
+        self.assertEqual(stdout, "")
 
     def test_creator_cli_safely_publishes_external_result_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2355,6 +2519,60 @@ raise SystemExit(2)
                 mock.call(probe.pid, signal.SIGKILL),
             ],
         )
+
+    def test_notes_state_probe_process_control_baseexceptions_cleanup_and_reraise(
+        self,
+    ) -> None:
+        class Pipe:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        class InterruptedProbe:
+            pid = 65432
+            returncode: int | None = None
+
+            def __init__(self, failure: BaseException) -> None:
+                self.failure = failure
+                self.stdout = Pipe()
+                self.stderr = Pipe()
+
+            def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+                raise self.failure
+
+            def wait(self, *, timeout: float) -> int:
+                self.returncode = -signal.SIGTERM
+                return self.returncode
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+        failures: tuple[BaseException, ...] = (
+            KeyboardInterrupt("simulated probe interrupt"),
+            SystemExit(19),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                probe = InterruptedProbe(failure)
+                with (
+                    mock.patch.object(
+                        MODULE.subprocess,
+                        "Popen",
+                        return_value=probe,
+                    ),
+                    mock.patch.object(MODULE.os, "killpg") as killpg,
+                    self.assertRaises(type(failure)) as raised,
+                ):
+                    MODULE.notes_is_running()
+                self.assertIs(raised.exception, failure)
+                self.assertTrue(probe.stdout.closed)
+                self.assertTrue(probe.stderr.closed)
+                self.assertEqual(
+                    killpg.call_args_list,
+                    [mock.call(probe.pid, signal.SIGTERM)],
+                )
 
     def test_compatibility_launcher_exports_packaged_api(self) -> None:
         spec = importlib.util.spec_from_file_location(

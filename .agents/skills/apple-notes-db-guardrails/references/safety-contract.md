@@ -398,17 +398,21 @@ must bind parent/directory identity and access policy. POSIX/Darwin `mkdir`, `mk
 and `mkdtempat_np` return no descriptor; `mkdir` followed by `open` therefore cannot establish
 created-object identity and is forbidden as a fallback.
 
-The packaged production client uses only a caller-inherited, already-connected
-`AF_UNIX`/`SOCK_DGRAM` supervisor channel supplied as `--directory-creator-fd`; it never discovers
-or reconnects to a mutable socket pathname. For each creation, send one bounded
+The packaged production launcher creates an already-connected `AF_UNIX`/`SOCK_DGRAM` socketpair,
+forks the bundled supervisor service, and launches the DB helper with the client descriptor
+supplied as `--directory-creator-fd`; it never discovers or reconnects to a mutable socket
+pathname. The wrapper selects this launcher automatically for write-producing commands unless
+the caller already supplied a stronger inherited supervisor channel. For each creation, send one bounded
 `apple-notes-directory-creator-request/v1` datagram and the already-held parent descriptor with
 `SCM_RIGHTS`. Bind the request nonce, operation, prefix, mode, effective UID, parent identity, and
 parent access policy. Accept only one bounded `apple-notes-directory-creator-response/v1`
 datagram with the same nonce, status `created`, exactly one returned descriptor, canonical staging
-basename, and the normal creation attestation. The invoking macOS supervisor is the trusted
-creation authority: it must enforce a creation boundary that keeps the exact created directory
-descriptor continuously held through response and exclusive namespace handoff. A same-UID
-supervisor that merely calls `mkdir` and then reopens the name does not meet this contract.
+basename, and the normal creation attestation. The bundled service opens a randomized private
+source directory, validates it through its descriptor, then atomically publishes that already-open
+object under a separate randomized protocol-visible basename with the platform no-replace
+directory rename. It keeps the descriptor continuously held through response and revalidates the
+parent and directory identity/access policy around publication. A same-UID supervisor that merely
+calls `mkdir` and then reopens the returned protocol-visible name does not meet this contract.
 Validate the returned descriptor/name/proof again inside the helper. No configured channel or a
 non-socket/wrong socket type detected before the first send attempt is a proved no-mutation
 `directory-creation-identity-inconclusive`; after entering the request-send boundary, send or

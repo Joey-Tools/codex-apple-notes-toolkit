@@ -8048,6 +8048,19 @@ def _terminate_notes_state_probe(
     }
 
 
+def _close_notes_state_probe_pipes(process: subprocess.Popen[bytes]) -> None:
+    """Close probe pipes without replacing a pending process-control exception."""
+
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(process, stream_name, None)
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except BaseException:
+            pass
+
+
 def notes_is_running() -> bool:
     process: subprocess.Popen[bytes] | None = None
     try:
@@ -8079,6 +8092,7 @@ def notes_is_running() -> bool:
         stdout, stderr = process.communicate(timeout=NOTES_STATE_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired as exc:
         cleanup = _terminate_notes_state_probe(process)
+        _close_notes_state_probe_pipes(process)
         raise StoreSafetyError(
             "notes-state-unknown",
             "The Notes.app state probe exceeded its hard deadline",
@@ -8092,6 +8106,7 @@ def notes_is_running() -> bool:
         ) from exc
     except OSError as exc:
         cleanup = _terminate_notes_state_probe(process)
+        _close_notes_state_probe_pipes(process)
         raise StoreSafetyError(
             "notes-state-unknown",
             f"Cannot collect the Notes.app state probe result: {exc}",
@@ -8102,6 +8117,14 @@ def notes_is_running() -> bool:
                 "cleanup": cleanup,
             },
         ) from exc
+    except BaseException:
+        try:
+            _terminate_notes_state_probe(process)
+        except BaseException:
+            pass
+        finally:
+            _close_notes_state_probe_pipes(process)
+        raise
     returncode = process.returncode
     if not isinstance(stdout, bytes) or not isinstance(stderr, bytes):
         raise StoreSafetyError(

@@ -4,7 +4,7 @@
 
 - Apple Notes database reads bind untrusted leaves with no-follow, nonblocking opens before regular-file and identity validation.
 - File and directory publication use a monotonic commit latch before post-rename evidence work.
-- Write-producing CLI commands support an inherited supervisor FD protocol for identity-bound directory creation.
+- Write-producing wrapper commands automatically launch the packaged supervisor while retaining the inherited-FD interface for stronger external authorities.
 - Snapshot and patch creator CLIs can atomically publish owner-only external result files without shell redirection.
 - Cross-root creator result files bind their artifact and result alias scopes independently, and committed result receipts survive late scope teardown failures.
 - Newly created copied, JSON, and standalone files retain a pre-write identity and access-policy baseline through content and publication validation.

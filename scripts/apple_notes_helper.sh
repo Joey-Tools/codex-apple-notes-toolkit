@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="${SCRIPT_DIR}/../.agents/skills/apple-notes-db-guardrails"
 DB_HELPER="${SKILL_DIR}/scripts/apple_notes_db.py"
+DIRECTORY_SUPERVISOR="${SKILL_DIR}/scripts/apple_notes_directory_supervisor.py"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 OSASCRIPT_BIN="${OSASCRIPT_BIN:-/usr/bin/osascript}"
 
@@ -30,8 +31,9 @@ Notes:
   - DB-heavy subcommands delegate to the helper packaged with apple-notes-db-guardrails.
   - Use copy-db/stage-patch --result-file to atomically create the successful
     JSON outside the artifact for every consuming command.
-  - Write-producing DB commands require an inherited connected supervisor FD
-    for identity-bound directory creation; the wrapper forwards that FD option.
+  - Write-producing DB commands automatically launch the packaged identity-bound
+    directory-creation supervisor. An explicitly inherited supervisor FD remains
+    available for callers that already own a stronger platform authority.
   - No subcommand mutates the live Notes store; writeback remains an explicit separate phase.
   - In Codex, prefer this wrapper under an approved/escalated prefix when Notes automation is needed.
 EOF
@@ -153,7 +155,25 @@ main() {
       shift
       show_note_prefix "$@"
       ;;
-    probe-db-access|copy-db|merge-db|validate-snapshot|recover-snapshot|stage-patch|validate-patch-stage|preflight-writeback|verify-writeback|note-tags|fingerprint-db)
+    copy-db|merge-db|recover-snapshot|stage-patch)
+      local has_directory_creator_fd="false"
+      local argument
+      for argument in "$@"; do
+        case "$argument" in
+          --directory-creator-fd|--directory-creator-fd=*)
+            has_directory_creator_fd="true"
+            ;;
+        esac
+      done
+      if [[ "$has_directory_creator_fd" == "true" ]]; then
+        exec "$PYTHON_BIN" "$DB_HELPER" "$@"
+      fi
+      exec "$PYTHON_BIN" "$DIRECTORY_SUPERVISOR" \
+        --helper "$DB_HELPER" \
+        --python "$PYTHON_BIN" \
+        -- "$@"
+      ;;
+    probe-db-access|validate-snapshot|validate-patch-stage|preflight-writeback|verify-writeback|note-tags|fingerprint-db)
       exec "$PYTHON_BIN" "$DB_HELPER" "$@"
       ;;
     -h|--help|help)
