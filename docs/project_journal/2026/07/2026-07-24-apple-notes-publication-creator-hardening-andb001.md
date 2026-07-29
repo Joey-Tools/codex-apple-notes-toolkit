@@ -500,3 +500,23 @@ superseded_by:
 - Direct Claude Code review is omitted under Joey's explicit temporary waiver
   for work completed before 2026-08-01; no substitute reviewer is counted as
   that lane.
+- Fresh single-review follow-up base:
+  `277ef08e8a3ee19a211e3be6fd849d8555d3682e`.
+- Regular-file binding now rejects same-object mode, ownership, or protected
+  flag drift unless the pre-open path, opened descriptor, and immediate
+  post-open descriptor-relative path retain one access-policy baseline before
+  the first hash.
+- A quarantine namespace move is reported as
+  `namespace-moved-unverified` with inconclusive cleanup unless
+  descriptor-relative directory policy, parent durability, complete-tree
+  receipt, and terminal public-alias proofs all succeed.
+- Focused regressions passed four tests covering deterministic mode/protected-
+  flag `os.open` races, the verified quarantine path, and all four
+  post-rename quarantine-proof failures.
+- Full regressions: Python `3.13.0` and system Python `3.9.6` each passed all
+  `301` tests with two sandbox-scoped skips for the fixed `/usr/bin/pgrep`
+  process probe.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.

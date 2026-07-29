@@ -5864,6 +5864,138 @@ raise SystemExit(2)
                             os.fstat(opened_source_fd)
                         self.assertEqual(closed.exception.errno, errno.EBADF)
 
+    def test_bound_source_file_rejects_mode_drift_across_open_boundary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            source.chmod(0o600)
+
+            with MODULE._bind_existing_directory_with_trusted_alias(root) as parent:
+                original_open = MODULE.os.open
+                opened_source_fd: int | None = None
+
+                def mutate_mode_during_source_open(
+                    target: object,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal opened_source_fd
+                    fd = original_open(target, flags, mode, dir_fd=dir_fd)
+                    if dir_fd == parent.fd and os.fspath(target) == source.name:
+                        opened_source_fd = fd
+                        os.fchmod(fd, 0o640)
+                    return fd
+
+                with (
+                    mock.patch.object(
+                        MODULE.os,
+                        "open",
+                        side_effect=mutate_mode_during_source_open,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    with MODULE._bind_regular_file_at(
+                        source,
+                        parent,
+                        MODULE.SOURCE_FILE_CODES,
+                    ):
+                        self.fail("source mode drift across open was accepted")
+
+            self._assert_safety_code("source-access-policy-mismatch", raised)
+            self.assertEqual(stat.S_IMODE(source.stat().st_mode), 0o640)
+            self.assertIsNotNone(opened_source_fd)
+            assert opened_source_fd is not None
+            with self.assertRaises(OSError) as closed:
+                os.fstat(opened_source_fd)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+
+    def test_bound_source_file_rejects_protected_flag_drift_across_open_boundary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            protected_flag = MODULE._DARWIN_ACCESS_POLICY_FLAG_BITS["UF_IMMUTABLE"]
+
+            with MODULE._bind_existing_directory_with_trusted_alias(root) as parent:
+                original_open = MODULE.os.open
+                original_fstat = MODULE.os.fstat
+                original_stat = MODULE.os.stat
+                opened_source_fd: int | None = None
+
+                def mutate_flags_during_source_open(
+                    target: object,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal opened_source_fd
+                    fd = original_open(target, flags, mode, dir_fd=dir_fd)
+                    if dir_fd == parent.fd and os.fspath(target) == source.name:
+                        opened_source_fd = fd
+                    return fd
+
+                def source_fstat_with_drift(fd: int) -> os.stat_result:
+                    observed = original_fstat(fd)
+                    if fd == opened_source_fd:
+                        return _StatWithFlags(observed, protected_flag)
+                    return observed
+
+                def source_stat_with_drift(
+                    target: object,
+                    *args: object,
+                    **kwargs: object,
+                ) -> os.stat_result:
+                    observed = original_stat(target, *args, **kwargs)
+                    if (
+                        opened_source_fd is not None
+                        and kwargs.get("dir_fd") == parent.fd
+                        and os.fspath(target) == source.name
+                    ):
+                        return _StatWithFlags(observed, protected_flag)
+                    return observed
+
+                with (
+                    mock.patch.object(
+                        MODULE.os,
+                        "open",
+                        side_effect=mutate_flags_during_source_open,
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "fstat",
+                        side_effect=source_fstat_with_drift,
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "stat",
+                        side_effect=source_stat_with_drift,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    with MODULE._bind_regular_file_at(
+                        source,
+                        parent,
+                        MODULE.SOURCE_FILE_CODES,
+                    ):
+                        self.fail(
+                            "source protected-flag drift across open was accepted"
+                        )
+
+            self._assert_safety_code("source-access-policy-mismatch", raised)
+            self.assertIsNotNone(opened_source_fd)
+            assert opened_source_fd is not None
+            with self.assertRaises(OSError) as closed:
+                os.fstat(opened_source_fd)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+
     def test_source_directory_revalidation_uses_wrapped_os_error_causes(
         self,
     ) -> None:
@@ -7761,6 +7893,7 @@ raise SystemExit(2)
                 details["artifact_publication_state"],
                 "quarantined",
             )
+            self.assertEqual(details["cleanup_state"], "retained")
             self.assertFalse(details["writeback_grade"])
             self.assertFalse(details["successful_creation_receipt_emitted"])
             quarantine_receipt = details["recovery_locators"]["snapshot_quarantine"]
@@ -7772,6 +7905,205 @@ raise SystemExit(2)
                 quarantine_receipt["artifact_publication_state"],
                 "quarantined",
             )
+            self.assertEqual(
+                quarantine_receipt["quarantine_namespace_state"],
+                "moved-verified",
+            )
+            self.assertEqual(
+                quarantine_receipt["quarantine_verification"],
+                "verified",
+            )
+
+    def test_writeback_copy_does_not_overclaim_incomplete_quarantine_proofs(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "directory-policy",
+                "post-rename-directory-revalidation",
+            ),
+            (
+                "parent-durability",
+                "post-rename-parent-durability",
+            ),
+            (
+                "tree-receipt",
+                "post-rename-tree-receipt",
+            ),
+            (
+                "public-alias",
+                "post-rename-public-alias",
+            ),
+        )
+        for failure, expected_phase in cases:
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+                destination = root / "snapshot"
+                quarantine_rename_returned = False
+                original_rename = MODULE._rename_directory_no_replace_at
+                original_verify_directory = MODULE._verify_bound_directory_at
+                original_fsync_parent = MODULE._fsync_bound_parent_descriptor
+                original_tree_receipt = MODULE._descriptor_bound_prepared_tree_receipt
+                original_verify_alias = MODULE._verify_installed_directory_path
+
+                def observe_quarantine_rename(
+                    parent_fd: int,
+                    source_name: str,
+                    destination_name: str,
+                ) -> None:
+                    nonlocal quarantine_rename_returned
+                    original_rename(parent_fd, source_name, destination_name)
+                    if destination_name.startswith(
+                        ".snapshot.notes-started-quarantine-"
+                    ):
+                        quarantine_rename_returned = True
+
+                def fail_quarantine_directory_policy(
+                    binding: MODULE._BoundDirectory,
+                    *,
+                    parent_fd: int,
+                    basename: str,
+                    display_path: Path,
+                ) -> dict[str, object]:
+                    if failure == "directory-policy" and basename.startswith(
+                        ".snapshot.notes-started-quarantine-"
+                    ):
+                        raise MODULE.StoreSafetyError(
+                            "prepared-directory-access-policy-mismatch",
+                            "simulated quarantine directory policy drift",
+                        )
+                    return original_verify_directory(
+                        binding,
+                        parent_fd=parent_fd,
+                        basename=basename,
+                        display_path=display_path,
+                    )
+
+                def fail_quarantine_parent_durability(
+                    parent_fd: int,
+                    opened: os.stat_result,
+                    *,
+                    display_path: Path,
+                    identity_code: str,
+                    access_policy_code: str,
+                    inconclusive_code: str,
+                ) -> None:
+                    if failure == "parent-durability" and quarantine_rename_returned:
+                        raise MODULE.StoreSafetyError(
+                            inconclusive_code,
+                            "simulated quarantine parent fsync failure",
+                        )
+                    original_fsync_parent(
+                        parent_fd,
+                        opened,
+                        display_path=display_path,
+                        identity_code=identity_code,
+                        access_policy_code=access_policy_code,
+                        inconclusive_code=inconclusive_code,
+                    )
+
+                def fail_quarantine_tree_receipt(
+                    *args: object,
+                    **kwargs: object,
+                ) -> dict[str, object]:
+                    published_basename = str(kwargs["published_basename"])
+                    if failure == "tree-receipt" and published_basename.startswith(
+                        ".snapshot.notes-started-quarantine-"
+                    ):
+                        raise MODULE.StoreSafetyError(
+                            "prepared-file-revalidation-inconclusive",
+                            "simulated quarantine tree receipt failure",
+                        )
+                    return original_tree_receipt(*args, **kwargs)
+
+                def fail_quarantine_public_alias(
+                    binding: MODULE._BoundDirectory,
+                    installed_path: Path,
+                ) -> dict[str, object] | None:
+                    if failure == "public-alias" and installed_path.name.startswith(
+                        ".snapshot.notes-started-quarantine-"
+                    ):
+                        raise MODULE.StoreSafetyError(
+                            "prepared-directory-revalidation-inconclusive",
+                            "simulated quarantine public alias failure",
+                        )
+                    return original_verify_alias(binding, installed_path)
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        side_effect=[False, False, False, True],
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_rename_directory_no_replace_at",
+                        side_effect=observe_quarantine_rename,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_verify_bound_directory_at",
+                        side_effect=fail_quarantine_directory_policy,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_fsync_bound_parent_descriptor",
+                        side_effect=fail_quarantine_parent_durability,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_descriptor_bound_prepared_tree_receipt",
+                        side_effect=fail_quarantine_tree_receipt,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_verify_installed_directory_path",
+                        side_effect=fail_quarantine_public_alias,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    self._copy_db(
+                        paths,
+                        dest=destination,
+                        require_notes_quit=True,
+                    )
+
+                self._assert_safety_code("notes-started-during-capture", raised)
+                self.assertTrue(quarantine_rename_returned)
+                self.assertFalse(destination.exists())
+                quarantines = list(root.glob(".snapshot.notes-started-quarantine-*"))
+                self.assertEqual(len(quarantines), 1)
+                details = raised.exception.details
+                self.assertEqual(details["publication_state"], "committed")
+                self.assertEqual(
+                    details["artifact_publication_state"],
+                    "namespace-moved-unverified",
+                )
+                self.assertEqual(details["cleanup_state"], "inconclusive")
+                self.assertFalse(details["writeback_grade"])
+                self.assertFalse(details["successful_creation_receipt_emitted"])
+                locator = details["recovery_locators"]["snapshot_quarantine"]
+                self.assertEqual(
+                    locator["artifact_publication_state"],
+                    "namespace-moved-unverified",
+                )
+                self.assertEqual(
+                    locator["quarantine_namespace_state"],
+                    "moved-unverified",
+                )
+                self.assertEqual(
+                    locator["quarantine_verification"],
+                    "inconclusive",
+                )
+                self.assertEqual(
+                    locator["quarantine_failure_phase"],
+                    expected_phase,
+                )
 
     def test_writeback_copy_quarantines_snapshot_when_final_notes_probe_is_unknown(
         self,

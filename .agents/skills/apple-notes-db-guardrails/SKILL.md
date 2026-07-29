@@ -205,12 +205,15 @@ publication. If Notes is running or its state is unknown at the post-publication
 probe, move the exact descriptor-held published snapshot with a no-replace
 rename to an unpredictable owner-private hidden sibling under the same held
 parent. Revalidate parent/object identity, access policy, namespace absence,
-and the complete tree before reporting the quarantine. The command must fail
-with `writeback_grade: false`, no successful creation receipt, and exact
-primary/quarantine recovery evidence. If that exact move or its evidence cannot
-be proved, preserve a conservative committed-or-uncertain recovery receipt;
-never leave or describe the requested destination as a successful
-writeback-grade backup.
+parent durability, the complete tree, and the terminal public alias before
+reporting the quarantine as verified and retained. The command must fail with
+`writeback_grade: false`, no successful creation receipt, and exact
+primary/quarantine recovery evidence. If the namespace move is visible but any
+of those terminal proofs fails, report
+`artifact_publication_state: namespace-moved-unverified` with inconclusive
+cleanup rather than `quarantined`; otherwise preserve a conservative
+committed-or-uncertain recovery receipt. Never leave or describe the requested
+destination as a successful writeback-grade backup.
 
 Treat a snapshot captured while Notes is running as tentative.
 Do not use it for absence claims, exact counts, patch planning, or writeback.
@@ -261,7 +264,10 @@ only through the held group-container `dir_fd`. Do not restart discovery or open
 full pathname. Every existing untrusted regular-file leaf open combines `O_NOFOLLOW` with
 `O_NONBLOCK`; the same descriptor is then checked as regular and identity-bound. A regular-file
 name swapped to a FIFO or device between the pre-open stat and open therefore cannot block before
-the type mismatch is rejected.
+the type mismatch is rejected. Before hashing, the helper also requires identical object identity
+and complete access policy across the pre-open descriptor-relative path stat, opened descriptor
+stat, and immediate post-open descriptor-relative path stat; it never adopts a policy first
+observed after open as a new baseline.
 The helper binds the private partial directory, its nested `group.com.apple.notes` store, and their
 parents at creation. It verifies every prepared file against its creation receipt, fsyncs copied
 files, then fsyncs the held nested-store and snapshot-root descriptors bottom-up before the

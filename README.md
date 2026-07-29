@@ -74,7 +74,9 @@ open, hashing, membership checks, and terminal revalidation share one complete
 held no-follow group-container component chain. Every existing untrusted
 regular-file leaf is opened with both `O_NOFOLLOW` and `O_NONBLOCK`, then
 descriptor-checked as regular, so a stat/open FIFO or device replacement
-cannot block before type and identity rejection. Snapshot recovery acquires
+cannot block before type and identity rejection. The helper also requires the
+pre-open path, opened descriptor, and immediate post-open path to agree on
+identity and access policy before hashing. Snapshot recovery acquires
 its output/live-container guard before validation and then consumes the held
 snapshot store directly; recovery uses in-memory bytes and anonymous
 temporary file descriptors, not named temporary or recovery-clone
@@ -100,7 +102,10 @@ of the before-rename callback, and immediately after publication before
 emitting a successful result. If Notes starts after publication, the exact
 held snapshot object is moved with no replacement to an owner-private hidden
 quarantine sibling. The command fails with non-writeback-grade recovery
-evidence and never leaves that exact object at the requested destination.
+evidence and never leaves that exact object at the requested destination. It
+claims a verified quarantine only after directory-policy, parent-durability,
+complete-tree, and terminal-alias proofs; a visible rename with any missing
+proof is `namespace-moved-unverified` with inconclusive cleanup.
 The first action after a no-replace rename returns, or after an error path
 proves that the exact object committed, is a monotonic publication latch.
 Post-publication ordinary failures—including failures while constructing

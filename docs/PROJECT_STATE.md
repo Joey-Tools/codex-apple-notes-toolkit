@@ -3,6 +3,7 @@
 ## Current State
 
 - Apple Notes database reads bind untrusted leaves with no-follow, nonblocking opens before regular-file and identity validation.
+- Regular-file binding proves one identity and access policy across the pre-open path, opened descriptor, and immediate post-open path before hashing.
 - Live-container inputs are frozen to lexical absolute paths from one captured working directory before preflight.
 - `merge-db` and `stage-patch` freeze relative sources and every output from one API/CLI-entry CWD snapshot.
 - `merge-db` defaults copied-snapshot outputs outside the snapshot and rejects lexical, canonical-alias, or descriptor ancestry overlap.
@@ -15,6 +16,7 @@
 - Write-producing wrapper commands automatically launch the packaged supervisor while retaining the inherited-FD interface for stronger external authorities.
 - The legacy Python compatibility entrypoint is import-safe, retains its public exports, and routes every write-producing CLI command through that same supervisor.
 - Required-quit snapshots recheck Notes at the final pre-rename and immediate post-publication boundaries; a late restart quarantines the exact published object and cannot produce a writeback-grade receipt.
+- A visible quarantine rename is not reported as verified or retained until directory policy, parent durability, complete-tree, and terminal-alias proofs all succeed.
 - Snapshot and patch creator CLIs can atomically publish owner-only external result files without shell redirection.
 - Cross-root creator result files bind their artifact and result alias scopes independently, and committed result receipts survive late scope teardown failures.
 - Newly created copied, JSON, and standalone files retain a pre-write identity and access-policy baseline through content and publication validation.

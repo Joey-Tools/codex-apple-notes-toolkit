@@ -2554,6 +2554,7 @@ def _published_snapshot_quarantine_evidence(
     quarantine: Path,
     publication_receipt: dict[str, Any],
     quarantine_committed: bool,
+    failure_phase: str,
     error: BaseException,
 ) -> dict[str, Any]:
     parent_fd = binding.parent_fd
@@ -2594,19 +2595,24 @@ def _published_snapshot_quarantine_evidence(
     elif destination_matches:
         binding.path = destination
         binding.namespace_basename = destination.name
-    artifact_state = (
-        "quarantined"
-        if quarantine_matches and destination_state == "absent"
-        else "committed"
-        if destination_matches
-        else "uncertain"
-    )
+    if quarantine_matches and destination_state == "absent":
+        artifact_state = "namespace-moved-unverified"
+        namespace_state = "moved-unverified"
+    elif destination_matches:
+        artifact_state = "committed"
+        namespace_state = "not-moved"
+    else:
+        artifact_state = "uncertain"
+        namespace_state = "uncertain"
     locator: dict[str, Any] = {
         "schema": "apple-notes-snapshot-quarantine/v1",
         "original_destination": str(destination),
         "quarantine_path": str(quarantine),
         "quarantine_rename_returned": quarantine_committed,
         "artifact_publication_state": artifact_state,
+        "quarantine_namespace_state": namespace_state,
+        "quarantine_verification": "inconclusive",
+        "quarantine_failure_phase": failure_phase,
         "bound_snapshot_identity": _identity(binding.opened),
         "bound_snapshot_access_policy": _access_policy(binding.opened),
         "original_destination_observation": {
@@ -2631,11 +2637,7 @@ def _published_snapshot_quarantine_evidence(
         "mutation_performed": True,
         "publication_state": "committed",
         "artifact_publication_state": artifact_state,
-        "cleanup_state": (
-            "retained"
-            if artifact_state in {"quarantined", "committed"}
-            else "inconclusive"
-        ),
+        "cleanup_state": "inconclusive",
         "retry_safe": False,
         "writeback_grade": False,
         "recovery_locators": {
@@ -2671,6 +2673,7 @@ def _quarantine_published_snapshot(
         f".{destination.name}.notes-started-quarantine-{uuid.uuid4().hex}"
     )
     quarantine_committed = False
+    failure_phase = "pre-rename-parent-revalidation"
     try:
         _verify_bound_parent_descriptor(
             parent_fd,
@@ -2680,12 +2683,14 @@ def _quarantine_published_snapshot(
             access_policy_code="prepared-directory-access-policy-mismatch",
             inconclusive_code="prepared-directory-revalidation-inconclusive",
         )
+        failure_phase = "pre-rename-destination-revalidation"
         _verify_bound_directory_at(
             binding,
             parent_fd=parent_fd,
             basename=destination.name,
             display_path=destination,
         )
+        failure_phase = "pre-rename-quarantine-absence"
         quarantine_state, _ = _observe_bound_name(parent_fd, quarantine.name)
         if quarantine_state != "absent":
             raise StoreSafetyError(
@@ -2693,6 +2698,7 @@ def _quarantine_published_snapshot(
                 "The randomized snapshot quarantine name is not proved absent: "
                 f"{quarantine}",
             )
+        failure_phase = "quarantine-rename"
         _rename_directory_no_replace_at(
             parent_fd,
             destination.name,
@@ -2703,6 +2709,7 @@ def _quarantine_published_snapshot(
         binding.namespace_basename = quarantine.name
         if binding.canonical_path is not None:
             binding.canonical_path = binding.canonical_path.parent / quarantine.name
+        failure_phase = "post-rename-original-absence"
         original_state, _ = _observe_bound_name(parent_fd, destination.name)
         if original_state != "absent":
             raise StoreSafetyError(
@@ -2710,12 +2717,14 @@ def _quarantine_published_snapshot(
                 "The successful snapshot name is not absent after quarantine: "
                 f"{destination}",
             )
+        failure_phase = "post-rename-directory-revalidation"
         _verify_bound_directory_at(
             binding,
             parent_fd=parent_fd,
             basename=quarantine.name,
             display_path=quarantine,
         )
+        failure_phase = "post-rename-parent-durability"
         _fsync_bound_parent_descriptor(
             parent_fd,
             binding.parent_opened,
@@ -2724,17 +2733,22 @@ def _quarantine_published_snapshot(
             access_policy_code="prepared-directory-access-policy-mismatch",
             inconclusive_code="prepared-directory-revalidation-inconclusive",
         )
+        failure_phase = "post-rename-tree-receipt"
         tree_receipt = descriptor_tree_receipt_builder(quarantine.name)
+        failure_phase = "post-rename-public-alias"
         terminal_alias = _verify_installed_directory_path(
             binding,
             quarantine,
         )
+        failure_phase = "verified"
         return {
             "schema": "apple-notes-snapshot-quarantine/v1",
             "original_destination": str(destination),
             "quarantine_path": str(quarantine),
             "quarantine_rename_returned": True,
             "artifact_publication_state": "quarantined",
+            "quarantine_namespace_state": "moved-verified",
+            "quarantine_verification": "verified",
             "writeback_grade": False,
             "bound_snapshot_identity": _identity(binding.opened),
             "bound_snapshot_access_policy": _access_policy(binding.opened),
@@ -2749,6 +2763,7 @@ def _quarantine_published_snapshot(
             quarantine=quarantine,
             publication_receipt=publication_receipt,
             quarantine_committed=quarantine_committed,
+            failure_phase=failure_phase,
             error=exc,
         )
         raise StoreSafetyError(
@@ -4137,6 +4152,46 @@ def _bind_regular_file_at(
             raise StoreSafetyError(
                 codes.identity,
                 f"Descriptor-relative regular file was replaced while opening: {path}",
+            )
+        try:
+            path_after_open = os.stat(
+                path.name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as exc:
+            raise StoreSafetyError(
+                codes.missing,
+                "Descriptor-relative regular file disappeared immediately "
+                f"after open: {path}",
+            ) from exc
+        except OSError as exc:
+            raise _bound_file_revalidation_os_error(
+                path,
+                "inspect the descriptor-relative regular-file path immediately "
+                "after opening it",
+                exc,
+                codes,
+            ) from exc
+        if (
+            not stat.S_ISREG(path_after_open.st_mode)
+            or not _same_identity(path_before, path_after_open)
+            or not _same_identity(opened, path_after_open)
+        ):
+            raise StoreSafetyError(
+                codes.identity,
+                "Descriptor-relative regular file changed identity across its "
+                f"open boundary: {path}",
+            )
+        pre_open_access_policy = _access_policy(path_before)
+        if (
+            _access_policy(opened) != pre_open_access_policy
+            or _access_policy(path_after_open) != pre_open_access_policy
+        ):
+            raise StoreSafetyError(
+                codes.access_policy,
+                "Descriptor-relative regular-file access policy changed across "
+                f"its open boundary: {path}",
             )
         try:
             sha256 = _hash_fd(fd)

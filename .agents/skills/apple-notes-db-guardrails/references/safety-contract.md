@@ -133,11 +133,16 @@ separate flag contracts and are not substitutes for this leaf rule.
 
 For each file:
 
-1. Compare pre-open path identity with the opened descriptor.
-2. Copy or hash from that descriptor.
-3. Rewind and hash the same descriptor again.
-4. Compare descriptor identity, content stability, and access policy.
-5. Re-resolve the path without following symlinks and compare object identity.
+1. Compare pre-open path identity and access policy with the opened descriptor.
+2. Immediately re-resolve the descriptor-relative path without following
+   symlinks and require all three observations—pre-open path, opened
+   descriptor, and post-open path—to retain the same identity and access
+   policy. Never adopt the opened or post-open policy as a new baseline.
+3. Copy or hash from that descriptor only after the three-way open-boundary
+   proof succeeds.
+4. Rewind and hash the same descriptor again.
+5. Compare descriptor identity, content stability, and access policy.
+6. Re-resolve the path without following symlinks and compare object identity.
 
 Before releasing any live-source descriptor, hash that same descriptor once more and compare the
 receipt's SHA-256 and size plus descriptor/path identity and access policy both before and after
@@ -822,13 +827,17 @@ publication parent and exact snapshot descriptor remain held, move that exact
 object with a no-replace rename to an unpredictable hidden quarantine sibling.
 Revalidate the parent, object identity, access policy, requested-destination
 absence, quarantine identity, parent durability, and complete tree receipt.
-Return the original Notes-state code as primary with
+Terminally prove the quarantine's descriptor-relative directory access policy
+and public alias as well. Only after every one of those post-rename proofs
+succeeds may the result return the original Notes-state code as primary with
 `artifact_publication_state: quarantined`, `writeback_grade: false`, no
 successful creation receipt, and the exact quarantine locator. If the exact
-move or terminal evidence cannot be proved, retain committed-or-uncertain
-publication evidence and classify the quarantine sub-check separately as
-`snapshot-quarantine-inconclusive`; never delete through a mutable path or
-label the requested destination successful.
+move is visible but any terminal proof fails, report
+`artifact_publication_state: namespace-moved-unverified`,
+`cleanup_state: inconclusive`, and the failed proof phase. Otherwise retain
+committed-or-uncertain publication evidence. Classify every incomplete
+quarantine sub-check separately as `snapshot-quarantine-inconclusive`; never
+delete through a mutable path or label the requested destination successful.
 
 Keep patch preparation separate from live replacement.
 `stage-patch` and `preflight-writeback` are read-only with respect to the live container.
