@@ -197,6 +197,21 @@ running; only exit `1` with empty stdout/stderr means quit. Timeout, exec failur
 malformed output, or any other result is `notes-state-unknown` and never authorizes a writeback
 preflight or verification.
 
+For `copy-db --require-notes-quit`, one successful preflight probe is not
+enough. Probe again as the final operation of the before-publication rename
+callback, after all source and prepared-tree validation, and immediately after
+the no-replace publication returns before success labeling or result-file
+publication. If Notes is running or its state is unknown at the post-publication
+probe, move the exact descriptor-held published snapshot with a no-replace
+rename to an unpredictable owner-private hidden sibling under the same held
+parent. Revalidate parent/object identity, access policy, namespace absence,
+and the complete tree before reporting the quarantine. The command must fail
+with `writeback_grade: false`, no successful creation receipt, and exact
+primary/quarantine recovery evidence. If that exact move or its evidence cannot
+be proved, preserve a conservative committed-or-uncertain recovery receipt;
+never leave or describe the requested destination as a successful
+writeback-grade backup.
+
 Treat a snapshot captured while Notes is running as tentative.
 Do not use it for absence claims, exact counts, patch planning, or writeback.
 
@@ -451,9 +466,19 @@ Use `merge-db` only for a copied database file without a snapshot manifest:
 ```bash
 python3 "$SKILL_DIR/scripts/apple_notes_directory_supervisor.py" \
   --helper "$SKILL_DIR/scripts/apple_notes_db.py" -- merge-db \
-  --src /tmp/<copy>/NoteStore.sqlite \
-  --out /tmp/<copy>/NoteStore-analysis.sqlite
+  --src /tmp/<copy>/group.com.apple.notes/NoteStore.sqlite
 ```
+
+When that source has the canonical copied-snapshot layout, omitting `--out`
+creates a randomized owner-private standalone database in the snapshot
+parent, never inside the snapshot tree. An explicit output must also be
+external. Before output mutation, compare requested and registry-canonical
+forms in both ancestor directions, bind the snapshot root and output ancestor
+through descriptors, and reject a symlink/case/NFD/descriptor alias into or
+around the snapshot as `merge-output-inside-snapshot`; incomplete containment
+proof is `merge-output-scope-inconclusive`. Hold and revalidate the snapshot
+root and output-parent separation through publication so the source snapshot
+remains structurally valid.
 
 `merge-db` JSON and the compatibility Python launcher expose both `standalone_db` and the legacy
 `merged_db` alias for the same output path.
@@ -500,6 +525,13 @@ cannot therefore fail through a still-uncommitted outer guard.
 
 The packaged helper remains compatible with Python 3.9. Do not use newer runtime-only call
 arguments, such as `zip(..., strict=True)`, without adding a consistent minimum-version gate.
+The legacy-compatible `scripts/apple_notes_helper.py` module re-exports its
+established public names, including `notes_is_running` and `emit_json`, without
+starting a process or mutating the filesystem at import time. When executed,
+its `copy-db`, `merge-db`, `recover-snapshot`, and `stage-patch` commands route
+through the packaged directory-creator supervisor unless the caller supplied
+an explicit `--directory-creator-fd`; read-only commands and explicit-FD
+commands dispatch directly to the DB helper.
 
 ## Stage And Preflight A Patch
 

@@ -436,8 +436,11 @@ created-object identity and is forbidden as a fallback.
 The packaged production launcher creates an already-connected `AF_UNIX`/`SOCK_DGRAM` socketpair,
 forks the bundled supervisor service, and launches the DB helper with the client descriptor
 supplied as `--directory-creator-fd`; it never discovers or reconnects to a mutable socket
-pathname. The wrapper selects this launcher automatically for write-producing commands unless
-the caller already supplied a stronger inherited supervisor channel. For each creation, send one bounded
+pathname. The shell wrapper and the legacy-compatible Python executable both
+select this launcher automatically for write-producing commands unless the
+caller already supplied a stronger inherited supervisor channel. Importing the
+Python module must remain side-effect free. Read-only and explicit-supervisor-FD
+commands may dispatch directly. For each creation, send one bounded
 `apple-notes-directory-creator-request/v1` datagram and the already-held parent descriptor with
 `SCM_RIGHTS`. Bind the request nonce, operation, prefix, mode, effective UID, parent identity, and
 parent access policy. Accept only one bounded `apple-notes-directory-creator-response/v1`
@@ -751,6 +754,19 @@ In-place byte, size, or access-policy drift retains the failed artifact but chan
 classify it as `destination-exists`, keep publication `uncommitted`, and set `retry_safe: false`;
 if terminal destination observation is unavailable, classify publication as `uncertain`.
 
+When `merge-db` receives the canonical copied-snapshot main-file layout, infer
+and bind that snapshot root. Its default output must be an unpredictable
+owner-private sibling outside the root, not a member created beside
+`NoteStore.sqlite`. Before creating an explicit or default output, reject
+requested/registered-canonical lexical containment in either direction, then
+prove through held directory descriptors that the output ancestor neither is
+nor resolves inside the snapshot root. Keep both bindings through publication
+and terminal revalidation. Proved overlap is
+`merge-output-inside-snapshot`; unavailable or contradictory containment
+evidence is `merge-output-scope-inconclusive`. This protects exact snapshot
+membership and the snapshot root's object identity; ordinary child-entry
+metadata churn outside that protected tree is not a mismatch.
+
 Immediately after `source_backup` creates a private standalone `.tmp-*` database, bind that leaf
 relative to the already-held output-parent descriptor and compare its identity, SHA-256, size, and
 access policy with the creation receipt. Keep the same bound descriptor open across the
@@ -797,6 +813,22 @@ Only return code `0` with one or more positive decimal PID lines means running. 
 `1` with empty stdout and stderr means quit. Exec/collection failure, timeout, stderr, malformed
 PID output, an output/exit mismatch, or any other return code is `notes-state-unknown`; preflight
 and verification must stop rather than treating unknown as quit.
+
+For a required-quit snapshot, probe at preflight, as the final operation in the
+before-rename callback, and immediately after no-replace publication before
+success labeling, result-file publication, or return. A running/unknown
+post-publication result invalidates writeback-grade use. While the original
+publication parent and exact snapshot descriptor remain held, move that exact
+object with a no-replace rename to an unpredictable hidden quarantine sibling.
+Revalidate the parent, object identity, access policy, requested-destination
+absence, quarantine identity, parent durability, and complete tree receipt.
+Return the original Notes-state code as primary with
+`artifact_publication_state: quarantined`, `writeback_grade: false`, no
+successful creation receipt, and the exact quarantine locator. If the exact
+move or terminal evidence cannot be proved, retain committed-or-uncertain
+publication evidence and classify the quarantine sub-check separately as
+`snapshot-quarantine-inconclusive`; never delete through a mutable path or
+label the requested destination successful.
 
 Keep patch preparation separate from live replacement.
 `stage-patch` and `preflight-writeback` are read-only with respect to the live container.
@@ -904,6 +936,8 @@ The helper emits stable error codes, including:
 - `destination-exists`, `destination-install-failed`;
 - `destination-install-uncertain`;
 - `recovery-output-inside-snapshot`, `recovery-output-scope-inconclusive`;
+- `merge-output-inside-snapshot`, `merge-output-scope-inconclusive`;
+- `notes-started-during-capture`, `snapshot-quarantine-inconclusive`;
 - `post-writeback-identity-mismatch`, `post-writeback-file-set-mismatch`;
 - `post-writeback-content-mismatch`, `post-writeback-access-policy-mismatch`.
 
@@ -915,7 +949,9 @@ Do not reinterpret a safety error as an empty result.
 The helper does not:
 
 - grant TCC or Full Disk Access;
-- prove Notes remained quit between process-state probes;
+- prove Notes remained quit continuously between process-state probes; required-quit capture
+  narrows the unobserved windows with preflight, final pre-rename, and immediate post-publication
+  checks and quarantines an exact published object when the final probe fails;
 - create a transactional cross-file snapshot while Notes is running;
 - make a main/WAL/SHM filesystem replacement atomic;
 - mutate the live Notes store;

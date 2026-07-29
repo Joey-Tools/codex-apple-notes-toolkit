@@ -2928,9 +2928,96 @@ raise SystemExit(2)
         self.assertEqual(compatibility.HELPER_PATH, SCRIPT_PATH)
         self.assertTrue(callable(compatibility.main))
         self.assertTrue(callable(compatibility.directory_creator_supervisor))
+        self.assertTrue(callable(compatibility.emit_json))
+        self.assertTrue(callable(compatibility.notes_is_running))
+        self.assertTrue(callable(compatibility.build_parser))
+        self.assertEqual(compatibility.GROUP_CONTAINER, MODULE.GROUP_CONTAINER)
+        self.assertEqual(compatibility.APP_CONTAINER, MODULE.APP_CONTAINER)
+        self.assertEqual(
+            compatibility.NOTE_STORE_BASENAMES,
+            MODULE.NOTE_STORE_BASENAMES,
+        )
         self.assertEqual(
             compatibility.NoteStorePaths().note_store_files(),
             MODULE.NoteStorePaths().note_store_files(),
+        )
+
+    def test_compatibility_main_supervises_every_write_producing_command(
+        self,
+    ) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "compatibility_helper_supervision", COMPATIBILITY_SCRIPT
+        )
+        assert spec is not None
+        assert spec.loader is not None
+        compatibility = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = compatibility
+        spec.loader.exec_module(compatibility)
+
+        class Supervisor:
+            def __init__(self) -> None:
+                self.calls: list[list[str]] = []
+
+            def main(self, arguments: list[str]) -> int:
+                self.calls.append(arguments)
+                return 23
+
+        supervisor = Supervisor()
+        with (
+            mock.patch.object(
+                compatibility,
+                "_load_directory_supervisor",
+                return_value=supervisor,
+            ),
+            mock.patch.object(
+                compatibility._HELPER,
+                "main",
+                return_value=29,
+            ) as helper_main,
+        ):
+            for command in sorted(compatibility.WRITE_PRODUCING_COMMANDS):
+                with self.subTest(command=command):
+                    self.assertEqual(
+                        compatibility.main([command, "--synthetic"]),
+                        23,
+                    )
+            self.assertEqual(
+                compatibility.main(
+                    [
+                        "copy-db",
+                        "--directory-creator-fd",
+                        "17",
+                    ]
+                ),
+                29,
+            )
+            self.assertEqual(
+                compatibility.main(["probe-db-access"]),
+                29,
+            )
+
+        self.assertEqual(len(supervisor.calls), 4)
+        for call, command in zip(
+            supervisor.calls,
+            sorted(compatibility.WRITE_PRODUCING_COMMANDS),
+        ):
+            self.assertEqual(
+                call[-2:],
+                [command, "--synthetic"],
+            )
+            self.assertIn(str(SCRIPT_PATH), call)
+        self.assertEqual(
+            helper_main.call_args_list,
+            [
+                mock.call(
+                    [
+                        "copy-db",
+                        "--directory-creator-fd",
+                        "17",
+                    ]
+                ),
+                mock.call(["probe-db-access"]),
+            ],
         )
 
     def test_compatibility_python_api_preserves_merged_db_alias(self) -> None:
@@ -2978,6 +3065,127 @@ raise SystemExit(2)
         payload = json.loads(result.stdout)
         self.assertEqual(Path(payload["merged_db"]), output)
         self.assertEqual(Path(payload["standalone_db"]), output)
+
+    def test_compatibility_copy_cli_launches_packaged_supervisor(self) -> None:
+        process_probe = subprocess.run(
+            [MODULE.NOTES_PGREP_PATH, "-x", "Notes"],
+            check=False,
+            capture_output=True,
+        )
+        if process_probe.returncode not in {0, 1} or process_probe.stderr:
+            self.skipTest("fixed Notes process probe is unavailable in this sandbox")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = root / "snapshot"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(COMPATIBILITY_SCRIPT),
+                    "copy-db",
+                    "--group-container",
+                    str(paths.group_container),
+                    "--app-container",
+                    str(paths.app_container),
+                    "--dest",
+                    str(destination),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30.0,
+                env={
+                    **os.environ,
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+            )
+            payload = json.loads(result.stdout) if result.stdout else {}
+            copied = (
+                destination / "group.com.apple.notes" / MODULE.NOTE_STORE_MAIN
+            ).is_file()
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=result.stdout + result.stderr,
+        )
+        self.assertEqual(Path(payload["dest"]), destination)
+        self.assertTrue(copied)
+
+    def test_merge_default_output_is_external_to_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+            source = snapshot_dir / "group.com.apple.notes" / MODULE.NOTE_STORE_MAIN
+            merged = MODULE.merge_db(source, None, paths=paths)
+            output = Path(merged["standalone_db"])
+            validation = self._validate_snapshot(snapshot_dir)
+
+            self.assertEqual(output.parent, snapshot_dir.parent)
+            self.assertNotEqual(output, source)
+            self.assertFalse(output.is_relative_to(snapshot_dir))
+            self.assertEqual(validation["sqlite_validation"]["result"], "ok")
+
+    def test_merge_rejects_lexical_output_inside_snapshot_before_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+            source = snapshot_dir / "group.com.apple.notes" / MODULE.NOTE_STORE_MAIN
+            output = snapshot_dir / "analysis.sqlite"
+
+            with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                MODULE.merge_db(source, output, paths=paths)
+
+            self._assert_safety_code("merge-output-inside-snapshot", raised)
+            self.assertFalse(output.exists())
+            self.assertFalse(raised.exception.details["mutation_performed"])
+
+    def test_merge_rejects_descriptor_alias_output_inside_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+            source = snapshot_dir / "group.com.apple.notes" / MODULE.NOTE_STORE_MAIN
+            alias = root / "snapshot-alias"
+            alias.symlink_to(snapshot_dir, target_is_directory=True)
+            output = alias / "group.com.apple.notes" / "analysis.sqlite"
+
+            with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                MODULE.merge_db(source, output, paths=paths)
+
+            self._assert_safety_code("merge-output-inside-snapshot", raised)
+            self.assertFalse(
+                (snapshot_dir / "group.com.apple.notes" / "analysis.sqlite").exists()
+            )
 
     def test_capture_uses_python_39_compatible_zip_call(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -7480,6 +7688,138 @@ raise SystemExit(2)
                 raised,
             )
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o640)
+
+    def test_writeback_copy_rechecks_notes_at_end_of_before_rename(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = root / "snapshot"
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "notes_is_running",
+                    side_effect=[False, False, True],
+                ) as notes_probe,
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                self._copy_db(
+                    paths,
+                    dest=destination,
+                    require_notes_quit=True,
+                )
+
+            self._assert_safety_code("notes-started-during-capture", raised)
+            self.assertEqual(notes_probe.call_count, 3)
+            self.assertEqual(
+                raised.exception.details["capture_phase"],
+                "before-publication-rename",
+            )
+            self.assertFalse(destination.exists())
+            self._assert_retained_partial(root, ".snapshot.partial-*")
+
+    def test_writeback_copy_quarantines_snapshot_when_notes_start_after_publish(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = root / "snapshot"
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "notes_is_running",
+                    side_effect=[False, False, False, True],
+                ) as notes_probe,
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                self._copy_db(
+                    paths,
+                    dest=destination,
+                    require_notes_quit=True,
+                )
+
+            self._assert_safety_code("notes-started-during-capture", raised)
+            self.assertEqual(notes_probe.call_count, 4)
+            self.assertFalse(destination.exists())
+            quarantines = list(root.glob(".snapshot.notes-started-quarantine-*"))
+            self.assertEqual(len(quarantines), 1)
+            self.assertTrue(
+                (
+                    quarantines[0] / "group.com.apple.notes" / MODULE.NOTE_STORE_MAIN
+                ).is_file()
+            )
+            details = raised.exception.details
+            self.assertTrue(details["mutation_performed"])
+            self.assertEqual(details["publication_state"], "committed")
+            self.assertEqual(
+                details["artifact_publication_state"],
+                "quarantined",
+            )
+            self.assertFalse(details["writeback_grade"])
+            self.assertFalse(details["successful_creation_receipt_emitted"])
+            quarantine_receipt = details["recovery_locators"]["snapshot_quarantine"]
+            self.assertEqual(
+                Path(quarantine_receipt["quarantine_path"]),
+                quarantines[0],
+            )
+            self.assertEqual(
+                quarantine_receipt["artifact_publication_state"],
+                "quarantined",
+            )
+
+    def test_writeback_copy_quarantines_snapshot_when_final_notes_probe_is_unknown(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = root / "snapshot"
+            probe_error = MODULE.StoreSafetyError(
+                "notes-state-unknown",
+                "simulated final Notes process-state failure",
+                details={"probe_phase": "simulated"},
+            )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "notes_is_running",
+                    side_effect=[False, False, False, probe_error],
+                ) as notes_probe,
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                self._copy_db(
+                    paths,
+                    dest=destination,
+                    require_notes_quit=True,
+                )
+
+            self.assertIs(raised.exception.__cause__, None)
+            self._assert_safety_code("notes-state-unknown", raised)
+            self.assertEqual(notes_probe.call_count, 4)
+            self.assertFalse(destination.exists())
+            quarantines = list(root.glob(".snapshot.notes-started-quarantine-*"))
+            self.assertEqual(len(quarantines), 1)
+            details = raised.exception.details
+            self.assertEqual(details["notes_state"], "unknown")
+            self.assertEqual(
+                details["notes_probe_error_code"],
+                "notes-state-unknown",
+            )
+            self.assertEqual(details["probe_phase"], "simulated")
+            self.assertEqual(
+                details["artifact_publication_state"],
+                "quarantined",
+            )
+            self.assertFalse(details["writeback_grade"])
+            self.assertFalse(details["successful_creation_receipt_emitted"])
 
     def test_copy_failure_merges_file_and_partial_tree_recovery_locators(
         self,

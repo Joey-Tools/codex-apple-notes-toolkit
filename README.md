@@ -37,8 +37,10 @@ The packaged launcher creates an inherited, already-connected
 `--directory-creator-fd`. The service opens a randomized private source,
 atomically publishes that held object under the randomized returned name with
 the platform no-replace primitive, and holds its FD through the response. The
-wrapper selects this production launcher automatically for write-producing
+shell wrapper and the legacy-compatible `scripts/apple_notes_helper.py`
+entrypoint select this production launcher automatically for write-producing
 commands; callers may still provide a stronger inherited supervisor channel.
+Importing the Python compatibility module remains side-effect free.
 The launcher blocks and latches termination signals before child creation,
 publishes the worker PID atomically with `posix_spawn`, relocates a colliding
 non-inheritable channel FD, normalizes inherited `SIGCHLD=SIG_IGN` while it
@@ -86,9 +88,19 @@ against one captured working directory before preflight, manifest generation,
 or later equality checks.
 `merge-db` and `stage-patch` also freeze their source and all output paths from
 one API/CLI-entry CWD snapshot before destination preflight; stage manifests
-and creator result files record only those frozen paths.
+and creator result files record only those frozen paths. When a `merge-db`
+source belongs to a copied snapshot, its default output is a randomized
+owner-private file outside that snapshot. Explicit outputs are rejected when
+lexical, registered-canonical, or descriptor ancestry proves overlap in either
+direction.
 Notes process-state checks use fixed `/usr/bin/pgrep`, a minimal environment,
 a hard deadline, process-group cleanup, and a closed fail-unknown result matrix.
+For `copy-db --require-notes-quit`, the helper checks at preflight, at the end
+of the before-rename callback, and immediately after publication before
+emitting a successful result. If Notes starts after publication, the exact
+held snapshot object is moved with no replacement to an owner-private hidden
+quarantine sibling. The command fails with non-writeback-grade recovery
+evidence and never leaves that exact object at the requested destination.
 The first action after a no-replace rename returns, or after an error path
 proves that the exact object committed, is a monotonic publication latch.
 Post-publication ordinary failures—including failures while constructing

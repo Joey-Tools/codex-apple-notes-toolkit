@@ -2520,6 +2520,321 @@ def _publish_directory_no_replace(
     return descriptor_bound_destination
 
 
+def _require_notes_quit_during_capture(*, phase: str) -> None:
+    """Fail closed when a writeback-grade capture cannot prove Notes is quit."""
+
+    try:
+        running = notes_is_running()
+    except StoreSafetyError as exc:
+        exc.details = _merge_recovery_details(
+            exc.details,
+            {
+                "capture_phase": phase,
+                "mutation_performed": False,
+            },
+        )
+        raise
+    if running:
+        raise StoreSafetyError(
+            "notes-started-during-capture",
+            "Notes.app started before the writeback-grade snapshot completed "
+            f"its {phase} boundary",
+            details={
+                "capture_phase": phase,
+                "notes_state": "running",
+                "mutation_performed": False,
+            },
+        )
+
+
+def _published_snapshot_quarantine_evidence(
+    binding: _BoundDirectory,
+    *,
+    destination: Path,
+    quarantine: Path,
+    publication_receipt: dict[str, Any],
+    quarantine_committed: bool,
+    error: BaseException,
+) -> dict[str, Any]:
+    parent_fd = binding.parent_fd
+    destination_observation: tuple[str, os.stat_result | None] = (
+        "unavailable",
+        None,
+    )
+    quarantine_observation: tuple[str, os.stat_result | None] = (
+        "unavailable",
+        None,
+    )
+    if parent_fd is not None:
+        destination_observation = _observe_bound_name(
+            parent_fd,
+            destination.name,
+        )
+        quarantine_observation = _observe_bound_name(
+            parent_fd,
+            quarantine.name,
+        )
+    destination_state, destination_stat = destination_observation
+    quarantine_state, quarantine_stat = quarantine_observation
+    destination_matches = (
+        destination_state == "present"
+        and destination_stat is not None
+        and _same_identity(binding.opened, destination_stat)
+    )
+    quarantine_matches = (
+        quarantine_state == "present"
+        and quarantine_stat is not None
+        and _same_identity(binding.opened, quarantine_stat)
+    )
+    if quarantine_matches:
+        binding.path = quarantine
+        binding.namespace_basename = quarantine.name
+        if binding.canonical_path is not None:
+            binding.canonical_path = binding.canonical_path.parent / quarantine.name
+    elif destination_matches:
+        binding.path = destination
+        binding.namespace_basename = destination.name
+    artifact_state = (
+        "quarantined"
+        if quarantine_matches and destination_state == "absent"
+        else "committed"
+        if destination_matches
+        else "uncertain"
+    )
+    locator: dict[str, Any] = {
+        "schema": "apple-notes-snapshot-quarantine/v1",
+        "original_destination": str(destination),
+        "quarantine_path": str(quarantine),
+        "quarantine_rename_returned": quarantine_committed,
+        "artifact_publication_state": artifact_state,
+        "bound_snapshot_identity": _identity(binding.opened),
+        "bound_snapshot_access_policy": _access_policy(binding.opened),
+        "original_destination_observation": {
+            "state": destination_state,
+            "identity": (
+                _identity(destination_stat) if destination_stat is not None else None
+            ),
+        },
+        "quarantine_observation": {
+            "state": quarantine_state,
+            "identity": (
+                _identity(quarantine_stat) if quarantine_stat is not None else None
+            ),
+        },
+        "publication_receipt": publication_receipt,
+        "error_type": type(error).__name__,
+        "errno": getattr(error, "errno", None),
+    }
+    if isinstance(error, StoreSafetyError):
+        locator["error_code"] = error.code
+    return {
+        "mutation_performed": True,
+        "publication_state": "committed",
+        "artifact_publication_state": artifact_state,
+        "cleanup_state": (
+            "retained"
+            if artifact_state in {"quarantined", "committed"}
+            else "inconclusive"
+        ),
+        "retry_safe": False,
+        "writeback_grade": False,
+        "recovery_locators": {
+            "snapshot_quarantine": locator,
+        },
+    }
+
+
+def _quarantine_published_snapshot(
+    binding: _BoundDirectory,
+    destination: Path,
+    *,
+    publication_receipt: dict[str, Any],
+    descriptor_tree_receipt_builder: Callable[[str], dict[str, Any]],
+) -> dict[str, Any]:
+    """Move the exact published snapshot away from its successful artifact name."""
+
+    if binding.parent_fd is None:
+        raise StoreSafetyError(
+            "snapshot-quarantine-inconclusive",
+            "Published snapshot has no held parent descriptor for quarantine",
+            details={
+                "mutation_performed": True,
+                "publication_state": "committed",
+                "artifact_publication_state": "uncertain",
+                "cleanup_state": "inconclusive",
+                "retry_safe": False,
+                "writeback_grade": False,
+            },
+        )
+    parent_fd = binding.parent_fd
+    quarantine = destination.with_name(
+        f".{destination.name}.notes-started-quarantine-{uuid.uuid4().hex}"
+    )
+    quarantine_committed = False
+    try:
+        _verify_bound_parent_descriptor(
+            parent_fd,
+            binding.parent_opened,
+            display_path=destination.parent,
+            identity_code="prepared-directory-identity-mismatch",
+            access_policy_code="prepared-directory-access-policy-mismatch",
+            inconclusive_code="prepared-directory-revalidation-inconclusive",
+        )
+        _verify_bound_directory_at(
+            binding,
+            parent_fd=parent_fd,
+            basename=destination.name,
+            display_path=destination,
+        )
+        quarantine_state, _ = _observe_bound_name(parent_fd, quarantine.name)
+        if quarantine_state != "absent":
+            raise StoreSafetyError(
+                "snapshot-quarantine-inconclusive",
+                "The randomized snapshot quarantine name is not proved absent: "
+                f"{quarantine}",
+            )
+        _rename_directory_no_replace_at(
+            parent_fd,
+            destination.name,
+            quarantine.name,
+        )
+        quarantine_committed = True
+        binding.path = quarantine
+        binding.namespace_basename = quarantine.name
+        if binding.canonical_path is not None:
+            binding.canonical_path = binding.canonical_path.parent / quarantine.name
+        original_state, _ = _observe_bound_name(parent_fd, destination.name)
+        if original_state != "absent":
+            raise StoreSafetyError(
+                "snapshot-quarantine-inconclusive",
+                "The successful snapshot name is not absent after quarantine: "
+                f"{destination}",
+            )
+        _verify_bound_directory_at(
+            binding,
+            parent_fd=parent_fd,
+            basename=quarantine.name,
+            display_path=quarantine,
+        )
+        _fsync_bound_parent_descriptor(
+            parent_fd,
+            binding.parent_opened,
+            display_path=destination.parent,
+            identity_code="prepared-directory-identity-mismatch",
+            access_policy_code="prepared-directory-access-policy-mismatch",
+            inconclusive_code="prepared-directory-revalidation-inconclusive",
+        )
+        tree_receipt = descriptor_tree_receipt_builder(quarantine.name)
+        terminal_alias = _verify_installed_directory_path(
+            binding,
+            quarantine,
+        )
+        return {
+            "schema": "apple-notes-snapshot-quarantine/v1",
+            "original_destination": str(destination),
+            "quarantine_path": str(quarantine),
+            "quarantine_rename_returned": True,
+            "artifact_publication_state": "quarantined",
+            "writeback_grade": False,
+            "bound_snapshot_identity": _identity(binding.opened),
+            "bound_snapshot_access_policy": _access_policy(binding.opened),
+            "tree_receipt": tree_receipt,
+            "publication_receipt": publication_receipt,
+            "terminal_alias_receipt": terminal_alias,
+        }
+    except Exception as exc:
+        details = _published_snapshot_quarantine_evidence(
+            binding,
+            destination=destination,
+            quarantine=quarantine,
+            publication_receipt=publication_receipt,
+            quarantine_committed=quarantine_committed,
+            error=exc,
+        )
+        raise StoreSafetyError(
+            "snapshot-quarantine-inconclusive",
+            "Notes state became unsafe after snapshot publication and the "
+            f"identity-bound quarantine could not be fully proved: {exc}",
+            details=details,
+        ) from exc
+
+
+def _post_publication_notes_quit_check(
+    binding: _BoundDirectory,
+    destination: Path,
+    *,
+    publication_receipt: dict[str, Any],
+    descriptor_tree_receipt_builder: Callable[[str], dict[str, Any]],
+    publication_guard: dict[str, Any],
+) -> None:
+    """Recheck Notes and quarantine any artifact that cannot stay writeback-grade."""
+
+    probe_error: StoreSafetyError | None = None
+    try:
+        running = notes_is_running()
+    except StoreSafetyError as exc:
+        running = False
+        probe_error = exc
+    if not running and probe_error is None:
+        return
+
+    primary_code = (
+        probe_error.code if probe_error is not None else "notes-started-during-capture"
+    )
+    primary_message = (
+        "Notes state became unknown immediately after snapshot publication"
+        if probe_error is not None
+        else "Notes.app started before the published snapshot could be accepted"
+    )
+    try:
+        quarantine = _quarantine_published_snapshot(
+            binding,
+            destination,
+            publication_receipt=publication_receipt,
+            descriptor_tree_receipt_builder=descriptor_tree_receipt_builder,
+        )
+        details: dict[str, Any] = {
+            "mutation_performed": True,
+            "publication_state": "committed",
+            "artifact_publication_state": "quarantined",
+            "cleanup_state": "retained",
+            "retry_safe": False,
+            "writeback_grade": False,
+            "successful_creation_receipt_emitted": False,
+            "capture_phase": "post-publication-notes-check",
+            "notes_state": "unknown" if probe_error is not None else "running",
+            "recovery_locators": {
+                "snapshot_quarantine": quarantine,
+            },
+        }
+    except StoreSafetyError as quarantine_error:
+        details = _merge_recovery_details(
+            quarantine_error.details,
+            {
+                "mutation_performed": True,
+                "publication_state": "committed",
+                "retry_safe": False,
+                "writeback_grade": False,
+                "successful_creation_receipt_emitted": False,
+                "capture_phase": "post-publication-notes-check",
+                "notes_state": ("unknown" if probe_error is not None else "running"),
+                "quarantine_error_code": quarantine_error.code,
+                "quarantine_error": str(quarantine_error),
+            },
+        )
+    if probe_error is not None:
+        details = _merge_recovery_details(details, probe_error.details)
+        details["notes_probe_error_code"] = probe_error.code
+    error = StoreSafetyError(
+        primary_code,
+        primary_message,
+        details=details,
+    )
+    publication_guard["additional_details"] = details
+    publication_guard["handled_terminal_failure"] = error
+    raise error
+
+
 def _source_revalidation_os_error(
     path: Path,
     operation: str,
@@ -10685,6 +11000,8 @@ def _post_publication_failure_guard(
     except Exception as exc:
         if not state.get("committed"):
             raise
+        if state.get("handled_terminal_failure") is exc:
+            raise
         descriptor = state.get("descriptor_bound_destination")
         additional = state.get("additional_details")
         error = _post_publication_uncertain_error(
@@ -13645,11 +13962,9 @@ def copy_db(
                 "sidecar_consistency": sidecars,
                 "sqlite_validation": sqlite_integrity,
             }
-            if require_notes_quit and notes_is_running():
-                raise StoreSafetyError(
-                    "notes-started-during-capture",
-                    "Notes.app started before the writeback-grade snapshot was "
-                    "finalized",
+            if require_notes_quit:
+                _require_notes_quit_during_capture(
+                    phase="pre-manifest-publication",
                 )
             manifest_receipt = _write_json_atomic(
                 partial / SNAPSHOT_MANIFEST,
@@ -13756,6 +14071,10 @@ def copy_db(
                         missing_code="prepared-directory-identity-mismatch",
                     )
                     destination_scope.revalidate()
+                    if require_notes_quit:
+                        _require_notes_quit_during_capture(
+                            phase="before-publication-rename",
+                        )
 
                 def build_descriptor_snapshot_tree_receipt(
                     published_basename: str,
@@ -13791,6 +14110,16 @@ def copy_db(
                 )
                 publication_guard["committed"] = True
                 publication_guard["descriptor_bound_destination"] = publication_receipt
+                if require_notes_quit:
+                    _post_publication_notes_quit_check(
+                        bound_root,
+                        destination,
+                        publication_receipt=publication_receipt,
+                        descriptor_tree_receipt_builder=(
+                            build_descriptor_snapshot_tree_receipt
+                        ),
+                        publication_guard=publication_guard,
+                    )
                 try:
                     destination_scope.revalidate()
                     _scan_exact_prepared_directory_entries(
@@ -14275,6 +14604,120 @@ def validate_snapshot(
         return artifact.public_result
 
 
+def _merge_source_snapshot_root(src: Path) -> Path | None:
+    """Return the conservative artifact root for a canonical snapshot layout."""
+
+    if src.name != NOTE_STORE_MAIN or src.parent.name != "group.com.apple.notes":
+        return None
+    return src.parent.parent
+
+
+def _default_merge_output(src: Path, snapshot_root: Path | None) -> Path:
+    """Select a new analysis output outside a possible snapshot artifact."""
+
+    output_parent = (
+        snapshot_root.parent
+        if snapshot_root is not None
+        else Path(tempfile.gettempdir())
+    )
+    return output_parent / (
+        f".apple-notes-merged-for-analysis-{uuid.uuid4().hex}.sqlite"
+    )
+
+
+def _assert_merge_output_lexically_external(
+    output: Path,
+    snapshot_root: Path,
+) -> None:
+    """Reject requested/canonical alias overlap before any destination mutation."""
+
+    output_forms = _trusted_alias_scope_forms(output)
+    snapshot_forms = _trusted_alias_scope_forms(snapshot_root)
+    for output_form, output_path in output_forms:
+        output_parts = _normalized_scope_parts(output_path)
+        for snapshot_form, snapshot_path in snapshot_forms:
+            snapshot_parts = _normalized_scope_parts(snapshot_path)
+            output_inside_snapshot = (
+                output_parts[: len(snapshot_parts)] == snapshot_parts
+            )
+            snapshot_inside_output = snapshot_parts[: len(output_parts)] == output_parts
+            if not output_inside_snapshot and not snapshot_inside_output:
+                continue
+            raise StoreSafetyError(
+                "merge-output-inside-snapshot",
+                "Merge output must be external to the source snapshot in both "
+                "requested and registered-canonical alias forms: "
+                f"output={output}, snapshot={snapshot_root}",
+                details={
+                    "output": str(output),
+                    "snapshot": str(snapshot_root),
+                    "output_scope_form": output_form,
+                    "output_scope_path": str(output_path),
+                    "snapshot_scope_form": snapshot_form,
+                    "snapshot_scope_path": str(snapshot_path),
+                    "overlap_detection": (
+                        "normalized-lexical-output-inside-snapshot"
+                        if output_inside_snapshot
+                        else "normalized-lexical-snapshot-inside-output"
+                    ),
+                    "mutation_performed": False,
+                },
+            )
+
+
+def _preflight_merge_output_outside_snapshot(
+    snapshot_binding: _BoundDirectory,
+    output: Path,
+) -> None:
+    try:
+        _preflight_recovery_output_outside_snapshot(snapshot_binding, output)
+    except StoreSafetyError as exc:
+        code = (
+            "merge-output-inside-snapshot"
+            if exc.code == "recovery-output-inside-snapshot"
+            else "merge-output-scope-inconclusive"
+        )
+        raise StoreSafetyError(
+            code,
+            "Cannot prove that merge output is external to the descriptor-bound "
+            f"source snapshot: output={output}, "
+            f"snapshot={snapshot_binding.path}: {exc}",
+            details=_merge_recovery_details(
+                exc.details,
+                {"mutation_performed": False},
+            ),
+        ) from exc
+
+
+@contextmanager
+def _bind_merge_output_parent_outside_snapshot(
+    snapshot_binding: _BoundDirectory,
+    output: Path,
+    *,
+    output_parent_binding: _BoundDirectory,
+) -> Iterator[_BoundDirectory]:
+    try:
+        with _bind_recovery_output_parent_outside_snapshot(
+            snapshot_binding,
+            output,
+            output_parent_binding=output_parent_binding,
+        ) as parent:
+            yield parent
+    except StoreSafetyError as exc:
+        code = (
+            "merge-output-inside-snapshot"
+            if exc.code == "recovery-output-inside-snapshot"
+            else "merge-output-scope-inconclusive"
+        )
+        raise StoreSafetyError(
+            code,
+            "Merge output or its held parent no longer proves externality from "
+            f"the source snapshot: output={output}, "
+            f"snapshot={snapshot_binding.path}: {exc}",
+            details=exc.details,
+        ) from exc
+
+
 def merge_db(
     src: Path,
     out: Path | None,
@@ -14283,10 +14726,16 @@ def merge_db(
 ) -> dict[str, Any]:
     cwd = os.getcwd()
     src = _absolute_path_from_cwd(src, cwd)
+    snapshot_root = _merge_source_snapshot_root(src)
     requested_output = _absolute_path_from_cwd(
-        out or src.with_name("NoteStore-merged-for-analysis.sqlite"),
+        out or _default_merge_output(src, snapshot_root),
         cwd,
     )
+    if snapshot_root is not None:
+        _assert_merge_output_lexically_external(
+            requested_output,
+            snapshot_root,
+        )
     publication_guard: dict[str, Any] = {}
     with (
         _post_publication_failure_guard(
@@ -14298,15 +14747,39 @@ def merge_db(
                 "scope could not be revalidated or closed cleanly"
             ),
         ),
-        _bind_live_safe_destination_parent(
-            paths or NoteStorePaths(),
-            requested_output,
-        ) as destination_scope,
+        ExitStack() as transaction,
     ):
+        snapshot_binding: _BoundDirectory | None = None
+        if snapshot_root is not None:
+            snapshot_binding = transaction.enter_context(
+                _bind_artifact_root(
+                    snapshot_root,
+                    missing_code="source-missing",
+                )
+            )
+            _preflight_merge_output_outside_snapshot(
+                snapshot_binding,
+                requested_output,
+            )
+        destination_scope = transaction.enter_context(
+            _bind_live_safe_destination_parent(
+                paths or NoteStorePaths(),
+                requested_output,
+            )
+        )
+        output_parent = destination_scope.parent
+        if snapshot_binding is not None:
+            output_parent = transaction.enter_context(
+                _bind_merge_output_parent_outside_snapshot(
+                    snapshot_binding,
+                    destination_scope.destination,
+                    output_parent_binding=destination_scope.parent,
+                )
+            )
         result = _recover_to_standalone(
             src,
             destination_scope.destination,
-            output_parent_binding=destination_scope.parent,
+            output_parent_binding=output_parent,
         )
         publication_guard["committed"] = True
         publication_guard["descriptor_bound_destination"] = result.get(
@@ -17047,9 +17520,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             emit_json(result)
         elif args.command == "merge-db":
             merge_source = _absolute_path_from_cwd(args.src, command_cwd)
-            merge_output = _absolute_path_from_cwd(
-                args.out
-                or merge_source.with_name("NoteStore-merged-for-analysis.sqlite"),
+            merge_output = _optional_absolute_path_from_cwd(
+                args.out,
                 command_cwd,
             )
             emit_json(

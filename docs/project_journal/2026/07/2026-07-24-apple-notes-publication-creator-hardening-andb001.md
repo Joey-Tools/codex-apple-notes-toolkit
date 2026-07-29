@@ -3,7 +3,7 @@ id: 20260724-andb001
 title: Apple Notes Publication And Creator Failure Hardening
 status: completed
 created: 2026-07-24
-updated: 2026-07-29
+updated: 2026-07-30
 branch: codex/apple-db-hardening
 pr:
 supersedes: []
@@ -49,6 +49,11 @@ superseded_by:
 - Closed the live-source directory final-exit gap so the generic component
   context cannot leak `prepared-directory-*` after source-specific terminal
   validation.
+- Closed the Python compatibility, merge-output containment, and required-quit
+  publication-boundary gaps found in GitHub review. Legacy executable write
+  commands now use the packaged supervisor; copied-snapshot merges stay
+  outside the snapshot; a late Notes restart quarantines the exact published
+  object before any writeback-grade success result.
 
 ## Current State
 
@@ -467,3 +472,31 @@ superseded_by:
   Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
   `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
   `git diff --check`.
+- GitHub-review follow-up base:
+  `2f28bf3831465fa8f59b622c17ba305d9793888e`.
+- The legacy Python compatibility module now re-exports its complete historical
+  public surface, including `notes_is_running` and `emit_json`, while remaining
+  import-side-effect free. Its four write-producing CLI commands automatically
+  route through the packaged supervisor unless an explicit supervisor FD is
+  already present.
+- `merge-db` now chooses a randomized external sibling output for canonical
+  copied-snapshot sources when `--out` is omitted. Explicit/default outputs
+  reject requested, canonical-alias, and descriptor-resolved containment in
+  either direction before mutation and retain the root/output separation
+  binding through publication.
+- Required-quit `copy-db` now probes Notes at preflight, at the final
+  before-rename callback boundary, and immediately after publication before
+  success/result publication. A running or unknown final state moves the exact
+  held snapshot to a no-replace hidden quarantine sibling, reports
+  non-writeback-grade primary/recovery evidence, and leaves no successful
+  artifact at the requested destination.
+- Deterministic focused regressions cover compatibility exports and supervisor
+  routing, real compatibility-launcher copy behavior, external merge defaults,
+  lexical/descriptor alias overlap rejection, a pre-rename Notes restart, and
+  a post-publication restart with exact quarantine evidence.
+- Full regressions: Python `3.13.0` and system Python `3.9.6` each passed all
+  `298` tests with two sandbox-scoped skips for the fixed `/usr/bin/pgrep`
+  process probe.
+- Direct Claude Code review is omitted under Joey's explicit temporary waiver
+  for work completed before 2026-08-01; no substitute reviewer is counted as
+  that lane.
