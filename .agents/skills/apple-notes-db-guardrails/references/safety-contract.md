@@ -89,6 +89,14 @@ failure without a causal OS error is a proved mismatch. For `probe-db-access`, c
 file descriptor first and keep the final held-parent check inside that file's result boundary;
 failure leaves the file unreadable with the same source classification rather than aborting the
 whole probe with a prepared-directory error.
+Keep the underlying generic directory context inside one source-owned enter/body/exit lifecycle.
+After the source body and source-specific terminal revalidation succeed, translate any generic
+component-chain exit failure from the caught evidence without re-probing a mutable namespace.
+`ENOENT`, `EACCES`/`EPERM`, another stat error, a cause-free identity comparison, and a cause-free
+access-policy comparison remain respectively missing-after-read, revalidation-unreadable,
+revalidation-inconclusive, source-identity-mismatch, and source-access-policy-mismatch. Copy and
+merge wrappers may add mutation/publication evidence, but they must retain that source code as the
+underlying failure instead of exposing a `prepared-directory-*` code.
 
 ## Stable Descriptor Capture
 
@@ -457,6 +465,15 @@ descriptor cannot be reconciled, retain point-in-time provider/name evidence but
 protected property `creation-identity-inconclusive`; never sign a replacement as
 `transaction-created-object-identity`. If atomic no-replace is unsupported, stop rather than
 reverting to direct `mkdir(target)` or check-then-rename.
+Build the exact component install receipt from the creator-held parent/object/proof before the
+rename, but latch it as installed only in the first state update after the no-replace rename
+returns. Before any subsequent scope revalidation, register that receipt with the parent
+component transaction. Every ordinary failure after one or more installs—including the next
+component's precheck, post-install chain validation, yielded consumer failure, post-yield
+validation, and descriptor teardown—must merge every latched component receipt, report
+`mutation_performed: true`, preserve or worsen cleanup evidence, and force `retry_safe: false`.
+The outer parent scope must derive mutation from those details even when the component context
+never yielded.
 
 On creation collision or any post-creation failure, retain the created descriptor evidence plus
 point-in-time staging/target observations. Do not `stat(name)` and then `rmdir(name)`: there is no

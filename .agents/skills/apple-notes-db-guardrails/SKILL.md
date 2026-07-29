@@ -115,6 +115,11 @@ or access-policy drift fails closed with a structured retained-object locator; u
 evidence is labeled `creation-identity-inconclusive`, never
 `transaction-created-object-identity`. Metadata-only transitions remain benign. A platform
 without atomic directory no-replace support is unsupported.
+Immediately after a successful component install, the helper latches the exact
+`creation_install_receipt` before another scope check. Every later parent-chain revalidation,
+consumer failure, post-yield check, and descriptor teardown merges all already installed component
+receipts with `mutation_performed: true` and `retry_safe: false`; a caller must never infer
+zero mutation merely because the parent context did not reach its first yield.
 
 On macOS, only the exact registry entries `/tmp -> /private/tmp`, `/var -> /private/var`, and
 `/etc -> /private/etc` may bridge a root symlink. The helper binds the alias parent, alias entry and
@@ -228,6 +233,11 @@ The access probe closes each successfully opened file descriptor, then performs 
 source-aware held-parent revalidation inside that file's result boundary before marking it
 readable. Parent disappearance, unreadability, or another revalidation failure remains a
 per-file source error instead of escaping through the generic prepared-directory taxonomy.
+The live-source directory lifecycle also owns the final exit of its underlying generic
+component-chain context. A generic teardown failure after the source-specific terminal check is
+translated from its original cause: missing, unreadable, other stat failure, proved identity
+replacement, and proved access-policy drift retain their corresponding `source-*` classes for
+fingerprint, copy, and merge callers.
 On an ordinary pre-publication failure, the helper
 preserves the partial tree and attaches a creation-receipt-matched namespace locator plus a bounded
 no-follow sensitive-file inventory to the original error. If the root is replaced or inventory is

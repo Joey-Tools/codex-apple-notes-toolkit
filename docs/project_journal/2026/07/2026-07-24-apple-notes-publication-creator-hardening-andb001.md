@@ -42,6 +42,13 @@ superseded_by:
 - Closed the retained-preflight teardown gap so a late artifact/result
   destination-scope failure cannot overwrite already committed publication
   receipts with a false zero-write claim.
+- Closed the destination-parent component latch gap so a successful
+  no-replace directory install retains its exact receipt and all previously
+  installed component identities across later validation and teardown
+  failures.
+- Closed the live-source directory final-exit gap so the generic component
+  context cannot leak `prepared-directory-*` after source-specific terminal
+  validation.
 
 ## Current State
 
@@ -115,12 +122,24 @@ superseded_by:
   artifact-only teardown failures retain the descriptor-bound artifact
   recovery locator, while result-committed failures retain both that artifact
   identity and the exact result-file SHA-256/size/identity receipt.
+- A directory component's exact creator-held installation receipt is prepared
+  before rename and latched in the first state update after a successful
+  no-replace install. Parent creation then preserves every latched component
+  receipt through next-component checks, post-install validation, yielded
+  consumer errors, post-yield validation, and descriptor teardown, always
+  reporting mutation and a non-retryable result.
+- The complete live-source binding lifecycle now owns the underlying generic
+  directory context's final exit. Missing, permission, other stat, proved
+  identity, and proved access-policy failures in that final window remain
+  stable `source-*` classifications for fingerprint, copy, and merge.
 
 ## Next Steps
 
 - Parent may publish the signed follow-up, rerun the PR review gate, and handle
   the existing GitHub Codex thread; this worktree does not push or mutate PR
   state.
+- The Claude lane is waived only until `2026-08-01 00:00 Asia/Shanghai` and is
+  not counted as completed review evidence.
 
 ## Evidence
 
@@ -237,6 +256,22 @@ superseded_by:
   changed-Python format check; Python `3.14.3` and `3.9.6` bytecode
   compilation with separate task-scoped caches; `bash -n`; ShellCheck
   `0.11.0`; skill and project-journal validators; and `git diff --check`.
+- Directory-install/source-final-exit follow-up base:
+  `bc19e5d19c8a0e02366b706410a34874bd15e1b8`.
+- Directory-install/source-final-exit focused regressions: Homebrew Python
+  `3.14.3` and system Python `3.9.6` each passed ten focused tests. Coverage
+  includes install-success followed by scope failure, multi-component
+  post-install and post-yield failures with exact receipts, and final-window
+  missing, unreadable, EIO, identity, and access-policy classifications across
+  fingerprint, copy, and merge.
+- Directory-install/source-final-exit full suites: Homebrew Python `3.14.3`
+  and system Python `3.9.6` each passed all `265` tests outside the nested
+  sandbox required by the fixed `/usr/bin/pgrep` process-state probe.
+- Directory-install/source-final-exit static gates: full-repository Ruff
+  `0.13.2`; changed-Python format check; Python `3.14.3` and `3.9.6` bytecode
+  compilation with separate task-scoped caches; `bash -n`; ShellCheck
+  `0.11.0`; isolated skill validation with `PyYAML`; project-journal
+  validation; and `git diff --check`.
 - Skill validation: isolated `quick_validate.py` with `PyYAML` (`Skill is valid!`; direct local validation lacked that dependency)
 - Final skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)
 - Formal follow-up skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)

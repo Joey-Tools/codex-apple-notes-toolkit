@@ -3777,36 +3777,45 @@ def _verify_bound_source_directory(
 
     try:
         return _verify_bound_directory_namespace(directory)
-    except OSError as exc:
-        raise _source_revalidation_os_error(
+    except (OSError, StoreSafetyError) as exc:
+        raise _source_directory_revalidation_error(directory, exc) from exc
+
+
+def _source_directory_revalidation_error(
+    directory: _BoundDirectory,
+    error: OSError | StoreSafetyError,
+) -> StoreSafetyError:
+    """Translate one failed held-source-directory check without re-probing."""
+
+    if isinstance(error, OSError):
+        return _source_revalidation_os_error(
             directory.path,
             "revalidate the held live-source directory chain",
-            exc,
-        ) from exc
-    except StoreSafetyError as exc:
-        os_error = _causal_os_error(exc)
-        if os_error is not None:
-            code = _source_revalidation_os_error(
-                directory.path,
-                "revalidate the held live-source directory chain",
-                os_error,
-            ).code
-        else:
-            code = {
-                "prepared-directory-missing": "source-missing-after-read",
-                "prepared-directory-identity-mismatch": "source-identity-mismatch",
-                "directory-identity-mismatch": "source-identity-mismatch",
-                "prepared-directory-access-policy-mismatch": (
-                    "source-access-policy-mismatch"
-                ),
-                "directory-access-policy-mismatch": ("source-access-policy-mismatch"),
-            }.get(exc.code, "source-revalidation-inconclusive")
-        raise StoreSafetyError(
-            code,
-            "The held live-source directory chain failed terminal "
-            f"revalidation: {directory.path}: {exc}",
-            details=exc.details,
-        ) from exc
+            error,
+        )
+    os_error = _causal_os_error(error)
+    if os_error is not None:
+        code = _source_revalidation_os_error(
+            directory.path,
+            "revalidate the held live-source directory chain",
+            os_error,
+        ).code
+    else:
+        code = {
+            "prepared-directory-missing": "source-missing-after-read",
+            "prepared-directory-identity-mismatch": "source-identity-mismatch",
+            "directory-identity-mismatch": "source-identity-mismatch",
+            "prepared-directory-access-policy-mismatch": (
+                "source-access-policy-mismatch"
+            ),
+            "directory-access-policy-mismatch": "source-access-policy-mismatch",
+        }.get(error.code, "source-revalidation-inconclusive")
+    return StoreSafetyError(
+        code,
+        "The held live-source directory chain failed terminal "
+        f"revalidation: {directory.path}: {error}",
+        details=error.details,
+    )
 
 
 def _verify_bound_recovery_input(
@@ -4272,6 +4281,7 @@ def _identity_bound_directory_creation_failure_details(
         mutation_performed=True,
         # A failed provider handoff has not passed the helper's proof checks.
         creation_proof=None,
+        creation_install_receipt=None,
     )
     generic_locator = recovery["recovery_locators"].pop("created_directory_install")
     generic_locator.update(
@@ -4838,6 +4848,7 @@ def _created_directory_install_recovery_details(
     install_state: str,
     mutation_performed: bool,
     creation_proof: dict[str, Any] | None,
+    creation_install_receipt: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Describe a failed create/install without deleting through a mutable name."""
 
@@ -4863,6 +4874,8 @@ def _created_directory_install_recovery_details(
             "reconfirm identity at removal; retain point-in-time evidence."
         ),
     }
+    if creation_install_receipt is not None:
+        receipt["creation_install_receipt"] = creation_install_receipt
     try:
         parent_current = os.fstat(parent_fd)
     except OSError as exc:
@@ -4924,6 +4937,11 @@ def _created_directory_install_recovery_details(
         observations[label] = row
     receipt["namespace_observations"] = observations
     receipt.setdefault("evidence_status", "checked")
+    recovery_locators = {
+        "created_directory_install": receipt,
+    }
+    if creation_install_receipt is not None:
+        recovery_locators["creation_install_receipt"] = creation_install_receipt
     return {
         "mutation_performed": mutation_performed,
         "cleanup_state": (
@@ -4932,9 +4950,36 @@ def _created_directory_install_recovery_details(
             else "not-needed"
         ),
         "retry_safe": False,
-        "recovery_locators": {
-            "created_directory_install": receipt,
-        },
+        "recovery_locators": recovery_locators,
+    }
+
+
+def _created_directory_install_receipt(
+    *,
+    parent_opened: os.stat_result,
+    created: os.stat_result,
+    display_path: Path,
+    target_name: str,
+    staging_name: str,
+    creation_proof: dict[str, Any],
+) -> dict[str, Any]:
+    """Latch the exact creator-held object immediately after installation."""
+
+    return {
+        "schema": "apple-notes-created-directory-install/v1",
+        "protected_property": "transaction-created-object-identity",
+        "creation_protocol": "trusted-creator-returned-fd-before-no-replace-install",
+        "creation_proof": creation_proof,
+        "display_path": str(display_path),
+        "target_basename": target_name,
+        "staging_basename": staging_name,
+        "parent_identity": _identity(parent_opened),
+        "parent_access_policy": _access_policy(parent_opened),
+        "directory_identity": _identity(created),
+        "directory_access_policy": _access_policy(created),
+        "cleanup_policy": (
+            "delete-only-through-an-atomic-identity-bound-directory-primitive"
+        ),
     }
 
 
@@ -4962,6 +5007,7 @@ def _create_and_install_directory_at(
     directory_fd: int | None = None
     created: os.stat_result | None = None
     creation_proof: dict[str, Any] | None = None
+    creation_install_receipt: dict[str, Any] | None = None
     mutation_performed = False
     install_state = "not-created"
     try:
@@ -5024,14 +5070,25 @@ def _create_and_install_directory_at(
             inconclusive_code=inconclusive_code,
         )
 
+        pending_install_receipt = _created_directory_install_receipt(
+            parent_opened=parent_opened,
+            created=created,
+            display_path=display_path,
+            target_name=target_name,
+            staging_name=staging_name,
+            creation_proof=creation_proof,
+        )
         install_state = "no-replace-install-started"
         _install_created_directory_no_replace_at(
             parent_fd,
             staging_name,
             target_name,
         )
-        install_state = "no-replace-install-returned"
-        installed = _verify_created_directory_name_at(
+        creation_install_receipt, install_state = (
+            pending_install_receipt,
+            "no-replace-install-returned",
+        )
+        _verify_created_directory_name_at(
             parent_fd,
             parent_opened,
             directory_fd,
@@ -5051,7 +5108,7 @@ def _create_and_install_directory_at(
             )
         if revalidate_scope is not None:
             revalidate_scope()
-        installed = _verify_created_directory_name_at(
+        _verify_created_directory_name_at(
             parent_fd,
             parent_opened,
             directory_fd,
@@ -5066,24 +5123,7 @@ def _create_and_install_directory_at(
         return _CreatedDirectoryInstallation(
             fd=directory_fd,
             opened=created,
-            receipt={
-                "schema": "apple-notes-created-directory-install/v1",
-                "protected_property": "transaction-created-object-identity",
-                "creation_protocol": (
-                    "trusted-creator-returned-fd-before-no-replace-install"
-                ),
-                "creation_proof": creation_proof,
-                "display_path": str(display_path),
-                "target_basename": target_name,
-                "staging_basename": staging_name,
-                "parent_identity": _identity(parent_opened),
-                "parent_access_policy": _access_policy(parent_opened),
-                "directory_identity": installed["identity"],
-                "directory_access_policy": installed["access_policy"],
-                "cleanup_policy": (
-                    "delete-only-through-an-atomic-identity-bound-directory-primitive"
-                ),
-            },
+            receipt=creation_install_receipt,
         )
     except Exception as exc:
         if isinstance(exc, StoreSafetyError):
@@ -5115,6 +5155,7 @@ def _create_and_install_directory_at(
             install_state=install_state,
             mutation_performed=mutation_performed,
             creation_proof=creation_proof,
+            creation_install_receipt=creation_install_receipt,
         )
         if isinstance(exc, StoreSafetyError):
             exc.details = _merge_recovery_details(exc.details, details)
@@ -6898,12 +6939,32 @@ def _opened_source_from_bound(
 
 
 @contextmanager
+def _bind_source_directory(path: Path) -> Iterator[_BoundDirectory]:
+    """Keep generic directory teardown inside the live-source taxonomy."""
+
+    directory: _BoundDirectory | None = None
+    body_error: BaseException | None = None
+    try:
+        with _bind_existing_directory_with_trusted_alias(path) as bound:
+            directory = bound
+            try:
+                yield bound
+            except BaseException as exc:
+                body_error = exc
+                raise
+    except (OSError, StoreSafetyError) as exc:
+        if exc is body_error or directory is None:
+            raise
+        raise _source_directory_revalidation_error(directory, exc) from exc
+
+
+@contextmanager
 def _bind_source_store(main_path: Path) -> Iterator[_BoundSourceStore]:
     """Bind one NoteStore transaction through one complete no-follow chain."""
 
     main_path = _absolute_path(main_path)
     with (
-        _bind_existing_directory_with_trusted_alias(main_path.parent) as parent,
+        _bind_source_directory(main_path.parent) as parent,
         ExitStack() as stack,
     ):
         before_paths = _discover_database_files_at(main_path, parent)
@@ -8774,6 +8835,39 @@ def _create_bound_snapshot_destination_parent_components(
     current_opened = ancestor.opened
     flags = _directory_open_flags()
     mutation_performed = False
+    body_error: BaseException | None = None
+
+    def created_component_details() -> dict[str, Any]:
+        if not held_components:
+            return {}
+        return {
+            "mutation_performed": True,
+            "cleanup_state": "preserved-no-identity-safe-directory-unlink",
+            "retry_safe": False,
+            "recovery_locators": {
+                "created_destination_parent_components": {
+                    "schema": ("apple-notes-created-destination-parent-components/v1"),
+                    "destination": str(destination),
+                    "display_path": str(display_path),
+                    "protected_properties": {
+                        "object_identity": ["device", "inode", "file_type"],
+                        "access_policy": ["mode", "uid", "gid", "flags"],
+                    },
+                    "components": [
+                        {
+                            "path": str(component.path),
+                            "target_basename": component.basename,
+                            "directory_identity": _identity(component.opened),
+                            "directory_access_policy": _access_policy(component.opened),
+                            "creation_install_receipt": (
+                                component.creation_install_receipt
+                            ),
+                        }
+                        for component in held_components
+                    ],
+                }
+            },
+        }
 
     def fail(
         message: str,
@@ -8791,12 +8885,21 @@ def _create_bound_snapshot_destination_parent_components(
             cause=cause,
             mutation_performed=mutation_performed or cause_mutation,
         )
+        component_details = created_component_details()
+        if component_details:
+            error.details = _merge_recovery_details(
+                error.details,
+                component_details,
+            )
         if isinstance(cause, StoreSafetyError):
             error.details = _merge_recovery_details(
                 error.details,
                 cause.details,
             )
             error.details["mutation_performed"] = mutation_performed or cause_mutation
+        if mutation_performed or cause_mutation:
+            error.details["mutation_performed"] = True
+            error.details["retry_safe"] = False
         return error
 
     def revalidate_chain() -> dict[str, Any]:
@@ -8829,6 +8932,18 @@ def _create_bound_snapshot_destination_parent_components(
             "ancestor_chain": ancestor_chain,
         }
 
+    def revalidate_after_creation(phase: str) -> dict[str, Any]:
+        try:
+            return revalidate_chain()
+        except Exception as exc:
+            if not mutation_performed:
+                raise
+            raise fail(
+                "Cannot revalidate the snapshot-destination parent after "
+                f"directory creation during {phase}: {display_path}: {exc}",
+                cause=exc,
+            ) from exc
+
     try:
         current_fd = os.open(".", flags, dir_fd=ancestor.fd)
         owned_fds.append(current_fd)
@@ -8845,8 +8960,17 @@ def _create_bound_snapshot_destination_parent_components(
                     "Snapshot destination contains a non-canonical parent "
                     f"component: {display_path}"
                 )
-            revalidate_chain()
-            parent_before = os.fstat(current_fd)
+            revalidate_after_creation("before-next-component")
+            try:
+                parent_before = os.fstat(current_fd)
+            except Exception as exc:
+                if not mutation_performed:
+                    raise
+                raise fail(
+                    "Cannot inspect the held destination parent after prior "
+                    f"component creation: {display_path}: {exc}",
+                    cause=exc,
+                ) from exc
             if not _same_identity(
                 current_opened,
                 parent_before,
@@ -8897,11 +9021,8 @@ def _create_bound_snapshot_destination_parent_components(
             owned_fds.append(child_fd)
             current_fd = child_fd
             current_opened = child_opened
-            try:
-                revalidate_chain()
-            except Exception:
-                raise
-        revalidate_chain()
+            revalidate_after_creation("after-component-install")
+        revalidate_after_creation("before-parent-yield")
         if held_components:
             final = held_components[-1]
             binding = _BoundDirectory(
@@ -8930,11 +9051,78 @@ def _create_bound_snapshot_destination_parent_components(
                 trusted_alias=trusted_alias,
                 canonical_path=_bound_directory_canonical_path(ancestor),
             )
-        yield binding
-        revalidate_chain()
+        try:
+            yield binding
+        except StoreSafetyError as exc:
+            component_details = created_component_details()
+            if component_details:
+                exc.details = _merge_recovery_details(
+                    exc.details,
+                    component_details,
+                )
+                exc.details["mutation_performed"] = True
+                exc.details["retry_safe"] = False
+            raise
+        except Exception as exc:
+            if not mutation_performed:
+                raise
+            raise fail(
+                "A destination-parent operation failed after directory "
+                f"creation: {display_path}: {exc}",
+                cause=exc,
+            ) from exc
+        revalidate_after_creation("parent-context-teardown")
+    except BaseException as exc:
+        body_error = exc
+        raise
     finally:
+        close_failures: list[dict[str, Any]] = []
         for fd in reversed(owned_fds):
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError as exc:
+                close_failures.append(
+                    {
+                        "fd": fd,
+                        "error_type": type(exc).__name__,
+                        "errno": exc.errno,
+                        "error": str(exc),
+                    }
+                )
+        if close_failures:
+            cleanup_details = {
+                **created_component_details(),
+                "cleanup_state": "inconclusive",
+                "directory_descriptor_cleanup": {
+                    "status": "inconclusive",
+                    "failures": close_failures,
+                },
+            }
+            if isinstance(body_error, StoreSafetyError):
+                body_error.details = _merge_recovery_details(
+                    body_error.details,
+                    cleanup_details,
+                )
+                if mutation_performed:
+                    body_error.details["mutation_performed"] = True
+                    body_error.details["retry_safe"] = False
+            elif body_error is None:
+                cleanup_error = OSError(
+                    close_failures[0]["errno"],
+                    "Cannot close every held destination-parent descriptor",
+                )
+                if mutation_performed:
+                    error = fail(
+                        "Cannot close every held destination-parent descriptor "
+                        f"after directory creation: {display_path}",
+                        cause=cleanup_error,
+                    )
+                    error.details = _merge_recovery_details(
+                        error.details,
+                        cleanup_details,
+                    )
+                    raise error from cleanup_error
+                raise cleanup_error
 
 
 @contextmanager

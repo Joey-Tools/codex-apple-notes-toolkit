@@ -2916,6 +2916,192 @@ raise SystemExit(2)
             self.assertTrue(touched)
             self.assertTrue(destination.parent.is_dir())
 
+    def test_directory_install_latches_receipt_before_scope_revalidation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            parent_fd = os.open(root, MODULE._directory_open_flags())
+            revalidations = 0
+
+            def fail_after_no_replace_install() -> None:
+                nonlocal revalidations
+                revalidations += 1
+                if revalidations == 3:
+                    raise MODULE.StoreSafetyError(
+                        "prepared-directory-revalidation-inconclusive",
+                        "simulated post-install scope failure",
+                    )
+
+            try:
+                with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                    MODULE._create_and_install_directory_at(
+                        parent_fd,
+                        os.fstat(parent_fd),
+                        "installed",
+                        display_path=root / "installed",
+                        revalidate_scope=fail_after_no_replace_install,
+                        identity_code="prepared-directory-identity-mismatch",
+                        access_policy_code=(
+                            "prepared-directory-access-policy-mismatch"
+                        ),
+                        inconclusive_code=(
+                            "prepared-directory-revalidation-inconclusive"
+                        ),
+                        collision_code="prepared-directory-identity-mismatch",
+                    )
+            finally:
+                os.close(parent_fd)
+
+            self._assert_safety_code(
+                "prepared-directory-revalidation-inconclusive",
+                raised,
+            )
+            self.assertEqual(revalidations, 3)
+            installed = root / "installed"
+            self.assertTrue(installed.is_dir())
+            details = raised.exception.details
+            self.assertTrue(details["mutation_performed"])
+            self.assertFalse(details["retry_safe"])
+            self.assertEqual(
+                details["cleanup_state"],
+                "preserved-no-identity-safe-directory-unlink",
+            )
+            exact_receipt = details["recovery_locators"]["creation_install_receipt"]
+            recovery = details["recovery_locators"]["created_directory_install"]
+            self.assertEqual(recovery["install_state"], "no-replace-install-returned")
+            self.assertEqual(recovery["creation_install_receipt"], exact_receipt)
+            self.assertEqual(
+                exact_receipt["directory_identity"],
+                MODULE._identity(installed.stat()),
+            )
+            self.assertEqual(
+                exact_receipt["directory_access_policy"],
+                MODULE._access_policy(installed.stat()),
+            )
+
+    def test_created_parent_failure_retains_every_component_install_receipt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            destination = root / "created-one" / "created-two" / "snapshot"
+            original_verify = MODULE._verify_held_directory_components
+            failed = False
+
+            def fail_after_second_component(
+                components: object,
+            ) -> dict[str, object]:
+                nonlocal failed
+                held = list(components)
+                if len(held) == 2 and not failed:
+                    failed = True
+                    raise OSError(
+                        MODULE.errno.EIO,
+                        "simulated post-component chain revalidation failure",
+                    )
+                return original_verify(held)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_verify_held_directory_components",
+                    side_effect=fail_after_second_component,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                with MODULE._bind_live_safe_destination_parent(
+                    paths,
+                    destination,
+                ):
+                    self.fail("failed parent-component chain must not be yielded")
+
+            self._assert_safety_code(
+                "snapshot-destination-scope-inconclusive",
+                raised,
+            )
+            self.assertTrue(failed)
+            self.assertTrue(destination.parent.is_dir())
+            details = raised.exception.details
+            self.assertTrue(details["mutation_performed"])
+            self.assertFalse(details["retry_safe"])
+            recovery = details["recovery_locators"][
+                "created_destination_parent_components"
+            ]
+            components = recovery["components"]
+            self.assertEqual(len(components), 2)
+            self.assertEqual(
+                [Path(component["path"]).name for component in components],
+                ["created-one", "created-two"],
+            )
+            for component in components:
+                receipt = component["creation_install_receipt"]
+                self.assertEqual(
+                    receipt["directory_identity"],
+                    component["directory_identity"],
+                )
+                self.assertEqual(
+                    receipt["directory_access_policy"],
+                    component["directory_access_policy"],
+                )
+
+    def test_created_parent_teardown_retains_component_install_receipt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            destination = root / "created-parent" / "snapshot"
+            original_verify = MODULE._verify_held_directory_components
+            body_completed = False
+            failed = False
+
+            def fail_during_component_teardown(
+                components: object,
+            ) -> dict[str, object]:
+                nonlocal failed
+                held = list(components)
+                if body_completed and held and not failed:
+                    failed = True
+                    raise PermissionError(
+                        MODULE.errno.EACCES,
+                        "simulated component teardown failure",
+                    )
+                return original_verify(held)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_verify_held_directory_components",
+                    side_effect=fail_during_component_teardown,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                with MODULE._bind_live_safe_destination_parent(
+                    paths,
+                    destination,
+                ):
+                    body_completed = True
+
+            self._assert_safety_code(
+                "snapshot-destination-scope-inconclusive",
+                raised,
+            )
+            self.assertTrue(failed)
+            self.assertTrue(destination.parent.is_dir())
+            details = raised.exception.details
+            self.assertTrue(details["mutation_performed"])
+            self.assertFalse(details["retry_safe"])
+            components = details["recovery_locators"][
+                "created_destination_parent_components"
+            ]["components"]
+            self.assertEqual(len(components), 1)
+            self.assertEqual(
+                components[0]["creation_install_receipt"]["directory_identity"],
+                MODULE._identity(destination.parent.stat()),
+            )
+
     def test_directory_creation_without_supervisor_fails_before_mkdir(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -5152,6 +5338,181 @@ raise SystemExit(2)
                     "source-revalidation-inconclusive",
                     raised,
                 )
+
+    def test_source_directory_final_window_uses_source_taxonomy_across_commands(
+        self,
+    ) -> None:
+        fault_profiles = (
+            (
+                "missing",
+                "prepared-directory-identity-mismatch",
+                FileNotFoundError(
+                    MODULE.errno.ENOENT,
+                    "simulated final-window missing directory",
+                ),
+                "source-missing-after-read",
+            ),
+            (
+                "unreadable",
+                "prepared-directory-revalidation-inconclusive",
+                PermissionError(
+                    MODULE.errno.EACCES,
+                    "simulated final-window unreadable directory",
+                ),
+                "source-revalidation-unreadable",
+            ),
+            (
+                "stat-inconclusive",
+                "prepared-directory-revalidation-inconclusive",
+                OSError(
+                    MODULE.errno.EIO,
+                    "simulated final-window directory stat failure",
+                ),
+                "source-revalidation-inconclusive",
+            ),
+            (
+                "replacement",
+                "prepared-directory-identity-mismatch",
+                None,
+                "source-identity-mismatch",
+            ),
+            (
+                "access-policy",
+                "prepared-directory-access-policy-mismatch",
+                None,
+                "source-access-policy-mismatch",
+            ),
+        )
+        for operation in ("fingerprint", "copy", "merge"):
+            for (
+                fault_name,
+                generic_code,
+                causal_error,
+                expected_code,
+            ) in fault_profiles:
+                with (
+                    self.subTest(operation=operation, fault=fault_name),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    root = Path(temp_dir)
+                    live_root = root / "live"
+                    live_root.mkdir()
+                    paths = self._make_paths(live_root)
+                    source = paths.group_container / MODULE.NOTE_STORE_MAIN
+                    self._create_db(source, value=f"{operation}-{fault_name}")
+                    original_source_store = MODULE._bind_source_store
+                    original_directory_bind = (
+                        MODULE._bind_existing_directory_with_trusted_alias
+                    )
+                    source_transaction_active = False
+                    fault_injected = False
+
+                    @contextmanager
+                    def mark_source_transaction(
+                        main_path: Path,
+                    ) -> Iterator[MODULE._BoundSourceStore]:
+                        nonlocal source_transaction_active
+                        source_transaction_active = True
+                        try:
+                            with original_source_store(main_path) as store:
+                                yield store
+                        finally:
+                            source_transaction_active = False
+
+                    @contextmanager
+                    def fail_generic_final_window(
+                        path: Path,
+                        *,
+                        trusted_alias: MODULE._TrustedDirectoryAlias | None = None,
+                    ) -> Iterator[MODULE._BoundDirectory]:
+                        nonlocal fault_injected
+                        with original_directory_bind(
+                            path,
+                            trusted_alias=trusted_alias,
+                        ) as binding:
+                            yield binding
+                            if (
+                                source_transaction_active
+                                and not fault_injected
+                                and MODULE._absolute_path(path) == source.parent
+                            ):
+                                fault_injected = True
+                                if causal_error is None:
+                                    raise MODULE.StoreSafetyError(
+                                        generic_code,
+                                        "simulated generic source-directory "
+                                        "context teardown mismatch",
+                                    )
+                                try:
+                                    raise causal_error
+                                except OSError as cause:
+                                    raise MODULE.StoreSafetyError(
+                                        generic_code,
+                                        "simulated generic source-directory "
+                                        "context teardown syscall failure",
+                                    ) from cause
+
+                    destination = root / (
+                        "snapshot" if operation == "copy" else "merged.sqlite"
+                    )
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_bind_source_store",
+                            side_effect=mark_source_transaction,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_bind_existing_directory_with_trusted_alias",
+                            side_effect=fail_generic_final_window,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "notes_is_running",
+                            return_value=False,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        if operation == "fingerprint":
+                            MODULE.fingerprint_note_store(paths)
+                        elif operation == "copy":
+                            MODULE.copy_db(
+                                paths,
+                                dest=destination,
+                                require_notes_quit=True,
+                            )
+                        else:
+                            MODULE.merge_db(
+                                source,
+                                destination,
+                                paths=paths,
+                            )
+
+                    self.assertTrue(fault_injected)
+                    if operation == "merge":
+                        self._assert_safety_code(
+                            "destination-install-uncertain",
+                            raised,
+                        )
+                        self.assertEqual(
+                            raised.exception.details["post_publication_error_code"],
+                            expected_code,
+                        )
+                        self.assertTrue(destination.is_file())
+                    else:
+                        self._assert_safety_code(expected_code, raised)
+                        self.assertFalse(destination.exists())
+                    cause = raised.exception
+                    while (
+                        isinstance(cause, MODULE.StoreSafetyError)
+                        and cause.code != expected_code
+                        and cause.__cause__ is not None
+                    ):
+                        cause = cause.__cause__
+                    self.assertIsInstance(cause, MODULE.StoreSafetyError)
+                    assert isinstance(cause, MODULE.StoreSafetyError)
+                    self.assertEqual(cause.code, expected_code)
+                    self.assertFalse(cause.code.startswith("prepared-directory-"))
 
     def test_source_store_terminal_scan_rejects_sidecars_from_final_hash(
         self,
