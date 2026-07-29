@@ -5,6 +5,7 @@
 - Apple Notes database reads bind untrusted leaves with no-follow, nonblocking opens before regular-file and identity validation.
 - Live-container inputs are frozen to lexical absolute paths from one captured working directory before preflight.
 - `merge-db` and `stage-patch` freeze relative sources and every output from one API/CLI-entry CWD snapshot.
+- Copy, validation, recovery, and writeback APIs/CLIs freeze each related artifact, receipt, output, and container path set from one entry CWD before probes or callbacks.
 - Prepared/artifact directory scans reject unexpected raw names before `stat` and enforce 64-entry and 4-KiB raw-name limits per pass.
 - Retained-partial inventory lazily stops at the 65th descriptor-relative entry or 4-KiB aggregate raw-name ceiling, and supervisor emptiness checks consume at most one entry.
 - Darwin access policy tracks only immutable, append-only, Data Vault, restricted, and no-unlink flags; other raw file flags remain metadata evidence.

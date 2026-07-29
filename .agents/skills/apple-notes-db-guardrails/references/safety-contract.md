@@ -366,6 +366,15 @@ same one-shot rule for `src` and every output path, including the optional
 stage result file. Freeze them before any destination preflight and use the
 frozen source in manifests and terminal results. A CWD change after preflight
 must not retarget the database that can later reach writeback.
+Every other public multi-path API follows the same command-snapshot contract:
+freeze a copy destination before the Notes-state probe; freeze an artifact root
+and external receipt together for validation; freeze snapshot, receipt,
+standalone output, and live containers together for recovery; and freeze
+backup, patch stage, and both receipt files together for writeback preflight or
+verification. The CLI captures CWD before argument parsing and dispatch, then
+passes that exact value to internal API helpers. No probe, descriptor-binding
+callback, or nested validator may cause one related relative path to be
+reinterpreted against a later CWD.
 Compare the complete cross-product with case-folded NFD path components and reject either direction
 of normalized ancestor/descendant overlap before binding a component or invoking the directory
 creator. Thus an absent `/tmp/live` protects `/private/tmp/live/...`, and an absent
@@ -634,11 +643,13 @@ Receipt-parent binding never leaks the generic prepared-directory taxonomy: a mi
 `manifest-creation-receipt-unreadable`, and symlink, identity/access-policy, open, or other
 revalidation failures are `manifest-creation-receipt-scope-inconclusive`.
 
-Normalize every public snapshot/stage path once with lexical `abspath` semantics and derive the
-artifact root, manifest, nested store/database, and external receipt from that absolute policy.
-Do not use `resolve()` or another symlink-following canonicalizer. Relative API and CLI inputs must
-therefore share one absolute parent policy while component binding still rejects alias, symlink,
-and replacement races.
+Normalize every public snapshot/stage path set once with lexical `abspath`
+semantics from one captured CWD. Derive the artifact root, manifest, nested
+store/database, external receipt, recovery output, and writeback inputs from
+that absolute policy. Do not use `resolve()` or another symlink-following
+canonicalizer. Relative API and CLI inputs must therefore share one absolute
+command policy while component binding still rejects alias, symlink, and
+replacement races.
 Before consuming either a manifest or external receipt, scan the decoded JSON
 text with fixed nesting and integer-digit limits, then parse with the same
 bounded integer hook on every supported Python runtime. Map limit `ValueError`

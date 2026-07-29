@@ -78,6 +78,15 @@ directory once and freeze the source plus every output, including a stage
 `--result-file`, before any destination preflight. Manifests and result payloads
 use only those frozen source/output paths; a later CWD change cannot select a
 different edited database for staging or writeback.
+Apply the same one-shot rule to every public multi-path snapshot/stage
+boundary. Freeze a copy destination before the Notes-state probe; freeze each
+artifact root and its external receipt together; freeze a recovery artifact,
+receipt, standalone output, and live-container pair together; and freeze the
+backup artifact, patch stage, and both external receipts before writeback
+preflight or verification. CLI dispatch captures its command CWD before parser
+or callback execution and passes that exact snapshot through all internal
+helpers. No helper may independently re-read CWD for one member of these
+related path sets.
 
 Missing destination-parent components and private partial directories are never created directly
 at their target names. A trusted platform or supervisor creator must allocate an unpredictable

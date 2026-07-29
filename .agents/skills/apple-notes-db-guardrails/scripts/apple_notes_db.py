@@ -119,10 +119,20 @@ class NoteStorePaths:
     def __post_init__(self) -> None:
         """Freeze both public container inputs to one lexical absolute policy."""
 
-        cwd = os.getcwd()
+        values = {
+            field_name: os.fspath(getattr(self, field_name))
+            for field_name in ("group_container", "app_container")
+        }
+        cwd = (
+            None
+            if all(os.path.isabs(value) for value in values.values())
+            else os.getcwd()
+        )
         for field_name in ("group_container", "app_container"):
-            value = os.fspath(getattr(self, field_name))
-            absolute = Path(os.path.normpath(os.path.join(cwd, value)))
+            value = values[field_name]
+            absolute = Path(
+                os.path.normpath(value if cwd is None else os.path.join(cwd, value))
+            )
             object.__setattr__(self, field_name, absolute)
 
     def note_store_files(self) -> list[Path]:
@@ -1338,7 +1348,17 @@ def _absolute_path_from_cwd(path: Path, cwd: str) -> Path:
 def _absolute_path(path: Path) -> Path:
     """Normalize one public path lexically without following filesystem aliases."""
 
+    value = os.fspath(path)
+    if os.path.isabs(value):
+        return Path(os.path.normpath(value))
     return _absolute_path_from_cwd(path, os.getcwd())
+
+
+def _optional_absolute_path_from_cwd(
+    path: Path | None,
+    cwd: str,
+) -> Path | None:
+    return None if path is None else _absolute_path_from_cwd(path, cwd)
 
 
 def _optional_absolute_path(path: Path | None) -> Path | None:
@@ -1347,10 +1367,12 @@ def _optional_absolute_path(path: Path | None) -> Path | None:
 
 def _snapshot_artifact_paths(
     path: Path | _SnapshotArtifactPaths,
+    *,
+    cwd: str | None = None,
 ) -> _SnapshotArtifactPaths:
     if isinstance(path, _SnapshotArtifactPaths):
         return path
-    root = _absolute_path(path)
+    root = _absolute_path(path) if cwd is None else _absolute_path_from_cwd(path, cwd)
     return _SnapshotArtifactPaths(
         root=root,
         manifest=root / SNAPSHOT_MANIFEST,
@@ -1358,10 +1380,14 @@ def _snapshot_artifact_paths(
     )
 
 
-def _patch_artifact_paths(path: Path | _PatchArtifactPaths) -> _PatchArtifactPaths:
+def _patch_artifact_paths(
+    path: Path | _PatchArtifactPaths,
+    *,
+    cwd: str | None = None,
+) -> _PatchArtifactPaths:
     if isinstance(path, _PatchArtifactPaths):
         return path
-    root = _absolute_path(path)
+    root = _absolute_path(path) if cwd is None else _absolute_path_from_cwd(path, cwd)
     return _PatchArtifactPaths(
         root=root,
         manifest=root / PATCH_MANIFEST,
@@ -13430,7 +13456,13 @@ def copy_db(
     require_notes_quit: bool,
     _destination_preflight: _LiveDestinationPreflight | None = None,
     _notes_running: bool | None = None,
+    _command_cwd: str | None = None,
 ) -> dict[str, Any]:
+    command_cwd = os.getcwd() if _command_cwd is None else _command_cwd
+    requested_destination = _absolute_path_from_cwd(
+        dest or _timestamped_tmp_dir("apple-notes-probe"),
+        command_cwd,
+    )
     notes_running = (
         _preflight_copy_notes_state(require_notes_quit=require_notes_quit)
         if _notes_running is None
@@ -13443,9 +13475,6 @@ def copy_db(
             details={"mutation_performed": False},
         )
 
-    requested_destination = Path(
-        os.path.abspath(os.fspath(dest or _timestamped_tmp_dir("apple-notes-probe")))
-    )
     if _lexists(requested_destination):
         raise StoreSafetyError(
             "destination-exists",
@@ -14226,14 +14255,22 @@ def validate_snapshot(
     manifest_creation_receipt: dict[str, Any] | None = None,
     *,
     manifest_creation_receipt_file: Path | None = None,
+    _command_cwd: str | None = None,
 ) -> dict[str, Any]:
-    artifact_paths = _snapshot_artifact_paths(snapshot_dir)
+    command_cwd = os.getcwd() if _command_cwd is None else _command_cwd
+    requested_snapshot = _absolute_path_from_cwd(snapshot_dir, command_cwd)
+    requested_receipt = _optional_absolute_path_from_cwd(
+        manifest_creation_receipt_file,
+        command_cwd,
+    )
+    artifact_paths = _snapshot_artifact_paths(
+        requested_snapshot,
+        cwd=command_cwd,
+    )
     with _validated_snapshot_artifact(
         artifact_paths,
         manifest_creation_receipt,
-        manifest_creation_receipt_file=_optional_absolute_path(
-            manifest_creation_receipt_file
-        ),
+        manifest_creation_receipt_file=requested_receipt,
     ) as artifact:
         return artifact.public_result
 
@@ -14822,14 +14859,21 @@ def recover_snapshot(
     *,
     manifest_creation_receipt_file: Path | None = None,
     paths: NoteStorePaths | None = None,
+    _command_cwd: str | None = None,
 ) -> dict[str, Any]:
-    artifact_paths = _snapshot_artifact_paths(snapshot_dir)
+    command_cwd = os.getcwd() if _command_cwd is None else _command_cwd
+    requested_snapshot = _absolute_path_from_cwd(snapshot_dir, command_cwd)
+    requested_receipt = _optional_absolute_path_from_cwd(
+        manifest_creation_receipt_file,
+        command_cwd,
+    )
+    requested_out = _absolute_path_from_cwd(out, command_cwd)
+    artifact_paths = _snapshot_artifact_paths(
+        requested_snapshot,
+        cwd=command_cwd,
+    )
     snapshot_dir = artifact_paths.root
     source = artifact_paths.store / NOTE_STORE_MAIN
-    manifest_creation_receipt_file = _optional_absolute_path(
-        manifest_creation_receipt_file
-    )
-    requested_out = _absolute_path(out)
     recovered: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
     try:
@@ -14853,7 +14897,7 @@ def recover_snapshot(
             with _validated_snapshot_artifact(
                 artifact_paths,
                 manifest_creation_receipt,
-                manifest_creation_receipt_file=(manifest_creation_receipt_file),
+                manifest_creation_receipt_file=requested_receipt,
                 artifact_root_binding=artifact_root,
             ) as artifact:
                 validation = artifact.public_result
@@ -15180,12 +15224,19 @@ def validate_patch_stage(
     manifest_creation_receipt: dict[str, Any] | None = None,
     *,
     manifest_creation_receipt_file: Path | None = None,
+    _command_cwd: str | None = None,
 ) -> dict[str, Any]:
-    artifact_paths = _patch_artifact_paths(stage_dir)
-    stage_dir = artifact_paths.root
-    manifest_creation_receipt_file = _optional_absolute_path(
-        manifest_creation_receipt_file
+    command_cwd = os.getcwd() if _command_cwd is None else _command_cwd
+    requested_stage = _absolute_path_from_cwd(stage_dir, command_cwd)
+    requested_receipt = _optional_absolute_path_from_cwd(
+        manifest_creation_receipt_file,
+        command_cwd,
     )
+    artifact_paths = _patch_artifact_paths(
+        requested_stage,
+        cwd=command_cwd,
+    )
+    stage_dir = artifact_paths.root
     expected_stage_types = {
         NOTE_STORE_MAIN: stat.S_IFREG,
         PATCH_MANIFEST: stat.S_IFREG,
@@ -15200,7 +15251,7 @@ def validate_patch_stage(
         external_receipt = _manifest_creation_receipt_for_bound_artifact(
             artifact_root,
             manifest_creation_receipt=manifest_creation_receipt,
-            manifest_creation_receipt_file=manifest_creation_receipt_file,
+            manifest_creation_receipt_file=requested_receipt,
             artifact_kind="patch-stage",
             artifact_schema=PATCH_SCHEMA,
             manifest_name=PATCH_MANIFEST,
@@ -15457,15 +15508,27 @@ def preflight_writeback(
     stage_manifest_creation_receipt: dict[str, Any] | None = None,
     backup_manifest_creation_receipt_file: Path | None = None,
     stage_manifest_creation_receipt_file: Path | None = None,
+    _command_cwd: str | None = None,
 ) -> dict[str, Any]:
-    backup_dir = _snapshot_artifact_paths(backup_dir).root
-    stage_dir = _patch_artifact_paths(stage_dir).root
-    backup_manifest_creation_receipt_file = _optional_absolute_path(
-        backup_manifest_creation_receipt_file
+    command_cwd = os.getcwd() if _command_cwd is None else _command_cwd
+    requested_backup = _absolute_path_from_cwd(backup_dir, command_cwd)
+    requested_stage = _absolute_path_from_cwd(stage_dir, command_cwd)
+    requested_backup_receipt = _optional_absolute_path_from_cwd(
+        backup_manifest_creation_receipt_file,
+        command_cwd,
     )
-    stage_manifest_creation_receipt_file = _optional_absolute_path(
-        stage_manifest_creation_receipt_file
+    requested_stage_receipt = _optional_absolute_path_from_cwd(
+        stage_manifest_creation_receipt_file,
+        command_cwd,
     )
+    backup_dir = _snapshot_artifact_paths(
+        requested_backup,
+        cwd=command_cwd,
+    ).root
+    stage_dir = _patch_artifact_paths(
+        requested_stage,
+        cwd=command_cwd,
+    ).root
     if notes_is_running():
         raise StoreSafetyError(
             "notes-running", "Notes.app must stay quit for writeback preflight"
@@ -15473,7 +15536,8 @@ def preflight_writeback(
     backup = validate_snapshot(
         backup_dir,
         backup_manifest_creation_receipt,
-        manifest_creation_receipt_file=(backup_manifest_creation_receipt_file),
+        manifest_creation_receipt_file=requested_backup_receipt,
+        _command_cwd=command_cwd,
     )
     manifest = backup["manifest"]
     if (
@@ -15492,7 +15556,8 @@ def preflight_writeback(
     stage = validate_patch_stage(
         stage_dir,
         stage_manifest_creation_receipt,
-        manifest_creation_receipt_file=stage_manifest_creation_receipt_file,
+        manifest_creation_receipt_file=requested_stage_receipt,
+        _command_cwd=command_cwd,
     )
     live = fingerprint_note_store(paths)
     _compare_live_to_baseline(live, manifest)
@@ -15535,15 +15600,27 @@ def verify_writeback(
     stage_manifest_creation_receipt: dict[str, Any] | None = None,
     backup_manifest_creation_receipt_file: Path | None = None,
     stage_manifest_creation_receipt_file: Path | None = None,
+    _command_cwd: str | None = None,
 ) -> dict[str, Any]:
-    backup_dir = _snapshot_artifact_paths(backup_dir).root
-    stage_dir = _patch_artifact_paths(stage_dir).root
-    backup_manifest_creation_receipt_file = _optional_absolute_path(
-        backup_manifest_creation_receipt_file
+    command_cwd = os.getcwd() if _command_cwd is None else _command_cwd
+    requested_backup = _absolute_path_from_cwd(backup_dir, command_cwd)
+    requested_stage = _absolute_path_from_cwd(stage_dir, command_cwd)
+    requested_backup_receipt = _optional_absolute_path_from_cwd(
+        backup_manifest_creation_receipt_file,
+        command_cwd,
     )
-    stage_manifest_creation_receipt_file = _optional_absolute_path(
-        stage_manifest_creation_receipt_file
+    requested_stage_receipt = _optional_absolute_path_from_cwd(
+        stage_manifest_creation_receipt_file,
+        command_cwd,
     )
+    backup_dir = _snapshot_artifact_paths(
+        requested_backup,
+        cwd=command_cwd,
+    ).root
+    stage_dir = _patch_artifact_paths(
+        requested_stage,
+        cwd=command_cwd,
+    ).root
     if notes_is_running():
         raise StoreSafetyError(
             "notes-running", "Notes.app must stay quit for writeback verification"
@@ -15551,7 +15628,8 @@ def verify_writeback(
     backup = validate_snapshot(
         backup_dir,
         backup_manifest_creation_receipt,
-        manifest_creation_receipt_file=(backup_manifest_creation_receipt_file),
+        manifest_creation_receipt_file=requested_backup_receipt,
+        _command_cwd=command_cwd,
     )
     baseline_manifest = backup["manifest"]
     if (
@@ -15570,7 +15648,8 @@ def verify_writeback(
     stage = validate_patch_stage(
         stage_dir,
         stage_manifest_creation_receipt,
-        manifest_creation_receipt_file=stage_manifest_creation_receipt_file,
+        manifest_creation_receipt_file=requested_stage_receipt,
+        _command_cwd=command_cwd,
     )
     live = validate_database_recovery(paths.group_container / NOTE_STORE_MAIN)
     current = {record["basename"]: record["source"] for record in live["capture"]}
@@ -16921,16 +17000,23 @@ def main(argv: Iterable[str] | None = None) -> int:
         if supervisor_fd is not None:
             command_stack.enter_context(directory_creator_supervisor(supervisor_fd))
         if args.command == "probe-db-access":
-            emit_json(probe_db_access(_paths_from_args(args)))
+            emit_json(probe_db_access(_paths_from_args(args, cwd=command_cwd)))
         elif args.command == "copy-db":
-            paths = _paths_from_args(args)
-            copy_destination = args.dest or _timestamped_tmp_dir("apple-notes-probe")
+            paths = _paths_from_args(args, cwd=command_cwd)
+            copy_destination = _absolute_path_from_cwd(
+                args.dest or _timestamped_tmp_dir("apple-notes-probe"),
+                command_cwd,
+            )
+            copy_result_file = _optional_absolute_path_from_cwd(
+                args.result_file,
+                command_cwd,
+            )
             notes_running = _preflight_copy_notes_state(
                 require_notes_quit=args.require_notes_quit
             )
             with _preflight_creator_destinations(
                 paths,
-                args.result_file,
+                copy_result_file,
                 copy_destination,
             ) as destination_preflights:
                 result = copy_db(
@@ -16939,12 +17025,13 @@ def main(argv: Iterable[str] | None = None) -> int:
                     require_notes_quit=args.require_notes_quit,
                     _destination_preflight=destination_preflights.artifact,
                     _notes_running=notes_running,
+                    _command_cwd=command_cwd,
                 )
                 destination_preflights.published_artifact_payload = result
                 if destination_preflights.result is not None:
                     with _bind_creator_result_destination(
                         paths,
-                        args.result_file,
+                        copy_result_file,
                         copy_destination,
                         preflight=destination_preflights.result,
                         artifact_mutation_performed=True,
@@ -16973,23 +17060,41 @@ def main(argv: Iterable[str] | None = None) -> int:
                 )
             )
         elif args.command == "validate-snapshot":
+            snapshot_dir = _absolute_path_from_cwd(
+                args.snapshot_dir,
+                command_cwd,
+            )
+            snapshot_receipt = _absolute_path_from_cwd(
+                args.manifest_creation_receipt_file,
+                command_cwd,
+            )
             emit_json(
                 validate_snapshot(
-                    args.snapshot_dir,
-                    manifest_creation_receipt_file=(
-                        args.manifest_creation_receipt_file
-                    ),
+                    snapshot_dir,
+                    manifest_creation_receipt_file=snapshot_receipt,
+                    _command_cwd=command_cwd,
                 )
             )
         elif args.command == "recover-snapshot":
+            snapshot_dir = _absolute_path_from_cwd(
+                args.snapshot_dir,
+                command_cwd,
+            )
+            recovery_output = _absolute_path_from_cwd(
+                args.out,
+                command_cwd,
+            )
+            snapshot_receipt = _absolute_path_from_cwd(
+                args.manifest_creation_receipt_file,
+                command_cwd,
+            )
             emit_json(
                 recover_snapshot(
-                    args.snapshot_dir,
-                    args.out,
-                    manifest_creation_receipt_file=(
-                        args.manifest_creation_receipt_file
-                    ),
-                    paths=_paths_from_args(args),
+                    snapshot_dir,
+                    recovery_output,
+                    manifest_creation_receipt_file=snapshot_receipt,
+                    paths=_paths_from_args(args, cwd=command_cwd),
+                    _command_cwd=command_cwd,
                 )
             )
         elif args.command == "stage-patch":
@@ -17031,46 +17136,86 @@ def main(argv: Iterable[str] | None = None) -> int:
                         )
             emit_json(result)
         elif args.command == "validate-patch-stage":
+            stage_dir = _absolute_path_from_cwd(
+                args.stage_dir,
+                command_cwd,
+            )
+            stage_receipt = _absolute_path_from_cwd(
+                args.manifest_creation_receipt_file,
+                command_cwd,
+            )
             emit_json(
                 validate_patch_stage(
-                    args.stage_dir,
-                    manifest_creation_receipt_file=(
-                        args.manifest_creation_receipt_file
-                    ),
+                    stage_dir,
+                    manifest_creation_receipt_file=stage_receipt,
+                    _command_cwd=command_cwd,
                 )
             )
         elif args.command == "preflight-writeback":
+            paths = _paths_from_args(args, cwd=command_cwd)
+            backup_dir = _absolute_path_from_cwd(
+                args.backup_dir,
+                command_cwd,
+            )
+            stage_dir = _absolute_path_from_cwd(
+                args.stage_dir,
+                command_cwd,
+            )
+            backup_receipt = _absolute_path_from_cwd(
+                args.backup_manifest_creation_receipt_file,
+                command_cwd,
+            )
+            stage_receipt = _absolute_path_from_cwd(
+                args.stage_manifest_creation_receipt_file,
+                command_cwd,
+            )
             emit_json(
                 preflight_writeback(
-                    _paths_from_args(args),
-                    backup_dir=args.backup_dir,
-                    stage_dir=args.stage_dir,
-                    backup_manifest_creation_receipt_file=(
-                        args.backup_manifest_creation_receipt_file
-                    ),
-                    stage_manifest_creation_receipt_file=(
-                        args.stage_manifest_creation_receipt_file
-                    ),
+                    paths,
+                    backup_dir=backup_dir,
+                    stage_dir=stage_dir,
+                    backup_manifest_creation_receipt_file=backup_receipt,
+                    stage_manifest_creation_receipt_file=stage_receipt,
+                    _command_cwd=command_cwd,
                 )
             )
         elif args.command == "verify-writeback":
+            paths = _paths_from_args(args, cwd=command_cwd)
+            backup_dir = _absolute_path_from_cwd(
+                args.backup_dir,
+                command_cwd,
+            )
+            stage_dir = _absolute_path_from_cwd(
+                args.stage_dir,
+                command_cwd,
+            )
+            backup_receipt = _absolute_path_from_cwd(
+                args.backup_manifest_creation_receipt_file,
+                command_cwd,
+            )
+            stage_receipt = _absolute_path_from_cwd(
+                args.stage_manifest_creation_receipt_file,
+                command_cwd,
+            )
             emit_json(
                 verify_writeback(
-                    _paths_from_args(args),
-                    backup_dir=args.backup_dir,
-                    stage_dir=args.stage_dir,
-                    backup_manifest_creation_receipt_file=(
-                        args.backup_manifest_creation_receipt_file
-                    ),
-                    stage_manifest_creation_receipt_file=(
-                        args.stage_manifest_creation_receipt_file
-                    ),
+                    paths,
+                    backup_dir=backup_dir,
+                    stage_dir=stage_dir,
+                    backup_manifest_creation_receipt_file=backup_receipt,
+                    stage_manifest_creation_receipt_file=stage_receipt,
+                    _command_cwd=command_cwd,
                 )
             )
         elif args.command == "note-tags":
-            emit_json(query_note_tags(args.db, args.title))
+            emit_json(
+                query_note_tags(
+                    _absolute_path_from_cwd(args.db, command_cwd),
+                    args.title,
+                )
+            )
         elif args.command == "fingerprint-db":
-            emit_json(fingerprint_note_store(_paths_from_args(args)))
+            emit_json(fingerprint_note_store(_paths_from_args(args, cwd=command_cwd)))
         else:
             parser.error(f"Unsupported command: {args.command}")
     except StoreSafetyError as exc:

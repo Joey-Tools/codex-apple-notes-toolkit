@@ -408,6 +408,24 @@ superseded_by:
   Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
   `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
   `git diff --check`.
+- Multi-path CWD-freeze follow-up base:
+  `cf8f852c93a760c4ab8027c84f02c4e44ffb3005`.
+- Copy, snapshot/stage validation, recovery, and writeback preflight/verification
+  now freeze every related artifact, external receipt, live-container, and
+  output path from one public API-entry CWD before the first probe or callback.
+  CLI dispatch captures the same command CWD before argument parsing and passes
+  it through nested helpers instead of independently resolving each path.
+- API and CLI regressions deliberately change CWD at the first Notes/path
+  callback, provide a second valid live-container namespace, and prove copied
+  source roots, snapshot/stage receipts, recovery outputs, and writeback inputs
+  remain bound to the original namespace.
+- Focused regressions and full suites passed under Python `3.13.0` and system
+  Python `3.9.6`; each full run completed all `290` tests with the single
+  sandbox-scoped fixed `/usr/bin/pgrep` skip.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.
 - Stage/merge path-freeze and bounded-directory-scan follow-up base:
   `638c58986174a3033b464bf6db5c635a60c7800a`.
 - `merge-db` and `stage-patch` now capture one CWD at each public API boundary

@@ -12760,6 +12760,462 @@ raise SystemExit(2)
             finally:
                 os.chdir(previous_cwd)
 
+    def test_multi_path_apis_freeze_one_cwd_before_callbacks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_cwd = root / "source-cwd"
+            other_cwd = root / "other-cwd"
+            source_cwd.mkdir()
+            other_cwd.mkdir()
+            for cwd, value in (
+                (source_cwd, "frozen-live-source"),
+                (other_cwd, "wrong-live-source"),
+            ):
+                (cwd / "group").mkdir()
+                (cwd / "app").mkdir()
+                self._create_db(
+                    cwd / "group" / MODULE.NOTE_STORE_MAIN,
+                    value=value,
+                )
+            self._create_db(
+                source_cwd / "edited.sqlite",
+                value="frozen-edited-source",
+            )
+
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(source_cwd)
+                frozen_cwd = Path.cwd()
+                paths = MODULE.NoteStorePaths(
+                    group_container=Path("group"),
+                    app_container=Path("app"),
+                )
+
+                def change_cwd_after_notes_probe(
+                    *,
+                    require_notes_quit: bool,
+                ) -> bool:
+                    self.assertTrue(require_notes_quit)
+                    os.chdir(other_cwd)
+                    return False
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_preflight_copy_notes_state",
+                        side_effect=change_cwd_after_notes_probe,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ),
+                ):
+                    snapshot = self._copy_db(
+                        paths,
+                        dest=Path("snapshot"),
+                        require_notes_quit=True,
+                    )
+                self.assertEqual(Path(snapshot["dest"]), frozen_cwd / "snapshot")
+                self.assertFalse((other_cwd / "snapshot").exists())
+
+                os.chdir(source_cwd)
+                stage = self._stage_patch(
+                    Path("edited.sqlite"),
+                    Path("stage"),
+                    paths=paths,
+                )
+                snapshot_receipt_file = source_cwd / "snapshot-result.json"
+                snapshot_receipt_file.write_text(
+                    json.dumps(snapshot, default=str),
+                    encoding="utf-8",
+                )
+                stage_receipt_file = source_cwd / "stage-result.json"
+                stage_receipt_file.write_text(
+                    json.dumps(stage, default=str),
+                    encoding="utf-8",
+                )
+
+                original_snapshot_paths = MODULE._snapshot_artifact_paths
+
+                def change_cwd_after_snapshot_paths(
+                    *args: object,
+                    **kwargs: object,
+                ) -> MODULE._SnapshotArtifactPaths:
+                    artifact_paths = original_snapshot_paths(*args, **kwargs)
+                    os.chdir(other_cwd)
+                    return artifact_paths
+
+                original_patch_paths = MODULE._patch_artifact_paths
+
+                def change_cwd_after_patch_paths(
+                    *args: object,
+                    **kwargs: object,
+                ) -> MODULE._PatchArtifactPaths:
+                    artifact_paths = original_patch_paths(*args, **kwargs)
+                    os.chdir(other_cwd)
+                    return artifact_paths
+
+                os.chdir(source_cwd)
+                with mock.patch.object(
+                    MODULE,
+                    "_snapshot_artifact_paths",
+                    side_effect=change_cwd_after_snapshot_paths,
+                ):
+                    validation = MODULE.validate_snapshot(
+                        Path("snapshot"),
+                        manifest_creation_receipt_file=Path("snapshot-result.json"),
+                    )
+                self.assertEqual(
+                    Path(validation["snapshot_dir"]),
+                    frozen_cwd / "snapshot",
+                )
+
+                os.chdir(source_cwd)
+                with mock.patch.object(
+                    MODULE,
+                    "_snapshot_artifact_paths",
+                    side_effect=change_cwd_after_snapshot_paths,
+                ):
+                    recovered = MODULE.recover_snapshot(
+                        Path("snapshot"),
+                        Path("recovered.sqlite"),
+                        manifest_creation_receipt_file=Path("snapshot-result.json"),
+                        paths=paths,
+                    )
+                recovered_db = frozen_cwd / "recovered.sqlite"
+                self.assertEqual(
+                    Path(recovered["recovered"]["standalone_db"]),
+                    recovered_db,
+                )
+                self.assertFalse((other_cwd / "recovered.sqlite").exists())
+                with closing(sqlite3.connect(recovered_db)) as connection:
+                    self.assertEqual(
+                        connection.execute("SELECT value FROM sample").fetchone()[0],
+                        "frozen-live-source",
+                    )
+
+                os.chdir(source_cwd)
+                with mock.patch.object(
+                    MODULE,
+                    "_patch_artifact_paths",
+                    side_effect=change_cwd_after_patch_paths,
+                ):
+                    stage_validation = MODULE.validate_patch_stage(
+                        Path("stage"),
+                        manifest_creation_receipt_file=Path("stage-result.json"),
+                    )
+                self.assertEqual(
+                    Path(stage_validation["stage_dir"]),
+                    frozen_cwd / "stage",
+                )
+
+                os.chdir(source_cwd)
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_snapshot_artifact_paths",
+                        side_effect=change_cwd_after_snapshot_paths,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ),
+                ):
+                    preflight = MODULE.preflight_writeback(
+                        paths,
+                        backup_dir=Path("snapshot"),
+                        stage_dir=Path("stage"),
+                        backup_manifest_creation_receipt_file=Path(
+                            "snapshot-result.json"
+                        ),
+                        stage_manifest_creation_receipt_file=Path("stage-result.json"),
+                    )
+                self.assertEqual(
+                    Path(preflight["backup_dir"]),
+                    frozen_cwd / "snapshot",
+                )
+                self.assertEqual(
+                    Path(preflight["stage_dir"]),
+                    frozen_cwd / "stage",
+                )
+                self.assertEqual(
+                    Path(preflight["live_source_root"]),
+                    frozen_cwd / "group",
+                )
+
+                replacement = source_cwd / "replacement.sqlite"
+                shutil.copyfile(
+                    source_cwd / "stage" / MODULE.NOTE_STORE_MAIN,
+                    replacement,
+                )
+                live = source_cwd / "group" / MODULE.NOTE_STORE_MAIN
+                replacement.chmod(stat.S_IMODE(live.stat().st_mode))
+                os.replace(replacement, live)
+
+                os.chdir(source_cwd)
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_snapshot_artifact_paths",
+                        side_effect=change_cwd_after_snapshot_paths,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ),
+                ):
+                    verified = MODULE.verify_writeback(
+                        paths,
+                        backup_dir=Path("snapshot"),
+                        stage_dir=Path("stage"),
+                        backup_manifest_creation_receipt_file=Path(
+                            "snapshot-result.json"
+                        ),
+                        stage_manifest_creation_receipt_file=Path("stage-result.json"),
+                    )
+                self.assertTrue(verified["writeback_verified"])
+                self.assertEqual(
+                    Path(verified["backup_dir"]),
+                    frozen_cwd / "snapshot",
+                )
+                self.assertEqual(
+                    Path(verified["stage_dir"]),
+                    frozen_cwd / "stage",
+                )
+            finally:
+                os.chdir(previous_cwd)
+
+    def test_multi_path_cli_commands_freeze_cwd_before_argument_callbacks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_cwd = root / "source-cwd"
+            other_cwd = root / "other-cwd"
+            source_cwd.mkdir()
+            other_cwd.mkdir()
+            for cwd, value in (
+                (source_cwd, "frozen-live-source"),
+                (other_cwd, "wrong-live-source"),
+            ):
+                (cwd / "group").mkdir()
+                (cwd / "app").mkdir()
+                self._create_db(
+                    cwd / "group" / MODULE.NOTE_STORE_MAIN,
+                    value=value,
+                )
+            self._create_db(
+                source_cwd / "edited.sqlite",
+                value="frozen-edited-source",
+            )
+
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(source_cwd)
+                frozen_cwd = Path.cwd()
+                paths = MODULE.NoteStorePaths(
+                    group_container=Path("group"),
+                    app_container=Path("app"),
+                )
+                with mock.patch.object(
+                    MODULE,
+                    "notes_is_running",
+                    return_value=False,
+                ):
+                    snapshot = self._copy_db(
+                        paths,
+                        dest=Path("snapshot"),
+                        require_notes_quit=True,
+                    )
+                    stage = self._stage_patch(
+                        Path("edited.sqlite"),
+                        Path("stage"),
+                        paths=paths,
+                    )
+                (source_cwd / "snapshot-result.json").write_text(
+                    json.dumps(snapshot, default=str),
+                    encoding="utf-8",
+                )
+                (source_cwd / "stage-result.json").write_text(
+                    json.dumps(stage, default=str),
+                    encoding="utf-8",
+                )
+
+                real_build_parser = MODULE.build_parser
+
+                def build_parser_with_chdir_callback() -> object:
+                    parser = real_build_parser()
+                    real_parse_args = parser.parse_args
+
+                    def parse_args_and_change_cwd(
+                        *args: object,
+                        **kwargs: object,
+                    ) -> object:
+                        parsed = real_parse_args(*args, **kwargs)
+                        os.chdir(other_cwd)
+                        return parsed
+
+                    parser.parse_args = parse_args_and_change_cwd
+                    return parser
+
+                def run_cli(arguments: list[str]) -> tuple[int, dict[str, object]]:
+                    os.chdir(source_cwd)
+                    output = io.StringIO()
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "build_parser",
+                            side_effect=build_parser_with_chdir_callback,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "notes_is_running",
+                            return_value=False,
+                        ),
+                        redirect_stdout(output),
+                    ):
+                        return_code = MODULE.main(arguments)
+                    return return_code, json.loads(output.getvalue())
+
+                common_paths = [
+                    "--group-container",
+                    "group",
+                    "--app-container",
+                    "app",
+                ]
+                cases = (
+                    (
+                        [
+                            "copy-db",
+                            *common_paths,
+                            "--dest",
+                            "cli-snapshot",
+                            "--result-file",
+                            "cli-snapshot-result.json",
+                            "--require-notes-quit",
+                        ],
+                        "dest",
+                        frozen_cwd / "cli-snapshot",
+                    ),
+                    (
+                        [
+                            "validate-snapshot",
+                            "--snapshot-dir",
+                            "snapshot",
+                            "--manifest-creation-receipt-file",
+                            "snapshot-result.json",
+                        ],
+                        "snapshot_dir",
+                        frozen_cwd / "snapshot",
+                    ),
+                    (
+                        [
+                            "recover-snapshot",
+                            *common_paths,
+                            "--snapshot-dir",
+                            "snapshot",
+                            "--out",
+                            "cli-recovered.sqlite",
+                            "--manifest-creation-receipt-file",
+                            "snapshot-result.json",
+                        ],
+                        "snapshot_dir",
+                        frozen_cwd / "snapshot",
+                    ),
+                    (
+                        [
+                            "validate-patch-stage",
+                            "--stage-dir",
+                            "stage",
+                            "--manifest-creation-receipt-file",
+                            "stage-result.json",
+                        ],
+                        "stage_dir",
+                        frozen_cwd / "stage",
+                    ),
+                    (
+                        [
+                            "preflight-writeback",
+                            *common_paths,
+                            "--backup-dir",
+                            "snapshot",
+                            "--stage-dir",
+                            "stage",
+                            "--backup-manifest-creation-receipt-file",
+                            "snapshot-result.json",
+                            "--stage-manifest-creation-receipt-file",
+                            "stage-result.json",
+                        ],
+                        "backup_dir",
+                        frozen_cwd / "snapshot",
+                    ),
+                )
+                for arguments, result_key, expected_path in cases:
+                    with self.subTest(command=arguments[0]):
+                        return_code, payload = run_cli(arguments)
+                        self.assertEqual(return_code, 0, payload)
+                        self.assertEqual(Path(payload[result_key]), expected_path)
+
+                self.assertTrue((source_cwd / "cli-snapshot").is_dir())
+                self.assertTrue((source_cwd / "cli-snapshot-result.json").is_file())
+                self.assertFalse((other_cwd / "cli-snapshot").exists())
+                self.assertFalse((other_cwd / "cli-snapshot-result.json").exists())
+                copy_manifest = json.loads(
+                    (source_cwd / "cli-snapshot" / MODULE.SNAPSHOT_MANIFEST).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    Path(copy_manifest["source_root"]),
+                    frozen_cwd / "group",
+                )
+                recovered_db = source_cwd / "cli-recovered.sqlite"
+                self.assertTrue(recovered_db.is_file())
+                self.assertFalse((other_cwd / "cli-recovered.sqlite").exists())
+                with closing(sqlite3.connect(recovered_db)) as connection:
+                    self.assertEqual(
+                        connection.execute("SELECT value FROM sample").fetchone()[0],
+                        "frozen-live-source",
+                    )
+
+                replacement = source_cwd / "replacement.sqlite"
+                shutil.copyfile(
+                    source_cwd / "stage" / MODULE.NOTE_STORE_MAIN,
+                    replacement,
+                )
+                live = source_cwd / "group" / MODULE.NOTE_STORE_MAIN
+                replacement.chmod(stat.S_IMODE(live.stat().st_mode))
+                os.replace(replacement, live)
+                return_code, verified = run_cli(
+                    [
+                        "verify-writeback",
+                        *common_paths,
+                        "--backup-dir",
+                        "snapshot",
+                        "--stage-dir",
+                        "stage",
+                        "--backup-manifest-creation-receipt-file",
+                        "snapshot-result.json",
+                        "--stage-manifest-creation-receipt-file",
+                        "stage-result.json",
+                    ]
+                )
+                self.assertEqual(return_code, 0, verified)
+                self.assertTrue(verified["writeback_verified"])
+                self.assertEqual(
+                    Path(verified["backup_dir"]),
+                    frozen_cwd / "snapshot",
+                )
+                self.assertEqual(
+                    Path(verified["stage_dir"]),
+                    frozen_cwd / "stage",
+                )
+            finally:
+                os.chdir(previous_cwd)
+
     def test_relative_container_paths_stay_fixed_after_preflight_cwd_change(
         self,
     ) -> None:
