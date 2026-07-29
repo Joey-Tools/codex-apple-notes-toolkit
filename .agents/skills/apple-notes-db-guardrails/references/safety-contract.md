@@ -26,7 +26,9 @@ Protect five properties independently:
 1. **Object identity**: bind the opened regular file to device, inode, and file type, then require
    the pathname to resolve to that same object after the read.
 2. **Content stability**: hash the same opened descriptor twice and require equal SHA-256 and size.
-3. **Access policy**: require mode, owner, group, and platform file flags to remain unchanged.
+3. **Access policy**: require mode, owner, group, and Darwin flags that enforce
+   immutable, append-only, Data Vault, restricted, or no-unlink behavior to
+   remain unchanged. Raw `st_flags` outside that mask are metadata evidence.
 4. **Path-component identity**: open each absolute directory component no-follow relative to its
    already-held parent and reject every symlink/reparse point except an explicitly registered
    Darwin root-alias object.
@@ -51,9 +53,12 @@ access-policy signals are unchanged.
 For `validate-snapshot` and patch-stage validation, hold the manifest and every declared regular
 file descriptor through recovery-payload construction, WAL/SHM inspection, SQLite integrity checking,
 directory revalidation, and the terminal protected-property check. A same-byte inode replacement
-is an identity mismatch; a mode/owner/group/flags change is an access-policy mismatch; an in-place
-byte change is a content mismatch. Do not accept a fresh pathname open as proof about the object
-that supplied earlier validation evidence.
+is an identity mismatch; a mode/owner/group or access-controlling flag change is
+an access-policy mismatch; an in-place byte change is a content mismatch.
+Hidden, no-dump, opaque, compression, tracking, archived, firmlink, and File
+Provider/dataless flag transitions are reported as metadata when the protected
+properties stay stable. Do not accept a fresh pathname open as proof about the
+object that supplied earlier validation evidence.
 The v3 snapshot and patch manifests persist creation-time identity and access-policy receipts for
 their root directories and database files; snapshots also persist the nested store-directory
 receipt. Their successful creator results separately return an
@@ -193,8 +198,8 @@ WAL/SHM only relative to that held directory descriptor. Keep the complete paren
 chain, store directory, main, WAL, and SHM descriptors open across byte capture, integrity, and
 SQLite backup. Before and after SQLite consumption, require:
 
-- the directory descriptor and pathname to identify the same directory object with the same mode,
-  owner, group, and platform flags;
+- the directory descriptor and pathname to identify the same directory object
+  with the same mode, owner, group, and Darwin access-controlling flag mask;
 - two descriptor-relative directory scans to retain the exact name/type map captured at binding;
 - the main and WAL descriptor identities, SHA-256 values, sizes, and access policies to remain
   stable and to match their descriptor-relative names; and
@@ -346,6 +351,10 @@ empty directory that appeared after an earlier check, must remain untouched.
 Before `copy-db`, `merge-db`, `recover-snapshot`, or `stage-patch` creates any destination-parent
 component or output, enter one shared live-container guard. First expand the destination and every
 Apple Notes live-container path into distinct requested and exact registered-canonical alias forms.
+Construct both live-container inputs as lexical absolute paths against one
+captured working directory before the guard starts. Never re-resolve a relative
+container after preflight; the fixed paths are the only values persisted in
+`source_root`, returned as `live_source_root`, or used for equality.
 Compare the complete cross-product with case-folded NFD path components and reject either direction
 of normalized ancestor/descendant overlap before binding a component or invoking the directory
 creator. Thus an absent `/tmp/live` protects `/private/tmp/live/...`, and an absent
@@ -494,11 +503,12 @@ Validate the creator-returned descriptor against its staging name before using i
 held object at the target basename only with the platform's atomic no-replace directory rename,
 then verify the target name against the retained descriptor before and after the carried scope
 revalidation. Metadata-only changes are evidence, not object or access-policy changes;
-replacement, disappearance, or mode/owner/group/flags drift fails closed. If the proof, name, or
-descriptor cannot be reconciled, retain point-in-time provider/name evidence but label the
-protected property `creation-identity-inconclusive`; never sign a replacement as
-`transaction-created-object-identity`. If atomic no-replace is unsupported, stop rather than
-reverting to direct `mkdir(target)` or check-then-rename.
+replacement, disappearance, or mode/owner/group/access-controlling-flag drift
+fails closed. If the proof, name, or descriptor cannot be reconciled, retain
+point-in-time provider/name evidence but label the protected property
+`creation-identity-inconclusive`; never sign a replacement as
+`transaction-created-object-identity`. If atomic no-replace is unsupported,
+stop rather than reverting to direct `mkdir(target)` or check-then-rename.
 Build the exact component install receipt from the creator-held parent/object/proof before the
 rename, but latch it as installed only in the first state update after the no-replace rename
 returns. Before any subsequent scope revalidation, register that receipt with the parent
@@ -555,10 +565,12 @@ Create copied database files, standalone recovery files, and manifest temporary 
 relative to those held directory descriptors. Perform their name-based validation through the same
 descriptors; never reconstruct a full pathname for those operations. Immediately after each
 exclusive file creation and before writing bytes, enforce and bind the expected effective
-UID/GID, mode `0600`, file flags, object identity, and descriptor-relative no-follow name. Compare
-the complete creation-bound access policy and identity after the write, around consecutive
-readbacks, immediately before publication, after the name transition, and after parent durability.
-A post-write stat is never allowed to establish a new access-policy baseline.
+UID/GID, mode `0600`, the Darwin access-controlling flag mask, object identity,
+and descriptor-relative no-follow name. Preserve raw `st_flags` separately as
+metadata. Compare the complete creation-bound access policy and identity after
+the write, around consecutive readbacks, immediately before publication, after
+the name transition, and after parent durability. A post-write stat is never
+allowed to establish a new access-policy baseline.
 After the manifest is durably written, return its exact creation receipt in the successful
 `copy-db` or `stage-patch` result. The result file is a separate caller-owned authority and must be
 stored outside the published artifact. Use the packaged `--result-file` interface rather than
@@ -616,6 +628,12 @@ artifact root, manifest, nested store/database, and external receipt from that a
 Do not use `resolve()` or another symlink-following canonicalizer. Relative API and CLI inputs must
 therefore share one absolute parent policy while component binding still rejects alias, symlink,
 and replacement races.
+Before consuming either a manifest or external receipt, scan the decoded JSON
+text with fixed nesting and integer-digit limits, then parse with the same
+bounded integer hook on every supported Python runtime. Map limit `ValueError`
+and decoder `RecursionError` to `manifest-invalid` for manifests and
+`manifest-creation-receipt-invalid` for external receipts; neither may escape
+as `unexpected-error`.
 On writer failure, retain the created file and report the held parent/file descriptor identities,
 access policies, content status, and point-in-time namespace observations. Do not attempt automatic
 name-based cleanup: even descriptor-relative `stat(name)` followed by `unlink(name)` has a
@@ -793,7 +811,8 @@ After replacement, require:
 
 - live main-database object identity differs from the baseline object;
 - live bytes equal the staged database;
-- live mode, owner, group, and file flags equal the baseline access policy;
+- live mode, owner, group, and Darwin access-controlling flag mask equal the
+  baseline access policy;
 - live WAL and SHM names are absent before Notes restarts;
 - full SQLite integrity succeeds from an anonymous descriptor-backed verification image.
 

@@ -382,3 +382,29 @@ superseded_by:
   Python `3.9.6` each passed the focused API/CLI classification test and the
   full `275`-test suite with the single sandbox-scoped fixed
   `/usr/bin/pgrep` skip.
+- Container-path, Darwin-flags, and bounded-JSON follow-up base:
+  `2097f3d9e695d41681192dcbb1bbcd3dc3940bcb`.
+- `NoteStorePaths` now freezes both public container inputs to lexical absolute
+  paths using one captured working directory. API and CLI regressions change
+  CWD after destination preflight and prove source reads, manifest
+  `source_root`, fingerprints, and returned paths remain bound to the original
+  containers.
+- Darwin `st_flags` are split by protected property. Immutable, append-only,
+  Data Vault, restricted, and no-unlink bits remain access-policy signals;
+  benign raw flag transitions are recorded as `platform_flags` metadata.
+  Legacy receipts that stored all raw bits are normalized at manifest and
+  writeback boundaries without weakening the protected mask.
+- Manifest and external creation-receipt JSON now have fixed nesting and
+  integer-digit limits before decoding untrusted structures. Limit failures
+  and decoder recursion map to stable `manifest-invalid` or
+  `manifest-creation-receipt-invalid` results.
+- Focused regressions: Python `3.13.0` and system Python `3.9.6` each passed
+  five tests covering post-preflight CWD changes, benign versus protected
+  Darwin flags, legacy raw-flag receipts, excessive nesting, oversized
+  integers, and decoder recursion.
+- Full regressions: Python `3.13.0` and system Python `3.9.6` each passed all
+  `280` tests with the single sandbox-scoped fixed `/usr/bin/pgrep` skip.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.

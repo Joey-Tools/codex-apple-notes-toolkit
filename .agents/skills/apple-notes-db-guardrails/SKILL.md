@@ -69,6 +69,10 @@ rejects a normalized lexical overlap or a descriptor-ancestor identity match. It
 `NoteStore.sqlite`, `-wal`, `-shm`, and `-journal` as path components anywhere in a destination,
 even when that sidecar is currently absent. The guard runs before the first mkdir, file creation,
 rename, partial, backup, receipt, or helper output.
+The `NoteStorePaths` API object and CLI adapter freeze both live-container
+inputs to lexical absolute paths using one captured working directory before
+this preflight begins. A later CWD change cannot retarget either held-container
+proof, source read, manifest `source_root`, or writeback equality check.
 
 Missing destination-parent components and private partial directories are never created directly
 at their target names. A trusted platform or supervisor creator must allocate an unpredictable
@@ -316,6 +320,11 @@ through recovery-payload construction, SQLite integrity checking, standalone bac
 revalidation. No named recovery-clone directory is created. Object replacement, byte mutation,
 and access-policy change have distinct failure codes; timestamp-only changes do not fail when the
 protected properties remain stable.
+Manifest and external-receipt JSON parsing is bounded independently of the
+file-size ceiling: nesting and integer digits have fixed limits before any
+untrusted structure is consumed. Limit failures and decoder recursion map to
+`manifest-invalid` and `manifest-creation-receipt-invalid`, respectively,
+without runtime-version-dependent exceptions.
 Snapshot and patch-stage directory scans preserve their caller-specific missing, identity,
 access-policy, membership, and inconclusive codes even when the lower descriptor scanner detects
 the failure midway through a pass.
@@ -388,12 +397,16 @@ The native SQLite backup API writes first to an in-memory database; serialized d
 then written directly to the exclusively created output descriptor. Full integrity checking opens
 the prepared standalone file through that same held descriptor. Immediately after exclusive
 creation and before truncating or writing sensitive bytes, the standalone writer corrects the
-descriptor to the effective UID/GID and mode `0600`, then binds its flags, object identity, and
-descriptor-relative no-follow name. It also pre-binds the serialized payload's expected SHA-256
-and byte length. A post-write boundary must still match that creation-time policy; the helper
-accepts a creation receipt only after two consecutive same-descriptor readbacks plus size,
-access-policy, and descriptor-relative pathname identity/access checks all match the pre-bound
-expectation.
+descriptor to the effective UID/GID and mode `0600`, then binds its Darwin
+access-controlling flag mask, object identity, and descriptor-relative no-follow
+name. Immutable, append-only, Data Vault, restricted, and no-unlink bits are
+access policy; hidden, no-dump, compression, tracking, firmlink, and File
+Provider/dataless transitions are retained as metadata. It also pre-binds the
+serialized payload's expected SHA-256 and byte length. A post-write boundary
+must still match that creation-time policy; the helper accepts a creation
+receipt only after two consecutive same-descriptor readbacks plus size,
+access-policy, and descriptor-relative pathname identity/access checks all match
+the pre-bound expectation.
 After the main file is published, fsynced, terminally rehashed, and path-verified, the helper keeps
 its parent directory descriptor open and observes the output's `-wal`, `-shm`, and `-journal`
 names twice without following links. It then rebinds the public parent pathname, proves that it is

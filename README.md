@@ -81,6 +81,9 @@ matched to its creation receipt before the second source revalidation; every
 pre-publication failure retains structured cleanup and recovery evidence.
 Snapshot/stage API and CLI inputs use one absolute lexical path policy for the
 root and every derived member, so relative paths cannot split parent authority.
+The API path object and CLI adapter likewise freeze both live-container inputs
+against one captured working directory before preflight, manifest generation,
+or later equality checks.
 Notes process-state checks use fixed `/usr/bin/pgrep`, a minimal environment,
 a hard deadline, process-group cleanup, and a closed fail-unknown result matrix.
 The first action after a no-replace rename returns, or after an error path
@@ -96,9 +99,11 @@ the live Notes store.
 Creator result-file publication similarly latches its exact terminal receipt:
 late result-scope teardown failures report the artifact mutation, committed
 result-file state, receipt, and non-retryable classification. Standalone
-recovery files bind effective ownership, group, mode, flags, and identity
-before the first sensitive write and revalidate that baseline immediately
-after writing.
+recovery files bind effective ownership, group, mode, Darwin access-controlling
+flags, and identity before the first sensitive write and revalidate that
+baseline immediately after writing. Other Darwin flags, including hidden,
+no-dump, compression, and File Provider state, remain metadata evidence rather
+than access-policy mismatch signals.
 
 `scripts/apple_notes_helper.sh` remains the top-level Notes/AppleScript wrapper
 and delegates database subcommands to the skill-packaged helper.

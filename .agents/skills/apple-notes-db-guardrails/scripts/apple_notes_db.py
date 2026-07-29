@@ -49,6 +49,8 @@ PATCH_SCHEMA = "apple-notes-patch/v3"
 MANIFEST_CREATION_RECEIPT_SCHEMA = "apple-notes-manifest-creation-receipt/v1"
 CHUNK_SIZE = 1024 * 1024
 MANIFEST_MAX_BYTES = 4 * 1024 * 1024
+MANIFEST_JSON_MAX_DEPTH = 64
+MANIFEST_JSON_MAX_INTEGER_DIGITS = 128
 WAL_MAGIC_NUMBERS = {0x377F0682, 0x377F0683}
 WAL_VERSION = 3007000
 RENAME_NOREPLACE = 1
@@ -67,6 +69,16 @@ DIRECTORY_CREATOR_PROVIDER_MAX_JSON_ITEMS = 32
 DIRECTORY_CREATOR_PROVIDER_MAX_JSON_NODES = 256
 DIRECTORY_CREATOR_PROVIDER_MAX_KEY_CHARS = 128
 DIRECTORY_CREATOR_PROVIDER_MAX_STRING_CHARS = 2048
+_DARWIN_ACCESS_POLICY_FLAG_BITS = {
+    "UF_IMMUTABLE": 0x00000002,
+    "UF_APPEND": 0x00000004,
+    "UF_DATAVAULT": 0x00000080,
+    "SF_IMMUTABLE": 0x00020000,
+    "SF_APPEND": 0x00040000,
+    "SF_RESTRICTED": 0x00080000,
+    "SF_NOUNLINK": 0x00100000,
+}
+DARWIN_ACCESS_POLICY_FLAG_MASK = sum(_DARWIN_ACCESS_POLICY_FLAG_BITS.values())
 SQLITE_OK = 0
 SQLITE_ABORT = 4
 SQLITE_DONE = 101
@@ -101,6 +113,15 @@ class StoreSafetyError(RuntimeError):
 class NoteStorePaths:
     group_container: Path = GROUP_CONTAINER
     app_container: Path = APP_CONTAINER
+
+    def __post_init__(self) -> None:
+        """Freeze both public container inputs to one lexical absolute policy."""
+
+        cwd = os.getcwd()
+        for field_name in ("group_container", "app_container"):
+            value = os.fspath(getattr(self, field_name))
+            absolute = Path(os.path.normpath(os.path.join(cwd, value)))
+            object.__setattr__(self, field_name, absolute)
 
     def note_store_files(self) -> list[Path]:
         return [self.group_container / name for name in NOTE_STORE_DISCOVERY_BASENAMES]
@@ -536,7 +557,7 @@ def _access_policy(value: os.stat_result) -> dict[str, int]:
         "mode": stat.S_IMODE(value.st_mode),
         "uid": value.st_uid,
         "gid": value.st_gid,
-        "flags": int(getattr(value, "st_flags", 0)),
+        "flags": int(getattr(value, "st_flags", 0)) & DARWIN_ACCESS_POLICY_FLAG_MASK,
     }
 
 
@@ -545,6 +566,7 @@ def _metadata(value: os.stat_result) -> dict[str, int]:
         "mtime_ns": _stat_ns(value, "mtime"),
         "ctime_ns": _stat_ns(value, "ctime"),
         "link_count": value.st_nlink,
+        "platform_flags": int(getattr(value, "st_flags", 0)),
     }
 
 
@@ -7394,6 +7416,41 @@ def _write_json_atomic(
         os.close(fd)
 
 
+def _assert_bounded_json_nesting(payload: str) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in payload:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > MANIFEST_JSON_MAX_DEPTH:
+                raise ValueError("JSON nesting exceeds the manifest limit")
+        elif character in "]}" and depth:
+            depth -= 1
+
+
+def _parse_bounded_json_integer(value: str) -> int:
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > MANIFEST_JSON_MAX_INTEGER_DIGITS:
+        raise ValueError("JSON integer exceeds the manifest digit limit")
+    return int(value)
+
+
+def _bounded_json_loads(payload: str) -> Any:
+    _assert_bounded_json_nesting(payload)
+    return json.loads(payload, parse_int=_parse_bounded_json_integer)
+
+
 def _parse_manifest_bytes(
     payload_bytes: bytes,
     *,
@@ -7401,10 +7458,21 @@ def _parse_manifest_bytes(
     expected_schema: str,
 ) -> dict[str, Any]:
     try:
-        payload = json.loads(payload_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        payload_text = payload_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
         raise StoreSafetyError(
             "manifest-unreadable", f"Cannot read manifest {path}: {exc}"
+        ) from exc
+    try:
+        payload = _bounded_json_loads(payload_text)
+    except json.JSONDecodeError as exc:
+        raise StoreSafetyError(
+            "manifest-unreadable", f"Cannot read manifest {path}: {exc}"
+        ) from exc
+    except (ValueError, RecursionError) as exc:
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Manifest exceeds bounded JSON parsing limits: {path}",
         ) from exc
     if not isinstance(payload, dict) or payload.get("schema") != expected_schema:
         raise StoreSafetyError(
@@ -7617,7 +7685,14 @@ def _manifest_protection_receipt(
         )
     return {
         "identity": {key: int(identity[key]) for key in sorted(identity_keys)},
-        "access_policy": {key: int(access_policy[key]) for key in sorted(access_keys)},
+        "access_policy": {
+            key: (
+                int(access_policy[key]) & DARWIN_ACCESS_POLICY_FLAG_MASK
+                if key == "flags"
+                else int(access_policy[key])
+            )
+            for key in sorted(access_keys)
+        },
     }
 
 
@@ -13279,6 +13354,7 @@ def copy_db(
                         "mtime_ns",
                         "ctime_ns",
                         "link_count",
+                        "platform_flags",
                     ],
                 },
                 "external_creation_receipt": {
@@ -13841,6 +13917,7 @@ def _validated_snapshot_artifact(
                     "mtime_ns",
                     "ctime_ns",
                     "link_count",
+                    "platform_flags",
                 ],
             },
             "directories": {
@@ -14315,8 +14392,15 @@ def _load_external_manifest_creation_receipt(
         mismatch_code=mismatch_code,
     )
     try:
-        payload = json.loads(payload_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        payload_text = payload_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise StoreSafetyError(
+            "manifest-creation-receipt-invalid",
+            f"Cannot parse manifest creation receipt {receipt_file}: {exc}",
+        ) from exc
+    try:
+        payload = _bounded_json_loads(payload_text)
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
         raise StoreSafetyError(
             "manifest-creation-receipt-invalid",
             f"Cannot parse manifest creation receipt {receipt_file}: {exc}",
@@ -15014,6 +15098,7 @@ def validate_patch_stage(
                         "mtime_ns",
                         "ctime_ns",
                         "link_count",
+                        "platform_flags",
                     ],
                 },
                 "stage_directory": stage_directory,
@@ -15070,7 +15155,17 @@ def _source_manifest_map(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "manifest-invalid",
             "Snapshot manifest source evidence is incomplete",
         )
-    return result
+    normalized: dict[str, dict[str, Any]] = {}
+    for basename, source in result.items():
+        protection = _manifest_protection_receipt(
+            source,
+            label=f"snapshot source {basename}",
+        )
+        normalized[basename] = {
+            **source,
+            **protection,
+        }
+    return normalized
 
 
 def _fingerprint_map(fingerprint: dict[str, Any]) -> dict[str, dict[str, Any]]:

@@ -51,6 +51,15 @@ COMPATIBILITY_SCRIPT = REPO_ROOT / "scripts/apple_notes_helper.py"
 HOT_JOURNAL_FIXTURE = REPO_ROOT / "tests/create_hot_rollback_journal.py"
 
 
+class _StatWithFlags:
+    def __init__(self, value: os.stat_result, flags: int) -> None:
+        self._value = value
+        self.st_flags = flags
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._value, name)
+
+
 @contextmanager
 def _fail_if_deadline_exceeded(seconds: float) -> Iterator[None]:
     previous_handler = signal.getsignal(signal.SIGALRM)
@@ -8623,6 +8632,138 @@ raise SystemExit(2)
         )
         self.assertIn("mtime_ns", result["metadata_transitions"])
 
+    def test_darwin_file_flags_separate_access_policy_from_metadata(self) -> None:
+        benign_flags = (
+            0x00000001  # UF_NODUMP
+            | 0x00000008  # UF_OPAQUE
+            | 0x00000020  # UF_COMPRESSED
+            | 0x00000040  # UF_TRACKED
+            | 0x00008000  # UF_HIDDEN
+            | 0x00010000  # SF_ARCHIVED
+            | 0x00800000  # SF_FIRMLINK
+            | 0x40000000  # SF_DATALESS
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "file.sqlite"
+            path.write_bytes(b"stable-bytes")
+            parent_fd = os.open(path.parent, MODULE._directory_open_flags())
+            file_fd = os.open(
+                path.name,
+                MODULE._untrusted_regular_read_open_flags(),
+                dir_fd=parent_fd,
+            )
+            try:
+                baseline = _StatWithFlags(os.fstat(file_fd), 0)
+                benign = _StatWithFlags(os.fstat(file_fd), benign_flags)
+                opened = MODULE._OpenedSource(
+                    path=path,
+                    fd=file_fd,
+                    before=baseline,
+                    parent_fd=parent_fd,
+                    parent_opened=os.fstat(parent_fd),
+                    first_sha256=hashlib.sha256(b"stable-bytes").hexdigest(),
+                )
+                original_fstat = MODULE.os.fstat
+                original_stat = MODULE.os.stat
+
+                def benign_fstat(fd: int) -> object:
+                    observed = original_fstat(fd)
+                    return (
+                        _StatWithFlags(observed, benign_flags)
+                        if fd == file_fd
+                        else observed
+                    )
+
+                def benign_stat(
+                    target: object,
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    observed = original_stat(target, *args, **kwargs)
+                    if target == path.name and kwargs.get("dir_fd") == parent_fd:
+                        return _StatWithFlags(observed, benign_flags)
+                    return observed
+
+                with (
+                    mock.patch.object(
+                        MODULE.os,
+                        "fstat",
+                        side_effect=benign_fstat,
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "stat",
+                        side_effect=benign_stat,
+                    ),
+                ):
+                    result = MODULE._revalidate_open_source(
+                        opened,
+                        hashlib.sha256(b"stable-bytes").hexdigest(),
+                    )
+                self.assertEqual(result["access_policy"]["flags"], 0)
+                self.assertEqual(result["metadata"]["platform_flags"], benign_flags)
+                self.assertEqual(
+                    result["metadata_transitions"]["platform_flags"],
+                    {"before": 0, "after": benign_flags},
+                )
+                self.assertEqual(
+                    MODULE._access_policy(baseline),
+                    MODULE._access_policy(benign),
+                )
+
+                for name, flag in MODULE._DARWIN_ACCESS_POLICY_FLAG_BITS.items():
+                    with self.subTest(flag=name):
+                        protected = _StatWithFlags(os.fstat(file_fd), flag)
+                        self.assertNotEqual(
+                            MODULE._access_policy(baseline),
+                            MODULE._access_policy(protected),
+                        )
+
+                protected_flag = MODULE._DARWIN_ACCESS_POLICY_FLAG_BITS["UF_IMMUTABLE"]
+
+                def protected_fstat(fd: int) -> object:
+                    observed = original_fstat(fd)
+                    return (
+                        _StatWithFlags(observed, protected_flag)
+                        if fd == file_fd
+                        else observed
+                    )
+
+                def protected_stat(
+                    target: object,
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    observed = original_stat(target, *args, **kwargs)
+                    if target == path.name and kwargs.get("dir_fd") == parent_fd:
+                        return _StatWithFlags(observed, protected_flag)
+                    return observed
+
+                with (
+                    mock.patch.object(
+                        MODULE.os,
+                        "fstat",
+                        side_effect=protected_fstat,
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "stat",
+                        side_effect=protected_stat,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE._revalidate_open_source(
+                        opened,
+                        hashlib.sha256(b"stable-bytes").hexdigest(),
+                    )
+                self._assert_safety_code(
+                    "source-access-policy-mismatch",
+                    raised,
+                )
+            finally:
+                os.close(file_fd)
+                os.close(parent_fd)
+
     def test_merge_db_creates_readable_sidecar_free_backup(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -11477,6 +11618,125 @@ raise SystemExit(2)
                 self.assertEqual(return_code, 1)
                 self.assertEqual(cli_payload["error_code"], "manifest-invalid")
 
+    def test_bounded_manifest_json_failures_are_manifest_invalid(self) -> None:
+        bounded_payloads = {
+            "oversized-integer": (
+                b'{"schema":"'
+                + MODULE.PATCH_SCHEMA.encode("ascii")
+                + b'","value":'
+                + b"9" * (MODULE.MANIFEST_JSON_MAX_INTEGER_DIGITS + 1)
+                + b"}"
+            ),
+            "excessive-depth": (
+                b'{"schema":"'
+                + MODULE.PATCH_SCHEMA.encode("ascii")
+                + b'","value":'
+                + b"[" * (MODULE.MANIFEST_JSON_MAX_DEPTH + 1)
+                + b"0"
+                + b"]" * (MODULE.MANIFEST_JSON_MAX_DEPTH + 1)
+                + b"}"
+            ),
+        }
+        for label, payload in bounded_payloads.items():
+            with self.subTest(boundary=label):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    edited = root / "edited.sqlite"
+                    self._create_db(edited)
+                    stage_dir = Path(
+                        self._stage_patch(edited, root / "stage")["stage_dir"]
+                    )
+                    manifest_path = stage_dir / MODULE.PATCH_MANIFEST
+                    manifest_path.write_bytes(payload)
+                    receipt = self._reanchor_manifest_for_test(
+                        stage_dir,
+                        artifact_kind="patch-stage",
+                    )
+                    with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                        MODULE.validate_patch_stage(stage_dir, receipt)
+                    self._assert_safety_code("manifest-invalid", raised)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_bounded_json_loads",
+                side_effect=RecursionError("simulated decoder recursion"),
+            ),
+            self.assertRaises(MODULE.StoreSafetyError) as raised,
+        ):
+            MODULE._parse_manifest_bytes(
+                json.dumps({"schema": MODULE.PATCH_SCHEMA}).encode("utf-8"),
+                path=Path("/bounded/manifest.json"),
+                expected_schema=MODULE.PATCH_SCHEMA,
+            )
+        self._assert_safety_code("manifest-invalid", raised)
+
+    def test_bounded_external_receipt_json_failures_are_receipt_invalid(
+        self,
+    ) -> None:
+        bounded_payloads = {
+            "oversized-integer": (
+                b'{"value":'
+                + b"9" * (MODULE.MANIFEST_JSON_MAX_INTEGER_DIGITS + 1)
+                + b"}"
+            ),
+            "excessive-depth": (
+                b'{"value":'
+                + b"[" * (MODULE.MANIFEST_JSON_MAX_DEPTH + 1)
+                + b"0"
+                + b"]" * (MODULE.MANIFEST_JSON_MAX_DEPTH + 1)
+                + b"}"
+            ),
+        }
+        for label, payload in bounded_payloads.items():
+            with self.subTest(boundary=label):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    edited = root / "edited.sqlite"
+                    self._create_db(edited)
+                    stage_dir = Path(
+                        self._stage_patch(edited, root / "stage")["stage_dir"]
+                    )
+                    receipt_file = root / "creation-receipt.json"
+                    receipt_file.write_bytes(payload)
+                    with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                        MODULE.validate_patch_stage(
+                            stage_dir,
+                            manifest_creation_receipt_file=receipt_file,
+                        )
+                    self._assert_safety_code(
+                        "manifest-creation-receipt-invalid",
+                        raised,
+                    )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            stage = self._stage_patch(edited, root / "stage")
+            stage_dir = Path(stage["stage_dir"])
+            receipt_file = root / "creation-receipt.json"
+            receipt_file.write_text(
+                json.dumps(stage["manifest_creation_receipt"]),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_bounded_json_loads",
+                    side_effect=RecursionError("simulated decoder recursion"),
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.validate_patch_stage(
+                    stage_dir,
+                    manifest_creation_receipt_file=receipt_file,
+                )
+        self._assert_safety_code(
+            "manifest-creation-receipt-invalid",
+            raised,
+        )
+
     def test_creators_return_exact_external_manifest_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -12261,6 +12521,115 @@ raise SystemExit(2)
             finally:
                 os.chdir(previous_cwd)
 
+    def test_relative_container_paths_stay_fixed_after_preflight_cwd_change(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_cwd = root / "source-cwd"
+            other_cwd = root / "other-cwd"
+            source_cwd.mkdir()
+            other_cwd.mkdir()
+            (source_cwd / "group").mkdir()
+            (source_cwd / "app").mkdir()
+            self._create_db(
+                source_cwd / "group" / MODULE.NOTE_STORE_MAIN,
+                value="fixed-source",
+            )
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(source_cwd)
+                canonical_source_cwd = Path.cwd()
+                paths = MODULE.NoteStorePaths(
+                    group_container=Path("group"),
+                    app_container=Path("app"),
+                )
+                self.assertEqual(
+                    paths.group_container,
+                    canonical_source_cwd / "group",
+                )
+                self.assertEqual(paths.app_container, canonical_source_cwd / "app")
+
+                api_destination = root / "api-snapshot"
+                with MODULE._preflight_live_safe_destination_parent(
+                    paths,
+                    api_destination,
+                ) as preflight:
+                    os.chdir(other_cwd)
+                    api_result = self._copy_db(
+                        paths,
+                        dest=api_destination,
+                        require_notes_quit=False,
+                        _destination_preflight=preflight,
+                        _notes_running=False,
+                    )
+                api_manifest = json.loads(
+                    (api_destination / MODULE.SNAPSHOT_MANIFEST).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    Path(api_manifest["source_root"]),
+                    canonical_source_cwd / "group",
+                )
+                self.assertEqual(
+                    MODULE.fingerprint_note_store(paths)["source_root"],
+                    canonical_source_cwd / "group",
+                )
+                self.assertEqual(Path(api_result["dest"]), api_destination)
+
+                os.chdir(source_cwd)
+                cli_destination = root / "cli-snapshot"
+                original_preflight = MODULE._preflight_creator_destinations
+
+                @contextmanager
+                def change_cwd_after_preflight(
+                    *args: object,
+                    **kwargs: object,
+                ) -> Iterator[MODULE._CreatorDestinationPreflights]:
+                    with original_preflight(*args, **kwargs) as preflights:
+                        os.chdir(other_cwd)
+                        yield preflights
+
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_preflight_creator_destinations",
+                        side_effect=change_cwd_after_preflight,
+                    ),
+                    mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                    redirect_stdout(stdout),
+                ):
+                    return_code = MODULE.main(
+                        [
+                            "copy-db",
+                            "--group-container",
+                            "group",
+                            "--app-container",
+                            "app",
+                            "--dest",
+                            str(cli_destination),
+                        ]
+                    )
+                cli_result = json.loads(stdout.getvalue())
+                cli_manifest = json.loads(
+                    (cli_destination / MODULE.SNAPSHOT_MANIFEST).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(return_code, 0, cli_result)
+                self.assertEqual(
+                    Path(cli_manifest["source_root"]),
+                    canonical_source_cwd / "group",
+                )
+                self.assertEqual(
+                    Path(cli_result["copied_files"][0]["source"]),
+                    canonical_source_cwd / "group" / MODULE.NOTE_STORE_MAIN,
+                )
+            finally:
+                os.chdir(previous_cwd)
+
     def test_artifact_swap_between_receipt_load_and_consumption_is_rejected(
         self,
     ) -> None:
@@ -12585,7 +12954,12 @@ raise SystemExit(2)
                         else:
                             receipt = manifest["database"]
                             expected_code = "patch-file-access-policy-mismatch"
-                        receipt["access_policy"][field] += 1
+                        if field == "flags":
+                            receipt["access_policy"][field] ^= (
+                                MODULE._DARWIN_ACCESS_POLICY_FLAG_BITS["UF_IMMUTABLE"]
+                            )
+                        else:
+                            receipt["access_policy"][field] += 1
                         manifest_path.write_text(
                             json.dumps(manifest),
                             encoding="utf-8",
@@ -12599,6 +12973,79 @@ raise SystemExit(2)
                         with self.assertRaises(MODULE.StoreSafetyError) as raised:
                             self._validate_patch_stage(stage)
                         self._assert_safety_code(expected_code, raised)
+
+    def test_legacy_raw_benign_flags_are_normalized_in_manifests_and_receipts(
+        self,
+    ) -> None:
+        benign_flags = (
+            0x00000001  # UF_NODUMP
+            | 0x00000020  # UF_COMPRESSED
+            | 0x00000040  # UF_TRACKED
+            | 0x00008000  # UF_HIDDEN
+            | 0x40000000  # SF_DATALESS
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            edited = root / "edited.sqlite"
+            self._create_db(edited)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            snapshot_dir = Path(snapshot["dest"])
+            stage_dir = Path(self._stage_patch(edited, root / "stage")["stage_dir"])
+
+            manifest_path = snapshot_dir / MODULE.SNAPSHOT_MANIFEST
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for receipt_name in ("snapshot_directory", "store_directory"):
+                manifest["creation_receipts"][receipt_name]["access_policy"][
+                    "flags"
+                ] |= benign_flags
+            for row in manifest["files"]:
+                row["source"]["access_policy"]["flags"] |= benign_flags
+                row["copy"]["access_policy"]["flags"] |= benign_flags
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            snapshot_receipt = self._reanchor_manifest_for_test(
+                snapshot_dir,
+                artifact_kind="snapshot",
+            )
+            snapshot_receipt["manifest"]["access_policy"]["flags"] |= benign_flags
+
+            stage_receipt = self._stage_manifest_receipts[stage_dir]
+            stage_receipt["manifest"]["access_policy"]["flags"] |= benign_flags
+
+            snapshot_validation = MODULE.validate_snapshot(
+                snapshot_dir,
+                snapshot_receipt,
+            )
+            stage_validation = MODULE.validate_patch_stage(
+                stage_dir,
+                stage_receipt,
+            )
+            self.assertEqual(
+                snapshot_validation["sqlite_validation"]["result"],
+                "ok",
+            )
+            self.assertEqual(stage_validation["sqlite_validation"]["result"], "ok")
+
+            with mock.patch.object(
+                MODULE,
+                "notes_is_running",
+                return_value=False,
+            ):
+                preflight = MODULE.preflight_writeback(
+                    paths,
+                    backup_dir=snapshot_dir,
+                    stage_dir=stage_dir,
+                    backup_manifest_creation_receipt=snapshot_receipt,
+                    stage_manifest_creation_receipt=stage_receipt,
+                )
+            self.assertEqual(preflight["live_source_root"], paths.group_container)
+            self.assertTrue(preflight["ready_for_explicit_writeback"])
 
     def test_legacy_manifests_fail_closed_without_v3_external_receipts(
         self,
