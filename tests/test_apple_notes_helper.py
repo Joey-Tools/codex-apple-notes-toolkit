@@ -3100,6 +3100,91 @@ raise SystemExit(2)
             mkdir.assert_not_called()
             self.assertFalse(reserved.exists())
 
+    def test_live_scope_canonicalizes_absent_darwin_tmp_aliases_before_writes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            app = root / "app"
+            app.mkdir()
+            basename = f"apple-notes-absent-live-{MODULE.uuid.uuid4().hex}"
+            alias_live = Path("/tmp") / basename
+            canonical_live = Path("/private/tmp") / basename
+            cases = (
+                (
+                    alias_live,
+                    canonical_live / "nested" / "snapshot",
+                    "requested",
+                    "canonical",
+                ),
+                (
+                    canonical_live,
+                    alias_live / "nested" / "snapshot",
+                    "canonical",
+                    "requested",
+                ),
+            )
+            for (
+                live_container,
+                destination,
+                expected_destination_form,
+                expected_live_form,
+            ) in cases:
+                creator = mock.Mock(
+                    side_effect=AssertionError(
+                        "alias overlap must fail before directory creation"
+                    )
+                )
+                with (
+                    self.subTest(
+                        live_container=live_container,
+                        destination=destination,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_trusted_directory_alias_registry",
+                        return_value=((Path("/tmp"), Path("/private/tmp")),),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_IDENTITY_BOUND_DIRECTORY_CREATOR",
+                        creator,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_bind_snapshot_live_containers",
+                        wraps=MODULE._bind_snapshot_live_containers,
+                    ) as bind_live,
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    with MODULE._bind_live_safe_destination_parent(
+                        MODULE.NoteStorePaths(
+                            group_container=live_container,
+                            app_container=app,
+                        ),
+                        destination,
+                    ):
+                        self.fail("overlapping alias scope must not be yielded")
+
+                self._assert_safety_code(
+                    "snapshot-destination-inside-live-container",
+                    raised,
+                )
+                self.assertFalse(raised.exception.details["mutation_performed"])
+                self.assertEqual(
+                    raised.exception.details["destination_scope_form"],
+                    expected_destination_form,
+                )
+                self.assertEqual(
+                    raised.exception.details["live_container_scope_form"],
+                    expected_live_form,
+                )
+                bind_live.assert_not_called()
+                creator.assert_not_called()
+                self.assertFalse(os.path.lexists(alias_live))
+                self.assertFalse(os.path.lexists(canonical_live))
+                self.assertFalse(os.path.lexists(destination))
+
     @unittest.skipUnless(sys.platform == "darwin", "macOS root alias contract")
     def test_copy_db_supports_real_macos_tmp_alias(self) -> None:
         with (
@@ -3460,6 +3545,94 @@ raise SystemExit(2)
                     self.assertTrue(injected)
             self.assertEqual(list(target.iterdir()), [])
             self.assertEqual(list(alternate.iterdir()), [])
+
+    def test_absent_live_alias_replacement_fails_before_parent_creation(
+        self,
+    ) -> None:
+        for attack in ("retarget", "same-target-replacement"):
+            with (
+                self.subTest(attack=attack),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir).resolve()
+                target = root / "canonical"
+                alternate = root / "alternate"
+                app = root / "app"
+                target.mkdir()
+                alternate.mkdir()
+                app.mkdir()
+                alias = root / "trusted-alias"
+                parked_alias = root / "trusted-alias-original"
+                alias.symlink_to(target, target_is_directory=True)
+                live_container = alias / "initially-absent-live"
+                destination = root / "initially-absent-output-parent" / "output"
+                paths = MODULE.NoteStorePaths(
+                    group_container=live_container,
+                    app_container=app,
+                )
+                registry = ((alias, target),)
+                creator = mock.Mock(
+                    side_effect=AssertionError(
+                        "alias replacement must fail before directory creation"
+                    )
+                )
+                original_verify = MODULE._verify_snapshot_live_container_bindings
+                attacked = False
+
+                def replace_alias_before_creation(
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    nonlocal attacked
+                    if not attacked:
+                        attacked = True
+                        alias.rename(parked_alias)
+                        alias.symlink_to(
+                            alternate if attack == "retarget" else target,
+                            target_is_directory=True,
+                        )
+                    return original_verify(*args, **kwargs)
+
+                try:
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_trusted_directory_alias_registry",
+                            return_value=registry,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_IDENTITY_BOUND_DIRECTORY_CREATOR",
+                            creator,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_verify_snapshot_live_container_bindings",
+                            side_effect=replace_alias_before_creation,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        with MODULE._bind_live_safe_destination_parent(
+                            paths,
+                            destination,
+                        ):
+                            self.fail("replaced live alias must not enter write scope")
+
+                    self._assert_safety_code(
+                        "snapshot-destination-scope-inconclusive",
+                        raised,
+                    )
+                    self.assertTrue(attacked)
+                    self.assertFalse(raised.exception.details["mutation_performed"])
+                    creator.assert_not_called()
+                    self.assertFalse(destination.parent.exists())
+                    self.assertFalse((target / live_container.name).exists())
+                    self.assertFalse((alternate / live_container.name).exists())
+                finally:
+                    if alias.is_symlink():
+                        alias.unlink()
+                    if parked_alias.is_symlink():
+                        parked_alias.rename(alias)
 
     def test_untrusted_case_and_nfd_aliases_fail_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

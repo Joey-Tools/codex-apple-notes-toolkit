@@ -3,7 +3,7 @@ id: 20260724-andb001
 title: Apple Notes Publication And Creator Failure Hardening
 status: completed
 created: 2026-07-24
-updated: 2026-07-27
+updated: 2026-07-29
 branch: codex/apple-db-hardening
 pr:
 supersedes: []
@@ -32,6 +32,9 @@ superseded_by:
 - Closed the artifact-directory translation gap so snapshot and patch-stage
   scans retain their caller-specific identity, access-policy, and
   revalidation codes.
+- Closed the absent-live Darwin root-alias overlap gap so `/tmp` and
+  `/private/tmp` forms are compared in both directions before any component
+  binding or creation.
 
 ## Current State
 
@@ -79,12 +82,18 @@ superseded_by:
 - Snapshot and patch-stage directory validation now translates lower scan-time
   identity, access-policy, membership, and I/O failures with the exact codes
   supplied by the artifact caller instead of generic `directory-*` codes.
+- Live-safe destination preflight now compares every destination requested /
+  registry-canonical form against every requested / registry-canonical live
+  container form before binding or creating any component. An absent live
+  leaf therefore remains protected across `/tmp` and `/private/tmp`, while
+  alias retargeting or same-target replacement still fails closed through the
+  held alias identity and access-policy proof before the creator can run.
 
 ## Next Steps
 
-- Run a parent-owned fresh whole-range review for the new signed checkpoint.
-- Update the existing draft PR only after the frozen range is clean; do not
-  merge as part of this checkpoint.
+- Parent may publish the signed follow-up, rerun the PR review gate, and handle
+  the existing GitHub Codex thread; this worktree does not push or mutate PR
+  state.
 
 ## Evidence
 
@@ -157,6 +166,23 @@ superseded_by:
   Python format check; Python `3.14.3` and `3.9.6` bytecode compilation with
   separate task-scoped caches; `bash -n`; ShellCheck `0.11.0`; skill and
   project-journal validators; and `git diff --check`.
+- GitHub Codex root-alias follow-up base:
+  `2ce9735b06133914a1a88b148469f3a8f399b6be`.
+- Root-alias zero-write regressions: Python `3.14.3` and system Python `3.9.6`
+  each passed the two focused tests covering absent `/tmp` /
+  `/private/tmp` live containers in both directions plus pre-creation alias
+  retargeting and same-target replacement. The tests prove the live binder and
+  identity-bound directory creator were not called for lexical overlap, and
+  prove the creator was not called after alias identity drift.
+- Root-alias full suites: Python `3.14.3` and system Python `3.9.6` each passed
+  all `255` tests outside the nested sandbox required by the fixed
+  `/usr/bin/pgrep` process-state probe.
+- Root-alias static checks: full-repository Ruff `0.13.2`; changed Python
+  format check; Python `3.14.3` and `3.9.6` bytecode compilation with separate
+  task-scoped caches; `bash -n`; ShellCheck `0.11.0`; and `git diff --check`.
+- Root-alias skill validation: the installed wrapper could not import local
+  `PyYAML`; the documented isolated `uv run --with pyyaml` fallback returned
+  `Skill is valid!`. Project-journal validation also passed.
 - Skill validation: isolated `quick_validate.py` with `PyYAML` (`Skill is valid!`; direct local validation lacked that dependency)
 - Final skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)
 - Formal follow-up skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)

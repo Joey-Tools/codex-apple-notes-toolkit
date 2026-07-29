@@ -56,13 +56,16 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" copy-db \
 
 Before creating even the destination parent, every write-producing command (`copy-db`, `merge-db`,
 `recover-snapshot`, and `stage-patch`) enters the same live-container guard. It normalizes the
-requested path with case-folded NFD components and binds the nearest existing ancestor plus both
-Apple Notes live containers. Every absolute path component is opened no-follow relative to its
-already-held parent; an initially absent live container remains anchored to its nearest existing
-component and missing suffix. The same component chain authorizes parent creation and remains held
-for creator receipts, publication, and terminal revalidation. It rejects normalized lexical
-overlap, either direction of ancestor/descendant overlap, or a descriptor-ancestor identity match.
-It also rejects
+requested path with case-folded NFD components. Before binding any component or calling the
+directory creator, it expands the destination and both Apple Notes live containers into their
+distinct requested and exact registry-canonical alias forms and rejects every cross-form
+ancestor/descendant overlap. This catches both `/tmp/live` against
+`/private/tmp/live/...` and the reverse while the live leaf is still absent. It then binds the
+nearest existing destination ancestor plus both live containers. Every absolute path component is
+opened no-follow relative to its already-held parent; an initially absent live container remains
+anchored to its nearest existing component and missing suffix. The same component chain authorizes
+parent creation and remains held for creator receipts, publication, and terminal revalidation. It
+rejects a normalized lexical overlap or a descriptor-ancestor identity match. It also rejects
 `NoteStore.sqlite`, `-wal`, `-shm`, and `-journal` as path components anywhere in a destination,
 even when that sidecar is currently absent. The guard runs before the first mkdir, file creation,
 rename, partial, backup, receipt, or helper output.
@@ -118,8 +121,9 @@ On macOS, only the exact registry entries `/tmp -> /private/tmp`, `/var -> /priv
 target text, plus the canonical target and its parent, then performs writes through canonical held
 descriptors while revalidating both namespaces. An arbitrary symlink, a case-folded spelling, an
 NFC/NFD variant, a retarget, or an alias replacement fails closed before mutation. Live-container,
-trusted-alias, and destination-ancestor identity and access policy remain bound through
-publication. The exact alias binding object is propagated into every derived directory/file
+trusted-alias, and destination-ancestor identity and access policy are revalidated before the first
+destination component creation and remain bound through publication. The exact alias binding
+object is propagated into every derived directory/file
 binding, a same-alias external receipt parent, creator-result scope evidence, and terminal
 public-parent rebind; later boundaries must reuse it rather than authorizing a new alias or
 falling back to the public pathname. When an artifact and its external receipt/result use

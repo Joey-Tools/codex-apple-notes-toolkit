@@ -330,13 +330,17 @@ instead of falling back to a check-then-rename sequence. An existing destination
 empty directory that appeared after an earlier check, must remain untouched.
 
 Before `copy-db`, `merge-db`, `recover-snapshot`, or `stage-patch` creates any destination-parent
-component or output, enter one shared live-container guard. Compare case-folded NFD path components
-against both Apple Notes live-container paths and bind those live containers plus the nearest
-existing destination ancestor. Traverse from the filesystem root through every existing component
-with descriptor-relative no-follow `stat`/`open`, retaining each parent/child identity and access
+component or output, enter one shared live-container guard. First expand the destination and every
+Apple Notes live-container path into distinct requested and exact registered-canonical alias forms.
+Compare the complete cross-product with case-folded NFD path components and reject either direction
+of normalized ancestor/descendant overlap before binding a component or invoking the directory
+creator. Thus an absent `/tmp/live` protects `/private/tmp/live/...`, and an absent
+`/private/tmp/live` protects `/tmp/live/...`, without relying on the live leaf already existing or
+on a post-creation revalidation. Then bind both live containers plus the nearest existing
+destination ancestor. Traverse from the filesystem root through every existing component with
+descriptor-relative no-follow `stat`/`open`, retaining each parent/child identity and access
 policy. For an initially absent live container, retain its nearest existing ancestor plus exact
-missing suffix and fail if the first missing component appears. Reject either direction of
-normalized ancestor/descendant overlap.
+missing suffix and fail if the first missing component appears.
 A lexical normalized overlap or a descriptor-ancestor identity match proves
 `snapshot-destination-inside-live-container`; an unavailable, replaced, or access-policy-mutated
 binding is `snapshot-destination-scope-inconclusive`. Reject `NoteStore.sqlite`,
@@ -436,17 +440,19 @@ Darwin root aliases are an explicit, exact registry rather than a general symlin
 `/tmp -> /private/tmp`, `/var -> /private/var`, and `/etc -> /private/etc`. Bind the alias parent,
 the no-follow alias entry identity/access policy, the exact link text, the followed canonical
 target, and the canonical target parent before descending. Use the canonical target descriptors
-for all mutation, and revalidate both alias and canonical namespaces before each write and at
-terminal boundaries. Reject unregistered symlinks, case-only spellings, NFC/NFD variants,
-retargeting, replacement, and mocked ABA observations before mutation. Carry the same live alias
-binding object through derived prepared directories/files, same-root manifest-receipt parent
-binding, creator-result scope evidence, directory/file installation checks, standalone public
-parent rebind, and all final scans. A later boundary may bind a canonical descendant while that
-object is held, but may not reopen the public alias raw or silently create a replacement alias
-authorization. Carry a trusted alias object into another binding only when both paths resolve
-through the same exact registry pair. If artifact and external result/receipt paths use different
-registry pairs, or only one uses a registered alias, bind the other path independently and keep
-both alias/root proofs separate.
+for all mutation, and revalidate both alias and canonical namespaces before the first destination
+component creation, before each later write, and at terminal boundaries. Reject unregistered
+symlinks, case-only spellings, NFC/NFD variants, retargeting, replacement, and mocked ABA
+observations before mutation. An initially absent live descendant still carries this held alias
+object, so same-target alias replacement or retargeting fails closed before its destination
+creator can run. Carry the same live alias binding object through derived prepared
+directories/files, same-root manifest-receipt parent binding, creator-result scope evidence,
+directory/file installation checks, standalone public parent rebind, and all final scans. A later
+boundary may bind a canonical descendant while that object is held, but may not reopen the public
+alias raw or silently create a replacement alias authorization. Carry a trusted alias object into
+another binding only when both paths resolve through the same exact registry pair. If artifact and
+external result/receipt paths use different registry pairs, or only one uses a registered alias,
+bind the other path independently and keep both alias/root proofs separate.
 Successful snapshot/stage creator results expose
 `manifest_creation_destination_scope`, `terminal_destination_scope`, and
 `descriptor_bound_destination`; standalone merge/recovery results expose the terminal scope and

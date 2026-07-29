@@ -8121,6 +8121,16 @@ def _trusted_alias_paths(
     return requested, canonical, alias_spec
 
 
+def _trusted_alias_scope_forms(path: Path) -> tuple[tuple[str, Path], ...]:
+    """Return distinct requested and registry-canonical lexical scope forms."""
+
+    requested, canonical, alias_spec = _trusted_alias_paths(path)
+    forms = (("requested", requested),)
+    if alias_spec is not None and canonical != requested:
+        forms += (("canonical", canonical),)
+    return forms
+
+
 def _alias_target_path(alias: Path, target_text: str) -> Path:
     return Path(
         os.path.abspath(
@@ -8486,52 +8496,69 @@ def _assert_snapshot_destination_lexically_outside_live_containers(
     destination: Path,
     live_containers: tuple[Path, ...],
 ) -> None:
-    destination_parts = _normalized_scope_parts(destination)
+    destination_forms = _trusted_alias_scope_forms(destination)
+    requested_destination = destination_forms[0][1]
     reserved = {
         unicodedata.normalize("NFD", basename).casefold()
         for basename in NOTE_STORE_DISCOVERY_BASENAMES
     }
-    reserved_component = next(
-        (component for component in destination_parts if component in reserved),
-        None,
-    )
-    if reserved_component is not None:
-        raise StoreSafetyError(
-            "snapshot-destination-reserved-store-path",
-            "Destination would use a live or reserved SQLite store name, "
-            "including through a case-insensitive or Unicode-normalized alias: "
-            f"{destination}",
-            details={
-                "destination": str(destination),
-                "reserved_component_normalized": reserved_component,
-                "overlap_detection": "normalized-lexical-scope",
-                "mutation_performed": False,
-            },
+    for destination_form, destination_path in destination_forms:
+        destination_parts = _normalized_scope_parts(destination_path)
+        reserved_component = next(
+            (component for component in destination_parts if component in reserved),
+            None,
         )
+        if reserved_component is not None:
+            raise StoreSafetyError(
+                "snapshot-destination-reserved-store-path",
+                "Destination would use a live or reserved SQLite store name, "
+                "including through a case-insensitive, Unicode-normalized, or "
+                f"trusted-alias canonical form: {requested_destination}",
+                details={
+                    "destination": str(requested_destination),
+                    "destination_scope_form": destination_form,
+                    "destination_scope_path": str(destination_path),
+                    "reserved_component_normalized": reserved_component,
+                    "overlap_detection": "normalized-lexical-scope",
+                    "mutation_performed": False,
+                },
+            )
     for live_container in live_containers:
-        live_parts = _normalized_scope_parts(live_container)
-        destination_inside_live = destination_parts[: len(live_parts)] == live_parts
-        destination_contains_live = (
-            live_parts[: len(destination_parts)] == destination_parts
-        )
-        if not destination_inside_live and not destination_contains_live:
-            continue
-        raise StoreSafetyError(
-            "snapshot-destination-inside-live-container",
-            "Destination overlaps an Apple Notes live container as an ancestor "
-            "or descendant, including through a case-insensitive or "
-            f"Unicode-normalized alias: {destination}",
-            details={
-                "destination": str(destination),
-                "live_container": str(live_container),
-                "overlap_detection": (
-                    "normalized-lexical-descendant"
-                    if destination_inside_live
-                    else "normalized-lexical-ancestor"
-                ),
-                "mutation_performed": False,
-            },
-        )
+        live_forms = _trusted_alias_scope_forms(live_container)
+        requested_live_container = live_forms[0][1]
+        for destination_form, destination_path in destination_forms:
+            destination_parts = _normalized_scope_parts(destination_path)
+            for live_form, live_path in live_forms:
+                live_parts = _normalized_scope_parts(live_path)
+                destination_inside_live = (
+                    destination_parts[: len(live_parts)] == live_parts
+                )
+                destination_contains_live = (
+                    live_parts[: len(destination_parts)] == destination_parts
+                )
+                if not destination_inside_live and not destination_contains_live:
+                    continue
+                raise StoreSafetyError(
+                    "snapshot-destination-inside-live-container",
+                    "Destination overlaps an Apple Notes live container as an "
+                    "ancestor or descendant, including through a "
+                    "case-insensitive, Unicode-normalized, or trusted-alias "
+                    f"canonical form: {requested_destination}",
+                    details={
+                        "destination": str(requested_destination),
+                        "destination_scope_form": destination_form,
+                        "destination_scope_path": str(destination_path),
+                        "live_container": str(requested_live_container),
+                        "live_container_scope_form": live_form,
+                        "live_container_scope_path": str(live_path),
+                        "overlap_detection": (
+                            "normalized-lexical-descendant"
+                            if destination_inside_live
+                            else "normalized-lexical-ancestor"
+                        ),
+                        "mutation_performed": False,
+                    },
+                )
 
 
 def _raise_snapshot_destination_scope_inconclusive(
@@ -8897,19 +8924,11 @@ def _bind_live_safe_destination_parent(
     requested_destination, canonical_destination, alias_spec = _trusted_alias_paths(
         destination
     )
-    alias_canonical_destination = (
-        canonical_destination if alias_spec is not None else None
-    )
     live_containers = (paths.group_container, paths.app_container)
     _assert_snapshot_destination_lexically_outside_live_containers(
         requested_destination,
         live_containers,
     )
-    if alias_canonical_destination is not None:
-        _assert_snapshot_destination_lexically_outside_live_containers(
-            alias_canonical_destination,
-            live_containers,
-        )
     with ExitStack() as stack:
         trusted_alias: _TrustedDirectoryAlias | None = None
         if alias_spec is not None:
@@ -9006,10 +9025,6 @@ def _bind_live_safe_destination_parent(
                 requested_destination,
                 live_containers,
             )
-            _assert_snapshot_destination_lexically_outside_live_containers(
-                canonical_destination,
-                live_containers,
-            )
             alias_receipt = (
                 _verify_trusted_directory_alias(
                     trusted_alias,
@@ -9055,8 +9070,8 @@ def _bind_live_safe_destination_parent(
                 "protected_properties": {
                     "object_identity": ["device", "inode", "file_type"],
                     "location_scope": (
-                        "normalized-lexical-bidirectional-and-descriptor-ancestor-"
-                        "exclusion"
+                        "normalized-requested-and-canonical-alias-forms-"
+                        "bidirectional-and-descriptor-ancestor-exclusion"
                     ),
                     "access_policy": ["mode", "uid", "gid", "flags"],
                     "trusted_alias": (
