@@ -11412,6 +11412,71 @@ raise SystemExit(2)
                 self._validate_snapshot(Path(snapshot["dest"]))
         self._assert_safety_code("snapshot-content-mismatch", raised)
 
+    def test_snapshot_manifest_rejects_non_string_basenames_across_api_and_cli(
+        self,
+    ) -> None:
+        malformed_basenames = (
+            ("list", []),
+            ("object", {}),
+            ("null", None),
+            ("bool", True),
+        )
+        for label, malformed_basename in malformed_basenames:
+            with self.subTest(kind=label):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    paths = self._make_paths(root)
+                    self._create_db(
+                        paths.group_container / MODULE.NOTE_STORE_MAIN,
+                    )
+                    with mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ):
+                        snapshot = self._copy_db(
+                            paths,
+                            dest=root / "snapshot",
+                            require_notes_quit=True,
+                        )
+                    snapshot_dir = Path(snapshot["dest"])
+                    manifest_path = snapshot_dir / MODULE.SNAPSHOT_MANIFEST
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    manifest["files"][0]["basename"] = malformed_basename
+                    manifest_path.write_text(
+                        json.dumps(manifest),
+                        encoding="utf-8",
+                    )
+                    receipt = self._reanchor_manifest_for_test(
+                        snapshot_dir,
+                        artifact_kind="snapshot",
+                    )
+
+                    with self.assertRaises(MODULE.StoreSafetyError) as api_raised:
+                        MODULE.validate_snapshot(snapshot_dir, receipt)
+                    self._assert_safety_code("manifest-invalid", api_raised)
+
+                    receipt_file = root / "snapshot-receipt.json"
+                    receipt_file.write_text(
+                        json.dumps(receipt),
+                        encoding="utf-8",
+                    )
+                    stdout = io.StringIO()
+                    with redirect_stdout(stdout):
+                        return_code = MODULE.main(
+                            [
+                                "validate-snapshot",
+                                "--snapshot-dir",
+                                str(snapshot_dir),
+                                "--manifest-creation-receipt-file",
+                                str(receipt_file),
+                            ]
+                        )
+                    cli_payload = json.loads(stdout.getvalue())
+
+                self.assertEqual(return_code, 1)
+                self.assertEqual(cli_payload["error_code"], "manifest-invalid")
+
     def test_creators_return_exact_external_manifest_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

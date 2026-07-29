@@ -66,6 +66,12 @@ object or child descriptors opened relative to it. No artifact consumer may reop
 pathname after the receipt load. Compare the external receipt with the descriptor-relative held
 manifest before parsing or trusting any manifest field. Reject v1/v2 manifests and missing
 receipts rather than silently deriving an anchor from current artifact bytes.
+After that anchor check, require snapshot `files` to be a non-empty JSON array of exact objects and
+validate every `basename` as an exact string in the closed NoteStore allowlist before constructing
+any set, mapping, hash key, or path from those values. A list, object, null, boolean, unsupported
+string, duplicate, or missing main database entry is stable `manifest-invalid`; never let an
+unhashable manifest value escape as `unexpected-error`, and never echo its potentially large
+representation into the error.
 
 Treat these outcomes separately:
 

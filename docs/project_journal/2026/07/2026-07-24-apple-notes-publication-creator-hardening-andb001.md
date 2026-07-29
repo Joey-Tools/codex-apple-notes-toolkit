@@ -372,3 +372,13 @@ superseded_by:
   `3.9.6` each passed all `274` tests with the single sandbox-scoped fixed
   `/usr/bin/pgrep` skip, including the final child-setup and immediate-reap
   hardening.
+- Snapshot-manifest basename follow-up base:
+  `59b1b5830990ae511c49be1fa049ae8872940081`.
+- Snapshot validation now completes exact entry-object and basename
+  string/allowlist validation before constructing a set, dictionary, hash key,
+  or path. Malformed list, object, null, and boolean basenames return stable
+  `manifest-invalid` without echoing the untrusted value.
+- Snapshot-manifest malformed-basename regressions: Python `3.13.0` and system
+  Python `3.9.6` each passed the focused API/CLI classification test and the
+  full `275`-test suite with the single sandbox-scoped fixed
+  `/usr/bin/pgrep` skip.

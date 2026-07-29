@@ -13625,24 +13625,31 @@ def _validated_snapshot_artifact(
         if (
             not isinstance(rows, list)
             or not rows
-            or any(not isinstance(row, dict) for row in rows)
+            or any(type(row) is not dict for row in rows)
         ):
             raise StoreSafetyError(
                 "manifest-invalid",
                 "Snapshot manifest has no files",
             )
-        manifest_names = [row.get("basename") for row in rows]
+        manifest_names: list[str] = []
+        for row in rows:
+            basename = row.get("basename")
+            if type(basename) is not str or basename not in NOTE_STORE_BASENAMES:
+                raise StoreSafetyError(
+                    "manifest-invalid",
+                    "Snapshot manifest has an invalid database file entry",
+                )
+            manifest_names.append(basename)
         expected_names = set(manifest_names)
         if (
             len(expected_names) != len(manifest_names)
             or NOTE_STORE_MAIN not in expected_names
-            or not expected_names.issubset(NOTE_STORE_BASENAMES)
         ):
             raise StoreSafetyError(
                 "manifest-invalid",
                 "Snapshot manifest has duplicate or unsupported database file entries",
             )
-        expected_store_types = {str(name): stat.S_IFREG for name in expected_names}
+        expected_store_types = {name: stat.S_IFREG for name in expected_names}
         store_binding = stack.enter_context(
             _bind_directory_at(
                 store_dir,
@@ -13669,13 +13676,10 @@ def _validated_snapshot_artifact(
             identity_code="snapshot-directory-identity-mismatch",
             access_policy_code="snapshot-directory-access-policy-mismatch",
         )
-        manifest_by_name = {row.get("basename"): row for row in rows}
+        manifest_by_name = {row["basename"]: row for row in rows}
         for basename, row in manifest_by_name.items():
-            expected_relative = Path("group.com.apple.notes") / str(basename)
-            if (
-                basename not in NOTE_STORE_BASENAMES
-                or Path(str(row.get("relative_path"))) != expected_relative
-            ):
+            expected_relative = Path("group.com.apple.notes") / basename
+            if Path(str(row.get("relative_path"))) != expected_relative:
                 raise StoreSafetyError(
                     "manifest-invalid",
                     f"Manifest path is not canonical for {basename}: "
