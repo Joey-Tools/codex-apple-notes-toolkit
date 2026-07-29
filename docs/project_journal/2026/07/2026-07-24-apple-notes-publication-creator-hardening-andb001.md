@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-24
 updated: 2026-07-30
 branch: codex/apple-db-hardening
-pr:
+pr: https://github.com/Joey-Tools/codex-apple-notes-toolkit/pull/3
 supersedes: []
 superseded_by:
 ---
@@ -57,6 +57,10 @@ superseded_by:
   commands now use the packaged supervisor; copied-snapshot merges stay
   outside the snapshot; a late Notes restart quarantines the exact published
   object before any writeback-grade success result.
+- Closed the final source-open and quarantine-reporting review gaps: access
+  policy remains bound to the pre-open observation across descriptor and
+  descriptor-relative pathname checks, and nested Notes probe evidence cannot
+  upgrade an unverified namespace move to a verified quarantine.
 
 ## Current State
 
@@ -140,6 +144,15 @@ superseded_by:
   directory context's final exit. Missing, permission, other stat, proved
   identity, and proved access-policy failures in that final window remain
   stable `source-*` classifications for fingerprint, copy, and merge.
+- Bound source files compare the pre-open pathname, opened descriptor, and
+  immediate post-open pathname for object identity and access policy before
+  hashing. Tests cover mode, UID, GID, protected-flag, and post-`fstat`
+  pathname-only drift while preserving benign metadata transitions.
+- Post-publication Notes checks now retain the terminal state proved by the
+  quarantine attempt after merging nested probe details. Only a complete
+  parent-durability, directory-policy, tree-receipt, and public-alias proof can
+  report `quarantined` / `retained`; incomplete namespace moves remain
+  `namespace-moved-unverified` / `inconclusive`.
 
 ## Next Steps
 
@@ -161,6 +174,15 @@ superseded_by:
 - Formal single-review follow-up base: `06b45f4eb3ab01027eb1d70314196b0ff74f0083`
 - Final formal-review follow-up base: `6590340811403af7b796b61dea5bb4a824fac2fc`
 - Final safety-resumption base: `95ec4d293179c59c9ea10934fef454f9a9d744a6`
+- Source-open/quarantine terminal-state follow-up base:
+  `9bbac3abae3f58581dde2b7e1736df70fed3ac2b`
+- Source-open/quarantine focused regressions: Python `3.13.0`,
+  `python3 -B -m unittest <seven focused test cases>` (`7` tests passed).
+- Source-open/quarantine full suite: Python `3.13.0`,
+  `python3 -B -m unittest tests.test_apple_notes_helper` (`304` tests passed,
+  `2` skipped, `36.461s`).
+- Source-open/quarantine static gates: Ruff check and format check over both
+  changed Python files, `python3 -B -m py_compile`, and `git diff --check`.
 - Hosted Linux failure evidence: GitHub Actions run `30126900959`, job `89592422565`, head `48e0869ca19f7b905ebbfbbd7cf0dcd9a4e271fc` (`182` `unable to open database file` occurrences rooted at anonymous descriptor URI consumption)
 - Targeted adversarial tests: `python3 -m unittest <eight focused test cases>` (`8` tests passed)
 - Supervisor/malformed-result tests: `python3 -m unittest <four focused test cases>` (`4` tests passed)

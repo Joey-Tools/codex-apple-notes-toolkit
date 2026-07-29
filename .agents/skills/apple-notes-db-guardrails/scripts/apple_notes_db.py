@@ -2901,6 +2901,8 @@ def _post_publication_notes_quit_check(
         if probe_error is not None
         else "Notes.app started before the published snapshot could be accepted"
     )
+    terminal_artifact_state = "uncertain"
+    terminal_cleanup_state = "inconclusive"
     try:
         quarantine = _quarantine_published_snapshot(
             binding,
@@ -2908,6 +2910,8 @@ def _post_publication_notes_quit_check(
             publication_receipt=publication_receipt,
             descriptor_tree_receipt_builder=descriptor_tree_receipt_builder,
         )
+        terminal_artifact_state = "quarantined"
+        terminal_cleanup_state = "retained"
         details: dict[str, Any] = {
             "mutation_performed": True,
             "publication_state": "committed",
@@ -2937,9 +2941,25 @@ def _post_publication_notes_quit_check(
                 "quarantine_error": str(quarantine_error),
             },
         )
+        reported_artifact_state = details.get("artifact_publication_state")
+        terminal_artifact_state = (
+            reported_artifact_state
+            if isinstance(reported_artifact_state, str)
+            else "uncertain"
+        )
     if probe_error is not None:
         details = _merge_recovery_details(details, probe_error.details)
         details["notes_probe_error_code"] = probe_error.code
+    # These are terminal properties of the quarantine attempt. Nested Notes
+    # probe details must neither upgrade an incomplete namespace move nor
+    # weaken a verified quarantine receipt.
+    details["mutation_performed"] = True
+    details["publication_state"] = "committed"
+    details["artifact_publication_state"] = terminal_artifact_state
+    details["cleanup_state"] = terminal_cleanup_state
+    details["retry_safe"] = False
+    details["writeback_grade"] = False
+    details["successful_creation_receipt_emitted"] = False
     error = StoreSafetyError(
         primary_code,
         primary_message,

@@ -52,13 +52,20 @@ COMPATIBILITY_SCRIPT = REPO_ROOT / "scripts/apple_notes_helper.py"
 HOT_JOURNAL_FIXTURE = REPO_ROOT / "tests/create_hot_rollback_journal.py"
 
 
-class _StatWithFlags:
-    def __init__(self, value: os.stat_result, flags: int) -> None:
+class _StatWithOverrides:
+    def __init__(self, value: os.stat_result, **overrides: int) -> None:
         self._value = value
-        self.st_flags = flags
+        self._overrides = overrides
 
     def __getattr__(self, name: str) -> object:
+        if name in self._overrides:
+            return self._overrides[name]
         return getattr(self._value, name)
+
+
+class _StatWithFlags(_StatWithOverrides):
+    def __init__(self, value: os.stat_result, flags: int) -> None:
+        super().__init__(value, st_flags=flags)
 
 
 @contextmanager
@@ -6193,6 +6200,169 @@ raise SystemExit(2)
                 os.fstat(opened_source_fd)
             self.assertEqual(closed.exception.errno, errno.EBADF)
 
+    def test_bound_source_file_rejects_ownership_drift_across_open_boundary(
+        self,
+    ) -> None:
+        for attribute in ("st_uid", "st_gid"):
+            with (
+                self.subTest(attribute=attribute),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                source = root / MODULE.NOTE_STORE_MAIN
+                self._create_db(source)
+
+                with MODULE._bind_existing_directory_with_trusted_alias(root) as parent:
+                    original_open = MODULE.os.open
+                    original_fstat = MODULE.os.fstat
+                    original_stat = MODULE.os.stat
+                    opened_source_fd: int | None = None
+
+                    def observe_source_open(
+                        target: object,
+                        flags: int,
+                        mode: int = 0o777,
+                        *,
+                        dir_fd: int | None = None,
+                    ) -> int:
+                        nonlocal opened_source_fd
+                        fd = original_open(target, flags, mode, dir_fd=dir_fd)
+                        if dir_fd == parent.fd and os.fspath(target) == source.name:
+                            opened_source_fd = fd
+                        return fd
+
+                    def source_fstat_with_drift(fd: int) -> os.stat_result:
+                        observed = original_fstat(fd)
+                        if fd == opened_source_fd:
+                            return _StatWithOverrides(
+                                observed,
+                                **{attribute: getattr(observed, attribute) + 1},
+                            )
+                        return observed
+
+                    def source_stat_with_drift(
+                        target: object,
+                        *args: object,
+                        **kwargs: object,
+                    ) -> os.stat_result:
+                        observed = original_stat(target, *args, **kwargs)
+                        if (
+                            opened_source_fd is not None
+                            and kwargs.get("dir_fd") == parent.fd
+                            and os.fspath(target) == source.name
+                        ):
+                            return _StatWithOverrides(
+                                observed,
+                                **{attribute: getattr(observed, attribute) + 1},
+                            )
+                        return observed
+
+                    with (
+                        mock.patch.object(
+                            MODULE.os,
+                            "open",
+                            side_effect=observe_source_open,
+                        ),
+                        mock.patch.object(
+                            MODULE.os,
+                            "fstat",
+                            side_effect=source_fstat_with_drift,
+                        ),
+                        mock.patch.object(
+                            MODULE.os,
+                            "stat",
+                            side_effect=source_stat_with_drift,
+                        ),
+                        mock.patch.object(MODULE, "_hash_fd") as hash_fd,
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        with MODULE._bind_regular_file_at(
+                            source,
+                            parent,
+                            MODULE.SOURCE_FILE_CODES,
+                        ):
+                            self.fail("source ownership drift across open was accepted")
+
+                self._assert_safety_code(
+                    "source-access-policy-mismatch",
+                    raised,
+                )
+                hash_fd.assert_not_called()
+                self.assertIsNotNone(opened_source_fd)
+                assert opened_source_fd is not None
+                with self.assertRaises(OSError) as closed:
+                    os.fstat(opened_source_fd)
+                self.assertEqual(closed.exception.errno, errno.EBADF)
+
+    def test_bound_source_file_rejects_path_policy_drift_after_opened_fstat(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            source.chmod(0o600)
+
+            with MODULE._bind_existing_directory_with_trusted_alias(root) as parent:
+                original_open = MODULE.os.open
+                original_fstat = MODULE.os.fstat
+                opened_source_fd: int | None = None
+                mutated = False
+
+                def observe_source_open(
+                    target: object,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal opened_source_fd
+                    fd = original_open(target, flags, mode, dir_fd=dir_fd)
+                    if dir_fd == parent.fd and os.fspath(target) == source.name:
+                        opened_source_fd = fd
+                    return fd
+
+                def mutate_after_opened_fstat(fd: int) -> os.stat_result:
+                    nonlocal mutated
+                    observed = original_fstat(fd)
+                    if fd == opened_source_fd and not mutated:
+                        os.fchmod(fd, 0o640)
+                        mutated = True
+                    return observed
+
+                with (
+                    mock.patch.object(
+                        MODULE.os,
+                        "open",
+                        side_effect=observe_source_open,
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "fstat",
+                        side_effect=mutate_after_opened_fstat,
+                    ),
+                    mock.patch.object(MODULE, "_hash_fd") as hash_fd,
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    with MODULE._bind_regular_file_at(
+                        source,
+                        parent,
+                        MODULE.SOURCE_FILE_CODES,
+                    ):
+                        self.fail(
+                            "source path policy drift after opened fstat was accepted"
+                        )
+
+            self._assert_safety_code("source-access-policy-mismatch", raised)
+            self.assertTrue(mutated)
+            hash_fd.assert_not_called()
+            self.assertEqual(stat.S_IMODE(source.stat().st_mode), 0o640)
+            self.assertIsNotNone(opened_source_fd)
+            assert opened_source_fd is not None
+            with self.assertRaises(OSError) as closed:
+                os.fstat(opened_source_fd)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+
     def test_bound_source_file_rejects_protected_flag_drift_across_open_boundary(
         self,
     ) -> None:
@@ -8200,21 +8370,43 @@ raise SystemExit(2)
             (
                 "directory-policy",
                 "post-rename-directory-revalidation",
+                True,
+                "notes-started-during-capture",
             ),
             (
                 "parent-durability",
                 "post-rename-parent-durability",
+                True,
+                "notes-started-during-capture",
             ),
             (
                 "tree-receipt",
                 "post-rename-tree-receipt",
+                True,
+                "notes-started-during-capture",
             ),
             (
                 "public-alias",
                 "post-rename-public-alias",
+                True,
+                "notes-started-during-capture",
+            ),
+            (
+                "parent-durability-conflicting-probe-details",
+                "post-rename-parent-durability",
+                MODULE.StoreSafetyError(
+                    "notes-state-unknown",
+                    "simulated final Notes process-state failure",
+                    details={
+                        "artifact_publication_state": "quarantined",
+                        "cleanup_state": "retained",
+                        "probe_phase": "simulated-conflict",
+                    },
+                ),
+                "notes-state-unknown",
             ),
         )
-        for failure, expected_phase in cases:
+        for failure, expected_phase, final_probe, expected_code in cases:
             with (
                 self.subTest(failure=failure),
                 tempfile.TemporaryDirectory() as temp_dir,
@@ -8272,7 +8464,10 @@ raise SystemExit(2)
                     access_policy_code: str,
                     inconclusive_code: str,
                 ) -> None:
-                    if failure == "parent-durability" and quarantine_rename_returned:
+                    if (
+                        failure.startswith("parent-durability")
+                        and quarantine_rename_returned
+                    ):
                         raise MODULE.StoreSafetyError(
                             inconclusive_code,
                             "simulated quarantine parent fsync failure",
@@ -8317,7 +8512,7 @@ raise SystemExit(2)
                     mock.patch.object(
                         MODULE,
                         "notes_is_running",
-                        side_effect=[False, False, False, True],
+                        side_effect=[False, False, False, final_probe],
                     ),
                     mock.patch.object(
                         MODULE,
@@ -8352,7 +8547,7 @@ raise SystemExit(2)
                         require_notes_quit=True,
                     )
 
-                self._assert_safety_code("notes-started-during-capture", raised)
+                self._assert_safety_code(expected_code, raised)
                 self.assertTrue(quarantine_rename_returned)
                 self.assertFalse(destination.exists())
                 quarantines = list(root.glob(".snapshot.notes-started-quarantine-*"))
