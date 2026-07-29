@@ -38,8 +38,14 @@ Protect five properties independently:
 For the snapshot store directory and patch-stage directory, bind object identity and access policy
 in the same way. Treat the complete no-follow entry name/type map as directory content: an extra
 directory, FIFO, socket, device, or symlink—including a broken symlink—is a file-set mismatch.
-Scan the directory twice through opened descriptors. Do not infer mutation from directory `mtime`
-alone when identity, access policy, and both name/type scans remain stable.
+Give each scan the exact small expected raw-name namespace. Reject the first
+unexpected raw name before calling `stat` or retaining it. Each pass has a
+hard limit of 64 entries and 4 KiB of aggregate raw name bytes; reject
+duplicate raw names, decoded-name collisions, invalid round trips, and any
+limit overflow as a file-set mismatch. Scan the directory twice through opened
+descriptors and compare both raw-name/type and decoded-name/type maps. Do not
+infer mutation from directory `mtime` alone when identity, access policy, and
+both bounded scans remain stable.
 At every point in those scans, translate lower prepared-directory identity, access-policy,
 membership, and revalidation failures into the exact snapshot or patch-stage codes selected by the
 caller. Generic `directory-*` or `prepared-directory-*` codes must not escape an artifact-specific
@@ -355,6 +361,11 @@ Construct both live-container inputs as lexical absolute paths against one
 captured working directory before the guard starts. Never re-resolve a relative
 container after preflight; the fixed paths are the only values persisted in
 `source_root`, returned as `live_source_root`, or used for equality.
+For `merge-db` and `stage-patch`, the public API and CLI boundary uses that
+same one-shot rule for `src` and every output path, including the optional
+stage result file. Freeze them before any destination preflight and use the
+frozen source in manifests and terminal results. A CWD change after preflight
+must not retarget the database that can later reach writeback.
 Compare the complete cross-product with case-folded NFD path components and reject either direction
 of normalized ancestor/descendant overlap before binding a component or invoking the directory
 creator. Thus an absent `/tmp/live` protects `/private/tmp/live/...`, and an absent

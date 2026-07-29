@@ -6281,6 +6281,198 @@ raise SystemExit(2)
                         os.close(artifact_fd)
                         os.close(parent_fd)
 
+    def test_bound_directory_scan_rejects_large_extra_sets_before_stat(
+        self,
+    ) -> None:
+        class UnexpectedEntry:
+            def __init__(self, name: str, owner: ManyUnexpectedEntries) -> None:
+                self.name = name
+                self._owner = owner
+
+            def stat(self, *, follow_symlinks: bool) -> os.stat_result:
+                self._owner.stat_calls += 1
+                raise AssertionError("unexpected entries must be rejected before stat")
+
+        class ManyUnexpectedEntries:
+            def __init__(self, total: int) -> None:
+                self.total = total
+                self.yielded = 0
+                self.stat_calls = 0
+
+            def __enter__(self) -> ManyUnexpectedEntries:
+                return self
+
+            def __exit__(
+                self,
+                exc_type: object,
+                exc: object,
+                traceback: object,
+            ) -> None:
+                return None
+
+            def __iter__(self) -> ManyUnexpectedEntries:
+                return self
+
+            def __next__(self) -> UnexpectedEntry:
+                if self.yielded >= self.total:
+                    raise StopIteration
+                name = f"unexpected-{self.yielded:08d}"
+                self.yielded += 1
+                return UnexpectedEntry(name, self)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            simulated = ManyUnexpectedEntries(
+                MODULE.BOUND_DIRECTORY_SCAN_MAX_ENTRIES * 1024
+            )
+            with (
+                MODULE._bind_existing_directory_with_trusted_alias(
+                    directory
+                ) as binding,
+                mock.patch.object(
+                    MODULE.os,
+                    "scandir",
+                    return_value=simulated,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._scan_bound_directory_entry_types(
+                    binding,
+                    {"expected-member"},
+                )
+
+        self._assert_safety_code("prepared-file-set-mismatch", raised)
+        self.assertEqual(simulated.yielded, 1)
+        self.assertEqual(simulated.stat_calls, 0)
+
+    def test_bound_directory_scan_caps_entries_and_raw_name_bytes(self) -> None:
+        too_many_names = {
+            f"entry-{index}"
+            for index in range(MODULE.BOUND_DIRECTORY_SCAN_MAX_ENTRIES + 1)
+        }
+        long_names = {f"{index:02d}-{'é' * 100}" for index in range(24)}
+        self.assertLess(
+            sum(len(name) for name in long_names),
+            MODULE.BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES,
+        )
+        self.assertGreater(
+            sum(len(os.fsencode(name)) for name in long_names),
+            MODULE.BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES,
+        )
+
+        for label, names, detail_key in (
+            ("entry-count", too_many_names, "entry_limit"),
+            ("raw-name-bytes", long_names, "raw_name_bytes_limit"),
+        ):
+            with (
+                self.subTest(limit=label),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                directory = Path(temp_dir)
+                with (
+                    MODULE._bind_existing_directory_with_trusted_alias(
+                        directory
+                    ) as binding,
+                    mock.patch.object(
+                        MODULE.os,
+                        "scandir",
+                        side_effect=AssertionError(
+                            "oversized expected sets must fail before scanning"
+                        ),
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE._scan_bound_directory_entry_types(binding, names)
+                self._assert_safety_code(
+                    "prepared-file-set-mismatch",
+                    raised,
+                )
+                self.assertIn(detail_key, raised.exception.details)
+
+    def test_bound_directory_scan_preserves_raw_names_and_rejects_collisions(
+        self,
+    ) -> None:
+        class RawEntry:
+            def __init__(
+                self,
+                name: bytes,
+                observed: os.stat_result,
+            ) -> None:
+                self.name = name
+                self._observed = observed
+                self.stat_calls = 0
+
+            def stat(self, *, follow_symlinks: bool) -> os.stat_result:
+                self.stat_calls += 1
+                if follow_symlinks:
+                    raise AssertionError("raw entry stat followed a symlink")
+                return self._observed
+
+        class RawScandir:
+            def __init__(self, entries: list[RawEntry]) -> None:
+                self._entries = entries
+
+            def __enter__(self) -> Iterator[RawEntry]:
+                return iter(self._entries)
+
+            def __exit__(
+                self,
+                exc_type: object,
+                exc: object,
+                traceback: object,
+            ) -> None:
+                return None
+
+        raw_name = b"\xff-member"
+        decoded_name = os.fsdecode(raw_name)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            member = directory / "stat-source"
+            member.write_bytes(b"member")
+            observed = member.stat()
+            scans = [
+                RawScandir([RawEntry(raw_name, observed)]),
+                RawScandir([RawEntry(raw_name, observed)]),
+            ]
+            with (
+                MODULE._bind_existing_directory_with_trusted_alias(
+                    directory
+                ) as binding,
+                mock.patch.object(
+                    MODULE.os,
+                    "scandir",
+                    side_effect=scans,
+                ),
+            ):
+                entries = MODULE._scan_bound_directory_entry_types(
+                    binding,
+                    {decoded_name},
+                )
+            self.assertEqual(entries, {decoded_name: stat.S_IFREG})
+
+            duplicate_entries = [
+                RawEntry(raw_name, observed),
+                RawEntry(raw_name, observed),
+            ]
+            with (
+                MODULE._bind_existing_directory_with_trusted_alias(
+                    directory
+                ) as binding,
+                mock.patch.object(
+                    MODULE.os,
+                    "scandir",
+                    return_value=RawScandir(duplicate_entries),
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE._scan_bound_directory_entry_types(
+                    binding,
+                    {decoded_name},
+                )
+            self._assert_safety_code("prepared-file-set-mismatch", raised)
+            self.assertEqual(duplicate_entries[0].stat_calls, 1)
+            self.assertEqual(duplicate_entries[1].stat_calls, 0)
+
     def test_copy_db_does_not_use_path_reopening_validation_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -12629,6 +12821,213 @@ raise SystemExit(2)
                 )
             finally:
                 os.chdir(previous_cwd)
+
+    def test_stage_patch_freezes_relative_paths_before_preflight_cwd_change(
+        self,
+    ) -> None:
+        for interface in ("api", "cli"):
+            with (
+                self.subTest(interface=interface),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                source_cwd = root / "source-cwd"
+                other_cwd = root / "other-cwd"
+                source_cwd.mkdir()
+                other_cwd.mkdir()
+                for cwd in (source_cwd, other_cwd):
+                    (cwd / "group").mkdir()
+                    (cwd / "app").mkdir()
+                self._create_db(
+                    source_cwd / "edited.sqlite",
+                    value="frozen-edited-source",
+                )
+                self._create_db(
+                    other_cwd / "edited.sqlite",
+                    value="wrong-edited-source",
+                )
+                previous_cwd = Path.cwd()
+                try:
+                    os.chdir(source_cwd)
+                    frozen_cwd = Path.cwd()
+                    if interface == "api":
+                        paths = MODULE.NoteStorePaths(
+                            group_container=Path("group"),
+                            app_container=Path("app"),
+                        )
+                        original_preflight = MODULE._bind_live_safe_destination_parent
+
+                        @contextmanager
+                        def change_api_cwd_after_preflight(
+                            *args: object,
+                            **kwargs: object,
+                        ) -> Iterator[MODULE._LiveDestinationScope]:
+                            with original_preflight(*args, **kwargs) as scope:
+                                os.chdir(other_cwd)
+                                yield scope
+
+                        with mock.patch.object(
+                            MODULE,
+                            "_bind_live_safe_destination_parent",
+                            side_effect=change_api_cwd_after_preflight,
+                        ):
+                            result = self._stage_patch(
+                                Path("edited.sqlite"),
+                                Path("stage"),
+                                paths=paths,
+                            )
+                        result_file = None
+                    else:
+                        original_preflight = MODULE._preflight_creator_destinations
+
+                        @contextmanager
+                        def change_cli_cwd_after_preflight(
+                            *args: object,
+                            **kwargs: object,
+                        ) -> Iterator[MODULE._CreatorDestinationPreflights]:
+                            with original_preflight(*args, **kwargs) as preflights:
+                                os.chdir(other_cwd)
+                                yield preflights
+
+                        stdout = io.StringIO()
+                        with (
+                            mock.patch.object(
+                                MODULE,
+                                "_preflight_creator_destinations",
+                                side_effect=change_cli_cwd_after_preflight,
+                            ),
+                            redirect_stdout(stdout),
+                        ):
+                            return_code = MODULE.main(
+                                [
+                                    "stage-patch",
+                                    "--src",
+                                    "edited.sqlite",
+                                    "--dest",
+                                    "stage",
+                                    "--result-file",
+                                    "stage-result.json",
+                                    "--group-container",
+                                    "group",
+                                    "--app-container",
+                                    "app",
+                                ]
+                            )
+                        result = json.loads(stdout.getvalue())
+                        self.assertEqual(return_code, 0, result)
+                        result_file = frozen_cwd / "stage-result.json"
+
+                    stage_dir = frozen_cwd / "stage"
+                    manifest = json.loads(
+                        (stage_dir / MODULE.PATCH_MANIFEST).read_text(encoding="utf-8")
+                    )
+                    with closing(
+                        sqlite3.connect(stage_dir / MODULE.NOTE_STORE_MAIN)
+                    ) as connection:
+                        value = connection.execute(
+                            "SELECT value FROM sample"
+                        ).fetchone()[0]
+                    self.assertEqual(value, "frozen-edited-source")
+                    self.assertEqual(
+                        Path(manifest["source_db"]),
+                        frozen_cwd / "edited.sqlite",
+                    )
+                    self.assertEqual(Path(result["stage_dir"]), stage_dir)
+                    self.assertFalse((other_cwd / "stage").exists())
+                    if result_file is not None:
+                        persisted = json.loads(result_file.read_text(encoding="utf-8"))
+                        self.assertEqual(Path(persisted["stage_dir"]), stage_dir)
+                        self.assertFalse((other_cwd / "stage-result.json").exists())
+                finally:
+                    os.chdir(previous_cwd)
+
+    def test_merge_db_freezes_relative_paths_before_preflight_cwd_change(
+        self,
+    ) -> None:
+        for interface in ("api", "cli"):
+            with (
+                self.subTest(interface=interface),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                source_cwd = root / "source-cwd"
+                other_cwd = root / "other-cwd"
+                source_cwd.mkdir()
+                other_cwd.mkdir()
+                for cwd in (source_cwd, other_cwd):
+                    (cwd / "group").mkdir()
+                    (cwd / "app").mkdir()
+                self._create_db(
+                    source_cwd / "source.sqlite",
+                    value="frozen-merge-source",
+                )
+                self._create_db(
+                    other_cwd / "source.sqlite",
+                    value="wrong-merge-source",
+                )
+                previous_cwd = Path.cwd()
+                try:
+                    os.chdir(source_cwd)
+                    frozen_cwd = Path.cwd()
+                    original_preflight = MODULE._bind_live_safe_destination_parent
+
+                    @contextmanager
+                    def change_cwd_after_preflight(
+                        *args: object,
+                        **kwargs: object,
+                    ) -> Iterator[MODULE._LiveDestinationScope]:
+                        with original_preflight(*args, **kwargs) as scope:
+                            os.chdir(other_cwd)
+                            yield scope
+
+                    with mock.patch.object(
+                        MODULE,
+                        "_bind_live_safe_destination_parent",
+                        side_effect=change_cwd_after_preflight,
+                    ):
+                        if interface == "api":
+                            paths = MODULE.NoteStorePaths(
+                                group_container=Path("group"),
+                                app_container=Path("app"),
+                            )
+                            result = MODULE.merge_db(
+                                Path("source.sqlite"),
+                                Path("merged.sqlite"),
+                                paths=paths,
+                            )
+                        else:
+                            stdout = io.StringIO()
+                            with redirect_stdout(stdout):
+                                return_code = MODULE.main(
+                                    [
+                                        "merge-db",
+                                        "--src",
+                                        "source.sqlite",
+                                        "--out",
+                                        "merged.sqlite",
+                                        "--group-container",
+                                        "group",
+                                        "--app-container",
+                                        "app",
+                                    ]
+                                )
+                            result = json.loads(stdout.getvalue())
+                            self.assertEqual(return_code, 0, result)
+
+                    output = frozen_cwd / "merged.sqlite"
+                    with closing(sqlite3.connect(output)) as connection:
+                        value = connection.execute(
+                            "SELECT value FROM sample"
+                        ).fetchone()[0]
+                    self.assertEqual(value, "frozen-merge-source")
+                    self.assertEqual(
+                        Path(result["source_db"]),
+                        frozen_cwd / "source.sqlite",
+                    )
+                    self.assertEqual(Path(result["merged_db"]), output)
+                    self.assertFalse((other_cwd / "merged.sqlite").exists())
+                finally:
+                    os.chdir(previous_cwd)
 
     def test_artifact_swap_between_receipt_load_and_consumption_is_rejected(
         self,

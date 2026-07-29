@@ -408,3 +408,25 @@ superseded_by:
   Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
   `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
   `git diff --check`.
+- Stage/merge path-freeze and bounded-directory-scan follow-up base:
+  `638c58986174a3033b464bf6db5c635a60c7800a`.
+- `merge-db` and `stage-patch` now capture one CWD at each public API boundary
+  and freeze the source plus every output before destination preflight. Their
+  CLI adapters capture once before parsing/dispatch and pass absolute source,
+  artifact, result-file, and live-container paths into the APIs. Manifests and
+  result payloads use only the frozen paths.
+- Prepared and artifact directory scans receive a small expected raw-name
+  namespace before enumeration. The first unexpected name fails before
+  per-entry `stat`; expected and observed scans each have 64-entry and 4-KiB
+  aggregate raw-name limits, reject duplicate/raw-decoded collisions, and
+  compare raw-name/type plus decoded-name/type maps across both passes.
+- Focused regressions: Python `3.13.0` and system Python `3.9.6` each passed
+  five tests covering API/CLI stage and merge CWD changes after preflight,
+  early rejection of a simulated 65,536-entry extra set, entry/raw-name byte
+  limits, surrogate-escaped raw names, and duplicate collision rejection.
+- Full regressions: Python `3.13.0` and system Python `3.9.6` each passed all
+  `285` tests with the single sandbox-scoped fixed `/usr/bin/pgrep` skip.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.

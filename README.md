@@ -84,6 +84,9 @@ root and every derived member, so relative paths cannot split parent authority.
 The API path object and CLI adapter likewise freeze both live-container inputs
 against one captured working directory before preflight, manifest generation,
 or later equality checks.
+`merge-db` and `stage-patch` also freeze their source and all output paths from
+one API/CLI-entry CWD snapshot before destination preflight; stage manifests
+and creator result files record only those frozen paths.
 Notes process-state checks use fixed `/usr/bin/pgrep`, a minimal environment,
 a hard deadline, process-group cleanup, and a closed fail-unknown result matrix.
 The first action after a no-replace rename returns, or after an error path
@@ -92,7 +95,10 @@ Post-publication ordinary failures—including failures while constructing
 terminal recovery evidence—therefore retain descriptor-bound, non-retryable
 uncertain-state evidence. Snapshot sidecar and SQLite validation reuse the
 capture-bound file descriptors, and uncertain directory publication records
-an exact descriptor-bound tree receipt. `merge-db` retains the legacy
+an exact descriptor-bound tree receipt. Prepared and artifact directory scans
+reject names outside the small expected namespace before per-entry metadata
+reads, enforce 64-entry and 4-KiB aggregate raw-name limits, and compare
+raw-name/type maps across both passes. `merge-db` retains the legacy
 `merged_db` JSON key alongside `standalone_db`. The toolkit does not mutate
 the live Notes store.
 

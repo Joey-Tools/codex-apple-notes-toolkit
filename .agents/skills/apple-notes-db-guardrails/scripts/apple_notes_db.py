@@ -21,7 +21,7 @@ import sys
 import tempfile
 import unicodedata
 import uuid
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -51,6 +51,8 @@ CHUNK_SIZE = 1024 * 1024
 MANIFEST_MAX_BYTES = 4 * 1024 * 1024
 MANIFEST_JSON_MAX_DEPTH = 64
 MANIFEST_JSON_MAX_INTEGER_DIGITS = 128
+BOUND_DIRECTORY_SCAN_MAX_ENTRIES = 64
+BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES = 4 * 1024
 WAL_MAGIC_NUMBERS = {0x377F0682, 0x377F0683}
 WAL_VERSION = 3007000
 RENAME_NOREPLACE = 1
@@ -1327,10 +1329,16 @@ def _bound_directory_basename(binding: _BoundDirectory) -> str:
     return binding.namespace_basename or binding.path.name
 
 
+def _absolute_path_from_cwd(path: Path, cwd: str) -> Path:
+    """Freeze one public path lexically against an already captured CWD."""
+
+    return Path(os.path.normpath(os.path.join(cwd, os.fspath(path))))
+
+
 def _absolute_path(path: Path) -> Path:
     """Normalize one public path lexically without following filesystem aliases."""
 
-    return Path(os.path.abspath(os.fspath(path)))
+    return _absolute_path_from_cwd(path, os.getcwd())
 
 
 def _optional_absolute_path(path: Path | None) -> Path | None:
@@ -3247,8 +3255,89 @@ def _bind_regular_file(
 
 def _scan_bound_directory_entry_types(
     binding: _BoundDirectory,
+    expected_names: Collection[str],
 ) -> dict[str, int]:
+    if isinstance(expected_names, (str, bytes, bytearray)) or not isinstance(
+        expected_names,
+        Collection,
+    ):
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "The expected recovery-directory namespace is not a bounded "
+            "collection of names",
+        )
+    if len(expected_names) > BOUND_DIRECTORY_SCAN_MAX_ENTRIES:
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "The expected recovery-directory entry set exceeds the bounded "
+            f"entry limit ({BOUND_DIRECTORY_SCAN_MAX_ENTRIES})",
+            details={
+                "entry_limit": BOUND_DIRECTORY_SCAN_MAX_ENTRIES,
+                "expected_entries": len(expected_names),
+            },
+        )
+    expected_by_raw_name: dict[bytes, str] = {}
+    expected_entry_count = 0
+    expected_raw_name_bytes = 0
+    for expected_name in expected_names:
+        expected_entry_count += 1
+        if expected_entry_count > BOUND_DIRECTORY_SCAN_MAX_ENTRIES:
+            raise StoreSafetyError(
+                "prepared-file-set-mismatch",
+                "The expected recovery-directory entry set exceeds the bounded "
+                f"entry limit ({BOUND_DIRECTORY_SCAN_MAX_ENTRIES})",
+                details={
+                    "entry_limit": BOUND_DIRECTORY_SCAN_MAX_ENTRIES,
+                    "expected_entries": expected_entry_count,
+                },
+            )
+        if type(expected_name) is not str:
+            raise StoreSafetyError(
+                "prepared-file-set-mismatch",
+                "The expected recovery-directory entry set contains a non-string name",
+            )
+        try:
+            raw_name = os.fsencode(expected_name)
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise StoreSafetyError(
+                "prepared-file-set-mismatch",
+                "The expected recovery-directory entry set contains an "
+                "unencodable raw name",
+            ) from exc
+        if (
+            not raw_name
+            or b"\x00" in raw_name
+            or b"/" in raw_name
+            or raw_name in {b".", b".."}
+        ):
+            raise StoreSafetyError(
+                "prepared-file-set-mismatch",
+                "The expected recovery-directory entry set contains an invalid "
+                "raw name",
+            )
+        previous = expected_by_raw_name.get(raw_name)
+        if previous is not None and previous != expected_name:
+            raise StoreSafetyError(
+                "prepared-file-set-mismatch",
+                "The expected recovery-directory entry set contains a raw-name "
+                "encoding collision",
+            )
+        expected_by_raw_name[raw_name] = expected_name
+        expected_raw_name_bytes += len(raw_name)
+        if expected_raw_name_bytes > BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES:
+            raise StoreSafetyError(
+                "prepared-file-set-mismatch",
+                "The expected recovery-directory entry set exceeds the bounded "
+                "raw name-byte limit "
+                f"({BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES})",
+                details={
+                    "raw_name_bytes_limit": BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES,
+                    "expected_raw_name_bytes": expected_raw_name_bytes,
+                },
+            )
+
     scans: list[dict[str, int]] = []
+    raw_scans: list[dict[bytes, int]] = []
     for _ in range(2):
         child_fd: int | None = None
         try:
@@ -3274,8 +3363,70 @@ def _scan_bound_directory_entry_types(
                 )
             with os.scandir(child_fd) as entries:
                 scan: dict[str, int] = {}
+                raw_scan: dict[bytes, int] = {}
+                decoded_to_raw_name: dict[str, bytes] = {}
+                entry_count = 0
+                raw_name_bytes = 0
                 for entry in entries:
-                    name = os.fsdecode(entry.name)
+                    entry_count += 1
+                    if entry_count > BOUND_DIRECTORY_SCAN_MAX_ENTRIES:
+                        raise StoreSafetyError(
+                            "prepared-file-set-mismatch",
+                            "Recovery-directory membership exceeds the bounded "
+                            f"entry limit ({BOUND_DIRECTORY_SCAN_MAX_ENTRIES})",
+                            details={
+                                "entry_limit": BOUND_DIRECTORY_SCAN_MAX_ENTRIES,
+                                "observed_entries": entry_count,
+                            },
+                        )
+                    try:
+                        raw_name = os.fsencode(entry.name)
+                        name = os.fsdecode(raw_name)
+                    except (TypeError, ValueError, UnicodeError) as exc:
+                        raise StoreSafetyError(
+                            "prepared-file-set-mismatch",
+                            "A recovery-directory entry has an invalid raw name",
+                        ) from exc
+                    raw_name_bytes += len(raw_name)
+                    if raw_name_bytes > BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES:
+                        raise StoreSafetyError(
+                            "prepared-file-set-mismatch",
+                            "Recovery-directory membership exceeds the bounded "
+                            "raw name-byte limit "
+                            f"({BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES})",
+                            details={
+                                "raw_name_bytes_limit": (
+                                    BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES
+                                ),
+                                "observed_raw_name_bytes": raw_name_bytes,
+                            },
+                        )
+                    expected_name = expected_by_raw_name.get(raw_name)
+                    if expected_name is None:
+                        raise StoreSafetyError(
+                            "prepared-file-set-mismatch",
+                            "Recovery-directory membership contains an entry "
+                            "outside the exact bounded expected namespace",
+                            details={
+                                "expected_entries": len(expected_by_raw_name),
+                                "observed_entries_before_rejection": entry_count,
+                            },
+                        )
+                    if name != expected_name:
+                        raise StoreSafetyError(
+                            "prepared-file-set-mismatch",
+                            "A recovery-directory entry does not round-trip to "
+                            "its expected raw name",
+                        )
+                    previous_raw_name = decoded_to_raw_name.get(name)
+                    if raw_name in raw_scan or (
+                        previous_raw_name is not None and previous_raw_name != raw_name
+                    ):
+                        raise StoreSafetyError(
+                            "prepared-file-set-mismatch",
+                            "Recovery-directory membership contains a duplicate "
+                            "or decoded-name collision",
+                        )
                     try:
                         entry_stat = entry.stat(follow_symlinks=False)
                     except FileNotFoundError as exc:
@@ -3290,7 +3441,10 @@ def _scan_bound_directory_entry_types(
                             "Cannot inspect a recovery-directory entry without "
                             f"following links: {binding.path / name}: {exc}",
                         ) from exc
-                    scan[name] = stat.S_IFMT(entry_stat.st_mode)
+                    entry_type = stat.S_IFMT(entry_stat.st_mode)
+                    decoded_to_raw_name[name] = raw_name
+                    raw_scan[raw_name] = entry_type
+                    scan[name] = entry_type
             after = os.fstat(child_fd)
             if not _same_identity(binding.opened, after):
                 raise StoreSafetyError(
@@ -3305,6 +3459,7 @@ def _scan_bound_directory_entry_types(
                     f"descriptor-relative scan: {binding.path}",
                 )
             scans.append(scan)
+            raw_scans.append(raw_scan)
         except StoreSafetyError:
             raise
         except OSError as exc:
@@ -3316,11 +3471,11 @@ def _scan_bound_directory_entry_types(
         finally:
             if child_fd is not None:
                 os.close(child_fd)
-    if scans[0] != scans[1]:
+    if scans[0] != scans[1] or raw_scans[0] != raw_scans[1]:
         raise StoreSafetyError(
             "prepared-file-set-mismatch",
-            "Recovery-directory membership changed between descriptor-relative "
-            f"scans: {binding.path}",
+            "Recovery-directory raw-name/type membership changed between "
+            f"descriptor-relative scans: {binding.path}",
         )
     return scans[1]
 
@@ -3399,7 +3554,7 @@ def _scan_exact_bound_directory_entries(
         mismatch_code=mismatch_code,
     )
     try:
-        entries = _scan_bound_directory_entry_types(binding)
+        entries = _scan_bound_directory_entry_types(binding, expected_types)
     except StoreSafetyError as exc:
         raise _translated_bound_directory_error(
             exc,
@@ -3714,7 +3869,10 @@ def _verify_bound_recovery_store(
         for basename, bound in store.files.items()
     }
     try:
-        entries = _scan_bound_directory_entry_types(store.directory)
+        entries = _scan_bound_directory_entry_types(
+            store.directory,
+            store.entry_types,
+        )
     except StoreSafetyError as exc:
         if codes is not SNAPSHOT_FILE_CODES:
             raise
@@ -3914,7 +4072,10 @@ def _bind_recovery_store_from_directory(
         )
     else:
         _verify_bound_directory(directory)
-    initial_entries = _scan_bound_directory_entry_types(directory)
+    initial_entries = _scan_bound_directory_entry_types(
+        directory,
+        creation_receipt.entry_types,
+    )
     if initial_entries != creation_receipt.entry_types:
         raise StoreSafetyError(
             "prepared-file-set-mismatch",
@@ -3959,7 +4120,7 @@ def _recovery_store_creation_receipt(
 ) -> _RecoveryStoreReceipt:
     expected_entries = {basename: stat.S_IFREG for basename in file_receipts}
     directory_receipt = _verify_bound_directory(directory)
-    entries = _scan_bound_directory_entry_types(directory)
+    entries = _scan_bound_directory_entry_types(directory, expected_entries)
     if entries != expected_entries:
         raise StoreSafetyError(
             "prepared-file-set-mismatch",
@@ -4090,7 +4251,18 @@ def _bind_recovery_store(
     os.close(parent_fd)
     parent_fd = None
     try:
-        initial_entries = _scan_bound_directory_entry_types(directory)
+        main_name = main_path.name
+        wal_name = f"{main_name}-wal"
+        shm_name = f"{main_name}-shm"
+        expected_names: Collection[str] = (
+            creation_receipt.entry_types
+            if creation_receipt is not None
+            else (main_name, wal_name, shm_name)
+        )
+        initial_entries = _scan_bound_directory_entry_types(
+            directory,
+            expected_names,
+        )
         if creation_receipt is not None:
             current_directory = _verify_bound_directory(directory)
             if current_directory["identity"] != creation_receipt.directory_identity:
@@ -4114,8 +4286,6 @@ def _bind_recovery_store(
                     "Recovery-directory membership differs from its creation "
                     f"receipt: {directory_path}",
                 )
-        main_name = main_path.name
-        wal_name = f"{main_name}-wal"
         if initial_entries.get(main_name) != stat.S_IFREG:
             code = (
                 "prepared-file-missing"
@@ -7983,7 +8153,10 @@ def _descriptor_bound_prepared_tree_receipt(
         basename=published_basename,
         display_path=root_binding.path.parent / published_basename,
     )
-    root_entries = _scan_bound_directory_entry_types(root_binding)
+    root_entries = _scan_bound_directory_entry_types(
+        root_binding,
+        root_receipt["entry_types"],
+    )
     if root_current["identity"] != root_receipt.get("identity") or root_current[
         "access_policy"
     ] != root_receipt.get("access_policy"):
@@ -8014,7 +8187,10 @@ def _descriptor_bound_prepared_tree_receipt(
             basename=relative_path.name,
             display_path=root_binding.path / relative_path,
         )
-        entries = _scan_bound_directory_entry_types(directory)
+        entries = _scan_bound_directory_entry_types(
+            directory,
+            receipt["entry_types"],
+        )
         if current["identity"] != receipt.get("identity") or current[
             "access_policy"
         ] != receipt.get("access_policy"):
@@ -14005,10 +14181,11 @@ def merge_db(
     *,
     paths: NoteStorePaths | None = None,
 ) -> dict[str, Any]:
-    requested_output = Path(
-        os.path.abspath(
-            os.fspath(out or src.with_name("NoteStore-merged-for-analysis.sqlite"))
-        )
+    cwd = os.getcwd()
+    src = _absolute_path_from_cwd(src, cwd)
+    requested_output = _absolute_path_from_cwd(
+        out or src.with_name("NoteStore-merged-for-analysis.sqlite"),
+        cwd,
     )
     publication_guard: dict[str, Any] = {}
     with (
@@ -14686,7 +14863,9 @@ def stage_patch(
     paths: NoteStorePaths | None = None,
     _destination_preflight: _LiveDestinationPreflight | None = None,
 ) -> dict[str, Any]:
-    requested_dest = Path(os.path.abspath(os.fspath(dest)))
+    cwd = os.getcwd()
+    src = _absolute_path_from_cwd(src, cwd)
+    requested_dest = _absolute_path_from_cwd(dest, cwd)
     if _lexists(requested_dest):
         raise StoreSafetyError(
             "destination-exists",
@@ -15422,10 +15601,21 @@ def query_note_tags(db_path: Path, note_title: str) -> dict[str, Any]:
     }
 
 
-def _paths_from_args(args: argparse.Namespace) -> NoteStorePaths:
+def _paths_from_args(
+    args: argparse.Namespace,
+    *,
+    cwd: str | None = None,
+) -> NoteStorePaths:
+    captured_cwd = os.getcwd() if cwd is None else cwd
     return NoteStorePaths(
-        group_container=args.group_container,
-        app_container=args.app_container,
+        group_container=_absolute_path_from_cwd(
+            args.group_container,
+            captured_cwd,
+        ),
+        app_container=_absolute_path_from_cwd(
+            args.app_container,
+            captured_cwd,
+        ),
     )
 
 
@@ -16659,6 +16849,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
+    command_cwd = os.getcwd()
     parser = build_parser()
     args = parser.parse_args(argv)
     command_stack = ExitStack()
@@ -16705,11 +16896,17 @@ def main(argv: Iterable[str] | None = None) -> int:
                         )
             emit_json(result)
         elif args.command == "merge-db":
+            merge_source = _absolute_path_from_cwd(args.src, command_cwd)
+            merge_output = _absolute_path_from_cwd(
+                args.out
+                or merge_source.with_name("NoteStore-merged-for-analysis.sqlite"),
+                command_cwd,
+            )
             emit_json(
                 merge_db(
-                    args.src,
-                    args.out,
-                    paths=_paths_from_args(args),
+                    merge_source,
+                    merge_output,
+                    paths=_paths_from_args(args, cwd=command_cwd),
                 )
             )
         elif args.command == "validate-snapshot":
@@ -16733,15 +16930,22 @@ def main(argv: Iterable[str] | None = None) -> int:
                 )
             )
         elif args.command == "stage-patch":
-            paths = _paths_from_args(args)
+            paths = _paths_from_args(args, cwd=command_cwd)
+            stage_source = _absolute_path_from_cwd(args.src, command_cwd)
+            stage_destination = _absolute_path_from_cwd(args.dest, command_cwd)
+            stage_result_file = (
+                _absolute_path_from_cwd(args.result_file, command_cwd)
+                if args.result_file is not None
+                else None
+            )
             with _preflight_creator_destinations(
                 paths,
-                args.result_file,
-                args.dest,
+                stage_result_file,
+                stage_destination,
             ) as destination_preflights:
                 result = stage_patch(
-                    args.src,
-                    args.dest,
+                    stage_source,
+                    stage_destination,
                     paths=paths,
                     _destination_preflight=destination_preflights.artifact,
                 )
@@ -16749,8 +16953,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 if destination_preflights.result is not None:
                     with _bind_creator_result_destination(
                         paths,
-                        args.result_file,
-                        args.dest,
+                        stage_result_file,
+                        stage_destination,
                         preflight=destination_preflights.result,
                         artifact_mutation_performed=True,
                         artifact_payload=result,

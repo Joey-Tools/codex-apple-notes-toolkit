@@ -73,6 +73,11 @@ The `NoteStorePaths` API object and CLI adapter freeze both live-container
 inputs to lexical absolute paths using one captured working directory before
 this preflight begins. A later CWD change cannot retarget either held-container
 proof, source read, manifest `source_root`, or writeback equality check.
+At the `merge-db` and `stage-patch` API/CLI boundaries, capture that working
+directory once and freeze the source plus every output, including a stage
+`--result-file`, before any destination preflight. Manifests and result payloads
+use only those frozen source/output paths; a later CWD change cannot select a
+different edited database for staging or writeback.
 
 Missing destination-parent components and private partial directories are never created directly
 at their target names. A trusted platform or supervisor creator must allocate an unpredictable
@@ -328,6 +333,11 @@ without runtime-version-dependent exceptions.
 Snapshot and patch-stage directory scans preserve their caller-specific missing, identity,
 access-policy, membership, and inconclusive codes even when the lower descriptor scanner detects
 the failure midway through a pass.
+Every prepared/artifact directory scan receives its small expected raw-name
+namespace first. It rejects an unexpected entry before its metadata is read,
+caps each pass at 64 entries and 4 KiB of aggregate raw name bytes, rejects
+raw/decoded-name collisions, and compares both raw-name/type and decoded-name/type
+maps across the two scans.
 
 ## Recover For Analysis
 
@@ -492,7 +502,9 @@ python3 "$SKILL_DIR/scripts/apple_notes_directory_supervisor.py" \
 
 Require the stage to contain only `NoteStore.sqlite` and `patch-manifest.json`.
 Validation examines every no-follow directory entry and rejects extra directories, FIFOs, and
-symlinks as well as extra regular files.
+symlinks as well as extra regular files. The exact expected namespace is
+checked before per-entry `stat`; both scans are bounded to 64 entries and
+4 KiB of aggregate raw filename bytes.
 Validate a stage independently when needed:
 
 ```bash
