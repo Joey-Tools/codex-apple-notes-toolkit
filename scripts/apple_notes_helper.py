@@ -3,15 +3,19 @@
 
 from __future__ import annotations
 
-import importlib.util
+import hashlib
+import os
+import stat
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Iterable
 
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
 HELPER_PATH = (
-    Path(__file__).resolve().parent.parent
+    REPO_ROOT
     / ".agents"
     / "skills"
     / "apple-notes-db-guardrails"
@@ -19,6 +23,19 @@ HELPER_PATH = (
     / "apple_notes_db.py"
 )
 DIRECTORY_SUPERVISOR_PATH = HELPER_PATH.with_name("apple_notes_directory_supervisor.py")
+SUPERVISOR_SOURCE_MAX_BYTES = 2 * 1024 * 1024
+SUPERVISOR_SOURCE_READ_CHUNK_BYTES = 64 * 1024
+_DARWIN_ACCESS_POLICY_FLAG_MASK = sum(
+    (
+        0x00000002,  # UF_IMMUTABLE
+        0x00000004,  # UF_APPEND
+        0x00000080,  # UF_DATAVAULT
+        0x00020000,  # SF_IMMUTABLE
+        0x00040000,  # SF_APPEND
+        0x00080000,  # SF_RESTRICTED
+        0x00100000,  # SF_NOUNLINK
+    )
+)
 WRITE_PRODUCING_COMMANDS = frozenset(
     {
         "copy-db",
@@ -29,34 +46,182 @@ WRITE_PRODUCING_COMMANDS = frozenset(
 )
 
 
-def _load_helper() -> ModuleType:
-    spec = importlib.util.spec_from_file_location(
-        "packaged_apple_notes_db", HELPER_PATH
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load packaged helper: {HELPER_PATH}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+@dataclass(frozen=True)
+class _CapturedSupervisorSource:
+    display_path: Path
+    source: bytes
+    sha256: str
+    identity: tuple[int, int, int]
+    access_policy: tuple[int, int, int, int]
 
 
-def _load_directory_supervisor() -> ModuleType:
-    spec = importlib.util.spec_from_file_location(
-        "packaged_apple_notes_directory_supervisor",
-        DIRECTORY_SUPERVISOR_PATH,
+def _source_identity(value: os.stat_result) -> tuple[int, int, int]:
+    return (value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode))
+
+
+def _source_access_policy(
+    value: os.stat_result,
+) -> tuple[int, int, int, int]:
+    return (
+        stat.S_IMODE(value.st_mode),
+        value.st_uid,
+        value.st_gid,
+        int(getattr(value, "st_flags", 0)) & _DARWIN_ACCESS_POLICY_FLAG_MASK,
     )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(
-            f"Cannot load packaged directory supervisor: {DIRECTORY_SUPERVISOR_PATH}"
+
+
+def _read_source_pass(descriptor: int, expected_size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = expected_size
+    while remaining:
+        chunk = os.read(
+            descriptor,
+            min(remaining, SUPERVISOR_SOURCE_READ_CHUNK_BYTES),
         )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+        if not chunk:
+            raise RuntimeError(
+                "packaged directory supervisor source became truncated during capture"
+            )
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(descriptor, 1):
+        raise RuntimeError(
+            "packaged directory supervisor source grew during bounded capture"
+        )
+    return b"".join(chunks)
+
+
+def _capture_directory_supervisor_source(
+    path: Path,
+) -> _CapturedSupervisorSource:
+    """Capture one stable no-follow supervisor byte object before execution."""
+
+    display_path = Path(os.path.abspath(os.fspath(path)))
+    try:
+        before_path = os.stat(display_path, follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cannot inspect packaged directory supervisor: {display_path}: {exc}"
+        ) from exc
+    if not stat.S_ISREG(before_path.st_mode):
+        raise RuntimeError(
+            f"Packaged directory supervisor is not a regular file: {display_path}"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    nonblock = getattr(os, "O_NONBLOCK", None)
+    if nofollow is None or cloexec is None or nonblock is None:
+        raise RuntimeError(
+            "Packaged directory supervisor capture requires "
+            "O_NOFOLLOW, O_CLOEXEC, and O_NONBLOCK"
+        )
+    try:
+        descriptor = os.open(
+            display_path,
+            os.O_RDONLY | nofollow | cloexec | nonblock,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cannot open packaged directory supervisor safely: {display_path}: {exc}"
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _source_identity(opened) != _source_identity(before_path)
+            or _source_access_policy(opened) != _source_access_policy(before_path)
+        ):
+            raise RuntimeError(
+                "Packaged directory supervisor changed across no-follow open: "
+                f"{display_path}"
+            )
+        expected_size = opened.st_size
+        if expected_size < 1 or expected_size > SUPERVISOR_SOURCE_MAX_BYTES:
+            raise RuntimeError(
+                "Packaged directory supervisor size is outside the bounded "
+                f"capture contract: {display_path}: {expected_size}"
+            )
+        first = _read_source_pass(descriptor, expected_size)
+        middle = os.fstat(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        second = _read_source_pass(descriptor, expected_size)
+        after = os.fstat(descriptor)
+        try:
+            after_path = os.stat(display_path, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError(
+                "Cannot terminally inspect packaged directory supervisor: "
+                f"{display_path}: {exc}"
+            ) from exc
+    finally:
+        os.close(descriptor)
+
+    identity = _source_identity(opened)
+    access_policy = _source_access_policy(opened)
+    if any(
+        _source_identity(value) != identity for value in (middle, after, after_path)
+    ):
+        raise RuntimeError(
+            "Packaged directory supervisor identity changed during capture: "
+            f"{display_path}"
+        )
+    if any(
+        _source_access_policy(value) != access_policy
+        for value in (middle, after, after_path)
+    ):
+        raise RuntimeError(
+            "Packaged directory supervisor access policy changed during capture: "
+            f"{display_path}"
+        )
+    if any(value.st_size != expected_size for value in (middle, after, after_path)):
+        raise RuntimeError(
+            f"Packaged directory supervisor size changed during capture: {display_path}"
+        )
+    if first != second:
+        raise RuntimeError(
+            "Packaged directory supervisor content changed during capture: "
+            f"{display_path}"
+        )
+    return _CapturedSupervisorSource(
+        display_path=display_path,
+        source=first,
+        sha256=hashlib.sha256(first).hexdigest(),
+        identity=identity,
+        access_policy=access_policy,
+    )
+
+
+def _load_directory_supervisor(
+    capture: _CapturedSupervisorSource,
+    *,
+    module_name: str = "packaged_apple_notes_directory_supervisor",
+) -> ModuleType:
+    module = ModuleType(module_name)
+    module.__file__ = os.fspath(capture.display_path)
+    module.__package__ = ""
+    module.__cached__ = None
+    module.__captured_source_sha256__ = capture.sha256
+    sys.modules[module_name] = module
+    try:
+        code = compile(
+            capture.source,
+            os.fspath(capture.display_path),
+            "exec",
+            dont_inherit=True,
+        )
+        exec(code, module.__dict__, module.__dict__)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
     return module
 
 
-_HELPER = _load_helper()
+DIRECTORY_SUPERVISOR_CAPTURE = _capture_directory_supervisor_source(
+    DIRECTORY_SUPERVISOR_PATH
+)
+_SUPERVISOR = _load_directory_supervisor(DIRECTORY_SUPERVISOR_CAPTURE)
+HELPER_CAPTURE = _SUPERVISOR.HELPER_CAPTURE
+_HELPER = _SUPERVISOR.HELPER
 
 # Preserve the complete legacy public Python API while keeping one implementation.
 GROUP_CONTAINER = _HELPER.GROUP_CONTAINER
@@ -128,16 +293,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         and arguments[0] in WRITE_PRODUCING_COMMANDS
         and not _has_directory_creator_fd(arguments)
     ):
-        supervisor = _load_directory_supervisor()
-        return supervisor.main(
-            [
-                "--helper",
-                str(HELPER_PATH),
-                "--python",
-                sys.executable,
-                "--",
-                *arguments,
-            ]
+        return _SUPERVISOR.run_supervised(
+            HELPER_CAPTURE.display_path,
+            arguments,
+            python_bin=sys.executable,
         )
     return _HELPER.main(arguments)
 

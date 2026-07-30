@@ -74,6 +74,12 @@ superseded_by:
 - Closed the probe terminal-consistency gaps so post-sample container failures
   retain source taxonomy across every dependent file row, including when
   group/app paths are equal.
+- Closed the compatibility-entry source-loading gap so the wrapper first
+  captures the packaged supervisor and then reuses that module's single helper
+  capture for legacy API calls, the parent/service protocol, and the worker.
+- Closed the initial group-bind dependency gap so permission and I/O failures
+  remain visible on every NoteStore file row that could not be checked, while
+  true initial absence and app-only failures remain isolated.
 
 ## Current State
 
@@ -189,6 +195,14 @@ superseded_by:
   BrokenPipe, malformed-frame, or early child exit closes both pipe ends and
   enters bounded worker kill/reap. Atomic path replacement and pre-held
   in-place overwrite after capture cannot change executed bytes.
+- Once the compatibility wrapper source is already executing, it captures the
+  fixed supervisor through a no-follow/nonblocking/close-on-exec regular-file
+  descriptor, binds identity/access policy and a 2-MiB ceiling, requires two
+  identical reads, and compile-executes only those bytes. That supervisor's
+  exact `HELPER_CAPTURE` / `HELPER` supplies the legacy API and both supervised
+  consumers; neither dependency loader writes source-tree bytecode. This does
+  not authenticate or revalidate the already executing wrapper itself or
+  protect process memory from a malicious same-UID debugger/`ptrace` peer.
 - `probe-db-access` gives each container its own enter/body/exit result
   boundary. After a successful sample, explicit terminal-check and exit-only
   generic component-chain failures translate from their caught evidence into
@@ -200,6 +214,11 @@ superseded_by:
 - Probe iteration carries explicit group/app roles. Equal configured container
   paths still close two independent contexts exactly once and cannot overwrite
   the retained group ExitStack.
+- Before a group binding exists, initial permission and generic I/O failures
+  propagate `container-unreadable` or
+  `container-revalidation-inconclusive` to every dependent file row.
+  `prepared-directory-missing` remains ordinary absence, and an app-only bind
+  failure does not taint group-derived file evidence.
 - Container child samples enforce a complete 64-entry and 4-KiB raw-name
   budget, stop on overflow, and sort only the bounded set before retaining five
   names.
@@ -292,6 +311,22 @@ superseded_by:
 - A final fresh read-only implementation audit found no remaining concrete P1
   or P2 in probe role ownership, terminal taxonomy, or dependent file-row
   invalidation.
+- Compatibility-entry and initial-bind follow-up base:
+  `05e7de7952ae325022d8e9c8396494514e6e038c`.
+- Compatibility-entry focused regressions: Python `3.13.0` and system Python
+  `3.9.6` each passed `9` tests covering helper symlink / atomic-replacement /
+  in-place-mutation rejection before execution, supervisor no-follow and
+  access-policy capture, no source-tree bytecode under a direct no-`-B`
+  compatibility entry, exact API/supervisor capture identity, existing
+  service/worker capture identity, initial group permission/EIO/missing
+  propagation, app-only isolation, and terminal source taxonomy.
+- Compatibility-entry full regressions: Python `3.13.0` passed all `329` tests
+  with `2` sandbox-scoped fixed-`/usr/bin/pgrep` skips in `39.577s`; system
+  Python `3.9.6` passed the same `329` tests with `2` skips in `46.780s`.
+- Compatibility-entry static and documentation gates: full-repository Ruff
+  `0.13.2`; changed-Python format check; Python `3.13.0` and `3.9.6` isolated
+  `py_compile`; `bash -n`; ShellCheck `0.11.0`; skill validation;
+  project-journal validation; and `git diff --check`.
 - Hosted Linux failure evidence: GitHub Actions run `30126900959`, job `89592422565`, head `48e0869ca19f7b905ebbfbbd7cf0dcd9a4e271fc` (`182` `unable to open database file` occurrences rooted at anonymous descriptor URI consumption)
 - Targeted adversarial tests: `python3 -m unittest <eight focused test cases>` (`8` tests passed)
 - Supervisor/malformed-result tests: `python3 -m unittest <four focused test cases>` (`4` tests passed)
@@ -609,10 +644,10 @@ superseded_by:
 - GitHub-review follow-up base:
   `2f28bf3831465fa8f59b622c17ba305d9793888e`.
 - The legacy Python compatibility module now re-exports its complete historical
-  public surface, including `notes_is_running` and `emit_json`, while remaining
-  import-side-effect free. Its four write-producing CLI commands automatically
-  route through the packaged supervisor unless an explicit supervisor FD is
-  already present.
+  public surface, including `notes_is_running` and `emit_json`, without
+  starting a child process or mutating Notes data during module loading. Its
+  four write-producing CLI commands automatically route through the packaged
+  supervisor unless an explicit supervisor FD is already present.
 - `merge-db` now chooses a randomized external sibling output for canonical
   copied-snapshot sources when `--out` is omitted. Explicit/default outputs
   reject requested, canonical-alias, and descriptor-resolved containment in

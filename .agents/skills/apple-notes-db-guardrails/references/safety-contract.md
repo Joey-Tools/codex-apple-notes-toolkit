@@ -111,14 +111,17 @@ post-read boundary: translate failure from the following explicit namespace chec
 component-chain exit to the corresponding source class without treating it as initial absence or
 aborting the whole probe. Close each opened file descriptor first and keep the final held-parent
 check inside that file's result boundary; failure leaves the file unreadable with the same source
-classification rather than aborting the whole probe with a prepared-directory error. Retain the
-group-container binding until all dependent NoteStore file rows have been inspected. If its final
-context exit then fails, set every dependent row `readable: false`, replace its error with that
-terminal source classification, and remove `size`, `identity`, and `access_policy`; no file row may
-retain authority after its parent source boundary becomes invalid. Carry group/app roles as
-explicit control state, not `Path` equality. If both configured paths are equal, open and close
-both role contexts exactly once and retain only the first role's group binding through dependent
-file inspection.
+classification rather than aborting the whole probe with a prepared-directory error. If the
+initial group-container bind fails before a binding exists, keep `prepared-directory-missing` as
+ordinary absence, but propagate initial permission failure as `container-unreadable` and other
+I/O uncertainty as `container-revalidation-inconclusive` to every dependent NoteStore file row;
+an app-container-only failure must not affect those group-derived rows. Retain the group-container
+binding until all dependent NoteStore file rows have been inspected. If its final context exit
+then fails, set every dependent row `readable: false`, replace its error with that terminal source
+classification, and remove `size`, `identity`, and `access_policy`; no file row may retain authority
+after its parent source boundary becomes invalid. Carry group/app roles as explicit control state,
+not `Path` equality. If both configured paths are equal, open and close both role contexts exactly
+once and retain only the first role's group binding through dependent file inspection.
 Keep the underlying generic directory context inside one source-owned enter/body/exit lifecycle.
 After the source body and source-specific terminal revalidation succeed, translate any generic
 component-chain exit failure from the caught evidence without re-probing a mutable namespace.
@@ -463,9 +466,18 @@ forks the bundled supervisor service, and launches the DB helper with the client
 supplied as `--directory-creator-fd`; it never discovers or reconnects to a mutable socket
 pathname. The shell wrapper and the legacy-compatible Python executable both
 select this launcher automatically for write-producing commands unless the
-caller already supplied a stronger inherited supervisor channel. Importing the
-Python module must remain side-effect free. Read-only and explicit-supervisor-FD
-commands may dispatch directly. For each creation, send one bounded
+caller already supplied a stronger inherited supervisor channel. Once the
+compatibility wrapper source is already executing, it must capture the fixed
+supervisor source through a lexical-absolute regular-file descriptor using
+`O_NOFOLLOW`, `O_NONBLOCK`, and `O_CLOEXEC`; bind identity and complete access
+policy across pre-open path / descriptor / terminal path, enforce `1..2 MiB`,
+and require two identical complete reads. Compile-exec only those captured bytes;
+do not use `SourceFileLoader`, write source-tree bytecode, or reopen the
+supervisor path. The captured supervisor module owns the only helper capture
+and helper module used by the compatibility API, parent/service protocol, and
+worker. Read-only and explicit-supervisor-FD commands dispatch through that
+already captured helper. Write-producing commands call that same supervisor
+module's `run_supervised`. For each creation, send one bounded
 `apple-notes-directory-creator-request/v1` datagram and the already-held parent descriptor with
 `SCM_RIGHTS`. Bind the request nonce, operation, prefix, mode, effective UID, parent identity, and
 parent access policy. Accept only one bounded `apple-notes-directory-creator-response/v1`
@@ -484,11 +496,12 @@ that merely calls `mkdir` and then reopens any name does not meet this contract.
 Before forking the service or spawning the independent-session worker, the launcher blocks
 `SIGHUP`, `SIGINT`, and `SIGTERM` and installs non-raising first-signal latches. Worker creation
 must use a close-all-except primitive after the child snapshot, never a parent-side open-FD
-inventory followed by per-FD close actions. Before either child exists, capture
-the fixed packaged helper from a lexical-absolute no-follow, nonblocking,
-close-on-exec regular-file descriptor. Bind one object identity and complete
-access policy across the pre-open path, descriptor, and terminal path; accept
-only `1..2 MiB`; require two identical complete reads around descriptor/path
+inventory followed by per-FD close actions. Before either child exists, the
+already captured supervisor module must have captured the fixed packaged
+helper from a lexical-absolute no-follow, nonblocking, close-on-exec
+regular-file descriptor. Bind one object identity and complete access policy
+across the pre-open path, descriptor, and terminal path; accept only `1..2
+MiB`; require two identical complete reads around descriptor/path
 revalidation. Do not treat timestamps as content authority. Reject every
 non-packaged `--helper` path before capture, module execution, service fork, or
 worker spawn. Load the parent/service protocol module and deliver worker source
@@ -506,7 +519,11 @@ digest mismatch, or trailing bytes, then closes the source descriptor before
 restoring the exact selected child signal defaults/mask. It compiles the
 captured bytes with the recorded path used only as diagnostic display metadata;
 it never reopens either helper or supervisor pathname. At helper execution,
-only the supervisor channel plus standard descriptors remain. A descriptor
+only the supervisor channel plus standard descriptors remain. These source
+capture properties begin after the compatibility wrapper itself is already
+executing: they neither authenticate nor revalidate that already-running
+wrapper object, and they do not defend process memory from a malicious
+same-UID debugger or `ptrace` peer. A descriptor
 made inheritable immediately before the fork is either absent from the child
 snapshot or closed in the child before its first exec. Delivery
 timeout/BrokenPipe closes both pipe ends and triggers bounded worker

@@ -25,6 +25,7 @@ import unittest
 from collections.abc import Iterator
 from contextlib import closing, contextmanager, redirect_stdout
 from pathlib import Path
+from types import ModuleType
 from unittest import mock
 
 
@@ -133,6 +134,56 @@ class AppleNotesHelperTests(unittest.TestCase):
             )
         finally:
             sys.modules.pop(module_name, None)
+
+    def _load_compatibility_module(
+        self,
+        compatibility_path: Path,
+        module_name: str,
+    ) -> ModuleType:
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            compatibility_path,
+        )
+        assert spec is not None
+        assert spec.loader is not None
+        compatibility = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = compatibility
+        try:
+            spec.loader.exec_module(compatibility)
+        except BaseException:
+            sys.modules.pop(module_name, None)
+            raise
+        self.addCleanup(sys.modules.pop, module_name, None)
+        self.addCleanup(
+            sys.modules.pop,
+            "packaged_apple_notes_directory_supervisor",
+            None,
+        )
+        self.addCleanup(
+            sys.modules.pop,
+            "packaged_apple_notes_db_for_supervisor",
+            None,
+        )
+        return compatibility
+
+    @staticmethod
+    def _write_compatibility_tree(
+        root: Path,
+        *,
+        helper_source: bytes | None = None,
+    ) -> tuple[Path, Path, Path]:
+        compatibility_path = root / "scripts/apple_notes_helper.py"
+        packaged_scripts = root / ".agents/skills/apple-notes-db-guardrails/scripts"
+        supervisor_path = packaged_scripts / "apple_notes_directory_supervisor.py"
+        helper_path = packaged_scripts / "apple_notes_db.py"
+        compatibility_path.parent.mkdir(parents=True)
+        packaged_scripts.mkdir(parents=True)
+        compatibility_path.write_bytes(COMPATIBILITY_SCRIPT.read_bytes())
+        supervisor_path.write_bytes(DIRECTORY_SUPERVISOR_PATH.read_bytes())
+        helper_path.write_bytes(
+            SCRIPT_PATH.read_bytes() if helper_source is None else helper_source
+        )
+        return compatibility_path, supervisor_path, helper_path
 
     def _synthetic_identity_bound_directory_creator(
         self,
@@ -3889,14 +3940,10 @@ raise SystemExit(2)
                 )
 
     def test_compatibility_launcher_exports_packaged_api(self) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "compatibility_helper", COMPATIBILITY_SCRIPT
+        compatibility = self._load_compatibility_module(
+            COMPATIBILITY_SCRIPT,
+            "compatibility_helper",
         )
-        assert spec is not None
-        assert spec.loader is not None
-        compatibility = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = compatibility
-        spec.loader.exec_module(compatibility)
         self.assertEqual(compatibility.HELPER_PATH, SCRIPT_PATH)
         self.assertTrue(callable(compatibility.main))
         self.assertTrue(callable(compatibility.directory_creator_supervisor))
@@ -3913,34 +3960,274 @@ raise SystemExit(2)
             compatibility.NoteStorePaths().note_store_files(),
             MODULE.NoteStorePaths().note_store_files(),
         )
+        self.assertIs(
+            compatibility.HELPER_CAPTURE,
+            compatibility._SUPERVISOR.HELPER_CAPTURE,
+        )
+        self.assertIs(compatibility._HELPER, compatibility._SUPERVISOR.HELPER)
+        self.assertEqual(
+            compatibility._HELPER.__captured_source_sha256__,
+            compatibility.HELPER_CAPTURE.sha256,
+        )
+        self.assertEqual(
+            compatibility._SUPERVISOR.__captured_source_sha256__,
+            compatibility.DIRECTORY_SUPERVISOR_CAPTURE.sha256,
+        )
+
+    def test_compatibility_entry_rejects_unstable_helper_before_execution(
+        self,
+    ) -> None:
+        internal_modules = (
+            "packaged_apple_notes_directory_supervisor",
+            "packaged_apple_notes_db_for_supervisor",
+        )
+        for mutation in ("symlink", "atomic-replacement", "in-place-mutation"):
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                execution_evidence = root / "helper-executed"
+
+                def helper_source(label: str) -> bytes:
+                    return (
+                        "from pathlib import Path\n"
+                        f"Path({str(execution_evidence)!r}).write_text("
+                        f"{label!r}, encoding='ascii')\n"
+                    ).encode("ascii")
+
+                initial_source = helper_source("first")
+                replacement_source = helper_source("other")
+                self.assertEqual(len(initial_source), len(replacement_source))
+                compatibility_path, _, helper_path = self._write_compatibility_tree(
+                    root,
+                    helper_source=initial_source,
+                )
+                for module_name in internal_modules:
+                    sys.modules.pop(module_name, None)
+                held_fd: int | None = None
+                try:
+                    if mutation == "symlink":
+                        symlink_target = root / "symlink-helper.py"
+                        symlink_target.write_bytes(replacement_source)
+                        helper_path.unlink()
+                        helper_path.symlink_to(symlink_target)
+                        patcher = mock.patch.object(os, "open", wraps=os.open)
+                    elif mutation == "atomic-replacement":
+                        replacement = root / "replacement-helper.py"
+                        replacement.write_bytes(replacement_source)
+                        canonical_helper_path = helper_path.resolve()
+                        original_open = os.open
+                        replaced = False
+
+                        def replace_before_helper_open(
+                            path: object,
+                            flags: int,
+                            mode: int = 0o777,
+                            *,
+                            dir_fd: int | None = None,
+                        ) -> int:
+                            nonlocal replaced
+                            if (
+                                not replaced
+                                and Path(os.path.abspath(os.fspath(path)))
+                                == canonical_helper_path
+                            ):
+                                os.replace(replacement, helper_path)
+                                replaced = True
+                            return original_open(
+                                path,
+                                flags,
+                                mode,
+                                dir_fd=dir_fd,
+                            )
+
+                        patcher = mock.patch.object(
+                            os,
+                            "open",
+                            side_effect=replace_before_helper_open,
+                        )
+                    else:
+                        held_fd = os.open(helper_path, os.O_RDWR)
+                        helper_identity = helper_path.stat()
+                        original_lseek = os.lseek
+                        mutated = False
+
+                        def mutate_before_second_helper_read(
+                            descriptor: int,
+                            offset: int,
+                            whence: int,
+                        ) -> int:
+                            nonlocal mutated
+                            opened = os.fstat(descriptor)
+                            if (
+                                not mutated
+                                and opened.st_dev == helper_identity.st_dev
+                                and opened.st_ino == helper_identity.st_ino
+                            ):
+                                assert held_fd is not None
+                                self.assertEqual(
+                                    os.pwrite(
+                                        held_fd,
+                                        replacement_source,
+                                        0,
+                                    ),
+                                    len(replacement_source),
+                                )
+                                mutated = True
+                            return original_lseek(descriptor, offset, whence)
+
+                        patcher = mock.patch.object(
+                            os,
+                            "lseek",
+                            side_effect=mutate_before_second_helper_read,
+                        )
+
+                    with (
+                        patcher,
+                        self.assertRaises(RuntimeError),
+                    ):
+                        self._load_compatibility_module(
+                            compatibility_path,
+                            f"compatibility_unstable_helper_{mutation}",
+                        )
+                    self.assertFalse(execution_evidence.exists())
+                finally:
+                    if held_fd is not None:
+                        os.close(held_fd)
+                    for module_name in internal_modules:
+                        sys.modules.pop(module_name, None)
+
+    def test_compatibility_entry_captures_supervisor_before_execution(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            execution_evidence = root / "supervisor-executed"
+            compatibility_path, supervisor_path, _ = self._write_compatibility_tree(
+                root
+            )
+            symlink_target = root / "symlink-supervisor.py"
+            symlink_target.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(execution_evidence)!r}).write_text("
+                "'executed', encoding='ascii')\n",
+                encoding="ascii",
+            )
+            supervisor_path.unlink()
+            supervisor_path.symlink_to(symlink_target)
+
+            with self.assertRaises(RuntimeError):
+                self._load_compatibility_module(
+                    compatibility_path,
+                    "compatibility_symlink_supervisor",
+                )
+
+            self.assertFalse(execution_evidence.exists())
+
+        compatibility = self._load_compatibility_module(
+            COMPATIBILITY_SCRIPT,
+            "compatibility_supervisor_access_policy",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "supervisor.py"
+            source.write_text("CAPTURED = True\n", encoding="ascii")
+            original_fstat = compatibility.os.fstat
+            fstat_calls = 0
+
+            def report_access_policy_drift(
+                descriptor: int,
+            ) -> os.stat_result:
+                nonlocal fstat_calls
+                fstat_calls += 1
+                opened = original_fstat(descriptor)
+                if fstat_calls == 2:
+                    return _StatWithOverrides(
+                        opened,
+                        st_mode=opened.st_mode ^ stat.S_IWGRP,
+                    )
+                return opened
+
+            with (
+                mock.patch.object(
+                    compatibility.os,
+                    "fstat",
+                    side_effect=report_access_policy_drift,
+                ),
+                self.assertRaises(RuntimeError),
+            ):
+                compatibility._capture_directory_supervisor_source(source)
+
+    def test_compatibility_entry_load_writes_no_source_bytecode(self) -> None:
+        source_roots = {
+            "compatibility": COMPATIBILITY_SCRIPT.parent,
+            "packaged": DIRECTORY_SUPERVISOR_PATH.parent,
+        }
+
+        def source_inventory() -> dict[tuple[str, str], tuple[object, ...]]:
+            inventory: dict[tuple[str, str], tuple[object, ...]] = {}
+            for label, source_root in source_roots.items():
+                for path in (source_root, *sorted(source_root.rglob("*"))):
+                    relative = (
+                        "."
+                        if path == source_root
+                        else str(path.relative_to(source_root))
+                    )
+                    if path.is_symlink():
+                        value: tuple[object, ...] = (
+                            "symlink",
+                            os.readlink(path),
+                        )
+                    elif path.is_dir():
+                        value = ("directory",)
+                    elif path.is_file():
+                        payload = path.read_bytes()
+                        value = (
+                            "file",
+                            len(payload),
+                            hashlib.sha256(payload).hexdigest(),
+                        )
+                    else:
+                        value = ("other", stat.S_IFMT(path.lstat().st_mode))
+                    inventory[(label, relative)] = value
+            return inventory
+
+        before = source_inventory()
+        self.assertFalse(any("__pycache__" in key[1].split(os.sep) for key in before))
+        environment = dict(os.environ)
+        environment.pop("PYTHONDONTWRITEBYTECODE", None)
+        environment.pop("PYTHONPYCACHEPREFIX", None)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(COMPATIBILITY_SCRIPT),
+                "--help",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+            env=environment,
+        )
+        after = source_inventory()
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(after, before)
+        self.assertFalse(any("__pycache__" in key[1].split(os.sep) for key in after))
 
     def test_compatibility_main_routes_writes_through_packaged_capability_gate(
         self,
     ) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "compatibility_helper_supervision", COMPATIBILITY_SCRIPT
+        compatibility = self._load_compatibility_module(
+            COMPATIBILITY_SCRIPT,
+            "compatibility_helper_supervision",
         )
-        assert spec is not None
-        assert spec.loader is not None
-        compatibility = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = compatibility
-        spec.loader.exec_module(compatibility)
-
-        class Supervisor:
-            def __init__(self) -> None:
-                self.calls: list[list[str]] = []
-
-            def main(self, arguments: list[str]) -> int:
-                self.calls.append(arguments)
-                return 23
-
-        supervisor = Supervisor()
         with (
             mock.patch.object(
-                compatibility,
-                "_load_directory_supervisor",
-                return_value=supervisor,
-            ),
+                compatibility._SUPERVISOR,
+                "run_supervised",
+                return_value=23,
+            ) as run_supervised,
             mock.patch.object(
                 compatibility._HELPER,
                 "main",
@@ -3968,16 +4255,19 @@ raise SystemExit(2)
                 29,
             )
 
-        self.assertEqual(len(supervisor.calls), 4)
+        self.assertEqual(run_supervised.call_count, 4)
         for call, command in zip(
-            supervisor.calls,
+            run_supervised.call_args_list,
             sorted(compatibility.WRITE_PRODUCING_COMMANDS),
         ):
             self.assertEqual(
-                call[-2:],
-                [command, "--synthetic"],
+                call,
+                mock.call(
+                    compatibility.HELPER_CAPTURE.display_path,
+                    [command, "--synthetic"],
+                    python_bin=sys.executable,
+                ),
             )
-            self.assertIn(str(SCRIPT_PATH), call)
         self.assertEqual(
             helper_main.call_args_list,
             [
@@ -3993,14 +4283,10 @@ raise SystemExit(2)
         )
 
     def test_compatibility_python_api_preserves_merged_db_alias(self) -> None:
-        spec = importlib.util.spec_from_file_location(
-            "compatibility_helper_merge", COMPATIBILITY_SCRIPT
+        compatibility = self._load_compatibility_module(
+            COMPATIBILITY_SCRIPT,
+            "compatibility_helper_merge",
         )
-        assert spec is not None
-        assert spec.loader is not None
-        compatibility = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = compatibility
-        spec.loader.exec_module(compatibility)
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             source = root / MODULE.NOTE_STORE_MAIN
@@ -6834,6 +7120,165 @@ raise SystemExit(2)
                 self.assertTrue(source_record["exists"])
                 self.assertFalse(source_record["readable"])
                 self.assertEqual(source_record["error_code"], expected_code)
+
+    def test_probe_initial_group_failure_propagates_dependency_classification(
+        self,
+    ) -> None:
+        cases = (
+            (
+                PermissionError(
+                    MODULE.errno.EACCES,
+                    "simulated initial group unreadable",
+                ),
+                "container-unreadable",
+            ),
+            (
+                OSError(
+                    MODULE.errno.EIO,
+                    "simulated initial group EIO",
+                ),
+                "container-revalidation-inconclusive",
+            ),
+            (
+                MODULE.StoreSafetyError(
+                    "prepared-directory-missing",
+                    "simulated initial group absence",
+                ),
+                None,
+            ),
+        )
+        original_bind = MODULE._bind_existing_directory_with_trusted_alias
+        for fault, expected_code in cases:
+            with (
+                self.subTest(expected_code=expected_code),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+
+                def fail_initial_group_bind(
+                    path: Path,
+                    *,
+                    trusted_alias: MODULE._TrustedDirectoryAlias | None = None,
+                ) -> object:
+                    if path == paths.group_container:
+                        raise fault
+                    return original_bind(
+                        path,
+                        trusted_alias=trusted_alias,
+                    )
+
+                with mock.patch.object(
+                    MODULE,
+                    "_bind_existing_directory_with_trusted_alias",
+                    side_effect=fail_initial_group_bind,
+                ):
+                    result = MODULE.probe_db_access(paths)
+
+                group_record = next(
+                    record
+                    for record in result["paths"]
+                    if Path(record["path"]) == paths.group_container
+                )
+                app_record = next(
+                    record
+                    for record in result["paths"]
+                    if Path(record["path"]) == paths.app_container
+                )
+                self.assertFalse(group_record["readable"])
+                self.assertTrue(app_record["readable"])
+                for file_record in result["note_store_files"]:
+                    self.assertFalse(file_record["exists"])
+                    self.assertFalse(file_record["readable"])
+                    self.assertNotIn("size", file_record)
+                    self.assertNotIn("identity", file_record)
+                    self.assertNotIn("access_policy", file_record)
+                    if expected_code is None:
+                        self.assertNotIn("error_code", group_record)
+                        self.assertNotIn("error_code", file_record)
+                        self.assertNotIn("error", file_record)
+                    else:
+                        self.assertEqual(
+                            group_record["error_code"],
+                            expected_code,
+                        )
+                        self.assertEqual(
+                            file_record["error_code"],
+                            expected_code,
+                        )
+                        self.assertIn("error", file_record)
+
+    def test_probe_initial_app_failure_does_not_taint_group_file_rows(
+        self,
+    ) -> None:
+        cases = (
+            (
+                PermissionError(
+                    MODULE.errno.EACCES,
+                    "simulated initial app unreadable",
+                ),
+                "container-unreadable",
+            ),
+            (
+                OSError(
+                    MODULE.errno.EIO,
+                    "simulated initial app EIO",
+                ),
+                "container-revalidation-inconclusive",
+            ),
+        )
+        original_bind = MODULE._bind_existing_directory_with_trusted_alias
+        for fault, expected_code in cases:
+            with (
+                self.subTest(expected_code=expected_code),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                source = paths.group_container / MODULE.NOTE_STORE_MAIN
+                self._create_db(source)
+
+                def fail_initial_app_bind(
+                    path: Path,
+                    *,
+                    trusted_alias: MODULE._TrustedDirectoryAlias | None = None,
+                ) -> object:
+                    if path == paths.app_container:
+                        raise fault
+                    return original_bind(
+                        path,
+                        trusted_alias=trusted_alias,
+                    )
+
+                with mock.patch.object(
+                    MODULE,
+                    "_bind_existing_directory_with_trusted_alias",
+                    side_effect=fail_initial_app_bind,
+                ):
+                    result = MODULE.probe_db_access(paths)
+
+                app_record = next(
+                    record
+                    for record in result["paths"]
+                    if Path(record["path"]) == paths.app_container
+                )
+                self.assertFalse(app_record["readable"])
+                self.assertEqual(app_record["error_code"], expected_code)
+                source_record = next(
+                    record
+                    for record in result["note_store_files"]
+                    if Path(record["path"]) == source
+                )
+                self.assertTrue(source_record["exists"])
+                self.assertTrue(source_record["readable"])
+                self.assertIn("size", source_record)
+                self.assertIn("identity", source_record)
+                self.assertIn("access_policy", source_record)
+                for file_record in result["note_store_files"]:
+                    self.assertNotEqual(
+                        file_record.get("error_code"),
+                        expected_code,
+                    )
 
     def test_probe_contains_each_container_context_exit_failure(self) -> None:
         fault_profiles = (

@@ -562,14 +562,23 @@ cannot therefore fail through a still-uncommitted outer guard.
 The packaged helper remains compatible with Python 3.9. Do not use newer runtime-only call
 arguments, such as `zip(..., strict=True)`, without adding a consistent minimum-version gate.
 The legacy-compatible `scripts/apple_notes_helper.py` module re-exports its
-established public names, including `notes_is_running` and `emit_json`, without
-starting a process or mutating the filesystem at import time. When executed,
-its `copy-db`, `merge-db`, `recover-snapshot`, and `stage-patch` commands route
-through the packaged directory-creator supervisor unless the caller supplied
-an explicit `--directory-creator-fd`; read-only commands and explicit-FD
-commands dispatch directly to the DB helper. The packaged route is a
+established public names, including `notes_is_running` and `emit_json`, from
+one captured supervisor module's exact `HELPER_CAPTURE` / `HELPER`. Once the
+wrapper source is already executing, it no-follow/nonblocking captures the
+fixed supervisor source as one regular file, binds identity and access policy,
+enforces the 2-MiB ceiling, requires two identical complete reads, and
+compile-executes those bytes without `SourceFileLoader` or source-tree
+bytecode. The supervisor then performs its one helper capture; the wrapper
+must not independently load or reopen the helper. When executed, the wrapper's
+`copy-db`, `merge-db`, `recover-snapshot`, and `stage-patch` commands call that
+same supervisor module's `run_supervised` unless the caller supplied an
+explicit `--directory-creator-fd`; read-only commands and explicit-FD commands
+dispatch through its already captured helper module. The packaged route is a
 pre-creation capability gate and currently fails closed when directory creation
-is required; it is not itself a creation authority.
+is required; it is not itself a creation authority. This loader contract does
+not authenticate or protect the already executing compatibility wrapper and
+does not defend its process memory from a malicious same-UID debugger or
+`ptrace` peer.
 
 ## Stage And Preflight A Patch
 

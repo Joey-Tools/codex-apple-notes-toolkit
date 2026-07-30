@@ -41,9 +41,17 @@ calling `mkdir`/`open` or sending a directory descriptor. The shell wrapper
 and the legacy-compatible `scripts/apple_notes_helper.py`
 entrypoint select this production launcher automatically for write-producing
 commands; callers may still provide a stronger inherited supervisor channel.
-Importing the Python compatibility module remains side-effect free.
+Once Python has begun executing the compatibility wrapper, it no-follow /
+nonblocking captures the fixed supervisor source under the same regular-file,
+identity, access-policy, two-read, and 2-MiB constraints used for helper
+source. It compile-executes those captured supervisor bytes directly, without
+`SourceFileLoader` or source-tree bytecode, and re-exports only that module's
+single captured helper instance. Write routing calls the same module's
+`run_supervised`, so the compatibility API, parent/service protocol, and
+worker all share its exact `HELPER_CAPTURE` / `HELPER`.
 The launcher blocks and latches termination signals before child creation.
-Before either child exists, it captures the fixed packaged helper through a
+Before either child exists, the captured supervisor module has captured the
+fixed packaged helper through a
 no-follow/nonblocking regular-file descriptor, checks stable identity/access
 policy and a 2-MiB ceiling, and requires two identical complete reads.
 Arbitrary `--helper` paths are rejected before capture or execution. The
@@ -62,6 +70,10 @@ from interrupting bounded worker/service reap. An unexpected `ECHILD` fails
 conservatively without bypassing cleanup or signaling a possibly reused PID.
 It consumes one pending-signal snapshot before restoring and re-delivering
 the first signal.
+These capture guarantees begin only after the compatibility wrapper's own
+source is already executing. They neither authenticate nor revalidate that
+already-running wrapper object nor defend process memory against a malicious
+same-UID process with debugging or `ptrace` access.
 It transfers the held parent FD with `SCM_RIGHTS`; a stronger external
 authority may return the actual created-object FD plus a request-bound
 attestation, while the packaged capability refusal returns none. The client

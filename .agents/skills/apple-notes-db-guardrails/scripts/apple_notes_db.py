@@ -10473,23 +10473,25 @@ def _record_probe_container_failure(
         if error.code == "prepared-directory-missing":
             return None
         record["exists"] = error.code != "prepared-directory-missing"
-        record["error_code"] = (
+        error_code = (
             "container-unreadable"
             if _exception_chain_contains_permission_error(error)
             else "container-revalidation-inconclusive"
         )
+        record["error_code"] = error_code
         record["error"] = str(error)
-        return None
+        return StoreSafetyError(error_code, str(error))
     if isinstance(error, FileNotFoundError):
         return None
     record["exists"] = not isinstance(error, FileNotFoundError)
-    record["error_code"] = (
+    error_code = (
         "container-unreadable"
         if isinstance(error, PermissionError)
         else "container-revalidation-inconclusive"
     )
+    record["error_code"] = error_code
     record["error"] = str(error)
-    return None
+    return StoreSafetyError(error_code, str(error))
 
 
 def _record_probe_terminal_source_failure(
@@ -10527,7 +10529,7 @@ def probe_db_access(paths: NoteStorePaths) -> dict[str, Any]:
     group_binding: _BoundDirectory | None = None
     group_stack: ExitStack | None = None
     group_record: dict[str, Any] | None = None
-    group_terminal_error: StoreSafetyError | None = None
+    group_dependency_error: StoreSafetyError | None = None
     for is_group, path in (
         (True, paths.group_container),
         (False, paths.app_container),
@@ -10555,23 +10557,23 @@ def probe_db_access(paths: NoteStorePaths) -> dict[str, Any]:
                 group_binding = binding
                 group_record = record
         except (FileNotFoundError, StoreSafetyError) as exc:
-            terminal_error = _record_probe_container_failure(
+            dependency_error = _record_probe_container_failure(
                 record,
                 exc,
                 binding=binding,
                 terminal=body_complete,
             )
-            if is_group and terminal_error is not None:
-                group_terminal_error = terminal_error
+            if is_group and dependency_error is not None:
+                group_dependency_error = dependency_error
         except OSError as exc:
-            terminal_error = _record_probe_container_failure(
+            dependency_error = _record_probe_container_failure(
                 record,
                 exc,
                 binding=binding,
                 terminal=body_complete,
             )
-            if is_group and terminal_error is not None:
-                group_terminal_error = terminal_error
+            if is_group and dependency_error is not None:
+                group_dependency_error = dependency_error
         entries.append(record)
 
     file_records: list[dict[str, Any]] = []
@@ -10583,9 +10585,9 @@ def probe_db_access(paths: NoteStorePaths) -> dict[str, Any]:
                 "readable": False,
             }
             if group_binding is None:
-                if group_terminal_error is not None:
-                    file_record["error_code"] = group_terminal_error.code
-                    file_record["error"] = str(group_terminal_error)
+                if group_dependency_error is not None:
+                    file_record["error_code"] = group_dependency_error.code
+                    file_record["error"] = str(group_dependency_error)
                 file_records.append(file_record)
                 continue
             try:
