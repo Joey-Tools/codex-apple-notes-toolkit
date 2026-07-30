@@ -5692,6 +5692,19 @@ def _created_directory_install_receipt(
         "parent_access_policy": _access_policy(parent_opened),
         "directory_identity": _identity(created),
         "directory_access_policy": _access_policy(created),
+        "directory_entry_durability": {
+            "schema": "apple-notes-directory-entry-durability/v1",
+            "protected_property": "directory-entry-durability",
+            "operation": "fsync-held-parent-after-no-replace-install",
+            "name_installation_state": "not-installed",
+            "status": "not-attempted",
+            "display_path": str(display_path),
+            "parent_identity": _identity(parent_opened),
+            "parent_access_policy": _access_policy(parent_opened),
+            "directory_identity": _identity(created),
+            "directory_access_policy": _access_policy(created),
+            "target_basename": target_name,
+        },
         "cleanup_policy": (
             "delete-only-through-an-atomic-identity-bound-directory-primitive"
         ),
@@ -5803,6 +5816,10 @@ def _create_and_install_directory_at(
             pending_install_receipt,
             "no-replace-install-returned",
         )
+        directory_entry_durability = creation_install_receipt[
+            "directory_entry_durability"
+        ]
+        directory_entry_durability["name_installation_state"] = "installed"
         _verify_created_directory_name_at(
             parent_fd,
             parent_opened,
@@ -5834,7 +5851,82 @@ def _create_and_install_directory_at(
             access_policy_code=access_policy_code,
             inconclusive_code=inconclusive_code,
         )
-        install_state = "installed-and-revalidated"
+        install_state = "installed-revalidated-parent-fsync-started"
+        directory_entry_durability["status"] = "attempted-unverified"
+        try:
+            _fsync_bound_parent_descriptor(
+                parent_fd,
+                parent_opened,
+                display_path=display_path.parent,
+                identity_code=identity_code,
+                access_policy_code=access_policy_code,
+                inconclusive_code=inconclusive_code,
+            )
+        except Exception as exc:
+            underlying = (
+                exc.__cause__
+                if isinstance(exc, StoreSafetyError) and exc.__cause__ is not None
+                else exc
+            )
+            directory_entry_durability.update(
+                {
+                    "status": "unverified",
+                    "failure_type": type(underlying).__name__,
+                    "failure_errno": getattr(underlying, "errno", None),
+                }
+            )
+            directory_component_commit = {
+                "schema": "apple-notes-directory-component-commit/v1",
+                "scope": "internal-created-directory-component",
+                "name_commit_state": "committed",
+                "display_path": str(display_path),
+                "target_basename": target_name,
+                "parent_identity": _identity(parent_opened),
+                "parent_access_policy": _access_policy(parent_opened),
+                "directory_identity": _identity(created),
+                "directory_access_policy": _access_policy(created),
+                "directory_entry_durability": dict(directory_entry_durability),
+            }
+            durability_details = {
+                "mutation_performed": True,
+                "retry_safe": False,
+                "directory_component_commit": directory_component_commit,
+                "directory_entry_durability": dict(directory_entry_durability),
+                "recovery_locators": {
+                    "directory_component_commit": directory_component_commit,
+                    "directory_entry_durability": dict(directory_entry_durability),
+                },
+            }
+            if isinstance(exc, StoreSafetyError):
+                exc.details = _merge_recovery_details(
+                    exc.details,
+                    durability_details,
+                )
+                raise
+            raise StoreSafetyError(
+                inconclusive_code,
+                "The directory name was installed, but its held parent could "
+                f"not be fsynced for directory-entry durability: {display_path}: "
+                f"{exc}",
+                details=durability_details,
+            ) from exc
+        directory_entry_durability["status"] = "fsync-completed"
+        install_state = "installed-parent-fsync-returned"
+        if revalidate_scope is not None:
+            revalidate_scope()
+        _verify_created_directory_name_at(
+            parent_fd,
+            parent_opened,
+            directory_fd,
+            created,
+            basename=target_name,
+            display_path=display_path,
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+        )
+        directory_entry_durability["status"] = "verified"
+        install_state = "installed-revalidated-parent-durable"
         return _CreatedDirectoryInstallation(
             fd=directory_fd,
             opened=created,
@@ -5885,7 +5977,10 @@ def _create_and_install_directory_at(
             details=details,
         ) from exc
     finally:
-        if install_state != "installed-and-revalidated" and directory_fd is not None:
+        if (
+            install_state != "installed-revalidated-parent-durable"
+            and directory_fd is not None
+        ):
             os.close(directory_fd)
 
 

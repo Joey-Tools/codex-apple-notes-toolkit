@@ -5020,8 +5020,353 @@ raise SystemExit(2)
                         receipt["creation_protocol"],
                         "trusted-creator-returned-fd-before-no-replace-install",
                     )
+                    self.assertEqual(
+                        receipt["directory_entry_durability"]["status"],
+                        "verified",
+                    )
             self.assertTrue(touched)
             self.assertTrue(destination.parent.is_dir())
+
+    def test_destination_parent_fsyncs_each_install_before_descending(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            first = root / "created-one"
+            second = first / "created-two"
+            destination = second / "snapshot"
+            events: list[tuple[str, str]] = []
+            original_create = MODULE._create_identity_bound_directory_at
+            original_install = MODULE._install_created_directory_no_replace_at
+            original_fsync_parent = MODULE._fsync_bound_parent_descriptor
+
+            def record_create(
+                parent_fd: int,
+                parent_opened: os.stat_result,
+                **kwargs: object,
+            ) -> MODULE._IdentityBoundDirectoryCreation:
+                display_path = Path(os.fspath(kwargs["display_path"]))
+                events.append(("create", str(display_path)))
+                return original_create(parent_fd, parent_opened, **kwargs)
+
+            def record_install(
+                parent_fd: int,
+                staging_name: str,
+                target_name: str,
+            ) -> None:
+                events.append(("install", target_name))
+                original_install(parent_fd, staging_name, target_name)
+
+            def record_fsync_parent(
+                parent_fd: int,
+                opened: os.stat_result,
+                **kwargs: object,
+            ) -> None:
+                display_path = Path(os.fspath(kwargs["display_path"]))
+                events.append(("fsync-parent", str(display_path)))
+                original_fsync_parent(parent_fd, opened, **kwargs)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_create_identity_bound_directory_at",
+                    side_effect=record_create,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_install_created_directory_no_replace_at",
+                    side_effect=record_install,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_fsync_bound_parent_descriptor",
+                    side_effect=record_fsync_parent,
+                ),
+            ):
+                with MODULE._bind_live_safe_destination_parent(
+                    paths,
+                    destination,
+                ) as scope:
+                    receipt = scope.parent.creation_install_receipt
+                    self.assertIsNotNone(receipt)
+                    assert receipt is not None
+                    self.assertEqual(
+                        receipt["directory_entry_durability"]["status"],
+                        "verified",
+                    )
+
+            self.assertEqual(
+                events,
+                [
+                    ("create", str(first)),
+                    ("install", first.name),
+                    ("fsync-parent", str(root)),
+                    ("create", str(second)),
+                    ("install", second.name),
+                    ("fsync-parent", str(first)),
+                ],
+            )
+
+    def test_destination_parent_component_fsync_failure_is_post_install(
+        self,
+    ) -> None:
+        for failure_level, failed_component_name in enumerate(
+            ("created-one", "created-two"),
+        ):
+            with (
+                self.subTest(failure_level=failure_level),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                first = root / "created-one"
+                second = first / "created-two"
+                destination = second / "snapshot"
+                original_fsync = MODULE.os.fsync
+                fsynced_parent_identities: list[dict[str, object]] = []
+                yielded = False
+
+                def fail_selected_parent_fsync(fd: int) -> None:
+                    fsynced_parent_identities.append(MODULE._identity(os.fstat(fd)))
+                    if len(fsynced_parent_identities) == failure_level + 1:
+                        raise OSError(
+                            errno.EIO,
+                            "simulated destination parent component fsync failure",
+                        )
+                    original_fsync(fd)
+
+                with (
+                    mock.patch.object(
+                        MODULE.os,
+                        "fsync",
+                        side_effect=fail_selected_parent_fsync,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    with MODULE._bind_live_safe_destination_parent(
+                        paths,
+                        destination,
+                    ):
+                        yielded = True
+
+                self.assertFalse(yielded)
+                self._assert_safety_code(
+                    "snapshot-destination-scope-inconclusive",
+                    raised,
+                )
+                details = raised.exception.details
+                self.assertTrue(details["mutation_performed"])
+                self.assertFalse(details["retry_safe"])
+                self.assertNotIn("publication_state", details)
+                durability = details["directory_entry_durability"]
+                self.assertEqual(
+                    durability["protected_property"],
+                    "directory-entry-durability",
+                )
+                self.assertEqual(
+                    durability["name_installation_state"],
+                    "installed",
+                )
+                self.assertEqual(durability["status"], "unverified")
+                self.assertEqual(durability["failure_type"], "OSError")
+                self.assertEqual(durability["failure_errno"], errno.EIO)
+                self.assertEqual(
+                    durability["target_basename"],
+                    failed_component_name,
+                )
+                failed_component = first if failure_level == 0 else second
+                self.assertEqual(
+                    durability["display_path"],
+                    str(failed_component),
+                )
+                self.assertEqual(
+                    durability["directory_identity"],
+                    MODULE._identity(failed_component.stat()),
+                )
+                self.assertEqual(
+                    durability["directory_access_policy"],
+                    MODULE._access_policy(failed_component.stat()),
+                )
+                component_commit = details["directory_component_commit"]
+                self.assertEqual(
+                    component_commit["scope"],
+                    "internal-created-directory-component",
+                )
+                self.assertEqual(
+                    component_commit["name_commit_state"],
+                    "committed",
+                )
+                self.assertEqual(
+                    component_commit["display_path"],
+                    str(failed_component),
+                )
+                self.assertEqual(
+                    component_commit["directory_identity"],
+                    MODULE._identity(failed_component.stat()),
+                )
+                self.assertEqual(
+                    component_commit["directory_entry_durability"],
+                    durability,
+                )
+                exact_receipt = details["recovery_locators"]["creation_install_receipt"]
+                self.assertEqual(
+                    exact_receipt["directory_entry_durability"],
+                    durability,
+                )
+                recovery = details["recovery_locators"]["created_directory_install"]
+                self.assertEqual(
+                    recovery["install_state"],
+                    "installed-revalidated-parent-fsync-started",
+                )
+                self.assertTrue(failed_component.is_dir())
+                self.assertEqual(
+                    exact_receipt["directory_identity"],
+                    MODULE._identity(failed_component.stat()),
+                )
+                self.assertTrue(first.is_dir())
+                self.assertEqual(second.is_dir(), failure_level == 1)
+                self.assertFalse(destination.exists())
+                self.assertEqual(
+                    len(fsynced_parent_identities),
+                    failure_level + 1,
+                )
+                self.assertEqual(
+                    fsynced_parent_identities[0],
+                    MODULE._identity(root.stat()),
+                )
+                if failure_level == 1:
+                    self.assertEqual(
+                        fsynced_parent_identities[1],
+                        MODULE._identity(first.stat()),
+                    )
+
+    def test_nested_snapshot_component_fsync_failure_retains_partial_root(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = root / "snapshot"
+            original_fsync_parent = MODULE._fsync_bound_parent_descriptor
+            failed = False
+
+            def fail_nested_component_parent_fsync(
+                parent_fd: int,
+                opened: os.stat_result,
+                **kwargs: object,
+            ) -> None:
+                nonlocal failed
+                display_path = Path(os.fspath(kwargs["display_path"]))
+                if not failed and display_path.name.startswith(".snapshot.partial-"):
+                    failed = True
+                    raise OSError(
+                        errno.EIO,
+                        "simulated nested snapshot component parent fsync failure",
+                    )
+                original_fsync_parent(parent_fd, opened, **kwargs)
+
+            with (
+                mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                mock.patch.object(
+                    MODULE,
+                    "_fsync_bound_parent_descriptor",
+                    side_effect=fail_nested_component_parent_fsync,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                self._copy_db(
+                    paths,
+                    dest=destination,
+                    require_notes_quit=False,
+                )
+
+            self.assertTrue(failed)
+            self._assert_safety_code(
+                "prepared-directory-revalidation-inconclusive",
+                raised,
+            )
+            self.assertFalse(destination.exists())
+            partial = self._assert_retained_partial(root, ".snapshot.partial-*")
+            nested = partial / "group.com.apple.notes"
+            self.assertTrue(nested.is_dir())
+
+            details = raised.exception.details
+            self.assertTrue(details["mutation_performed"])
+            self.assertFalse(details["retry_safe"])
+            self.assertNotIn("publication_state", details)
+            self.assertNotIn("descriptor_bound_destination", details)
+            durability = details["directory_entry_durability"]
+            self.assertEqual(durability["status"], "unverified")
+            self.assertEqual(durability["display_path"], str(nested))
+            component_commit = details["directory_component_commit"]
+            self.assertEqual(
+                component_commit["name_commit_state"],
+                "committed",
+            )
+            self.assertEqual(
+                component_commit["directory_identity"],
+                MODULE._identity(nested.stat()),
+            )
+
+            locators = details["recovery_locators"]
+            self.assertEqual(
+                locators["directory_component_commit"],
+                component_commit,
+            )
+            self.assertEqual(Path(locators["prepared_namespace"]), partial)
+            self.assertEqual(
+                locators["namespace_verification"],
+                "creation-receipt-matched",
+            )
+            self.assertEqual(
+                locators["prepared_identity"],
+                MODULE._identity(partial.stat()),
+            )
+            inventory = details["sensitive_partial_inventory"]
+            self.assertIn(
+                {
+                    "relative_path": "group.com.apple.notes",
+                    "file_type": "directory",
+                    "identity": MODULE._identity(nested.stat()),
+                    "access_policy": MODULE._access_policy(nested.stat()),
+                },
+                inventory,
+            )
+
+    def test_existing_destination_parent_needs_no_install_fsync(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            existing = root / "existing-parent"
+            existing.mkdir()
+            destination = existing / "snapshot"
+            before = existing.stat()
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_create_identity_bound_directory_at",
+                ) as create,
+                mock.patch.object(
+                    MODULE,
+                    "_fsync_bound_parent_descriptor",
+                ) as fsync_parent,
+            ):
+                with MODULE._bind_live_safe_destination_parent(
+                    paths,
+                    destination,
+                ) as scope:
+                    self.assertIsNone(scope.parent.creation_install_receipt)
+
+            create.assert_not_called()
+            fsync_parent.assert_not_called()
+            after = existing.stat()
+            self.assertEqual(MODULE._identity(before), MODULE._identity(after))
+            self.assertEqual(
+                MODULE._access_policy(before),
+                MODULE._access_policy(after),
+            )
+            self.assertEqual(list(existing.iterdir()), [])
 
     def test_directory_install_latches_receipt_before_scope_revalidation(
         self,
@@ -6114,6 +6459,15 @@ raise SystemExit(2)
                 recovery["namespace_observations"]["staging_name"][
                     "matches_created_identity"
                 ]
+            )
+            self.assertNotIn("publication_state", raised.exception.details)
+            self.assertNotIn(
+                "creation_install_receipt",
+                raised.exception.details["recovery_locators"],
+            )
+            self.assertNotIn(
+                "directory_entry_durability",
+                raised.exception.details,
             )
             self.assertFalse(
                 recovery["namespace_observations"]["target_name"][
@@ -10553,6 +10907,7 @@ raise SystemExit(2)
             details = raised.exception.details
             self.assertTrue(details["mutation_performed"])
             self.assertEqual(details["publication_state"], "committed")
+            self.assertNotIn("directory_component_commit", details)
             self.assertEqual(
                 details["artifact_publication_state"],
                 "quarantined",
@@ -11966,15 +12321,18 @@ raise SystemExit(2)
             parked = root.with_name(f"{root.name}-parked")
             original_fsync = MODULE._fsync_bound_parent_descriptor
             attacked = False
+            root_fsync_calls = 0
 
             def replace_parent_during_fsync(
                 parent_fd: int,
                 opened: os.stat_result,
                 **kwargs: object,
             ) -> None:
-                nonlocal attacked
+                nonlocal attacked, root_fsync_calls
                 display_path = Path(str(kwargs["display_path"]))
-                if not attacked and display_path == root:
+                if display_path == root:
+                    root_fsync_calls += 1
+                if not attacked and display_path == root and root_fsync_calls == 2:
                     attacked = True
                     root.rename(parked)
                     root.mkdir(mode=0o700)
@@ -12005,6 +12363,7 @@ raise SystemExit(2)
                     require_notes_quit=False,
                 )
             self.assertTrue(attacked)
+            self.assertGreaterEqual(root_fsync_calls, 2)
             self.assertEqual(Path(result["dest"]), destination)
             self.assertTrue((destination / MODULE.SNAPSHOT_MANIFEST).is_file())
 
@@ -12103,15 +12462,18 @@ raise SystemExit(2)
             destination = root / "snapshot"
             original_fsync = MODULE._fsync_bound_parent_descriptor
             attacked = False
+            root_fsync_calls = 0
 
             def change_parent_access_during_fsync(
                 parent_fd: int,
                 opened: os.stat_result,
                 **kwargs: object,
             ) -> None:
-                nonlocal attacked
+                nonlocal attacked, root_fsync_calls
                 display_path = Path(str(kwargs["display_path"]))
-                if not attacked and display_path == root:
+                if display_path == root:
+                    root_fsync_calls += 1
+                if not attacked and display_path == root and root_fsync_calls == 2:
                     attacked = True
                     baseline_mode = MODULE.stat.S_IMODE(opened.st_mode)
                     changed_mode = 0o750 if baseline_mode != 0o750 else 0o700
@@ -12139,6 +12501,7 @@ raise SystemExit(2)
                 )
             self._assert_safety_code("destination-install-uncertain", raised)
             self.assertTrue(attacked)
+            self.assertGreaterEqual(root_fsync_calls, 2)
             self.assertIsInstance(raised.exception.__cause__, MODULE.StoreSafetyError)
             assert isinstance(raised.exception.__cause__, MODULE.StoreSafetyError)
             self.assertEqual(

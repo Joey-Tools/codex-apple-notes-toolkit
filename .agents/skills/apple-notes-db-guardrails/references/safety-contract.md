@@ -613,6 +613,21 @@ validation, and descriptor teardown—must merge every latched component receipt
 `mutation_performed: true`, preserve or worsen cleanup evidence, and force `retry_safe: false`.
 The outer parent scope must derive mutation from those details even when the component context
 never yielded.
+After the installed target passes the carried scope and descriptor/name checks, fsync the exact
+held parent directory before returning the installation or creating the next missing component,
+then revalidate the installed target once more. The protected property is directory-entry
+durability; the final fsync of a later populated private output directory is a distinct boundary
+and cannot substitute for it. A parent-fsync failure after the no-replace rename proves that the
+name installation mutated the namespace and returned successfully, but does not prove persistence
+across a crash. Preserve the exact install and created-object recovery identities, report
+the committed internal name installation in `directory_component_commit`, mark
+directory-entry durability `unverified`, force `retry_safe: false`, and stop before every later
+component. That component-scoped receipt must not set top-level
+`publication_state: committed` before the enclosing artifact's own publication rename. When the
+component belongs to an unpublished private partial root, the enclosing transaction must still
+retain and merge the partial root's descriptor-bound locator and sensitive inventory while
+preserving the failed component's exact recovery identity. A failure before the no-replace rename
+must not acquire that committed-name classification or a successful durability receipt.
 
 On creation collision or any post-creation failure, retain the created descriptor evidence plus
 point-in-time staging/target observations. Do not `stat(name)` and then `rmdir(name)`: there is no

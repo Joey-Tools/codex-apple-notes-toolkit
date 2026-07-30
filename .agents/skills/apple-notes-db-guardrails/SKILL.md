@@ -167,6 +167,16 @@ Immediately after a successful component install, the helper latches the exact
 consumer failure, post-yield check, and descriptor teardown merges all already installed component
 receipts with `mutation_performed: true` and `retry_safe: false`; a caller must never infer
 zero mutation merely because the parent context did not reach its first yield.
+Before returning that installation or descending into the next missing component, the helper
+fsyncs the held parent directory and then revalidates the installed target again. This protects
+directory-entry durability, not merely object identity. A parent-fsync failure after rename is a
+committed internal component-name installation with unverified durability: retain the exact
+created-object and install receipts under `directory_component_commit`, report
+`mutation_performed: true` and `retry_safe: false`, and do not create a later component. Do not
+promote that component-scoped commit to top-level `publication_state: committed` before the
+enclosing artifact itself is published; an enclosing private partial root must still retain its
+descriptor-bound recovery and inventory evidence. This per-component parent fsync is separate
+from the later fsync of a populated private output directory before its own publication.
 
 On macOS, only the exact registry entries `/tmp -> /private/tmp`, `/var -> /private/var`, and
 `/etc -> /private/etc` may bridge a root symlink. The helper binds the alias parent, alias entry and

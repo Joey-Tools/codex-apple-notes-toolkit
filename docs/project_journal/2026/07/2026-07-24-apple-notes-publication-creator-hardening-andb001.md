@@ -52,6 +52,11 @@ superseded_by:
   no-replace directory install retains its exact receipt and all previously
   installed component identities across later validation and teardown
   failures.
+- Closed the destination-parent durability gap so every newly installed
+  component fsyncs its held parent before the transaction can descend, while a
+  post-install fsync failure retains the exact component identity and reports
+  the committed internal component-name installation with unverified
+  durability without claiming that the enclosing artifact was published.
 - Closed the live-source directory final-exit gap so the generic component
   context cannot leak `prepared-directory-*` after source-specific terminal
   validation.
@@ -167,6 +172,19 @@ superseded_by:
   receipt through next-component checks, post-install validation, yielded
   consumer errors, post-yield validation, and descriptor teardown, always
   reporting mutation and a non-retryable result.
+- Each successful component receipt now also proves
+  `directory-entry-durability`: the held parent descriptor is fsynced and the
+  target is revalidated before the helper returns or creates a deeper
+  component. An fsync failure keeps the installed name and object recovery
+  receipt, marks durability `unverified`, records the internal name commit in
+  `directory_component_commit`, and prevents every later component from being
+  created. It does not set top-level `publication_state: committed` before the
+  enclosing artifact publication rename. If the component is nested under an
+  unpublished private partial root, the outer scope still retains and merges
+  that root's descriptor-bound locator and sensitive inventory. Existing
+  parent components remain read-only and are not spuriously fsynced. This
+  boundary is independent of the later fsync for a populated private snapshot
+  or stage directory.
 - The complete live-source binding lifecycle now owns the underlying generic
   directory context's final exit. Missing, permission, other stat, proved
   identity, and proved access-policy failures in that final window remain
@@ -781,6 +799,44 @@ superseded_by:
 - Full regressions: Python `3.14.3` and system Python `3.9.6` each passed all
   `334` tests with two sandbox-scoped skips for the fixed `/usr/bin/pgrep`
   process probe.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.14.3` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.
+- Destination-parent directory-entry durability follow-up base:
+  `8c233e5b256d2a06d362ed3c6c0211cd7a796455`.
+- Focused regressions: Python `3.14.3` and system Python `3.9.6` each passed
+  seven tests covering successful install/fsync/descent ordering, first- and
+  second-level parent-fsync failures, exact post-install recovery identity,
+  pre-install collision classification, existing-parent non-mutation, and
+  separation from the final snapshot-publication parent fsync.
+- Full regressions: Python `3.14.3` passed all `337` tests with two
+  sandbox-scoped fixed-`/usr/bin/pgrep` skips in `38.241s`; system Python
+  `3.9.6` passed the same `337` tests with two skips in `45.925s`.
+- One preceding Python `3.14.3` full-suite attempt observed the existing
+  signal-teardown fixture reading its worker PID file before content appeared.
+  That unrelated test passed alone, and the bounded full-suite retry above
+  passed.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.14.3` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.
+- Component-commit/artifact-publication separation follow-up base:
+  `8c233e5b256d2a06d362ed3c6c0211cd7a796455`.
+- A nested `group.com.apple.notes` install whose held-parent fsync fails now
+  records only the internal `directory_component_commit`; it does not claim
+  top-level artifact publication. The enclosing unpublished partial root still
+  contributes its exact namespace/identity locators and sensitive inventory,
+  while the failed component retains its own exact identity and
+  `directory-entry-durability: unverified` receipt.
+- Focused regressions: Python `3.14.3` and system Python `3.9.6` each passed
+  six methods covering successful component fsync ordering, first- and
+  second-level component failures, nested partial-root recovery evidence,
+  existing-parent non-mutation, and unchanged true final-publication
+  `committed` semantics.
+- Full regressions: Python `3.14.3` passed all `338` tests with two
+  sandbox-scoped fixed-`/usr/bin/pgrep` skips in `42.643s`; system Python
+  `3.9.6` passed the same `338` tests with two skips in `50.368s`.
 - Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
   Python `3.14.3` and `3.9.6` bytecode compilation with isolated caches;
   `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
