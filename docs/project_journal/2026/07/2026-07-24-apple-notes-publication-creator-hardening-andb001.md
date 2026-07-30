@@ -61,6 +61,9 @@ superseded_by:
   policy remains bound to the pre-open observation across descriptor and
   descriptor-relative pathname checks, and nested Notes probe evidence cannot
   upgrade an unverified namespace move to a verified quarantine.
+- Closed the three current-head GitHub Codex follow-ups in patch-stage
+  integrity taxonomy, retained-partial mutation receipts, and direct-API
+  destination absence revalidation.
 
 ## Current State
 
@@ -153,6 +156,14 @@ superseded_by:
   parent-durability, directory-policy, tree-receipt, and public-alias proof can
   report `quarantined` / `retained`; incomplete namespace moves remain
   `namespace-moved-unverified` / `inconclusive`.
+- Patch-stage SQLite descriptor capture and terminal integrity revalidation use
+  the patch-specific identity, content, access-policy, and inconclusive codes.
+- A retained or possibly retained partial always sets
+  `mutation_performed: true`, even when the primary pre-publication failure
+  originally reported false.
+- Direct public output APIs prove the requested leaf is still absent through
+  the held parent before committing the destination parent or creating a
+  private partial.
 
 ## Next Steps
 
@@ -183,6 +194,17 @@ superseded_by:
   `2` skipped, `36.461s`).
 - Source-open/quarantine static gates: Ruff check and format check over both
   changed Python files, `python3 -B -m py_compile`, and `git diff --check`.
+- Current-head GitHub Codex three-P2 follow-up base:
+  `93739e6a0e137029b6d7ad4bf81d44945676eaa3`.
+- Current-head focused regressions: Python `3.13.0`,
+  `python3 -B -m unittest <nine focused test cases>` (`9` tests passed,
+  including three patch-integrity race subtests).
+- Current-head full suite: Python `3.13.0`,
+  `python3 -B -m unittest tests.test_apple_notes_helper` (`306` tests passed,
+  `2` skipped, `37.815s`).
+- Current-head static and documentation gates: full-repository Ruff `0.13.2`,
+  changed-Python format check, `bash -n`, ShellCheck `0.11.0`, skill validation,
+  project-journal validation, and `git diff --check`.
 - Hosted Linux failure evidence: GitHub Actions run `30126900959`, job `89592422565`, head `48e0869ca19f7b905ebbfbbd7cf0dcd9a4e271fc` (`182` `unable to open database file` occurrences rooted at anonymous descriptor URI consumption)
 - Targeted adversarial tests: `python3 -m unittest <eight focused test cases>` (`8` tests passed)
 - Supervisor/malformed-result tests: `python3 -m unittest <four focused test cases>` (`4` tests passed)

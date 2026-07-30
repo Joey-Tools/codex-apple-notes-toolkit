@@ -257,6 +257,11 @@ only a failure before its first held proof may claim `mutation_performed: false`
 artifact-only committed transaction instead returns `destination-install-uncertain` with
 `artifact_publication_state: committed`, `mutation_performed: true`, `retry_safe: false`,
 and the descriptor-bound artifact receipt.
+For a direct public API call that was not supplied a held creator preflight, the helper creates
+the same zero-write destination proof and rechecks the requested leaf through its descriptor-bound
+parent immediately before parent commit or partial creation. A destination that appears after the
+initial lexical check therefore fails with `destination-exists` before the helper creates a
+retained partial.
 Snapshot publication is atomic and no-replace on supported macOS/Linux filesystems.
 The live NoteStore is one descriptor transaction: bind the complete group-container path once,
 one no-follow component at a time, then perform main/WAL/SHM/rollback-journal discovery, every
@@ -298,6 +303,9 @@ On an ordinary pre-publication failure, the helper
 preserves the partial tree and attaches a creation-receipt-matched namespace locator plus a bounded
 no-follow sensitive-file inventory to the original error. If the root is replaced or inventory is
 inconclusive, the original error remains primary and reports the separate receipt failure.
+Every retained or possibly retained partial receipt sets `mutation_performed: true`, overriding an
+earlier false claim because the helper already created the partial namespace and may have copied
+sensitive NoteStore bytes into it.
 Each retained-partial pass lazily enumerates through held directory descriptors,
 stops on the 65th entry before reading its metadata, and enforces a 4 KiB
 aggregate raw-name ceiling across the complete recursive pass. It collects and
@@ -567,6 +575,10 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" validate-patch-stage \
   --manifest-creation-receipt-file \
     /tmp/<task-patch-stage>.creation-result.json
 ```
+
+The stage database remains bound through SQLite integrity consumption. Descriptor byte capture and
+every file revalidation inside that integrity boundary use the patch-stage
+`patch-file-*` / `patch-content-mismatch` taxonomy rather than prepared-output publication codes.
 
 While Notes remains quit, bind the live store, fresh backup, and stage:
 

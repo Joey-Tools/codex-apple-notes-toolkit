@@ -2271,6 +2271,64 @@ raise SystemExit(2)
                 self.assertFalse(destination.exists())
                 self.assertFalse(result_parent.exists())
 
+    def test_copy_db_direct_api_rechecks_destination_before_partial_creation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = root / "snapshot"
+            original_preflight = MODULE._preflight_live_safe_destination_parent
+            destination_created = False
+
+            @contextmanager
+            def create_destination_after_preflight(
+                selected_paths: MODULE.NoteStorePaths,
+                selected_destination: Path,
+            ) -> Iterator[MODULE._LiveDestinationPreflight]:
+                nonlocal destination_created
+                with original_preflight(
+                    selected_paths,
+                    selected_destination,
+                ) as preflight:
+                    selected_destination.mkdir()
+                    destination_created = True
+                    yield preflight
+
+            creator = mock.Mock(
+                side_effect=AssertionError(
+                    "destination appearance must fail before partial creation"
+                )
+            )
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_preflight_live_safe_destination_parent",
+                    side_effect=create_destination_after_preflight,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_IDENTITY_BOUND_DIRECTORY_CREATOR",
+                    creator,
+                ),
+                mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.copy_db(
+                    paths,
+                    dest=destination,
+                    require_notes_quit=False,
+                )
+
+            self.assertTrue(destination_created)
+            self._assert_safety_code("destination-exists", raised)
+            self.assertFalse(raised.exception.details["mutation_performed"])
+            creator.assert_not_called()
+            self.assertTrue(destination.is_dir())
+            self.assertEqual(list(destination.iterdir()), [])
+            self.assertEqual(list(root.glob(".snapshot.partial-*")), [])
+
     def test_creator_cli_accepts_artifact_created_shared_parent_prefix(
         self,
     ) -> None:
@@ -8299,8 +8357,22 @@ raise SystemExit(2)
                 raised.exception.details["capture_phase"],
                 "before-publication-rename",
             )
+            details = raised.exception.details
+            self.assertTrue(details["mutation_performed"])
+            self.assertEqual(details["cleanup_state"], "retained")
             self.assertFalse(destination.exists())
-            self._assert_retained_partial(root, ".snapshot.partial-*")
+            partial = self._assert_retained_partial(root, ".snapshot.partial-*")
+            retained_database = (
+                partial / "group.com.apple.notes" / MODULE.NOTE_STORE_MAIN
+            )
+            self.assertTrue(retained_database.is_file())
+            self.assertIn(
+                str(Path("group.com.apple.notes") / MODULE.NOTE_STORE_MAIN),
+                {
+                    row["relative_path"]
+                    for row in details["sensitive_partial_inventory"]
+                },
+            )
 
     def test_writeback_copy_quarantines_snapshot_when_notes_start_after_publish(
         self,
@@ -15449,6 +15521,70 @@ raise SystemExit(2)
                     ):
                         validator(argument)
                     self._assert_safety_code(expected_code, raised)
+
+    def test_patch_integrity_races_preserve_patch_file_taxonomy(self) -> None:
+        cases = (
+            ("identity", "patch-file-identity-mismatch"),
+            ("content", "patch-content-mismatch"),
+            ("access-policy", "patch-file-access-policy-mismatch"),
+        )
+        for attack, expected_code in cases:
+            with (
+                self.subTest(attack=attack),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                edited = root / "edited.sqlite"
+                self._create_db(edited)
+                stage_dir = Path(self._stage_patch(edited, root / "stage")["stage_dir"])
+                database = stage_dir / MODULE.NOTE_STORE_MAIN
+                original_exec = MODULE._native_sqlite_exec
+                attacked = False
+
+                def attack_after_integrity_query(
+                    api: MODULE._NativeSQLiteApi,
+                    database_handle: ctypes.c_void_p,
+                    sql: bytes,
+                    callback: object,
+                    error_text: ctypes.c_char_p,
+                ) -> int:
+                    nonlocal attacked
+                    result = original_exec(
+                        api,
+                        database_handle,
+                        sql,
+                        callback,
+                        error_text,
+                    )
+                    if not attacked and sql == b"PRAGMA integrity_check":
+                        if attack == "identity":
+                            replacement = database.with_name(
+                                f".{database.name}.replacement"
+                            )
+                            shutil.copy2(database, replacement)
+                            os.replace(replacement, database)
+                        elif attack == "content":
+                            with database.open("ab") as handle:
+                                handle.write(b"tampered")
+                                handle.flush()
+                                os.fsync(handle.fileno())
+                        else:
+                            database.chmod(0o640)
+                        attacked = True
+                    return result
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_native_sqlite_exec",
+                        side_effect=attack_after_integrity_query,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    self._validate_patch_stage(stage_dir)
+
+                self.assertTrue(attacked)
+                self._assert_safety_code(expected_code, raised)
 
     def test_validators_detect_file_access_change_during_integrity(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

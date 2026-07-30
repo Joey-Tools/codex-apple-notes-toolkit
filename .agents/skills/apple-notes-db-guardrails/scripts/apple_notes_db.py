@@ -7058,6 +7058,7 @@ def _retained_bound_directory_receipt(
 
     recovery_details = {
         "cleanup_state": "preserved-or-incomplete",
+        "mutation_performed": True,
         "recovery_locators": {
             "prepared_namespace": str(path),
             "prepared_parent": str(path.parent),
@@ -7113,6 +7114,7 @@ def _retained_bound_directory_receipt(
         )
         return {
             "cleanup_state": "retained",
+            "mutation_performed": True,
             "recovery_locators": {
                 "prepared_namespace": str(path),
                 "prepared_parent": str(path.parent),
@@ -10382,14 +10384,18 @@ def _bind_live_safe_destination_parent(
 ) -> Iterator[_LiveDestinationScope]:
     """Preflight and then bind one live-safe destination parent."""
 
-    with (
-        _preflight_live_safe_destination_parent(
-            paths,
-            destination,
-        ) as preflight,
-        _commit_live_safe_destination_parent(preflight) as destination_scope,
-    ):
-        yield destination_scope
+    with _preflight_live_safe_destination_parent(
+        paths,
+        destination,
+    ) as preflight:
+        _assert_destination_preflight_name_absent(
+            preflight,
+            exists_code="destination-exists",
+            inconclusive_code="snapshot-destination-scope-inconclusive",
+            label="Destination",
+        )
+        with _commit_live_safe_destination_parent(preflight) as destination_scope:
+            yield destination_scope
 
 
 def probe_db_access(paths: NoteStorePaths) -> dict[str, Any]:
@@ -10859,6 +10865,7 @@ def _sqlite_integrity(
     database: Path | _BoundRegularFile,
     *,
     parent: _BoundDirectory | None = None,
+    file_codes: _FileProtectionCodes = PREPARED_FILE_CODES,
 ) -> dict[str, Any]:
     db_path = database.path if isinstance(database, _BoundRegularFile) else database
     if isinstance(database, _BoundRegularFile):
@@ -10867,11 +10874,11 @@ def _sqlite_integrity(
             if parent is None:
                 return _verify_bound_regular_file(
                     database,
-                    PREPARED_FILE_CODES,
+                    file_codes,
                 )
             return _verify_bound_regular_file_at(
                 database,
-                PREPARED_FILE_CODES,
+                file_codes,
                 dir_fd=parent.fd,
                 basename=database.path.name,
             )
@@ -10882,6 +10889,7 @@ def _sqlite_integrity(
             verify_bound=verify_bound,
             error_code="sqlite-integrity-failed",
             require_backup=False,
+            file_codes=file_codes,
         ) as image:
             return _sqlite_integrity_from_image(image, db_path)
     try:
@@ -12513,6 +12521,8 @@ def _verify_anonymous_recovery_file(
 def _read_descriptor_bound_sqlite_bytes(
     bound: _BoundRegularFile,
     verify_bound: Callable[[], Any],
+    *,
+    file_codes: _FileProtectionCodes = PREPARED_FILE_CODES,
 ) -> bytes:
     verify_bound()
     try:
@@ -12533,7 +12543,7 @@ def _read_descriptor_bound_sqlite_bytes(
         descriptor_after = os.fstat(bound.fd)
     except OSError as exc:
         raise StoreSafetyError(
-            "prepared-file-revalidation-inconclusive",
+            file_codes.inconclusive,
             f"Cannot read the descriptor-bound SQLite input for {bound.path}: {exc}",
         ) from exc
     if (
@@ -12543,7 +12553,7 @@ def _read_descriptor_bound_sqlite_bytes(
         or not _same_identity(descriptor_before, descriptor_after)
     ):
         raise StoreSafetyError(
-            "prepared-file-identity-mismatch",
+            file_codes.identity,
             f"Descriptor-bound SQLite input identity changed for {bound.path}",
         )
     baseline_access = _access_policy(bound.opened)
@@ -12552,7 +12562,7 @@ def _read_descriptor_bound_sqlite_bytes(
         or _access_policy(descriptor_after) != baseline_access
     ):
         raise StoreSafetyError(
-            "prepared-file-access-policy-mismatch",
+            file_codes.access_policy,
             f"Descriptor-bound SQLite input access policy changed for {bound.path}",
         )
     if (
@@ -12562,7 +12572,7 @@ def _read_descriptor_bound_sqlite_bytes(
         or hashlib.sha256(payload).hexdigest() != bound.sha256
     ):
         raise StoreSafetyError(
-            "prepared-file-content-mismatch",
+            file_codes.content,
             f"Descriptor-bound SQLite input bytes changed for {bound.path}",
         )
     verify_bound()
@@ -12577,6 +12587,7 @@ def _deserialized_sqlite_image(
     verify_bound: Callable[[], Any],
     error_code: str,
     require_backup: bool,
+    file_codes: _FileProtectionCodes = PREPARED_FILE_CODES,
 ) -> Iterator[_DeserializedSQLiteImage]:
     api: _NativeSQLiteApi | None = None
     database = ctypes.c_void_p()
@@ -12587,7 +12598,11 @@ def _deserialized_sqlite_image(
     consumer_error: Exception | None = None
     process_control_error: BaseException | None = None
     try:
-        payload = _read_descriptor_bound_sqlite_bytes(bound, verify_bound)
+        payload = _read_descriptor_bound_sqlite_bytes(
+            bound,
+            verify_bound,
+            file_codes=file_codes,
+        )
         byte_count = len(payload)
         expected_sha256 = hashlib.sha256(payload).hexdigest()
         api = _load_native_sqlite_api(
@@ -16005,6 +16020,7 @@ def validate_patch_stage(
         integrity = _sqlite_integrity(
             database_bound,
             parent=artifact_root,
+            file_codes=PATCH_FILE_CODES,
         )
         _scan_exact_bound_directory_entries(
             artifact_root,

@@ -414,6 +414,13 @@ alias retargeting, access-policy drift, a newly present unproved component, or
 unavailable evidence between those two proofs fails before either creator may
 run.
 
+When a direct public output API was not supplied a held creator preflight, it
+must acquire the same zero-write proof and call the descriptor-bound absent-leaf
+assertion before committing the destination parent or creating a private
+partial. A destination that appears after an earlier lexical check is
+`destination-exists`; it must not cause the helper to create and retain a
+partial first.
+
 After both proofs succeed, commit the artifact destination first. A missing
 result parent remains absent until artifact publication succeeds. Artifact
 parent creation may legitimately create a prefix shared with the result
@@ -796,10 +803,13 @@ without following child links. Enumerate lazily through held descriptors, stop
 before metadata lookup for the 65th entry, and apply a 4 KiB aggregate raw-name
 ceiling across the complete recursive pass; sort only the at-most-64 admitted
 names. Preserve the complete partial tree and attach `cleanup_state: retained`,
-the verified root/parent identities, exact namespace, and inventory to the
-original error. If the root is missing, replaced, over the inventory bounds,
-or cannot be revalidated, preserve the current namespace, keep the original
-error primary, and attach a separate `cleanup_error_code` plus bounded recovery
+`mutation_performed: true`, the verified root/parent identities, exact
+namespace, and inventory to the original error. The mutation conclusion
+overrides an earlier false claim because the helper-created partial may already
+contain copied NoteStore bytes. If the root is missing, replaced, over the
+inventory bounds, or cannot be revalidated, preserve the current namespace,
+keep the original error primary, retain the same conservative mutation
+conclusion, and attach a separate `cleanup_error_code` plus bounded recovery
 locators. Access-policy changes remain distinct validation failures; mtime,
 ctime, and directory link-count behavior are not deletion-identity signals.
 Wrap an unclassified ordinary runtime failure as `prepared-operation-failed`, preserve the
@@ -859,6 +869,11 @@ A patch stage must contain only:
 It must also retain its successful artifact-external manifest creation receipt. Preflight and
 post-writeback verification require both the backup and stage receipts before consuming either
 manifest.
+Hold the staged database through SQLite integrity consumption. Its descriptor
+byte capture and every identity, content, access-policy, or inconclusive
+revalidation inside that boundary must use the patch-stage
+`patch-file-*` / `patch-content-mismatch` taxonomy, not the prepared-output
+publication taxonomy.
 
 Never install a staged main database beside an old live WAL or SHM.
 Treat replacement of the main name and removal of live sidecar names as one whole-store semantic
