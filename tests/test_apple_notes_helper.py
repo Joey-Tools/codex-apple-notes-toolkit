@@ -96,6 +96,44 @@ class AppleNotesHelperTests(unittest.TestCase):
         self._directory_creator_patch.start()
         self.addCleanup(self._directory_creator_patch.stop)
 
+    @staticmethod
+    def _supervised_worker_source(body: str) -> str:
+        indented = "\n".join(f"    {line}" for line in body.splitlines())
+        return (
+            "DIRECTORY_CREATOR_MAX_MESSAGE_BYTES = 65536\n"
+            "DIRECTORY_CREATOR_MAX_RECEIVED_FDS = 4\n"
+            "def _worker_main():\n"
+            f"{indented}\n"
+            "if __name__ == '__main__':\n"
+            "    _worker_main()\n"
+        )
+
+    @staticmethod
+    def _run_supervised_test_helper(
+        helper_path: Path,
+        command: list[str],
+    ) -> int:
+        """Explicitly inject one test-only capture/module pair."""
+
+        capture = SUPERVISOR_MODULE._capture_helper_source(helper_path)
+        module_name = (
+            "apple_notes_test_supervised_helper_"
+            f"{capture.sha256}_{os.getpid()}_{time.monotonic_ns()}"
+        )
+        helper_module = SUPERVISOR_MODULE._load_helper(
+            capture,
+            module_name=module_name,
+        )
+        try:
+            return SUPERVISOR_MODULE._run_supervised_capture(
+                capture,
+                helper_module,
+                command,
+                python_bin=sys.executable,
+            )
+        finally:
+            sys.modules.pop(module_name, None)
+
     def _synthetic_identity_bound_directory_creator(
         self,
         parent_fd: int,
@@ -342,6 +380,7 @@ class AppleNotesHelperTests(unittest.TestCase):
                 supervisor,
                 payload,
                 parent_descriptors,
+                SUPERVISOR_MODULE.HELPER,
             )
 
     @staticmethod
@@ -945,25 +984,52 @@ raise SystemExit(2)
             worker_script = root / "worker.py"
             worker_pid_file = root / "worker.pid"
             worker_script.write_text(
-                "import os\n"
+                self._supervised_worker_source(
+                    "import os\n"
+                    "import sys\n"
+                    "import time\n"
+                    "with open(sys.argv[1], 'w', encoding='ascii') as stream:\n"
+                    "    stream.write(str(os.getpid()))\n"
+                    "while True:\n"
+                    "    time.sleep(0.1)"
+                ),
+                encoding="utf-8",
+            )
+            test_launcher = root / "test_launcher.py"
+            test_launcher.write_text(
+                "import importlib.util\n"
+                "import pathlib\n"
                 "import sys\n"
-                "import time\n"
-                "with open(sys.argv[1], 'w', encoding='ascii') as stream:\n"
-                "    stream.write(str(os.getpid()))\n"
-                "while True:\n"
-                "    time.sleep(0.1)\n",
+                f"supervisor_path = pathlib.Path({str(DIRECTORY_SUPERVISOR_PATH)!r})\n"
+                "spec = importlib.util.spec_from_file_location(\n"
+                "    'apple_notes_test_signal_launcher',\n"
+                "    supervisor_path,\n"
+                ")\n"
+                "assert spec is not None and spec.loader is not None\n"
+                "supervisor = importlib.util.module_from_spec(spec)\n"
+                "sys.modules[spec.name] = supervisor\n"
+                "spec.loader.exec_module(supervisor)\n"
+                "capture = supervisor._capture_helper_source(pathlib.Path(sys.argv[1]))\n"
+                "helper_name = 'apple_notes_test_signal_helper'\n"
+                "helper = supervisor._load_helper(capture, module_name=helper_name)\n"
+                "try:\n"
+                "    return_code = supervisor._run_supervised_capture(\n"
+                "        capture,\n"
+                "        helper,\n"
+                "        [sys.argv[2]],\n"
+                "        python_bin=sys.executable,\n"
+                "    )\n"
+                "finally:\n"
+                "    sys.modules.pop(helper_name, None)\n"
+                "raise SystemExit(return_code)\n",
                 encoding="utf-8",
             )
             launcher = subprocess.Popen(
                 [
                     sys.executable,
                     "-B",
-                    str(DIRECTORY_SUPERVISOR_PATH),
-                    "--helper",
+                    str(test_launcher),
                     str(worker_script),
-                    "--python",
-                    sys.executable,
-                    "--",
                     str(worker_pid_file),
                 ],
                 stdin=subprocess.DEVNULL,
@@ -999,21 +1065,26 @@ raise SystemExit(2)
             root = Path(temp_dir)
             worker_script = root / "worker.py"
             worker_script.write_text(
-                "import time\nwhile True:\n    time.sleep(0.1)\n",
+                self._supervised_worker_source(
+                    "import time\nwhile True:\n    time.sleep(0.1)"
+                ),
                 encoding="utf-8",
             )
             spawned_pids: list[int] = []
             delivered_signals: list[int] = []
-            original_spawn = SUPERVISOR_MODULE.os.posix_spawn
+            original_spawn = SUPERVISOR_MODULE.subprocess.Popen
             original_terminate = SUPERVISOR_MODULE._terminate_worker
             original_handler = signal.getsignal(signal.SIGTERM)
             original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
 
-            def spawn_then_signal(*args: object, **kwargs: object) -> int:
-                pid = original_spawn(*args, **kwargs)
-                spawned_pids.append(pid)
+            def spawn_then_signal(
+                *args: object,
+                **kwargs: object,
+            ) -> subprocess.Popen[bytes]:
+                process = original_spawn(*args, **kwargs)
+                spawned_pids.append(process.pid)
                 os.kill(os.getpid(), signal.SIGTERM)
-                return pid
+                return process
 
             def repeat_signal_during_cleanup(
                 worker: object,
@@ -1029,8 +1100,8 @@ raise SystemExit(2)
             try:
                 with (
                     mock.patch.object(
-                        SUPERVISOR_MODULE.os,
-                        "posix_spawn",
+                        SUPERVISOR_MODULE.subprocess,
+                        "Popen",
                         side_effect=spawn_then_signal,
                     ),
                     mock.patch.object(
@@ -1039,10 +1110,9 @@ raise SystemExit(2)
                         side_effect=repeat_signal_during_cleanup,
                     ),
                 ):
-                    return_code = SUPERVISOR_MODULE.run_supervised(
+                    return_code = self._run_supervised_test_helper(
                         worker_script,
                         ["ignored"],
-                        python_bin=sys.executable,
                     )
             finally:
                 signal.signal(signal.SIGTERM, original_handler)
@@ -1055,7 +1125,7 @@ raise SystemExit(2)
             with self.assertRaises(ProcessLookupError):
                 os.kill(spawned_pids[0], 0)
 
-    def test_spawn_worker_relocates_colliding_supervisor_fd(self) -> None:
+    def test_spawn_worker_inherits_exact_supervisor_fd(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             worker_script = root / "worker.py"
@@ -1073,23 +1143,18 @@ raise SystemExit(2)
             )
             client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
             worker = None
-            collision_fd = client.fileno()
+            client_fd = client.fileno()
             try:
-                with mock.patch.object(
-                    SUPERVISOR_MODULE,
-                    "WORKER_SUPERVISOR_FD",
-                    collision_fd,
-                ):
-                    worker = SUPERVISOR_MODULE._spawn_worker(
-                        worker_script,
-                        [str(observed_fd_file)],
-                        python_bin=sys.executable,
-                        client_fd=collision_fd,
-                        child_signal_mask=set(
-                            signal.pthread_sigmask(signal.SIG_BLOCK, set())
-                        ),
-                    )
-                    return_code = worker.wait(timeout=5.0)
+                worker = SUPERVISOR_MODULE._spawn_worker(
+                    SUPERVISOR_MODULE._capture_helper_source(worker_script),
+                    [str(observed_fd_file)],
+                    python_bin=sys.executable,
+                    client_fd=client_fd,
+                    child_signal_mask=set(
+                        signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                    ),
+                )
+                return_code = worker.wait(timeout=5.0)
             finally:
                 if worker is not None and worker.poll() is None:
                     SUPERVISOR_MODULE._terminate_worker(worker, 0.5)
@@ -1099,7 +1164,759 @@ raise SystemExit(2)
             self.assertEqual(return_code, 0)
             self.assertEqual(
                 int(observed_fd_file.read_text(encoding="ascii")),
-                collision_fd + 1,
+                client_fd,
+            )
+
+    def test_spawn_worker_closes_last_moment_inheritable_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            worker_script = root / "worker.py"
+            sentinel = root / "sentinel"
+            sentinel.write_bytes(b"sentinel")
+            sentinel_metadata = root / "sentinel-metadata.json"
+            observed_file = root / "observed"
+            worker_script.write_text(
+                "import json\n"
+                "import os\n"
+                "import sys\n"
+                "metadata = json.loads(open(sys.argv[1], encoding='ascii').read())\n"
+                "inherited = False\n"
+                "try:\n"
+                "    opened = os.fstat(metadata['fd'])\n"
+                "except OSError:\n"
+                "    pass\n"
+                "else:\n"
+                "    inherited = [opened.st_dev, opened.st_ino] == metadata['identity']\n"
+                "with open(sys.argv[2], 'w', encoding='ascii') as stream:\n"
+                "    stream.write(json.dumps({'inherited': inherited}))\n",
+                encoding="utf-8",
+            )
+            original_spawn = SUPERVISOR_MODULE.subprocess.Popen
+            created_fd: int | None = None
+
+            def open_inheritable_then_spawn(
+                *args: object,
+                **kwargs: object,
+            ) -> subprocess.Popen[bytes]:
+                nonlocal created_fd
+                created_fd = os.open(sentinel, os.O_RDONLY)
+                os.set_inheritable(created_fd, True)
+                opened = os.fstat(created_fd)
+                sentinel_metadata.write_text(
+                    json.dumps(
+                        {
+                            "fd": created_fd,
+                            "identity": [opened.st_dev, opened.st_ino],
+                        }
+                    ),
+                    encoding="ascii",
+                )
+                try:
+                    return original_spawn(*args, **kwargs)
+                finally:
+                    os.close(created_fd)
+
+            client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+            worker = None
+            try:
+                with mock.patch.object(
+                    SUPERVISOR_MODULE.subprocess,
+                    "Popen",
+                    side_effect=open_inheritable_then_spawn,
+                ):
+                    worker = SUPERVISOR_MODULE._spawn_worker(
+                        SUPERVISOR_MODULE._capture_helper_source(worker_script),
+                        [str(sentinel_metadata), str(observed_file)],
+                        python_bin=sys.executable,
+                        client_fd=client.fileno(),
+                        child_signal_mask=set(
+                            signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                        ),
+                    )
+                return_code = worker.wait(timeout=5.0)
+            finally:
+                if worker is not None and worker.poll() is None:
+                    SUPERVISOR_MODULE._terminate_worker(worker, 0.5)
+                client.close()
+                server.close()
+
+            self.assertIsNotNone(created_fd)
+            self.assertEqual(return_code, 0)
+            self.assertFalse(
+                json.loads(observed_file.read_text(encoding="ascii"))["inherited"]
+            )
+
+    def test_spawn_worker_bootstrap_does_not_reopen_supervisor_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            worker_script = root / "worker.py"
+            observed_file = root / "observed"
+            worker_script.write_text(
+                "import pathlib\n"
+                "import sys\n"
+                "pathlib.Path(sys.argv[1]).write_text('started', encoding='ascii')\n",
+                encoding="utf-8",
+            )
+            observed_argv: list[str] = []
+            original_spawn = SUPERVISOR_MODULE.subprocess.Popen
+
+            def capture_argv_then_spawn(
+                argv: list[str],
+                **kwargs: object,
+            ) -> subprocess.Popen[bytes]:
+                observed_argv.extend(argv)
+                return original_spawn(argv, **kwargs)
+
+            client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+            worker = None
+            try:
+                with mock.patch.object(
+                    SUPERVISOR_MODULE.subprocess,
+                    "Popen",
+                    side_effect=capture_argv_then_spawn,
+                ):
+                    worker = SUPERVISOR_MODULE._spawn_worker(
+                        SUPERVISOR_MODULE._capture_helper_source(worker_script),
+                        [str(observed_file)],
+                        python_bin=sys.executable,
+                        client_fd=client.fileno(),
+                        child_signal_mask=set(
+                            signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                        ),
+                    )
+                return_code = worker.wait(timeout=5.0)
+            finally:
+                if worker is not None and worker.poll() is None:
+                    SUPERVISOR_MODULE._terminate_worker(worker, 0.5)
+                client.close()
+                server.close()
+
+            self.assertEqual(return_code, 0)
+            self.assertEqual(observed_file.read_text(encoding="ascii"), "started")
+            self.assertIn("-c", observed_argv)
+            self.assertIn(
+                SUPERVISOR_MODULE.WORKER_BOOTSTRAP_SOURCE,
+                observed_argv,
+            )
+            self.assertNotIn(
+                str(DIRECTORY_SUPERVISOR_PATH),
+                observed_argv,
+            )
+
+    def test_captured_helper_bytes_survive_post_capture_mutation(self) -> None:
+        def helper_source(marker: str) -> bytes:
+            return (
+                "import pathlib\n"
+                "import sys\n"
+                f"CAPTURE_MARKER = {marker!r}\n"
+                "if __name__ == '__main__':\n"
+                "    pathlib.Path(sys.argv[1]).write_text(\n"
+                "        CAPTURE_MARKER,\n"
+                "        encoding='ascii',\n"
+                "    )\n"
+            ).encode("ascii")
+
+        captured_source = helper_source("captured")
+        replacement_source = helper_source("replaced")
+        self.assertEqual(len(captured_source), len(replacement_source))
+        self.assertEqual(
+            SUPERVISOR_MODULE.HELPER.__captured_source_sha256__,
+            SUPERVISOR_MODULE.HELPER_CAPTURE.sha256,
+        )
+
+        for mutation in ("atomic-replace", "preheld-in-place-overwrite"):
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                worker_script = root / "worker.py"
+                observed_file = root / "observed"
+                worker_script.write_bytes(captured_source)
+                held_fd = (
+                    os.open(worker_script, os.O_RDWR)
+                    if mutation == "preheld-in-place-overwrite"
+                    else None
+                )
+                try:
+                    capture = SUPERVISOR_MODULE._capture_helper_source(worker_script)
+                    module_name = (
+                        f"captured_helper_source_test_{mutation.replace('-', '_')}"
+                    )
+                    parent_module = SUPERVISOR_MODULE._load_helper(
+                        capture,
+                        module_name=module_name,
+                    )
+                    self.addCleanup(sys.modules.pop, module_name, None)
+                    self.assertEqual(parent_module.CAPTURE_MARKER, "captured")
+                    self.assertEqual(
+                        parent_module.__captured_source_sha256__,
+                        capture.sha256,
+                    )
+
+                    if held_fd is None:
+                        replacement = root / "replacement.py"
+                        replacement.write_bytes(replacement_source)
+                        os.replace(replacement, worker_script)
+                    else:
+                        self.assertEqual(
+                            os.pwrite(held_fd, replacement_source, 0),
+                            len(replacement_source),
+                        )
+
+                    client, server = socket.socketpair(
+                        socket.AF_UNIX,
+                        socket.SOCK_DGRAM,
+                    )
+                    worker = None
+                    try:
+                        worker = SUPERVISOR_MODULE._spawn_worker(
+                            capture,
+                            [str(observed_file)],
+                            python_bin=sys.executable,
+                            client_fd=client.fileno(),
+                            child_signal_mask=set(
+                                signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                            ),
+                        )
+                        return_code = worker.wait(timeout=5.0)
+                    finally:
+                        if worker is not None and worker.poll() is None:
+                            SUPERVISOR_MODULE._terminate_worker(worker, 0.5)
+                        client.close()
+                        server.close()
+                finally:
+                    if held_fd is not None:
+                        os.close(held_fd)
+
+                self.assertEqual(return_code, 0)
+                self.assertEqual(
+                    worker_script.read_bytes(),
+                    replacement_source,
+                )
+                self.assertEqual(
+                    observed_file.read_text(encoding="ascii"),
+                    "captured",
+                )
+
+    def test_spawn_worker_closes_source_descriptor_before_helper_exec(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            worker_script = root / "worker.py"
+            observed_file = root / "observed"
+            worker_script.write_text(
+                "import errno\n"
+                "import os\n"
+                "import pathlib\n"
+                "import sys\n"
+                "descriptor = int(os.environ['APPLE_NOTES_TEST_SOURCE_FD'])\n"
+                "try:\n"
+                "    os.fstat(descriptor)\n"
+                "except OSError as exc:\n"
+                "    closed = exc.errno == errno.EBADF\n"
+                "else:\n"
+                "    closed = False\n"
+                "pathlib.Path(sys.argv[1]).write_text(str(closed), encoding='ascii')\n"
+                "if not closed:\n"
+                "    raise SystemExit(3)\n",
+                encoding="utf-8",
+            )
+            capture = SUPERVISOR_MODULE._capture_helper_source(worker_script)
+            source_descriptors: list[int] = []
+            original_spawn = SUPERVISOR_MODULE.subprocess.Popen
+
+            def expose_source_fd_then_spawn(
+                argv: list[str],
+                **kwargs: object,
+            ) -> subprocess.Popen[bytes]:
+                source_descriptors.append(int(argv[7]))
+                child_env = dict(kwargs["env"])
+                child_env["APPLE_NOTES_TEST_SOURCE_FD"] = argv[7]
+                kwargs["env"] = child_env
+                return original_spawn(argv, **kwargs)
+
+            client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+            worker = None
+            try:
+                with mock.patch.object(
+                    SUPERVISOR_MODULE.subprocess,
+                    "Popen",
+                    side_effect=expose_source_fd_then_spawn,
+                ):
+                    worker = SUPERVISOR_MODULE._spawn_worker(
+                        capture,
+                        [str(observed_file)],
+                        python_bin=sys.executable,
+                        client_fd=client.fileno(),
+                        child_signal_mask=set(
+                            signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                        ),
+                    )
+                return_code = worker.wait(timeout=5.0)
+            finally:
+                if worker is not None and worker.poll() is None:
+                    SUPERVISOR_MODULE._terminate_worker(worker, 0.5)
+                client.close()
+                server.close()
+
+            self.assertEqual(return_code, 0)
+            self.assertEqual(observed_file.read_text(encoding="ascii"), "True")
+            self.assertEqual(len(source_descriptors), 1)
+            with self.assertRaises(OSError) as raised:
+                os.fstat(source_descriptors[0])
+            self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def test_worker_helper_source_frame_corruption_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            worker_script = root / "worker.py"
+            worker_script.write_text(
+                "import pathlib\n"
+                "import sys\n"
+                "pathlib.Path(sys.argv[1]).write_text('executed', encoding='ascii')\n",
+                encoding="utf-8",
+            )
+            capture = SUPERVISOR_MODULE._capture_helper_source(worker_script)
+            valid_frame = SUPERVISOR_MODULE._helper_source_frame(capture)
+            source_offset = (
+                len(SUPERVISOR_MODULE.HELPER_SOURCE_FRAME_MAGIC)
+                + 8
+                + hashlib.sha256().digest_size
+            )
+            digest_corruption = bytearray(valid_frame)
+            digest_corruption[source_offset] ^= 1
+            oversized_header = b"".join(
+                (
+                    SUPERVISOR_MODULE.HELPER_SOURCE_FRAME_MAGIC,
+                    (SUPERVISOR_MODULE.HELPER_SOURCE_MAX_BYTES + 1).to_bytes(
+                        8,
+                        "big",
+                    ),
+                    hashlib.sha256(b"oversized").digest(),
+                )
+            )
+            corruptions = {
+                "truncated": valid_frame[:-1],
+                "digest": bytes(digest_corruption),
+                "trailing": valid_frame + b"x",
+                "oversize": oversized_header,
+            }
+
+            for label, corrupt_frame in corruptions.items():
+                with self.subTest(label=label):
+                    observed_file = root / f"observed-{label}"
+                    client, server = socket.socketpair(
+                        socket.AF_UNIX,
+                        socket.SOCK_DGRAM,
+                    )
+                    worker = None
+                    try:
+                        with mock.patch.object(
+                            SUPERVISOR_MODULE,
+                            "_helper_source_frame",
+                            return_value=corrupt_frame,
+                        ):
+                            worker = SUPERVISOR_MODULE._spawn_worker(
+                                capture,
+                                [str(observed_file)],
+                                python_bin=sys.executable,
+                                client_fd=client.fileno(),
+                                child_signal_mask=set(
+                                    signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                                ),
+                            )
+                        return_code = worker.wait(timeout=5.0)
+                    finally:
+                        if worker is not None and worker.poll() is None:
+                            SUPERVISOR_MODULE._terminate_worker(worker, 0.5)
+                        client.close()
+                        server.close()
+
+                    self.assertEqual(return_code, 1)
+                    self.assertFalse(observed_file.exists())
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(worker.pid, 0)
+
+    def test_helper_source_delivery_errors_reap_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker_script = Path(temp_dir) / "worker.py"
+            worker_script.write_text("raise SystemExit(0)\n", encoding="utf-8")
+            capture = SUPERVISOR_MODULE._capture_helper_source(worker_script)
+
+            for delivery_error in (
+                TimeoutError("simulated helper source delivery timeout"),
+                BrokenPipeError(errno.EPIPE, "simulated helper source reader exit"),
+            ):
+                with self.subTest(error=type(delivery_error).__name__):
+                    spawned_pids: list[int] = []
+                    original_spawn = SUPERVISOR_MODULE.subprocess.Popen
+
+                    def record_spawn(
+                        *args: object,
+                        **kwargs: object,
+                    ) -> subprocess.Popen[bytes]:
+                        process = original_spawn(*args, **kwargs)
+                        spawned_pids.append(process.pid)
+                        return process
+
+                    client, server = socket.socketpair(
+                        socket.AF_UNIX,
+                        socket.SOCK_DGRAM,
+                    )
+                    try:
+                        with (
+                            mock.patch.object(
+                                SUPERVISOR_MODULE.subprocess,
+                                "Popen",
+                                side_effect=record_spawn,
+                            ),
+                            mock.patch.object(
+                                SUPERVISOR_MODULE,
+                                "_write_helper_source_frame",
+                                side_effect=delivery_error,
+                            ),
+                        ):
+                            with self.assertRaises(type(delivery_error)):
+                                SUPERVISOR_MODULE._spawn_worker(
+                                    capture,
+                                    ["ignored"],
+                                    python_bin=sys.executable,
+                                    client_fd=client.fileno(),
+                                    child_signal_mask=set(
+                                        signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                                    ),
+                                )
+                    finally:
+                        client.close()
+                        server.close()
+
+                    self.assertEqual(len(spawned_pids), 1)
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(spawned_pids[0], 0)
+
+    def test_helper_source_delivery_times_out_on_a_real_full_pipe(self) -> None:
+        read_fd, write_fd = os.pipe()
+        frame = b"x" * (
+            len(SUPERVISOR_MODULE.HELPER_SOURCE_FRAME_MAGIC)
+            + 8
+            + hashlib.sha256().digest_size
+            + SUPERVISOR_MODULE.HELPER_SOURCE_MAX_BYTES
+        )
+        started = time.monotonic()
+        try:
+            with self.assertRaises(TimeoutError):
+                SUPERVISOR_MODULE._write_helper_source_frame(
+                    write_fd,
+                    frame,
+                    timeout_seconds=0.05,
+                )
+        finally:
+            os.close(write_fd)
+            os.close(read_fd)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_run_supervised_uses_one_capture_for_service_and_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            helper_path = root / "helper.py"
+            service_evidence = root / "service-digest"
+            worker_evidence = root / "worker-digest"
+            helper_path.write_text(
+                self._supervised_worker_source(
+                    "import pathlib\n"
+                    "import sys\n"
+                    "pathlib.Path(sys.argv[1]).write_text(\n"
+                    "    __captured_source_sha256__,\n"
+                    "    encoding='ascii',\n"
+                    ")"
+                ),
+                encoding="utf-8",
+            )
+            expected_capture = SUPERVISOR_MODULE._capture_helper_source(helper_path)
+            module_prefix = "apple_notes_test_supervised_helper_"
+            modules_before = {
+                name for name in sys.modules if name.startswith(module_prefix)
+            }
+
+            def record_service_capture(
+                supervisor_fd: int,
+                helper_module: object,
+            ) -> int:
+                try:
+                    service_evidence.write_text(
+                        helper_module.__captured_source_sha256__,
+                        encoding="ascii",
+                    )
+                finally:
+                    os.close(supervisor_fd)
+                return 0
+
+            with mock.patch.object(
+                SUPERVISOR_MODULE,
+                "_serve",
+                new=record_service_capture,
+            ):
+                return_code = self._run_supervised_test_helper(
+                    helper_path,
+                    [str(worker_evidence)],
+                )
+
+            self.assertEqual(return_code, 0)
+            self.assertEqual(
+                service_evidence.read_text(encoding="ascii"),
+                expected_capture.sha256,
+            )
+            self.assertEqual(
+                worker_evidence.read_text(encoding="ascii"),
+                expected_capture.sha256,
+            )
+            self.assertEqual(
+                {name for name in sys.modules if name.startswith(module_prefix)},
+                modules_before,
+            )
+
+    def test_production_launcher_rejects_custom_helper_before_execution(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            helper_path = root / "helper.py"
+            execution_evidence = root / "custom-helper-executed"
+            helper_path.write_text(
+                "import pathlib\n"
+                f"pathlib.Path({str(execution_evidence)!r}).write_text(\n"
+                "    'executed',\n"
+                "    encoding='ascii',\n"
+                ")\n",
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(
+                    SUPERVISOR_MODULE.os,
+                    "fork",
+                    side_effect=AssertionError("service must not fork"),
+                ) as fork,
+                mock.patch.object(
+                    SUPERVISOR_MODULE.subprocess,
+                    "Popen",
+                    side_effect=AssertionError("worker must not spawn"),
+                ) as spawn,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "custom --helper paths are unsupported",
+                ):
+                    SUPERVISOR_MODULE.run_supervised(
+                        helper_path,
+                        ["ignored"],
+                        python_bin=sys.executable,
+                    )
+
+            fork.assert_not_called()
+            spawn.assert_not_called()
+            self.assertFalse(execution_evidence.exists())
+
+    def test_helper_capture_failures_precede_service_or_worker_spawn(self) -> None:
+        def assert_fails_before_spawn(helper_path: Path) -> None:
+            with (
+                mock.patch.object(
+                    SUPERVISOR_MODULE.os,
+                    "fork",
+                    side_effect=AssertionError("service must not fork"),
+                ) as fork,
+                mock.patch.object(
+                    SUPERVISOR_MODULE.subprocess,
+                    "Popen",
+                    side_effect=AssertionError("worker must not spawn"),
+                ) as spawn,
+            ):
+                with self.assertRaises(RuntimeError):
+                    SUPERVISOR_MODULE._capture_helper_source(helper_path)
+            fork.assert_not_called()
+            spawn.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            helper = root / "helper.py"
+            helper.write_text("raise SystemExit(0)\n", encoding="utf-8")
+            helper_symlink = root / "helper-link.py"
+            helper_symlink.symlink_to(helper)
+            assert_fails_before_spawn(helper_symlink)
+            assert_fails_before_spawn(root)
+
+            original_fstat = SUPERVISOR_MODULE.os.fstat
+            fstat_calls = 0
+
+            def report_access_drift(descriptor: int) -> os.stat_result:
+                nonlocal fstat_calls
+                fstat_calls += 1
+                opened = original_fstat(descriptor)
+                if fstat_calls == 2:
+                    return _StatWithOverrides(
+                        opened,
+                        st_mode=opened.st_mode ^ stat.S_IWGRP,
+                    )
+                return opened
+
+            with mock.patch.object(
+                SUPERVISOR_MODULE.os,
+                "fstat",
+                side_effect=report_access_drift,
+            ):
+                assert_fails_before_spawn(helper)
+
+            replacement = b"raise SystemExit(1)\n"
+            self.assertEqual(len(helper.read_bytes()), len(replacement))
+            held_fd = os.open(helper, os.O_RDWR)
+            original_read_pass = SUPERVISOR_MODULE._read_helper_source_pass
+            read_passes = 0
+
+            def overwrite_between_capture_passes(
+                descriptor: int,
+                expected_size: int,
+            ) -> bytes:
+                nonlocal read_passes
+                captured = original_read_pass(descriptor, expected_size)
+                read_passes += 1
+                if read_passes == 1:
+                    self.assertEqual(
+                        os.pwrite(held_fd, replacement, 0),
+                        len(replacement),
+                    )
+                return captured
+
+            try:
+                with mock.patch.object(
+                    SUPERVISOR_MODULE,
+                    "_read_helper_source_pass",
+                    side_effect=overwrite_between_capture_passes,
+                ):
+                    assert_fails_before_spawn(helper)
+            finally:
+                os.close(held_fd)
+
+            helper.write_text("raise SystemExit(0)\n", encoding="utf-8")
+            original_open = SUPERVISOR_MODULE.os.open
+            open_flags: list[int] = []
+
+            def replace_regular_helper_with_fifo(
+                path: object,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                open_flags.append(flags)
+                os.unlink(helper)
+                os.mkfifo(helper)
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            with (
+                mock.patch.object(
+                    SUPERVISOR_MODULE.os,
+                    "open",
+                    side_effect=replace_regular_helper_with_fifo,
+                ),
+                _fail_if_deadline_exceeded(1.0),
+            ):
+                assert_fails_before_spawn(helper)
+            self.assertEqual(len(open_flags), 1)
+            self.assertTrue(open_flags[0] & os.O_NONBLOCK)
+
+    def test_spawn_worker_restores_default_signal_dispositions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            worker_script = root / "worker.py"
+            observed_file = root / "observed.json"
+            worker_script.write_text(
+                self._supervised_worker_source(
+                    "import json\n"
+                    "import pathlib\n"
+                    "import signal\n"
+                    "import sys\n"
+                    "signals = json.loads(sys.argv[2])\n"
+                    "pathlib.Path(sys.argv[1]).write_text(\n"
+                    "    json.dumps(\n"
+                    "        {str(value): signal.getsignal(value) for value in signals}\n"
+                    "    ),\n"
+                    "    encoding='ascii',\n"
+                    ")"
+                ),
+                encoding="utf-8",
+            )
+            defaults = sorted(
+                int(signum) for signum in SUPERVISOR_MODULE.SPAWN_DEFAULT_SIGNALS
+            )
+            original_handlers = {
+                signum: signal.getsignal(signum) for signum in defaults
+            }
+            try:
+                for signum in defaults:
+                    signal.signal(signum, signal.SIG_IGN)
+                return_code = self._run_supervised_test_helper(
+                    worker_script,
+                    [str(observed_file), json.dumps(defaults)],
+                )
+                restored_handlers = {
+                    signum: signal.getsignal(signum) for signum in defaults
+                }
+            finally:
+                for signum, handler in original_handlers.items():
+                    signal.signal(signum, handler)
+
+            self.assertEqual(return_code, 0)
+            self.assertEqual(
+                restored_handlers,
+                {signum: signal.SIG_IGN for signum in defaults},
+            )
+            observed = json.loads(observed_file.read_text(encoding="ascii"))
+            self.assertEqual(
+                observed,
+                {str(signum): signal.SIG_DFL for signum in defaults},
+            )
+
+    def test_spawn_worker_restores_exact_selected_signal_mask(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            worker_script = root / "worker.py"
+            observed_file = root / "observed.json"
+            worker_script.write_text(
+                self._supervised_worker_source(
+                    "import json\n"
+                    "import pathlib\n"
+                    "import signal\n"
+                    "import sys\n"
+                    "current = signal.pthread_sigmask(signal.SIG_BLOCK, set())\n"
+                    "pathlib.Path(sys.argv[1]).write_text(\n"
+                    "    json.dumps(sorted(int(signum) for signum in current)),\n"
+                    "    encoding='ascii',\n"
+                    ")"
+                ),
+                encoding="utf-8",
+            )
+            original_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK,
+                {signal.SIGUSR1},
+            )
+            expected_mask = set(original_mask).union({signal.SIGUSR1})
+            try:
+                return_code = self._run_supervised_test_helper(
+                    worker_script,
+                    [str(observed_file)],
+                )
+                retained_parent_mask = signal.pthread_sigmask(
+                    signal.SIG_BLOCK,
+                    set(),
+                )
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+
+            self.assertEqual(return_code, 0)
+            self.assertEqual(retained_parent_mask, expected_mask)
+            self.assertEqual(
+                json.loads(observed_file.read_text(encoding="ascii")),
+                sorted(int(signum) for signum in expected_mask),
             )
 
     def test_pending_signal_drain_is_snapshot_bounded(self) -> None:
@@ -1127,7 +1944,10 @@ raise SystemExit(2)
     def test_supervisor_normalizes_ignored_sigchld_and_restores(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             worker_script = Path(temp_dir) / "worker.py"
-            worker_script.write_text("raise SystemExit(0)\n", encoding="utf-8")
+            worker_script.write_text(
+                self._supervised_worker_source("raise SystemExit(0)"),
+                encoding="utf-8",
+            )
             original_sigchld_handler = signal.getsignal(signal.SIGCHLD)
             original_sigterm_handler = signal.getsignal(signal.SIGTERM)
             original_mask = signal.pthread_sigmask(
@@ -1142,10 +1962,9 @@ raise SystemExit(2)
             signal.signal(signal.SIGCHLD, signal.SIG_IGN)
             signal.signal(signal.SIGTERM, retained_sigterm_handler)
             try:
-                return_code = SUPERVISOR_MODULE.run_supervised(
+                return_code = self._run_supervised_test_helper(
                     worker_script,
                     ["ignored"],
-                    python_bin=sys.executable,
                 )
                 restored_sigchld_handler = signal.getsignal(signal.SIGCHLD)
                 restored_sigterm_handler = signal.getsignal(signal.SIGTERM)
@@ -1161,7 +1980,8 @@ raise SystemExit(2)
         self.assertEqual(restored_mask, expected_mask)
 
     def test_supervisor_echild_status_is_conservative_and_terminal(self) -> None:
-        worker = SUPERVISOR_MODULE._SpawnedWorker(12345)
+        process = mock.Mock(pid=12345, returncode=None)
+        worker = SUPERVISOR_MODULE._SpawnedWorker(12345, process=process)
         no_child = ChildProcessError(errno.ECHILD, "simulated external reap")
         with mock.patch.object(
             SUPERVISOR_MODULE.os,
@@ -1177,6 +1997,7 @@ raise SystemExit(2)
                 SUPERVISOR_MODULE.WORKER_RETURN_CODE_UNAVAILABLE,
             )
         waitpid.assert_called_once_with(12345, os.WNOHANG)
+        self.assertEqual(process.returncode, 1)
 
         with mock.patch.object(
             SUPERVISOR_MODULE.os,
@@ -1249,6 +2070,7 @@ raise SystemExit(2)
                         server,
                         request,
                         [os.dup(parent_fd)],
+                        SUPERVISOR_MODULE.HELPER,
                     )
                 payload, ancillary, flags, _ = client.recvmsg(
                     MODULE.DIRECTORY_CREATOR_MAX_MESSAGE_BYTES,
@@ -6012,6 +6834,419 @@ raise SystemExit(2)
                 self.assertTrue(source_record["exists"])
                 self.assertFalse(source_record["readable"])
                 self.assertEqual(source_record["error_code"], expected_code)
+
+    def test_probe_contains_each_container_context_exit_failure(self) -> None:
+        fault_profiles = (
+            (
+                lambda: FileNotFoundError(
+                    MODULE.errno.ENOENT,
+                    "simulated container exit disappearance",
+                ),
+                "source-missing-after-read",
+            ),
+            (
+                lambda: PermissionError(
+                    MODULE.errno.EACCES,
+                    "simulated container exit unreadable",
+                ),
+                "source-revalidation-unreadable",
+            ),
+            (
+                lambda: OSError(
+                    MODULE.errno.EIO,
+                    "simulated container exit revalidation failure",
+                ),
+                "source-revalidation-inconclusive",
+            ),
+            (
+                lambda: MODULE.StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "simulated container exit replacement",
+                ),
+                "source-identity-mismatch",
+            ),
+            (
+                lambda: MODULE.StoreSafetyError(
+                    "prepared-directory-access-policy-mismatch",
+                    "simulated container exit access-policy change",
+                ),
+                "source-access-policy-mismatch",
+            ),
+        )
+        original_bind = MODULE._bind_existing_directory_with_trusted_alias
+        for container_name in ("group_container", "app_container"):
+            for fault_factory, expected_code in fault_profiles:
+                with (
+                    self.subTest(
+                        container=container_name,
+                        expected_code=expected_code,
+                    ),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    root = Path(temp_dir)
+                    paths = self._make_paths(root)
+                    source = paths.group_container / MODULE.NOTE_STORE_MAIN
+                    self._create_db(source)
+                    target = getattr(paths, container_name)
+
+                    @contextmanager
+                    def fail_selected_context_exit(
+                        path: Path,
+                        *,
+                        trusted_alias: MODULE._TrustedDirectoryAlias | None = None,
+                    ) -> Iterator[MODULE._BoundDirectory]:
+                        with original_bind(
+                            path,
+                            trusted_alias=trusted_alias,
+                        ) as binding:
+                            yield binding
+                        if path == target:
+                            raise fault_factory()
+
+                    with mock.patch.object(
+                        MODULE,
+                        "_bind_existing_directory_with_trusted_alias",
+                        side_effect=fail_selected_context_exit,
+                    ):
+                        result = MODULE.probe_db_access(paths)
+
+                    target_record = next(
+                        record
+                        for record in result["paths"]
+                        if Path(record["path"]) == target
+                    )
+                    self.assertTrue(target_record["exists"])
+                    self.assertFalse(target_record["readable"])
+                    self.assertEqual(target_record["error_code"], expected_code)
+                    self.assertFalse(
+                        target_record["error_code"].startswith("prepared-directory-")
+                    )
+                    source_record = next(
+                        record
+                        for record in result["note_store_files"]
+                        if Path(record["path"]) == source
+                    )
+                    if container_name == "group_container":
+                        for file_record in result["note_store_files"]:
+                            self.assertFalse(file_record["readable"])
+                            self.assertEqual(
+                                file_record["error_code"],
+                                expected_code,
+                            )
+                            self.assertNotIn("size", file_record)
+                            self.assertNotIn("identity", file_record)
+                            self.assertNotIn("access_policy", file_record)
+                        self.assertTrue(source_record["exists"])
+                    else:
+                        self.assertTrue(source_record["exists"])
+                        self.assertTrue(source_record["readable"])
+                        self.assertIn("size", source_record)
+                        self.assertIn("identity", source_record)
+                        self.assertIn("access_policy", source_record)
+
+    def test_probe_explicit_terminal_check_uses_source_taxonomy(self) -> None:
+        fault_profiles = (
+            (
+                lambda: FileNotFoundError(
+                    MODULE.errno.ENOENT,
+                    "simulated explicit terminal disappearance",
+                ),
+                "source-missing-after-read",
+            ),
+            (
+                lambda: PermissionError(
+                    MODULE.errno.EACCES,
+                    "simulated explicit terminal unreadable",
+                ),
+                "source-revalidation-unreadable",
+            ),
+            (
+                lambda: OSError(
+                    MODULE.errno.EIO,
+                    "simulated explicit terminal EIO",
+                ),
+                "source-revalidation-inconclusive",
+            ),
+            (
+                lambda: MODULE.StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "simulated explicit terminal replacement",
+                ),
+                "source-identity-mismatch",
+            ),
+            (
+                lambda: MODULE.StoreSafetyError(
+                    "prepared-directory-access-policy-mismatch",
+                    "simulated explicit terminal access-policy change",
+                ),
+                "source-access-policy-mismatch",
+            ),
+        )
+        original_sample = MODULE._bounded_probe_directory_sample
+        original_verify = MODULE._verify_bound_directory_namespace
+        for container_name in ("group_container", "app_container"):
+            for fault_factory, expected_code in fault_profiles:
+                with (
+                    self.subTest(
+                        container=container_name,
+                        expected_code=expected_code,
+                    ),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    root = Path(temp_dir)
+                    paths = self._make_paths(root)
+                    source = paths.group_container / MODULE.NOTE_STORE_MAIN
+                    self._create_db(source)
+                    target = getattr(paths, container_name)
+                    target_sample_index = (
+                        1 if container_name == "group_container" else 2
+                    )
+                    sample_count = 0
+                    fail_next_target_verify = False
+
+                    def arm_after_selected_sample(directory_fd: int) -> list[str]:
+                        nonlocal sample_count, fail_next_target_verify
+                        sampled = original_sample(directory_fd)
+                        sample_count += 1
+                        if sample_count == target_sample_index:
+                            fail_next_target_verify = True
+                        return sampled
+
+                    def fail_selected_explicit_terminal_check(
+                        binding: MODULE._BoundDirectory,
+                    ) -> dict[str, object]:
+                        nonlocal fail_next_target_verify
+                        if fail_next_target_verify and binding.path == target:
+                            fail_next_target_verify = False
+                            raise fault_factory()
+                        return original_verify(binding)
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_bounded_probe_directory_sample",
+                            side_effect=arm_after_selected_sample,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_verify_bound_directory_namespace",
+                            side_effect=fail_selected_explicit_terminal_check,
+                        ),
+                    ):
+                        result = MODULE.probe_db_access(paths)
+
+                    self.assertFalse(fail_next_target_verify)
+                    target_record = next(
+                        record
+                        for record in result["paths"]
+                        if Path(record["path"]) == target
+                    )
+                    self.assertTrue(target_record["exists"])
+                    self.assertFalse(target_record["readable"])
+                    self.assertEqual(target_record["error_code"], expected_code)
+                    self.assertFalse(
+                        target_record["error_code"].startswith("prepared-directory-")
+                    )
+                    self.assertIn("sample_children", target_record)
+                    source_record = next(
+                        record
+                        for record in result["note_store_files"]
+                        if Path(record["path"]) == source
+                    )
+                    if container_name == "group_container":
+                        for file_record in result["note_store_files"]:
+                            self.assertFalse(file_record["readable"])
+                            self.assertEqual(
+                                file_record["error_code"],
+                                expected_code,
+                            )
+                            self.assertIn("error", file_record)
+                            self.assertNotIn("size", file_record)
+                            self.assertNotIn("identity", file_record)
+                            self.assertNotIn("access_policy", file_record)
+                        self.assertFalse(source_record["exists"])
+                    else:
+                        self.assertTrue(source_record["exists"])
+                        self.assertTrue(source_record["readable"])
+                        self.assertIn("size", source_record)
+                        self.assertIn("identity", source_record)
+                        self.assertIn("access_policy", source_record)
+                        self.assertNotIn("error_code", source_record)
+
+    def test_probe_same_container_path_closes_each_role_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            shared = Path(temp_dir) / "shared"
+            shared.mkdir()
+            source = shared / MODULE.NOTE_STORE_MAIN
+            self._create_db(source)
+            paths = MODULE.NoteStorePaths(
+                group_container=shared,
+                app_container=shared,
+            )
+            original_bind = MODULE._bind_existing_directory_with_trusted_alias
+            contexts: list[object] = []
+
+            class TrackingContext:
+                def __init__(
+                    self,
+                    path: Path,
+                    trusted_alias: MODULE._TrustedDirectoryAlias | None,
+                ) -> None:
+                    self.inner = original_bind(
+                        path,
+                        trusted_alias=trusted_alias,
+                    )
+                    self.entered = False
+                    self.exited = False
+                    self.binding_fd: int | None = None
+
+                def __enter__(self) -> MODULE._BoundDirectory:
+                    binding = self.inner.__enter__()
+                    self.entered = True
+                    self.binding_fd = binding.fd
+                    return binding
+
+                def __exit__(
+                    self,
+                    exc_type: object,
+                    exc: object,
+                    traceback: object,
+                ) -> object:
+                    self.exited = True
+                    return self.inner.__exit__(exc_type, exc, traceback)
+
+            def tracked_bind(
+                path: Path,
+                *,
+                trusted_alias: MODULE._TrustedDirectoryAlias | None = None,
+            ) -> TrackingContext:
+                context = TrackingContext(path, trusted_alias)
+                contexts.append(context)
+                return context
+
+            try:
+                with mock.patch.object(
+                    MODULE,
+                    "_bind_existing_directory_with_trusted_alias",
+                    side_effect=tracked_bind,
+                ):
+                    result = MODULE.probe_db_access(paths)
+
+                self.assertEqual(len(contexts), 2)
+                self.assertTrue(all(context.entered for context in contexts))
+                self.assertTrue(all(context.exited for context in contexts))
+                for context in contexts:
+                    self.assertIsNotNone(context.binding_fd)
+                    with self.assertRaises(OSError) as raised:
+                        os.fstat(context.binding_fd)
+                    self.assertEqual(raised.exception.errno, errno.EBADF)
+            finally:
+                for context in reversed(contexts):
+                    if context.entered and not context.exited:
+                        context.__exit__(None, None, None)
+
+            self.assertEqual(len(result["paths"]), 2)
+            self.assertTrue(all(record["readable"] for record in result["paths"]))
+            source_record = next(
+                record
+                for record in result["note_store_files"]
+                if Path(record["path"]) == source
+            )
+            self.assertTrue(source_record["exists"])
+            self.assertTrue(source_record["readable"])
+
+    def test_probe_sample_stops_at_entry_and_raw_name_byte_caps(self) -> None:
+        class FakeEntry:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        class CountingScandir:
+            def __init__(self, names: Iterator[str]) -> None:
+                self._names = names
+                self.next_calls = 0
+
+            def __enter__(self) -> CountingScandir:
+                return self
+
+            def __exit__(
+                self,
+                exc_type: object,
+                exc: object,
+                traceback: object,
+            ) -> None:
+                return None
+
+            def __iter__(self) -> CountingScandir:
+                return self
+
+            def __next__(self) -> FakeEntry:
+                self.next_calls += 1
+                return FakeEntry(next(self._names))
+
+        entry_scan = CountingScandir(
+            iter(
+                f"entry-{index}"
+                for index in range(MODULE.BOUND_DIRECTORY_SCAN_MAX_ENTRIES + 100)
+            )
+        )
+        with (
+            mock.patch.object(MODULE.os, "scandir", return_value=entry_scan),
+            self.assertRaises(MODULE.StoreSafetyError) as entry_raised,
+        ):
+            MODULE._bounded_probe_directory_sample(123)
+        self._assert_safety_code(
+            "container-revalidation-inconclusive",
+            entry_raised,
+        )
+        self.assertEqual(
+            entry_scan.next_calls,
+            MODULE.BOUND_DIRECTORY_SCAN_MAX_ENTRIES + 1,
+        )
+        self.assertEqual(
+            entry_raised.exception.details["entry_limit"],
+            MODULE.BOUND_DIRECTORY_SCAN_MAX_ENTRIES,
+        )
+
+        long_name = "é" * 128
+        encoded_name_bytes = len(os.fsencode(long_name))
+        name_scan = CountingScandir(iter(long_name for _ in range(100)))
+        with (
+            mock.patch.object(MODULE.os, "scandir", return_value=name_scan),
+            self.assertRaises(MODULE.StoreSafetyError) as name_raised,
+        ):
+            MODULE._bounded_probe_directory_sample(123)
+        self._assert_safety_code(
+            "container-revalidation-inconclusive",
+            name_raised,
+        )
+        expected_calls = (
+            MODULE.BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES // encoded_name_bytes + 1
+        )
+        self.assertEqual(name_scan.next_calls, expected_calls)
+        self.assertEqual(
+            name_raised.exception.details["raw_name_bytes_limit"],
+            MODULE.BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES,
+        )
+
+    def test_probe_reports_oversized_container_sample_as_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = self._make_paths(Path(temp_dir))
+            for index in range(MODULE.BOUND_DIRECTORY_SCAN_MAX_ENTRIES + 1):
+                (paths.group_container / f"entry-{index}").write_bytes(b"")
+
+            result = MODULE.probe_db_access(paths)
+
+        group_record = next(
+            record
+            for record in result["paths"]
+            if Path(record["path"]) == paths.group_container
+        )
+        self.assertTrue(group_record["exists"])
+        self.assertFalse(group_record["readable"])
+        self.assertEqual(
+            group_record["error_code"],
+            "container-revalidation-inconclusive",
+        )
 
     def test_descriptor_relative_open_maps_post_open_fstat_and_parent_errors(
         self,

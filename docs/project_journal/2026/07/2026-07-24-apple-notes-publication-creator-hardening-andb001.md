@@ -68,6 +68,12 @@ superseded_by:
   non-domain exception while inventorying an already-created sensitive
   partial keeps `mutation_performed: true` alongside bounded
   preserved-or-incomplete recovery evidence.
+- Closed the worker helper-source replacement window: the production launcher,
+  parent/service protocol module, and worker now use one immutable bounded
+  capture, with no child pathname reopen or production custom-helper execution.
+- Closed the probe terminal-consistency gaps so post-sample container failures
+  retain source taxonomy across every dependent file row, including when
+  group/app paths are equal.
 
 ## Current State
 
@@ -168,6 +174,35 @@ superseded_by:
 - Direct public output APIs prove the requested leaf is still absent through
   the held parent before committing the destination parent or creating a
   private partial.
+- Worker launch no longer snapshots parent descriptors before starting the
+  child. Before either child exists, the launcher no-follow/nonblocking-opens
+  the fixed packaged helper, binds identity/access policy and a 2-MiB ceiling,
+  and requires two identical reads around descriptor/path revalidation.
+  Production rejects every other `--helper` path before capture or execution.
+- CPython closes all non-allowlisted descriptors after the fork snapshot,
+  retaining only the exact supervisor channel and a launch-only anonymous
+  source-pipe reader. A fixed parent-memory bootstrap validates the framed
+  length/SHA-256, rejects truncation/trailing bytes, closes the source FD,
+  restores the exact selected signal defaults/mask, and compiles the captured
+  bytes with the pathname used only for diagnostics.
+- Helper-source delivery is nonblocking and deadline-bounded. Timeout,
+  BrokenPipe, malformed-frame, or early child exit closes both pipe ends and
+  enters bounded worker kill/reap. Atomic path replacement and pre-held
+  in-place overwrite after capture cannot change executed bytes.
+- `probe-db-access` gives each container its own enter/body/exit result
+  boundary. After a successful sample, explicit terminal-check and exit-only
+  generic component-chain failures translate from their caught evidence into
+  the corresponding `source-*` classification instead of becoming initial
+  absence/container taxonomy or aborting the complete probe.
+- If the retained group-container context fails its final exit after NoteStore
+  file inspection, all dependent file rows become unreadable under that same
+  source error and discard size, identity, and access-policy authority.
+- Probe iteration carries explicit group/app roles. Equal configured container
+  paths still close two independent contexts exactly once and cannot overwrite
+  the retained group ExitStack.
+- Container child samples enforce a complete 64-entry and 4-KiB raw-name
+  budget, stop on overflow, and sort only the bounded set before retaining five
+  names.
 
 ## Next Steps
 
@@ -209,6 +244,54 @@ superseded_by:
 - Current-head static and documentation gates: full-repository Ruff `0.13.2`,
   changed-Python format check, `bash -n`, ShellCheck `0.11.0`, skill validation,
   project-journal validation, and `git diff --check`.
+- Fresh-review launch/probe follow-up base:
+  `c4dc449ddadd01176bdb9b086dd7f718cffc09ed`.
+- Fresh-review focused regressions: Python `3.13.0` and system Python `3.9.6`
+  each passed `13` tests covering a last-moment inheritable descriptor,
+  supervisor-path-independent bootstrap argv, ignored signal dispositions,
+  bounded container samples, both container exit windows, and existing
+  per-file source classification.
+- Fresh-review full regressions: Python `3.13.0` passed all `313` tests with
+  `2` sandbox-scoped fixed-`/usr/bin/pgrep` skips in `41.000s`; system Python
+  `3.9.6` passed the same `313` tests with `2` skips in `49.427s`.
+- Fresh-review static and documentation gates: full-repository Ruff `0.13.2`,
+  changed-Python format check, Python `3.13.0` and `3.9.6` isolated
+  `py_compile`, `bash -n`, ShellCheck `0.11.0`, skill validation,
+  project-journal validation, and `git diff --check`.
+- Helper-source capture follow-up base:
+  `c4dc449ddadd01176bdb9b086dd7f718cffc09ed`.
+- Helper-source focused regressions: Python `3.13.0` and system Python `3.9.6`
+  each passed `21` tests covering post-capture atomic replacement and pre-held
+  in-place overwrite, no-follow/nonblocking capture races, canonical-only
+  production launch, parent/service/worker source identity, frame
+  truncation/digest/trailing/oversize rejection, real full-pipe timeout,
+  delivery-error reap, exact source-FD closure, signal defaults/mask, bounded
+  container samples, and per-container exit failures.
+- Helper-source full regressions: Python `3.13.0` passed all `322` tests with
+  `2` sandbox-scoped fixed-`/usr/bin/pgrep` skips in `44.995s`; system Python
+  `3.9.6` passed the same `322` tests with `2` skips in `52.439s`.
+- Helper-source static and documentation gates: full-repository Ruff `0.13.2`;
+  changed-Python format check; Python `3.13.0` and `3.9.6` isolated
+  `py_compile`; `bash -n`; ShellCheck `0.11.0`; skill validation;
+  project-journal validation; and `git diff --check`.
+- A fresh read-only implementation audit found no remaining production
+  blocker, P1, or P2 in capture, source delivery, descriptor inheritance,
+  cleanup, or signal restoration.
+- Probe terminal-consistency focused regressions: Python `3.13.0` and system
+  Python `3.9.6` each passed `7` tests covering post-open file errors, explicit
+  terminal missing/permission/EIO/identity/access failure, final context-exit
+  propagation to every dependent file row, equal-path role ownership and FD
+  closure, bounded samples, and per-file post-close revalidation.
+- Probe terminal-consistency full regressions: Python `3.13.0` passed all `324`
+  tests with `2` sandbox-scoped fixed-`/usr/bin/pgrep` skips in `42.770s`;
+  system Python `3.9.6` passed the same `324` tests with `2` skips in `50.560s`.
+- Probe terminal-consistency static and documentation gates:
+  full-repository Ruff `0.13.2`; changed-Python format check; Python `3.13.0`
+  and `3.9.6` isolated `py_compile`; `bash -n`; ShellCheck `0.11.0`; skill
+  validation; project-journal validation; and `git diff --check`.
+- A final fresh read-only implementation audit found no remaining concrete P1
+  or P2 in probe role ownership, terminal taxonomy, or dependent file-row
+  invalidation.
 - Hosted Linux failure evidence: GitHub Actions run `30126900959`, job `89592422565`, head `48e0869ca19f7b905ebbfbbd7cf0dcd9a4e271fc` (`182` `unable to open database file` occurrences rooted at anonymous descriptor URI consumption)
 - Targeted adversarial tests: `python3 -m unittest <eight focused test cases>` (`8` tests passed)
 - Supervisor/malformed-result tests: `python3 -m unittest <four focused test cases>` (`4` tests passed)

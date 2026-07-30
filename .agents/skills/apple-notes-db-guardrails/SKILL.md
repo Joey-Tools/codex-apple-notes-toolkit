@@ -104,16 +104,28 @@ only when the response has the exact schema, nonce, null basename/proof, zero de
 canonical typed details; every near-match remains a conservative possible-mutation transport
 failure. A caller may still supply an inherited channel for a genuinely stronger platform or
 privileged authority that returns the actual created-object FD and normal creation attestation.
-The launcher blocks termination signals before either child starts, atomically records the
-`posix_spawn` worker PID under that mask, relocates the child channel if its source FD collides with
-the preferred target, and temporarily normalizes `SIGCHLD` to a waitable default before either
-child exists. The worker receives a default `SIGCHLD`, while the launcher keeps it blocked until
-both owned children are reaped and then restores the caller's exact disposition/mask. An unexpected
-`ECHILD` is a conservative worker failure, never an exception that can skip cleanup. The launcher
-also restores the original child masks and latches the first parent signal without raising. It
-ignores later termination signals until the worker and service have both been killed, drained, and
-reaped, consumes only one bounded pending-signal snapshot, then restores the original handlers/mask
-and re-delivers the first signal.
+The launcher blocks termination signals before either child starts. Worker creation uses CPython's
+fork/exec path with child-side `close_fds=True` and only the exact supervisor channel plus a
+launch-only anonymous source-pipe reader in `pass_fds`; there is no parent-side descriptor
+inventory that can go stale before launch. Before either child exists, the parent opens the
+fixed packaged helper no-follow/nonblocking, proves one regular-file identity and access policy,
+enforces a 2-MiB size ceiling, and requires two identical complete byte reads around
+descriptor/path revalidation. Arbitrary `--helper` paths are rejected before capture or execution.
+The supervisor module and worker consume that same immutable capture. A fixed
+parent-memory `python -I -B -S -c` bootstrap receives the length- and SHA-256-bound bytes through
+the anonymous pipe under a hard delivery deadline, rejects truncation/trailing data, closes the
+source FD, restores the selected child default dispositions and mask, and compiles the captured
+bytes with the original path used only as a display filename. It never reopens either helper or
+supervisor pathname. At helper execution only the supervisor channel and standard descriptors
+remain. The returned worker PID becomes parent-owned while the parent mask is still closed, and
+the launcher temporarily normalizes `SIGCHLD` to a waitable default before either child exists.
+The worker receives a default `SIGCHLD`, while the launcher keeps it blocked until both owned
+children are reaped and then restores the caller's exact disposition/mask. An unexpected `ECHILD`
+is a conservative worker failure, never an exception that can skip cleanup. The launcher also
+restores the original child masks and latches the first parent signal without raising. It ignores
+later termination signals until the worker and service have both been killed, drained, and reaped,
+consumes only one bounded pending-signal snapshot, then restores the original handlers/mask and
+re-delivers the first signal.
 The helper sends the held parent descriptor and a request nonce with `SCM_RIGHTS`. A `created`
 response must carry exactly one directory descriptor plus the matching attestation; the packaged
 capability refusal must carry none. It never reconnects by socket pathname or accepts a direct
@@ -290,10 +302,20 @@ names through the held parent, compares them with the binding-time baseline, and
 directory chain again. A persistent late WAL or rollback journal and a persistent parent
 replacement therefore fail closed. Transient unrelated child-entry churn remains benign when
 directory identity, access policy, reserved membership, and bound-file content stay unchanged.
-The access probe closes each successfully opened file descriptor, then performs one final
-source-aware held-parent revalidation inside that file's result boundary before marking it
-readable. Parent disappearance, unreadability, or another revalidation failure remains a
-per-file source error instead of escaping through the generic prepared-directory taxonomy.
+The access probe bounds each container sample to a complete 64-entry/4-KiB raw-name scan before
+sorting and retaining at most five names. Overflow stops enumeration and records that container as
+revalidation-inconclusive. It also contains each container's enter/body/exit lifecycle inside the
+same result boundary. Once the sample succeeds, both the explicit terminal namespace check and a
+later component-chain exit failure are translated to the corresponding `source-*` class instead
+of being mistaken for initial absence or escaping the command. The probe closes each successfully
+opened file descriptor, then performs one final source-aware held-parent revalidation inside that
+file's result boundary before marking it readable. Parent disappearance, unreadability, or another
+revalidation failure remains a per-file source error instead of escaping through the generic
+prepared-directory taxonomy. If the retained group-container context fails its final exit after
+file inspection, the probe also withdraws every dependent file row's readable status and removes
+its size/identity/access-policy authority under that same source error. Group and app roles are
+carried explicitly rather than inferred from path equality, so identical configured paths still
+close both contexts and retain only the intended group binding for file inspection.
 The live-source directory lifecycle also owns the final exit of its underlying generic
 component-chain context. A generic teardown failure after the source-specific terminal check is
 translated from its original cause: missing, unreadable, other stat failure, proved identity

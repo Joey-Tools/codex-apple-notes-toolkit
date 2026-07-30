@@ -102,10 +102,23 @@ Apply that source mapping to post-open descriptor, descriptor-relative path, con
 held-parent checks. When a generic prepared-directory error wraps an OS error, inspect its explicit
 cause chain before interpreting the outer code: `ENOENT` is missing, `EACCES`/`EPERM` is
 unreadable, and another OS error is inconclusive. Only an identity or access-policy comparison
-failure without a causal OS error is a proved mismatch. For `probe-db-access`, close the opened
-file descriptor first and keep the final held-parent check inside that file's result boundary;
-failure leaves the file unreadable with the same source classification rather than aborting the
-whole probe with a prepared-directory error.
+failure without a causal OS error is a proved mismatch. For `probe-db-access`, enumerate each
+container through its held descriptor with a complete 64-entry/4-KiB aggregate raw-name cap, sort
+only that bounded set, and retain at most five names. Limit overflow stops iteration and records
+that container as revalidation-inconclusive. Keep each container's enter, sample, terminal check,
+and component-chain exit inside its own result boundary. A successful sample establishes the
+post-read boundary: translate failure from the following explicit namespace check or later generic
+component-chain exit to the corresponding source class without treating it as initial absence or
+aborting the whole probe. Close each opened file descriptor first and keep the final held-parent
+check inside that file's result boundary; failure leaves the file unreadable with the same source
+classification rather than aborting the whole probe with a prepared-directory error. Retain the
+group-container binding until all dependent NoteStore file rows have been inspected. If its final
+context exit then fails, set every dependent row `readable: false`, replace its error with that
+terminal source classification, and remove `size`, `identity`, and `access_policy`; no file row may
+retain authority after its parent source boundary becomes invalid. Carry group/app roles as
+explicit control state, not `Path` equality. If both configured paths are equal, open and close
+both role contexts exactly once and retain only the first role's group binding through dependent
+file inspection.
 Keep the underlying generic directory context inside one source-owned enter/body/exit lifecycle.
 After the source body and source-specific terminal revalidation succeed, translate any generic
 component-chain exit failure from the caught evidence without re-probing a mutable namespace.
@@ -470,19 +483,44 @@ channel may still represent a stronger platform or privileged authority. A same-
 that merely calls `mkdir` and then reopens any name does not meet this contract.
 Before forking the service or spawning the independent-session worker, the launcher blocks
 `SIGHUP`, `SIGINT`, and `SIGTERM` and installs non-raising first-signal latches. Worker creation
-uses `posix_spawn` with an explicit inherited-FD allowlist, child signal mask, and new session. If
-the non-inheritable source channel already occupies the preferred target FD, select a distinct
-target before the `dup2` action; never rely on a self-dup to clear `FD_CLOEXEC`. The PID becomes
-parent-owned while the parent mask is still closed. Also block `SIGCHLD` and temporarily replace
-its parent disposition with `SIG_DFL` before either child exists, so inherited `SIG_IGN` cannot
-auto-reap the raw-waitpid children. The worker must receive default `SIGCHLD`; keep parent
-`SIGCHLD` blocked until worker and service status collection finishes, then restore the caller's
-exact disposition and mask. If `waitpid` still reports `ECHILD`, treat the service as already
-terminal but fail the launcher because its status is unavailable; map unavailable worker status to
-conservative exit code `1`. Neither condition may escape the cleanup boundary or authorize
-signaling a possibly reused PID. The service restores its original handlers/mask after fork. The
-parent may then restore its termination-signal mask, but it retains the non-raising latches through
-bounded worker/service kill, drain, and reap. Later
+must use a close-all-except primitive after the child snapshot, never a parent-side open-FD
+inventory followed by per-FD close actions. Before either child exists, capture
+the fixed packaged helper from a lexical-absolute no-follow, nonblocking,
+close-on-exec regular-file descriptor. Bind one object identity and complete
+access policy across the pre-open path, descriptor, and terminal path; accept
+only `1..2 MiB`; require two identical complete reads around descriptor/path
+revalidation. Do not treat timestamps as content authority. Reject every
+non-packaged `--helper` path before capture, module execution, service fork, or
+worker spawn. Load the parent/service protocol module and deliver worker source
+from this exact same immutable capture.
+
+The packaged CPython launcher therefore uses
+`subprocess.Popen(close_fds=True, pass_fds=(client_fd, source_read_fd),
+start_new_session=True)`, with no `preexec_fn`; the second descriptor is an
+anonymous launch-only pipe, not a helper pathname. The parent frames the
+captured source with fixed magic, unsigned length, and SHA-256 and writes it
+nonblocking under a hard deadline and byte ceiling. Its fixed
+`python -I -B -S -c` bootstrap comes from already-loaded parent memory, reads
+the exact frame concurrently, rejects invalid magic, metadata, truncation,
+digest mismatch, or trailing bytes, then closes the source descriptor before
+restoring the exact selected child signal defaults/mask. It compiles the
+captured bytes with the recorded path used only as diagnostic display metadata;
+it never reopens either helper or supervisor pathname. At helper execution,
+only the supervisor channel plus standard descriptors remain. A descriptor
+made inheritable immediately before the fork is either absent from the child
+snapshot or closed in the child before its first exec. Delivery
+timeout/BrokenPipe closes both pipe ends and triggers bounded worker
+termination and reap. The PID becomes parent-owned while the parent mask is
+still closed. Also block `SIGCHLD` and temporarily
+replace its parent disposition with `SIG_DFL` before either child exists, so inherited `SIG_IGN`
+cannot auto-reap the raw-waitpid children. The worker must receive default `SIGHUP`, `SIGINT`,
+`SIGTERM`, and `SIGCHLD`; keep parent `SIGCHLD` blocked until worker and service status collection
+finishes, then restore the caller's exact disposition and mask. If `waitpid` still reports
+`ECHILD`, treat the service as already terminal but fail the launcher because its status is
+unavailable; map unavailable worker status to conservative exit code `1`. Neither condition may
+escape the cleanup boundary or authorize signaling a possibly reused PID. The service restores
+its original handlers/mask after fork. The parent may then restore its termination-signal mask,
+but it retains the non-raising latches through bounded worker/service kill, drain, and reap. Later
 termination signals cannot replace the first signal or interrupt cleanup. At the terminal
 boundary, block again, consume at most one snapshot of pending managed signals, restore the
 original handlers/mask, and re-deliver the first signal so teardown remains bounded even under a

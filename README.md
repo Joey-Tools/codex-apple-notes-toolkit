@@ -42,13 +42,26 @@ and the legacy-compatible `scripts/apple_notes_helper.py`
 entrypoint select this production launcher automatically for write-producing
 commands; callers may still provide a stronger inherited supervisor channel.
 Importing the Python compatibility module remains side-effect free.
-The launcher blocks and latches termination signals before child creation,
-publishes the worker PID atomically with `posix_spawn`, relocates a colliding
-non-inheritable channel FD, normalizes inherited `SIGCHLD=SIG_IGN` while it
-owns raw-waitpid children, and keeps later signals from interrupting bounded
-worker/service reap. An unexpected `ECHILD` fails the launcher conservatively
-without bypassing cleanup or signaling a possibly reused PID. It consumes one
-pending-signal snapshot before restoring and re-delivering the first signal.
+The launcher blocks and latches termination signals before child creation.
+Before either child exists, it captures the fixed packaged helper through a
+no-follow/nonblocking regular-file descriptor, checks stable identity/access
+policy and a 2-MiB ceiling, and requires two identical complete reads.
+Arbitrary `--helper` paths are rejected before capture or execution. The
+supervisor module and worker consume this same captured byte sequence. Its
+CPython fork/exec launch uses child-side `close_fds=True` with the exact
+supervisor channel and a launch-only anonymous source-pipe reader in
+`pass_fds`, so a descriptor opened concurrently in the parent cannot enter the
+worker after a stale parent inventory. A small fixed bootstrap receives a
+length/SHA-256-bound frame under a hard deadline, rejects truncation and
+trailing bytes, closes the source FD, restores the selected child signal
+defaults/mask, and compiles the captured source in the same new session. The
+recorded pathname is display metadata only; neither helper nor supervisor
+pathname is reopened. The launcher normalizes inherited
+`SIGCHLD=SIG_IGN` while it owns raw-waitpid children and keeps later signals
+from interrupting bounded worker/service reap. An unexpected `ECHILD` fails
+conservatively without bypassing cleanup or signaling a possibly reused PID.
+It consumes one pending-signal snapshot before restoring and re-delivering
+the first signal.
 It transfers the held parent FD with `SCM_RIGHTS`; a stronger external
 authority may return the actual created-object FD plus a request-bound
 attestation, while the packaged capability refusal returns none. The client

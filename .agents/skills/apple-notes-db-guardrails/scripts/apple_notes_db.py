@@ -10399,50 +10399,179 @@ def _bind_live_safe_destination_parent(
             yield destination_scope
 
 
+def _bounded_probe_directory_sample(directory_fd: int) -> list[str]:
+    """Return a small sorted sample while enforcing complete-scan input caps."""
+
+    names: list[str] = []
+    entry_count = 0
+    raw_name_bytes = 0
+    with os.scandir(directory_fd) as children:
+        for entry in children:
+            entry_count += 1
+            if entry_count > BOUND_DIRECTORY_SCAN_MAX_ENTRIES:
+                raise StoreSafetyError(
+                    "container-revalidation-inconclusive",
+                    "Container membership exceeds the bounded probe entry limit "
+                    f"({BOUND_DIRECTORY_SCAN_MAX_ENTRIES})",
+                    details={
+                        "entry_limit": BOUND_DIRECTORY_SCAN_MAX_ENTRIES,
+                        "observed_entries": entry_count,
+                    },
+                )
+            try:
+                raw_name = os.fsencode(entry.name)
+                name = os.fsdecode(raw_name)
+            except (TypeError, ValueError, UnicodeError) as exc:
+                raise StoreSafetyError(
+                    "container-revalidation-inconclusive",
+                    "Container membership contains an invalid raw entry name",
+                ) from exc
+            if (
+                not raw_name
+                or b"\x00" in raw_name
+                or b"/" in raw_name
+                or raw_name in {b".", b".."}
+                or os.fsencode(name) != raw_name
+            ):
+                raise StoreSafetyError(
+                    "container-revalidation-inconclusive",
+                    "Container membership contains an invalid raw entry name",
+                )
+            raw_name_bytes += len(raw_name)
+            if raw_name_bytes > BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES:
+                raise StoreSafetyError(
+                    "container-revalidation-inconclusive",
+                    "Container membership exceeds the bounded probe raw name-byte "
+                    f"limit ({BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES})",
+                    details={
+                        "raw_name_bytes_limit": (
+                            BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES
+                        ),
+                        "observed_raw_name_bytes": raw_name_bytes,
+                    },
+                )
+            names.append(name)
+    return sorted(names)[:5]
+
+
+def _record_probe_container_failure(
+    record: dict[str, Any],
+    error: OSError | StoreSafetyError,
+    *,
+    binding: _BoundDirectory | None,
+    terminal: bool,
+) -> StoreSafetyError | None:
+    """Keep one container failure inside its probe-result boundary."""
+
+    if terminal and binding is not None:
+        translated = _source_directory_revalidation_error(binding, error)
+        _record_probe_terminal_source_failure(record, translated)
+        return translated
+
+    record["sample_children"] = []
+    if isinstance(error, StoreSafetyError):
+        if error.code == "prepared-directory-missing":
+            return None
+        record["exists"] = error.code != "prepared-directory-missing"
+        record["error_code"] = (
+            "container-unreadable"
+            if _exception_chain_contains_permission_error(error)
+            else "container-revalidation-inconclusive"
+        )
+        record["error"] = str(error)
+        return None
+    if isinstance(error, FileNotFoundError):
+        return None
+    record["exists"] = not isinstance(error, FileNotFoundError)
+    record["error_code"] = (
+        "container-unreadable"
+        if isinstance(error, PermissionError)
+        else "container-revalidation-inconclusive"
+    )
+    record["error"] = str(error)
+    return None
+
+
+def _record_probe_terminal_source_failure(
+    record: dict[str, Any],
+    error: StoreSafetyError,
+) -> None:
+    """Replace one earlier readable result with terminal source evidence."""
+
+    record.update(
+        {
+            "exists": True,
+            "readable": False,
+            "error_code": error.code,
+            "error": str(error),
+        }
+    )
+
+
+def _invalidate_probe_file_records_for_terminal_source_failure(
+    file_records: list[dict[str, Any]],
+    error: StoreSafetyError,
+) -> None:
+    """Withdraw file authority derived from a terminally invalid directory."""
+
+    for file_record in file_records:
+        file_record["readable"] = False
+        file_record["error_code"] = error.code
+        file_record["error"] = str(error)
+        for field in ("size", "identity", "access_policy"):
+            file_record.pop(field, None)
+
+
 def probe_db_access(paths: NoteStorePaths) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     group_binding: _BoundDirectory | None = None
-    stack = ExitStack()
-    for path in (paths.group_container, paths.app_container):
+    group_stack: ExitStack | None = None
+    group_record: dict[str, Any] | None = None
+    group_terminal_error: StoreSafetyError | None = None
+    for is_group, path in (
+        (True, paths.group_container),
+        (False, paths.app_container),
+    ):
         record: dict[str, Any] = {"path": path, "exists": False, "readable": False}
+        binding: _BoundDirectory | None = None
+        body_complete = False
         try:
-            binding = stack.enter_context(
-                _bind_existing_directory_with_trusted_alias(path)
-            )
-            scan_fd = os.dup(binding.fd)
-            try:
-                with os.scandir(scan_fd) as children:
-                    record["sample_children"] = sorted(
-                        entry.name for entry in children
-                    )[:5]
-            finally:
-                os.close(scan_fd)
-            _verify_bound_directory_namespace(binding)
+            with ExitStack() as container_stack:
+                binding = container_stack.enter_context(
+                    _bind_existing_directory_with_trusted_alias(path)
+                )
+                scan_fd = os.dup(binding.fd)
+                try:
+                    record["sample_children"] = _bounded_probe_directory_sample(scan_fd)
+                finally:
+                    os.close(scan_fd)
+                body_complete = True
+                _verify_bound_directory_namespace(binding)
+                if is_group:
+                    group_stack = container_stack.pop_all()
             record["exists"] = True
             record["readable"] = True
-            if path == paths.group_container:
+            if is_group:
                 group_binding = binding
+                group_record = record
         except (FileNotFoundError, StoreSafetyError) as exc:
-            record["sample_children"] = []
-            if isinstance(exc, StoreSafetyError):
-                if exc.code == "prepared-directory-missing":
-                    pass
-                else:
-                    record["exists"] = exc.code != "prepared-directory-missing"
-                    record["error_code"] = (
-                        "container-unreadable"
-                        if _exception_chain_contains_permission_error(exc)
-                        else "container-revalidation-inconclusive"
-                    )
-                    record["error"] = str(exc)
-        except OSError as exc:
-            record["exists"] = not isinstance(exc, FileNotFoundError)
-            record["error_code"] = (
-                "container-unreadable"
-                if isinstance(exc, PermissionError)
-                else "container-revalidation-inconclusive"
+            terminal_error = _record_probe_container_failure(
+                record,
+                exc,
+                binding=binding,
+                terminal=body_complete,
             )
-            record["error"] = str(exc)
+            if is_group and terminal_error is not None:
+                group_terminal_error = terminal_error
+        except OSError as exc:
+            terminal_error = _record_probe_container_failure(
+                record,
+                exc,
+                binding=binding,
+                terminal=body_complete,
+            )
+            if is_group and terminal_error is not None:
+                group_terminal_error = terminal_error
         entries.append(record)
 
     file_records: list[dict[str, Any]] = []
@@ -10454,6 +10583,9 @@ def probe_db_access(paths: NoteStorePaths) -> dict[str, Any]:
                 "readable": False,
             }
             if group_binding is None:
+                if group_terminal_error is not None:
+                    file_record["error_code"] = group_terminal_error.code
+                    file_record["error"] = str(group_terminal_error)
                 file_records.append(file_record)
                 continue
             try:
@@ -10490,9 +10622,26 @@ def probe_db_access(paths: NoteStorePaths) -> dict[str, Any]:
                         }
                     )
             file_records.append(file_record)
-        return {"paths": entries, "note_store_files": file_records}
     finally:
-        stack.close()
+        if group_stack is not None:
+            try:
+                group_stack.close()
+            except (OSError, StoreSafetyError) as exc:
+                if group_record is None or group_binding is None:
+                    raise
+                translated = _source_directory_revalidation_error(
+                    group_binding,
+                    exc,
+                )
+                _record_probe_terminal_source_failure(
+                    group_record,
+                    translated,
+                )
+                _invalidate_probe_file_records_for_terminal_source_failure(
+                    file_records,
+                    translated,
+                )
+    return {"paths": entries, "note_store_files": file_records}
 
 
 def _wal_checksum(
