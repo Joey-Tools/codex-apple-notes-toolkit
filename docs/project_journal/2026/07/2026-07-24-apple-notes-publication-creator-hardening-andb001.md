@@ -64,6 +64,10 @@ superseded_by:
 - Closed the three current-head GitHub Codex follow-ups in patch-stage
   integrity taxonomy, retained-partial mutation receipts, and direct-API
   destination absence revalidation.
+- Closed the follow-up retained-receipt evidence-failure edge: even a
+  non-domain exception while inventorying an already-created sensitive
+  partial keeps `mutation_performed: true` alongside bounded
+  preserved-or-incomplete recovery evidence.
 
 ## Current State
 

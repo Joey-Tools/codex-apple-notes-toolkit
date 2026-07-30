@@ -16751,6 +16751,41 @@ raise SystemExit(2)
             str(partial),
         )
 
+    def test_retained_partial_receipt_failure_still_reports_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            partial = Path(temp_dir) / "retained"
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_retained_bound_directory_receipt",
+                    side_effect=OSError(
+                        errno.EIO,
+                        "simulated retained receipt evidence failure",
+                    ),
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                with MODULE._create_bound_directory(
+                    partial,
+                    retain_failure_receipt=True,
+                ):
+                    raise RuntimeError("simulated prepared-tree failure")
+
+            self._assert_safety_code("prepared-operation-failed", raised)
+            details = raised.exception.details
+            self.assertTrue(details["mutation_performed"])
+            self.assertEqual(details["cleanup_state"], "preserved-or-incomplete")
+            self.assertEqual(
+                details["cleanup_error_code"],
+                "prepared-directory-revalidation-inconclusive",
+            )
+            self.assertEqual(details["cleanup_error_type"], "OSError")
+            self.assertEqual(
+                details["recovery_locators"]["prepared_namespace"],
+                str(partial),
+            )
+            self.assertTrue(partial.is_dir())
+
     def test_cleanup_preserves_root_swapped_before_recursive_delete(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

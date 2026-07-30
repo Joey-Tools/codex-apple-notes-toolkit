@@ -6009,6 +6009,7 @@ def _create_bound_directory(
                                 merged,
                                 {
                                     "cleanup_state": "preserved-or-incomplete",
+                                    "mutation_performed": True,
                                     "recovery_locators": {
                                         "prepared_namespace": str(path),
                                         "prepared_parent": str(path.parent),
