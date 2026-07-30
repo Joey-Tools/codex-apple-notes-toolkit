@@ -757,3 +757,31 @@ superseded_by:
   Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
   `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
   `git diff --check`.
+- Python 3.14 CI bytecode-baseline follow-up base:
+  `8efee8076e59204793a1d0caed277bc761af841a`.
+- The CI failure occurred before the compatibility subprocess: importing the
+  unittest module without `-B` had already created legitimate runner-owned
+  `__pycache__` entries in an inspected packaged source root, while the test
+  incorrectly required the complete baseline inventory to contain no cache.
+  Preexisting cache is not evidence that the compatibility entry wrote it.
+- The regression now snapshots the complete wrapper and packaged source trees
+  before and after the direct compatibility entry. Equality binds every
+  entry's device/inode/type identity, mode/owner/group/protected-flags access
+  policy, `mtime_ns`, and regular-file size/SHA-256 or symlink target. The
+  subprocess still runs directly without `-B`, with
+  `PYTHONDONTWRITEBYTECODE` and `PYTHONPYCACHEPREFIX` removed.
+- A deterministic temporary-tree regression seeds separate wrapper and
+  packaged `__pycache__` files before launch and proves the entry preserves
+  the entire preexisting inventory instead of requiring an empty baseline.
+  The clean-baseline case uses a separate disposable copied tree as well, so a
+  proved regression cannot leave cache in the checkout and then be absorbed
+  as a valid baseline by a later single-test rerun.
+- Focused regressions: Python `3.14.3` and system Python `3.9.6` each passed
+  both compatibility bytecode/cache tests.
+- Full regressions: Python `3.14.3` and system Python `3.9.6` each passed all
+  `334` tests with two sandbox-scoped skips for the fixed `/usr/bin/pgrep`
+  process probe.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.14.3` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.

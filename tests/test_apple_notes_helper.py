@@ -185,6 +185,47 @@ class AppleNotesHelperTests(unittest.TestCase):
         )
         return compatibility_path, supervisor_path, helper_path
 
+    @staticmethod
+    def _source_tree_inventory(
+        source_roots: dict[str, Path],
+    ) -> dict[tuple[str, str], tuple[object, ...]]:
+        inventory: dict[tuple[str, str], tuple[object, ...]] = {}
+        for label, source_root in source_roots.items():
+            for path in (source_root, *sorted(source_root.rglob("*"))):
+                relative = (
+                    "." if path == source_root else str(path.relative_to(source_root))
+                )
+                observed = path.lstat()
+                common: tuple[object, ...] = (
+                    (
+                        observed.st_dev,
+                        observed.st_ino,
+                        stat.S_IFMT(observed.st_mode),
+                    ),
+                    tuple(
+                        sorted(
+                            MODULE._access_policy(observed).items(),
+                        )
+                    ),
+                    observed.st_mtime_ns,
+                )
+                if stat.S_ISLNK(observed.st_mode):
+                    value = ("symlink", *common, os.readlink(path))
+                elif stat.S_ISDIR(observed.st_mode):
+                    value = ("directory", *common)
+                elif stat.S_ISREG(observed.st_mode):
+                    payload = path.read_bytes()
+                    value = (
+                        "file",
+                        *common,
+                        len(payload),
+                        hashlib.sha256(payload).hexdigest(),
+                    )
+                else:
+                    value = ("other", *common)
+                inventory[(label, relative)] = value
+        return inventory
+
     def _synthetic_identity_bound_directory_creator(
         self,
         parent_fd: int,
@@ -4159,61 +4200,93 @@ raise SystemExit(2)
                 compatibility._capture_directory_supervisor_source(source)
 
     def test_compatibility_entry_load_writes_no_source_bytecode(self) -> None:
-        source_roots = {
-            "compatibility": COMPATIBILITY_SCRIPT.parent,
-            "packaged": DIRECTORY_SUPERVISOR_PATH.parent,
-        }
-
-        def source_inventory() -> dict[tuple[str, str], tuple[object, ...]]:
-            inventory: dict[tuple[str, str], tuple[object, ...]] = {}
-            for label, source_root in source_roots.items():
-                for path in (source_root, *sorted(source_root.rglob("*"))):
-                    relative = (
-                        "."
-                        if path == source_root
-                        else str(path.relative_to(source_root))
-                    )
-                    if path.is_symlink():
-                        value: tuple[object, ...] = (
-                            "symlink",
-                            os.readlink(path),
-                        )
-                    elif path.is_dir():
-                        value = ("directory",)
-                    elif path.is_file():
-                        payload = path.read_bytes()
-                        value = (
-                            "file",
-                            len(payload),
-                            hashlib.sha256(payload).hexdigest(),
-                        )
-                    else:
-                        value = ("other", stat.S_IFMT(path.lstat().st_mode))
-                    inventory[(label, relative)] = value
-            return inventory
-
-        before = source_inventory()
-        self.assertFalse(any("__pycache__" in key[1].split(os.sep) for key in before))
-        environment = dict(os.environ)
-        environment.pop("PYTHONDONTWRITEBYTECODE", None)
-        environment.pop("PYTHONPYCACHEPREFIX", None)
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(COMPATIBILITY_SCRIPT),
-                "--help",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30.0,
-            env=environment,
-        )
-        after = source_inventory()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            compatibility_path, supervisor_path, _ = self._write_compatibility_tree(
+                root
+            )
+            source_roots = {
+                "compatibility": compatibility_path.parent,
+                "packaged": supervisor_path.parent,
+            }
+            before = self._source_tree_inventory(source_roots)
+            environment = dict(os.environ)
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(compatibility_path),
+                    "--help",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30.0,
+                env=environment,
+            )
+            after = self._source_tree_inventory(source_roots)
 
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertEqual(after, before)
-        self.assertFalse(any("__pycache__" in key[1].split(os.sep) for key in after))
+
+    def test_compatibility_entry_preserves_preexisting_source_bytecode_cache(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            compatibility_path, supervisor_path, _ = self._write_compatibility_tree(
+                root
+            )
+            cache_tag = sys.implementation.cache_tag or "python"
+            seeded_cache_files = (
+                compatibility_path.parent
+                / "__pycache__"
+                / f"runner_preexisting.{cache_tag}.pyc",
+                supervisor_path.parent
+                / "__pycache__"
+                / f"packaged_preexisting.{cache_tag}.pyc",
+            )
+            for index, cache_file in enumerate(seeded_cache_files):
+                cache_file.parent.mkdir(exist_ok=True)
+                cache_file.write_bytes(f"preexisting-cache-{index}".encode("ascii"))
+
+            source_roots = {
+                "compatibility": compatibility_path.parent,
+                "packaged": supervisor_path.parent,
+            }
+            before = self._source_tree_inventory(source_roots)
+            seeded_cache_keys = {
+                (
+                    label,
+                    str(cache_file.relative_to(source_roots[label])),
+                )
+                for label, cache_file in zip(
+                    ("compatibility", "packaged"),
+                    seeded_cache_files,
+                )
+            }
+            self.assertTrue(seeded_cache_keys.issubset(before))
+            self.assertTrue(all(before[key][0] == "file" for key in seeded_cache_keys))
+            environment = dict(os.environ)
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(compatibility_path),
+                    "--help",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30.0,
+                env=environment,
+            )
+            after = self._source_tree_inventory(source_roots)
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(after, before)
 
     def test_compatibility_main_routes_writes_through_packaged_capability_gate(
         self,
