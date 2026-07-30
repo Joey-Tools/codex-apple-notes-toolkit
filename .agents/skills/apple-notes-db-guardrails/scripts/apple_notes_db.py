@@ -4236,9 +4236,11 @@ def _bind_regular_file_at(
             f"Descriptor-relative regular-file path is missing: {path}",
         ) from exc
     except OSError as exc:
-        raise StoreSafetyError(
-            codes.inconclusive,
-            f"Cannot inspect descriptor-relative regular file {path}: {exc}",
+        raise _bound_file_revalidation_os_error(
+            path,
+            "inspect the descriptor-relative regular file before opening it",
+            exc,
+            codes,
         ) from exc
     if not stat.S_ISREG(path_before.st_mode):
         raise StoreSafetyError(
@@ -4254,9 +4256,11 @@ def _bind_regular_file_at(
             f"Descriptor-relative regular file disappeared before open: {path}",
         ) from exc
     except OSError as exc:
-        raise StoreSafetyError(
-            codes.inconclusive,
-            f"Cannot safely open descriptor-relative regular file {path}: {exc}",
+        raise _bound_file_revalidation_os_error(
+            path,
+            "safely open the descriptor-relative regular file",
+            exc,
+            codes,
         ) from exc
     try:
         try:
@@ -7783,27 +7787,26 @@ def _bind_source_store(main_path: Path) -> Iterator[_BoundSourceStore]:
                     },
                 ) from exc
             except OSError as exc:
-                code = (
-                    "rollback-journal-present"
-                    if path.name == f"{main_path.name}-journal"
-                    else "source-revalidation-inconclusive"
+                source_error = _source_revalidation_os_error(
+                    path,
+                    "revalidate the discovered NoteStore member before "
+                    "descriptor-relative open",
+                    exc,
                 )
+                if path.name != f"{main_path.name}-journal":
+                    raise source_error from exc
                 raise StoreSafetyError(
-                    code,
+                    "rollback-journal-present",
                     "Cannot revalidate a discovered NoteStore member before "
                     f"descriptor-relative open: {path}: {exc}",
-                    details=(
-                        {
-                            "journal": str(path),
-                            "binding_status": "inconclusive",
-                            "reason_code": "source-revalidation-inconclusive",
-                            "safe_action": (
-                                "preserve-main-and-journal-and-retry-after-quiescence"
-                            ),
-                        }
-                        if code == "rollback-journal-present"
-                        else None
-                    ),
+                    details={
+                        "journal": str(path),
+                        "binding_status": "inconclusive",
+                        "reason_code": source_error.code,
+                        "safe_action": (
+                            "preserve-main-and-journal-and-retry-after-quiescence"
+                        ),
+                    },
                 ) from exc
         after_membership = tuple(
             path.name for path in _discover_database_files_at(main_path, parent)

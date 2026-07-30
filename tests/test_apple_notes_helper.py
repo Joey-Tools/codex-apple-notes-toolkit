@@ -7888,6 +7888,212 @@ raise SystemExit(2)
                             os.fstat(opened_source_fd)
                         self.assertEqual(closed.exception.errno, errno.EBADF)
 
+    def test_bound_source_file_initial_stat_and_open_errors_preserve_taxonomy(
+        self,
+    ) -> None:
+        cases = (
+            (
+                FileNotFoundError,
+                MODULE.errno.ENOENT,
+                "source-missing-after-read",
+            ),
+            (
+                PermissionError,
+                MODULE.errno.EACCES,
+                "source-revalidation-unreadable",
+            ),
+            (
+                PermissionError,
+                MODULE.errno.EPERM,
+                "source-revalidation-unreadable",
+            ),
+            (
+                OSError,
+                MODULE.errno.EIO,
+                "source-revalidation-inconclusive",
+            ),
+        )
+        for operation in ("initial-stat", "open"):
+            for error_type, error_number, expected_code in cases:
+                with (
+                    self.subTest(
+                        operation=operation,
+                        error_number=error_number,
+                        expected_code=expected_code,
+                    ),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    root = Path(temp_dir)
+                    source = root / MODULE.NOTE_STORE_MAIN
+                    self._create_db(source)
+                    fault = error_type(
+                        error_number,
+                        f"simulated source {operation} failure",
+                    )
+                    source_stat_calls = 0
+                    source_open_attempts = 0
+
+                    with MODULE._bind_existing_directory_with_trusted_alias(
+                        root
+                    ) as parent:
+                        original_stat = MODULE.os.stat
+                        original_open = MODULE.os.open
+
+                        def fail_source_initial_stat(
+                            target: object,
+                            *args: object,
+                            **kwargs: object,
+                        ) -> os.stat_result:
+                            nonlocal source_stat_calls
+                            if (
+                                kwargs.get("dir_fd") == parent.fd
+                                and os.fspath(target) == source.name
+                            ):
+                                source_stat_calls += 1
+                                if operation == "initial-stat":
+                                    raise fault
+                            return original_stat(target, *args, **kwargs)
+
+                        def fail_source_open(
+                            target: object,
+                            flags: int,
+                            mode: int = 0o777,
+                            *,
+                            dir_fd: int | None = None,
+                        ) -> int:
+                            nonlocal source_open_attempts
+                            if dir_fd == parent.fd and os.fspath(target) == source.name:
+                                source_open_attempts += 1
+                                if operation == "open":
+                                    raise fault
+                            if dir_fd is None:
+                                return original_open(target, flags, mode)
+                            return original_open(
+                                target,
+                                flags,
+                                mode,
+                                dir_fd=dir_fd,
+                            )
+
+                        with (
+                            mock.patch.object(
+                                MODULE.os,
+                                "stat",
+                                side_effect=fail_source_initial_stat,
+                            ),
+                            mock.patch.object(
+                                MODULE.os,
+                                "open",
+                                side_effect=fail_source_open,
+                            ),
+                            mock.patch.object(MODULE, "_hash_fd") as hash_fd,
+                            self.assertRaises(MODULE.StoreSafetyError) as raised,
+                        ):
+                            with MODULE._bind_regular_file_at(
+                                source,
+                                parent,
+                                MODULE.SOURCE_FILE_CODES,
+                            ):
+                                self.fail("initial source binding failure was accepted")
+
+                        self._assert_safety_code(expected_code, raised)
+                        self.assertEqual(source_stat_calls, 1)
+                        self.assertEqual(
+                            source_open_attempts,
+                            0 if operation == "initial-stat" else 1,
+                        )
+                        hash_fd.assert_not_called()
+
+    def test_non_source_initial_permission_errors_remain_domain_inconclusive(
+        self,
+    ) -> None:
+        for operation in ("initial-stat", "open"):
+            for error_number in (MODULE.errno.EACCES, MODULE.errno.EPERM):
+                with (
+                    self.subTest(
+                        operation=operation,
+                        error_number=error_number,
+                    ),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    root = Path(temp_dir)
+                    snapshot = root / MODULE.NOTE_STORE_MAIN
+                    self._create_db(snapshot)
+                    fault = PermissionError(
+                        error_number,
+                        f"simulated snapshot {operation} failure",
+                    )
+
+                    with MODULE._bind_existing_directory_with_trusted_alias(
+                        root
+                    ) as parent:
+                        original_stat = MODULE.os.stat
+                        original_open = MODULE.os.open
+
+                        def fail_snapshot_initial_stat(
+                            target: object,
+                            *args: object,
+                            **kwargs: object,
+                        ) -> os.stat_result:
+                            if (
+                                operation == "initial-stat"
+                                and kwargs.get("dir_fd") == parent.fd
+                                and os.fspath(target) == snapshot.name
+                            ):
+                                raise fault
+                            return original_stat(target, *args, **kwargs)
+
+                        def fail_snapshot_open(
+                            target: object,
+                            flags: int,
+                            mode: int = 0o777,
+                            *,
+                            dir_fd: int | None = None,
+                        ) -> int:
+                            if (
+                                operation == "open"
+                                and dir_fd == parent.fd
+                                and os.fspath(target) == snapshot.name
+                            ):
+                                raise fault
+                            if dir_fd is None:
+                                return original_open(target, flags, mode)
+                            return original_open(
+                                target,
+                                flags,
+                                mode,
+                                dir_fd=dir_fd,
+                            )
+
+                        with (
+                            mock.patch.object(
+                                MODULE.os,
+                                "stat",
+                                side_effect=fail_snapshot_initial_stat,
+                            ),
+                            mock.patch.object(
+                                MODULE.os,
+                                "open",
+                                side_effect=fail_snapshot_open,
+                            ),
+                            mock.patch.object(MODULE, "_hash_fd") as hash_fd,
+                            self.assertRaises(MODULE.StoreSafetyError) as raised,
+                        ):
+                            with MODULE._bind_regular_file_at(
+                                snapshot,
+                                parent,
+                                MODULE.SNAPSHOT_FILE_CODES,
+                            ):
+                                self.fail(
+                                    "initial snapshot binding failure was accepted"
+                                )
+
+                        self._assert_safety_code(
+                            MODULE.SNAPSHOT_FILE_CODES.inconclusive,
+                            raised,
+                        )
+                        hash_fd.assert_not_called()
+
     def test_bound_source_file_rejects_mode_drift_across_open_boundary(
         self,
     ) -> None:
@@ -8425,6 +8631,190 @@ raise SystemExit(2)
                     "source-revalidation-inconclusive",
                     raised,
                 )
+
+    def test_source_binding_permission_errors_propagate_across_commands(
+        self,
+    ) -> None:
+        for operation in ("fingerprint", "copy", "merge"):
+            for binding_stage in (
+                "post-discovery-stat",
+                "pre-open-stat",
+                "open",
+            ):
+                for error_number in (MODULE.errno.EACCES, MODULE.errno.EPERM):
+                    with (
+                        self.subTest(
+                            operation=operation,
+                            binding_stage=binding_stage,
+                            error_number=error_number,
+                        ),
+                        tempfile.TemporaryDirectory() as temp_dir,
+                    ):
+                        root = Path(temp_dir)
+                        paths = self._make_paths(root)
+                        source = paths.group_container / MODULE.NOTE_STORE_MAIN
+                        self._create_db(source)
+                        destination = root / (
+                            "snapshot" if operation == "copy" else "merged.sqlite"
+                        )
+                        fault = PermissionError(
+                            error_number,
+                            f"simulated {binding_stage} permission failure",
+                        )
+                        original_discovery = MODULE._discover_database_files_at
+                        original_bind_regular = MODULE._bind_regular_file_at
+                        original_stat = MODULE.os.stat
+                        original_open = MODULE.os.open
+                        initial_discovery_complete = False
+                        fault_injected = False
+
+                        def mark_initial_discovery(
+                            main_path: Path,
+                            parent: MODULE._BoundDirectory,
+                        ) -> list[Path]:
+                            nonlocal initial_discovery_complete
+                            result = original_discovery(main_path, parent)
+                            if MODULE._absolute_path(main_path) == source:
+                                initial_discovery_complete = True
+                            return result
+
+                        def fail_post_discovery_stat(
+                            target: object,
+                            *args: object,
+                            **kwargs: object,
+                        ) -> os.stat_result:
+                            nonlocal fault_injected
+                            if (
+                                binding_stage == "post-discovery-stat"
+                                and initial_discovery_complete
+                                and not fault_injected
+                                and kwargs.get("dir_fd") is not None
+                                and os.fspath(target) == source.name
+                            ):
+                                fault_injected = True
+                                raise fault
+                            return original_stat(target, *args, **kwargs)
+
+                        @contextmanager
+                        def inject_bound_source_failure(
+                            path: Path,
+                            parent: MODULE._BoundDirectory,
+                            codes: MODULE._FileProtectionCodes,
+                        ) -> Iterator[MODULE._BoundRegularFile]:
+                            nonlocal fault_injected
+                            if (
+                                MODULE._absolute_path(path) != source
+                                or codes is not MODULE.SOURCE_FILE_CODES
+                            ):
+                                with original_bind_regular(
+                                    path,
+                                    parent,
+                                    codes,
+                                ) as bound:
+                                    yield bound
+                                return
+
+                            def fail_bound_stat(
+                                target: object,
+                                *args: object,
+                                **kwargs: object,
+                            ) -> os.stat_result:
+                                nonlocal fault_injected
+                                if (
+                                    binding_stage == "pre-open-stat"
+                                    and not fault_injected
+                                    and kwargs.get("dir_fd") == parent.fd
+                                    and os.fspath(target) == path.name
+                                ):
+                                    fault_injected = True
+                                    raise fault
+                                return original_stat(target, *args, **kwargs)
+
+                            def fail_bound_open(
+                                target: object,
+                                flags: int,
+                                mode: int = 0o777,
+                                *,
+                                dir_fd: int | None = None,
+                            ) -> int:
+                                nonlocal fault_injected
+                                if (
+                                    binding_stage == "open"
+                                    and not fault_injected
+                                    and dir_fd == parent.fd
+                                    and os.fspath(target) == path.name
+                                ):
+                                    fault_injected = True
+                                    raise fault
+                                if dir_fd is None:
+                                    return original_open(target, flags, mode)
+                                return original_open(
+                                    target,
+                                    flags,
+                                    mode,
+                                    dir_fd=dir_fd,
+                                )
+
+                            with (
+                                mock.patch.object(
+                                    MODULE.os,
+                                    "stat",
+                                    side_effect=fail_bound_stat,
+                                ),
+                                mock.patch.object(
+                                    MODULE.os,
+                                    "open",
+                                    side_effect=fail_bound_open,
+                                ),
+                            ):
+                                with original_bind_regular(
+                                    path,
+                                    parent,
+                                    codes,
+                                ) as bound:
+                                    yield bound
+
+                        with (
+                            mock.patch.object(
+                                MODULE,
+                                "_discover_database_files_at",
+                                side_effect=mark_initial_discovery,
+                            ),
+                            mock.patch.object(
+                                MODULE.os,
+                                "stat",
+                                side_effect=fail_post_discovery_stat,
+                            ),
+                            mock.patch.object(
+                                MODULE,
+                                "_bind_regular_file_at",
+                                inject_bound_source_failure,
+                            ),
+                            self.assertRaises(MODULE.StoreSafetyError) as raised,
+                        ):
+                            if operation == "fingerprint":
+                                MODULE.fingerprint_note_store(paths)
+                            elif operation == "copy":
+                                MODULE.copy_db(
+                                    paths,
+                                    dest=destination,
+                                    require_notes_quit=False,
+                                    _notes_running=False,
+                                )
+                            else:
+                                MODULE.merge_db(
+                                    source,
+                                    destination,
+                                    paths=paths,
+                                )
+
+                        self.assertTrue(fault_injected)
+                        self._assert_safety_code(
+                            "source-revalidation-unreadable",
+                            raised,
+                        )
+                        if operation != "fingerprint":
+                            self.assertFalse(destination.exists())
 
     def test_source_directory_final_window_uses_source_taxonomy_across_commands(
         self,
@@ -10781,6 +11171,79 @@ raise SystemExit(2)
             "journal-membership-changed",
         )
         self.assertEqual(raised.exception.details["phase"], "after-open")
+
+    def test_rollback_journal_binding_permission_errors_keep_source_reason(
+        self,
+    ) -> None:
+        for error_number in (MODULE.errno.EACCES, MODULE.errno.EPERM):
+            with (
+                self.subTest(error_number=error_number),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                database = root / MODULE.NOTE_STORE_MAIN
+                journal = database.with_name(f"{database.name}-journal")
+                self._create_db(database)
+                journal.write_bytes(b"simulated rollback journal")
+                original_discovery = MODULE._discover_database_files_at
+                original_stat = MODULE.os.stat
+                initial_discovery_complete = False
+                fault_injected = False
+                fault = PermissionError(
+                    error_number,
+                    "simulated journal revalidation permission failure",
+                )
+
+                def mark_initial_discovery(
+                    main_path: Path,
+                    parent: MODULE._BoundDirectory,
+                ) -> list[Path]:
+                    nonlocal initial_discovery_complete
+                    result = original_discovery(main_path, parent)
+                    initial_discovery_complete = True
+                    return result
+
+                def fail_journal_revalidation(
+                    target: object,
+                    *args: object,
+                    **kwargs: object,
+                ) -> os.stat_result:
+                    nonlocal fault_injected
+                    if (
+                        initial_discovery_complete
+                        and not fault_injected
+                        and kwargs.get("dir_fd") is not None
+                        and os.fspath(target) == journal.name
+                    ):
+                        fault_injected = True
+                        raise fault
+                    return original_stat(target, *args, **kwargs)
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_discover_database_files_at",
+                        side_effect=mark_initial_discovery,
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "stat",
+                        side_effect=fail_journal_revalidation,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE._capture_database_files(database)
+
+            self.assertTrue(fault_injected)
+            self._assert_safety_code("rollback-journal-present", raised)
+            self.assertEqual(
+                raised.exception.details["binding_status"],
+                "inconclusive",
+            )
+            self.assertEqual(
+                raised.exception.details["reason_code"],
+                "source-revalidation-unreadable",
+            )
 
     def test_outputs_never_overwrite_existing_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

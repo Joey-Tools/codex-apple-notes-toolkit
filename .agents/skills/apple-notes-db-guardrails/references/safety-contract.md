@@ -99,7 +99,12 @@ Map generic descriptor/path/hash revalidation failures such as `EIO` or `ESTALE`
 `FileNotFoundError` to missing-after-read and `PermissionError` to revalidation-unreadable, while
 identity, content, and access-policy comparison failures keep their dedicated codes.
 Apply that source mapping to post-open descriptor, descriptor-relative path, content-hash, and
-held-parent checks. When a generic prepared-directory error wraps an OS error, inspect its explicit
+held-parent checks. Apply it before open as well: a discovered member's dedicated re-stat and the
+bound regular-file helper's descriptor-relative pre-open `stat` or `open` use the same source
+classifier. This source-specific rule must not change a snapshot, patch, or prepared-file caller's
+own inconclusive code. A rollback journal keeps the top-level `rollback-journal-present` policy
+result while its structured `reason_code` records the source-specific missing, unreadable, or
+inconclusive cause. When a generic prepared-directory error wraps an OS error, inspect its explicit
 cause chain before interpreting the outer code: `ENOENT` is missing, `EACCES`/`EPERM` is
 unreadable, and another OS error is inconclusive. Only an identity or access-policy comparison
 failure without a causal OS error is a proved mismatch. For `probe-db-access`, enumerate each

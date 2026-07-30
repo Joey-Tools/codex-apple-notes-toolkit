@@ -285,7 +285,13 @@ name swapped to a FIFO or device between the pre-open stat and open therefore ca
 the type mismatch is rejected. Before hashing, the helper also requires identical object identity
 and complete access policy across the pre-open descriptor-relative path stat, opened descriptor
 stat, and immediate post-open descriptor-relative path stat; it never adopts a policy first
-observed after open as a new baseline.
+observed after open as a new baseline. Once discovery has identified a live-source member, its
+dedicated re-stat plus the bound helper's pre-open descriptor-relative `stat` and `open` classify
+`ENOENT` as `source-missing-after-read`, `EACCES`/`EPERM` as
+`source-revalidation-unreadable`, and other I/O uncertainty as
+`source-revalidation-inconclusive`. Snapshot, patch, and prepared-file callers keep their own
+domain-specific inconclusive codes. A rollback journal retains `rollback-journal-present` as the
+top-level result and records this source classification in `details.reason_code`.
 The helper binds the private partial directory, its nested `group.com.apple.notes` store, and their
 parents at creation. It verifies every prepared file against its creation receipt, fsyncs copied
 files, then fsyncs the held nested-store and snapshot-root descriptors bottom-up before the

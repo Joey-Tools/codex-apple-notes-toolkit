@@ -26,6 +26,9 @@ superseded_by:
 - Closed the post-open descriptor-relative source error-classification gap so
   disappearance, unreadability, and other revalidation uncertainty remain
   stable probe results instead of escaping as `unexpected-error`.
+- Closed the remaining pre-open source-binding classification gap so a
+  discovered member's dedicated re-stat and descriptor-relative pre-open
+  `stat`/`open` preserve missing, unreadable, and inconclusive outcomes.
 - Closed the remaining bound-file, wrapped-directory, and post-close probe
   taxonomy gaps so causal OS failures remain missing, unreadable, or
   inconclusive while only proved property comparisons report mismatches.
@@ -113,6 +116,11 @@ superseded_by:
   `source-missing-after-read`, `source-revalidation-unreadable`, or
   `source-revalidation-inconclusive`. The access probe retains those codes in
   the affected file record.
+- The same source taxonomy now covers each discovered member's dedicated
+  re-stat plus the bound helper's pre-open descriptor-relative `stat` and
+  `open`. `EACCES` and `EPERM` are unreadable, while non-source callers retain
+  their domain-specific inconclusive codes; rollback journals keep the policy
+  result and record the source cause in `details.reason_code`.
 - Bound source files apply that taxonomy across descriptor stat, path stat, and
   repeated hashing while still closing the opened descriptor on every failure.
   Held source-directory translation inspects wrapped OS causes before generic
@@ -722,6 +730,28 @@ superseded_by:
   process probe.
 - Full regressions: Python `3.13.0` and system Python `3.9.6` each passed all
   `302` tests with two sandbox-scoped skips for the fixed `/usr/bin/pgrep`
+  process probe.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.
+- Fresh source-binding classification follow-up base:
+  `c9284d13fef8bc61c9b4628d53b1b7c41551f494`.
+- Discovered live-source members now use the shared source OS-error classifier
+  for their dedicated re-stat and the bound helper's descriptor-relative
+  pre-open `stat`/`open`. `EACCES` and `EPERM` remain
+  `source-revalidation-unreadable`; missing and other I/O failures remain
+  distinct, and snapshot callers retain their own inconclusive code.
+- Rollback-journal binding keeps `rollback-journal-present` as the policy
+  result while recording a permission failure as
+  `details.reason_code: source-revalidation-unreadable`.
+- Focused regressions: Python `3.13.0` and system Python `3.9.6` each passed
+  four test methods covering the complete initial stat/open taxonomy,
+  non-source isolation, fingerprint/copy/merge propagation across three
+  binding stages for `EACCES` and `EPERM`, and rollback-journal reason
+  retention.
+- Full regressions: Python `3.13.0` and system Python `3.9.6` each passed all
+  `333` tests with two sandbox-scoped skips for the fixed `/usr/bin/pgrep`
   process probe.
 - Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
   Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
