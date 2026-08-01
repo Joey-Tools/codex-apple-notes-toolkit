@@ -213,6 +213,12 @@ and access policies carried by the artifact's no-replace creator receipts;
 every other appeared component is a scope failure. Any error after a creator
 boundary conservatively retains `mutation_performed: true`; an artifact-created
 result transaction also retains `artifact_mutation_performed: true`.
+After each artifact parent is committed, treat the final descriptor-relative
+formal-leaf absence check as the zero-write linearization point: revalidate the
+held parent/live/alias scope and the requested public artifact name immediately
+before invoking the private `.partial-*` creator. A failure at that point must
+leave no partial object and must keep parent-creation evidence separate from
+artifact creation evidence.
 
 The Notes-running gate executes only `/usr/bin/pgrep -x Notes` with a minimal fixed environment,
 a hard deadline, and process-group cleanup. Only exit `0` plus one or more decimal PIDs means
@@ -259,6 +265,10 @@ After artifact publication succeeds, it commits that held parent scope, rejects 
 regular files and symlinks, creates an unpredictable descriptor-relative temporary regular file
 with `O_NOFOLLOW|O_CREAT|O_EXCL`, enforces the current effective owner/group and mode `0600` before
 writing, fsyncs the file, and publishes it with an atomic no-replace rename plus held-parent fsync.
+Immediately before that temporary-file `open`, the atomic writer invokes the
+creator-result callback that revalidates the held result scope and formal
+public result leaf. That callback is the result writer's zero-write
+linearization point; a failure creates no `.RESULT.tmp-*` object.
 It revalidates identity, content, and the complete access policy before and after publication. Its
 `manifest_creation_receipt` anchors the exact creation-time manifest SHA-256, size, identity, and
 access policy. Before writing the result, the helper binds the reopened artifact's parent, root,
@@ -363,6 +373,11 @@ locator plus point-in-time namespace observations. If the writer-created leaf ca
 retain its creation receipt and an explicitly unbound point-in-time namespace locator instead of
 claiming descriptor authority. If recovery-evidence construction itself fails, keep the original
 error primary and fall back to fixed inconclusive creation/descriptor/parent evidence.
+Before the standalone writer's actual `.OUT.tmp-*` `O_EXCL` open, invoke the
+publication callback through that writer and revalidate the held output parent
+plus the final public main, WAL, SHM, and rollback-journal names. This is the
+standalone zero-write linearization point after payload preparation; a failure
+must leave no private temporary output.
 An otherwise unclassified runtime failure becomes `prepared-operation-failed`, retains the
 underlying exception as its cause, and carries the same recovery details.
 If publication reports `destination-install-uncertain`, preserve the reported paths, do not retry

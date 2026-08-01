@@ -18,6 +18,9 @@
 - Required-quit snapshots recheck Notes at the final pre-rename and immediate post-publication boundaries; a late restart quarantines the exact published object and cannot produce a writeback-grade receipt.
 - A visible quarantine rename is not reported as verified or retained until directory policy, parent durability, complete-tree, and terminal-alias proofs all succeed.
 - Snapshot and patch creator CLIs can atomically publish owner-only external result files without shell redirection.
+- Artifact, standalone, and creator-result writers now define their zero-write
+  linearization point at the final held-parent/public-name revalidation
+  immediately before the first `.partial-*` or `.tmp-*` creator can run.
 - Cross-root creator result files bind their artifact and result alias scopes independently, and committed result receipts survive late scope teardown failures.
 - Newly created copied, JSON, and standalone files retain a pre-write identity and access-policy baseline through content and publication validation.
 - Structured, malformed, unstructured, and transport-evidence-construction creator failures retain conservative recovery evidence and close every owned or received FD.
@@ -29,4 +32,5 @@
 
 ## Global Blockers
 
-- None.
+- No canonical runtime blocker. Private-overlay packaging must consume this
+  repository's landed source instead of owning a second helper copy.

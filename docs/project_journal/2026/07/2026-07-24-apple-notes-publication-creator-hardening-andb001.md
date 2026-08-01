@@ -1,9 +1,9 @@
 ---
 id: 20260724-andb001
 title: Apple Notes Publication And Creator Failure Hardening
-status: completed
+status: active
 created: 2026-07-24
-updated: 2026-07-30
+updated: 2026-08-01
 branch: codex/apple-db-hardening
 pr: https://github.com/Joey-Tools/codex-apple-notes-toolkit/pull/3
 supersedes: []
@@ -15,6 +15,9 @@ superseded_by:
 ## Summary
 
 - Closed three fail-closed gaps in untrusted leaf opening, post-rename publication classification, and identity-bound directory creation failure recovery.
+- Closed three remaining zero-write races by making the committed artifact
+  scope, standalone public-name set, and creator result scope revalidate at
+  their actual temporary-object creation boundaries.
 - Closed the follow-up production gap by adding a packaged inherited-supervisor creator protocol and conservative malformed-result ownership handling.
 - Closed the packaged-supervisor same-UID replacement gap by turning the
   bundled service into a strict pre-creation capability gate while retaining
@@ -204,8 +207,10 @@ superseded_by:
   `mutation_performed: true`, even when the primary pre-publication failure
   originally reported false.
 - Direct public output APIs prove the requested leaf is still absent through
-  the held parent before committing the destination parent or creating a
-  private partial.
+  the held parent after committing the destination parent and immediately
+  before creating a private partial. Standalone and creator-result writers
+  likewise revalidate their final public names immediately before their actual
+  `O_EXCL` temporary-file opens.
 - Worker launch no longer snapshots parent descriptors before starting the
   child. Before either child exists, the launcher no-follow/nonblocking-opens
   the fixed packaged helper, binds identity/access policy and a 2-MiB ceiling,
@@ -251,14 +256,26 @@ superseded_by:
 
 ## Next Steps
 
-- Parent may publish the signed follow-up, rerun the PR review gate, and handle
-  the existing GitHub Codex thread; this worktree does not push or mutate PR
-  state.
-- The Claude lane is waived only until `2026-08-01 00:00 Asia/Shanghai` and is
-  not counted as completed review evidence.
+- Finalize this canonical zero-write slice with full regression, static,
+  named-single, exact-secret, and CI evidence.
+- Propagate the landed canonical checkout and digest to the private overlay so
+  packaging can add the canonical sync rule/inventory and update the
+  work-report integration without duplicating this helper.
 
 ## Evidence
 
+- Zero-write creator-boundary follow-up base:
+  `26d9ba3308be4866d245f9892a4b0b93bb8be6ee`.
+- Final focused regressions: Python `3.13.0` passed five methods covering the
+  two artifact creators, all four standalone public names, creator-result
+  revalidation injection, and the two existing held-parent swap/restore
+  controls (`5` tests in `0.942s`).
+- Final full regressions: Python `3.13.0` passed all `341` tests with two
+  sandbox-scoped fixed-`/usr/bin/pgrep` skips in `59.124s`; system Python
+  `3.9.6` passed the same `341` tests with two skips in `72.063s`.
+- Static gates: Ruff `0.13.2` full-repository check and changed-Python format
+  check; `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators;
+  and `git diff --check`.
 - Base commit: `393a87d57d3e6e03d625a384b8fbb16a2538df58`
 - Fresh-review follow-up base: `fdd702dcd774a8331c0505d5d9da4b04c7245d18`
 - Transport-evidence follow-up base: `2c6f77c798e7d57e52f359ca3efec5a86b883e39`

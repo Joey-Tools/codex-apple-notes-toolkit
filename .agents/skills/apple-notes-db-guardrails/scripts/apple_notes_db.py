@@ -258,7 +258,7 @@ class _ValidatedSnapshotArtifact:
     source_integrity: dict[str, Any]
     revalidate_recovery_clone: Callable[[], None]
     backup_recovery_clone: Callable[
-        [Path, _BoundDirectory | None],
+        [Path, _BoundDirectory | None, Callable[[], None] | None],
         dict[str, Any],
     ]
 
@@ -8127,6 +8127,7 @@ def _write_json_atomic(
     *,
     parent_binding: _BoundDirectory | None = None,
     ensure_ascii: bool = False,
+    pre_temp_create: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     if parent_binding is None:
         with _bind_existing_directory_with_trusted_alias(path.parent) as bound_parent:
@@ -8135,6 +8136,7 @@ def _write_json_atomic(
                 payload,
                 parent_binding=bound_parent,
                 ensure_ascii=ensure_ascii,
+                pre_temp_create=pre_temp_create,
             )
     if path.parent != parent_binding.path:
         raise StoreSafetyError(
@@ -8152,6 +8154,8 @@ def _write_json_atomic(
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
+    if pre_temp_create is not None:
+        pre_temp_create()
     try:
         fd = os.open(
             temp_path.name,
@@ -10346,6 +10350,64 @@ def _assert_destination_preflight_name_absent(
                 "mutation_performed": False,
             },
         )
+
+
+def _revalidate_live_destination_name_absent(
+    scope: _LiveDestinationScope,
+    *,
+    exists_code: str,
+    inconclusive_code: str,
+    label: str,
+) -> None:
+    """Linearize a zero-write boundary against the held formal leaf name."""
+
+    scope.revalidate()
+    state, _ = _observe_bound_name(
+        scope.parent.fd,
+        scope.destination.name,
+    )
+    if state == "present":
+        raise StoreSafetyError(
+            exists_code,
+            f"{label} already exists: {scope.destination}",
+            details={
+                "destination": str(scope.destination),
+                "mutation_performed": False,
+            },
+        )
+    if state != "absent":
+        raise StoreSafetyError(
+            inconclusive_code,
+            f"Cannot prove that the descriptor-bound {label.lower()} name is "
+            f"absent: {scope.destination}",
+            details={
+                "destination": str(scope.destination),
+                "mutation_performed": False,
+            },
+        )
+
+
+@contextmanager
+def _create_bound_artifact_partial_after_destination_revalidation(
+    scope: _LiveDestinationScope,
+) -> Iterator[_BoundDirectory]:
+    """Revalidate the public leaf immediately before any partial creator runs."""
+
+    _revalidate_live_destination_name_absent(
+        scope,
+        exists_code="destination-exists",
+        inconclusive_code="snapshot-destination-scope-inconclusive",
+        label="Destination",
+    )
+    partial = scope.destination.parent / (
+        f".{scope.destination.name}.partial-{uuid.uuid4().hex}"
+    )
+    with _create_bound_directory(
+        partial,
+        retain_failure_receipt=True,
+        parent_binding=scope.parent,
+    ) as bound_partial:
+        yield bound_partial
 
 
 @contextmanager
@@ -13733,11 +13795,45 @@ def _terminal_public_standalone_output_receipt(
     return receipt
 
 
+def _revalidate_standalone_public_names_before_temp_create(
+    destination_binding: _BoundDirectory,
+    output: Path,
+) -> None:
+    """Linearize zero-write publication against the main and sidecar names."""
+
+    _verify_bound_directory_namespace(destination_binding)
+    if destination_binding.before_write is not None:
+        destination_binding.before_write()
+    for candidate in (
+        output,
+        output.with_name(f"{output.name}-wal"),
+        output.with_name(f"{output.name}-shm"),
+        output.with_name(f"{output.name}-journal"),
+    ):
+        state, _ = _observe_bound_name(
+            destination_binding.fd,
+            candidate.name,
+        )
+        if state == "present":
+            raise StoreSafetyError(
+                "destination-exists",
+                f"Recovery destination already exists: {candidate}",
+                details={"mutation_performed": False},
+            )
+        if state != "absent":
+            raise StoreSafetyError(
+                "prepared-directory-revalidation-inconclusive",
+                f"Cannot inspect descriptor-bound recovery destination: {candidate}",
+                details={"mutation_performed": False},
+            )
+
+
 def _write_standalone_backup_payload(
     payload: bytes,
     output: Path,
     *,
     destination_binding: _BoundDirectory | None = None,
+    pre_temp_create: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     if destination_binding is None:
         with _bind_existing_directory_with_trusted_alias(
@@ -13747,6 +13843,7 @@ def _write_standalone_backup_payload(
                 payload,
                 output,
                 destination_binding=bound_destination,
+                pre_temp_create=pre_temp_create,
             )
     if output.parent != destination_binding.path:
         raise StoreSafetyError(
@@ -13766,6 +13863,8 @@ def _write_standalone_backup_payload(
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
+    if pre_temp_create is not None:
+        pre_temp_create()
     try:
         output_fd = os.open(
             output.name,
@@ -13842,6 +13941,7 @@ def _backup_bound_store_to_standalone(
     output: Path,
     *,
     destination_binding: _BoundDirectory | None = None,
+    pre_temp_create: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     recovered_payload = _bound_recovery_payload(source)
     payload = _sqlite_backup_bytes_from_payload(
@@ -13853,6 +13953,7 @@ def _backup_bound_store_to_standalone(
         payload,
         output,
         destination_binding=destination_binding,
+        pre_temp_create=pre_temp_create,
     )
 
 
@@ -13861,6 +13962,7 @@ def _backup_bound_regular_to_standalone(
     output: Path,
     *,
     destination_binding: _BoundDirectory | None = None,
+    pre_temp_create: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Back up an already validated standalone file without sidecar discovery."""
 
@@ -13877,6 +13979,7 @@ def _backup_bound_regular_to_standalone(
         payload,
         output,
         destination_binding=destination_binding,
+        pre_temp_create=pre_temp_create,
     )
     _verify_bound_regular_file(source, PREPARED_FILE_CODES)
     return result
@@ -13887,12 +13990,14 @@ def _backup_sqlite_to_standalone(
     output: Path,
     *,
     destination_binding: _BoundDirectory | None = None,
+    pre_temp_create: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     if isinstance(source, (_BoundRecoveryStore, _BoundSourceStore)):
         return _backup_bound_store_to_standalone(
             source,
             output,
             destination_binding=destination_binding,
+            pre_temp_create=pre_temp_create,
         )
     source_receipt = _verify_bound_regular_file(source, PREPARED_FILE_CODES)
     with _bind_recovery_store(source.path) as store:
@@ -13904,6 +14009,7 @@ def _backup_sqlite_to_standalone(
             store,
             output,
             destination_binding=destination_binding,
+            pre_temp_create=pre_temp_create,
         )
     _verify_bound_regular_file(source, PREPARED_FILE_CODES)
     return result
@@ -13918,7 +14024,7 @@ def _recover_validated_clone_to_standalone(
     source_integrity: dict[str, Any],
     source_revalidate: Callable[[], None] | None = None,
     source_backup: Callable[
-        [Path, _BoundDirectory | None],
+        [Path, _BoundDirectory | None, Callable[[], None] | None],
         dict[str, Any],
     ]
     | None = None,
@@ -13939,11 +14045,12 @@ def _recover_validated_clone_to_standalone(
                 recovery_evidence=recovery_evidence,
                 source_integrity=source_integrity,
                 source_revalidate=revalidate_bound_source,
-                source_backup=lambda output, destination_binding: (
+                source_backup=lambda output, destination_binding, pre_temp_create: (
                     _backup_sqlite_to_standalone(
                         recovered_store,
                         output,
                         destination_binding=destination_binding,
+                        pre_temp_create=pre_temp_create,
                     )
                 ),
                 output_parent_binding=output_parent_binding,
@@ -13971,31 +14078,21 @@ def _recover_validated_clone_to_standalone(
                 f"Recovery output does not use the supplied bound parent: {out}",
             )
         _verify_bound_directory_namespace(output_parent_binding)
-        for candidate in (
+        _revalidate_standalone_public_names_before_temp_create(
+            output_parent_binding,
             out,
-            out.with_name(f"{out.name}-wal"),
-            out.with_name(f"{out.name}-shm"),
-            out.with_name(f"{out.name}-journal"),
-        ):
-            state, _ = _observe_bound_name(
-                output_parent_binding.fd,
-                candidate.name,
-            )
-            if state == "present":
-                raise StoreSafetyError(
-                    "destination-exists",
-                    f"Recovery destination already exists: {candidate}",
-                )
-            if state == "unavailable":
-                raise StoreSafetyError(
-                    "prepared-directory-revalidation-inconclusive",
-                    "Cannot inspect descriptor-bound recovery destination: "
-                    f"{candidate}",
-                )
+        )
         temp_out = out.parent / f".{out.name}.tmp-{uuid.uuid4().hex}"
         if source_revalidate is not None:
             source_revalidate()
-        temp_receipt = source_backup(temp_out, output_parent_binding)
+        temp_receipt = source_backup(
+            temp_out,
+            output_parent_binding,
+            lambda: _revalidate_standalone_public_names_before_temp_create(
+                output_parent_binding,
+                out,
+            ),
+        )
         with _bind_prepared_regular_file_with_failure_receipt(
             temp_out,
             output_parent_binding,
@@ -14169,11 +14266,12 @@ def _recover_to_standalone(
             recovery_evidence=evidence,
             source_integrity=source_integrity,
             source_revalidate=revalidate_bound_source,
-            source_backup=lambda output, destination_binding: (
+            source_backup=lambda output, destination_binding, pre_temp_create: (
                 _backup_sqlite_to_standalone(
                     source_store,
                     output,
                     destination_binding=destination_binding,
+                    pre_temp_create=pre_temp_create,
                 )
             ),
             output_parent_binding=output_parent_binding,
@@ -14282,11 +14380,8 @@ def copy_db(
                 ),
             ),
             destination_parent_context as destination_scope,
-            _create_bound_directory(
-                destination_scope.destination.parent
-                / (f".{destination_scope.destination.name}.partial-{uuid.uuid4().hex}"),
-                retain_failure_receipt=True,
-                parent_binding=destination_scope.parent,
+            _create_bound_artifact_partial_after_destination_revalidation(
+                destination_scope,
             ) as bound_root,
             ExitStack() as snapshot_stack,
         ):
@@ -14891,11 +14986,13 @@ def _validated_snapshot_artifact(
         def backup_recovery_clone(
             output: Path,
             destination_binding: _BoundDirectory | None = None,
+            pre_temp_create: Callable[[], None] | None = None,
         ) -> dict[str, Any]:
             return _backup_bound_store_to_standalone(
                 snapshot_store,
                 output,
                 destination_binding=destination_binding,
+                pre_temp_create=pre_temp_create,
             )
 
         _scan_exact_bound_directory_entries(
@@ -15936,11 +16033,8 @@ def stage_patch(
                 ),
             ),
             destination_parent_context as destination_scope,
-            _create_bound_directory(
-                destination_scope.destination.parent
-                / (f".{destination_scope.destination.name}.partial-{uuid.uuid4().hex}"),
-                retain_failure_receipt=True,
-                parent_binding=destination_scope.parent,
+            _create_bound_artifact_partial_after_destination_revalidation(
+                destination_scope,
             ) as bound_root,
         ):
             dest = destination_scope.destination
@@ -16732,6 +16826,15 @@ def _assert_creator_result_name_absent(
             f"absent: {result_scope.destination}",
             details={"mutation_performed": False},
         )
+
+
+def _revalidate_creator_result_before_temp_create(
+    result_scope: _LiveDestinationScope,
+) -> None:
+    """Set the result writer's zero-write linearization point."""
+
+    result_scope.revalidate()
+    _assert_creator_result_name_absent(result_scope)
 
 
 @contextmanager
@@ -17712,6 +17815,9 @@ def _write_creator_result_file(
                     payload,
                     parent_binding=result_scope.parent,
                     ensure_ascii=True,
+                    pre_temp_create=lambda: (
+                        _revalidate_creator_result_before_temp_create(result_scope)
+                    ),
                 )
                 destination.publication_receipt = publication_receipt
                 revalidate_artifact()

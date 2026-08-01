@@ -441,6 +441,12 @@ assertion before committing the destination parent or creating a private
 partial. A destination that appears after an earlier lexical check is
 `destination-exists`; it must not cause the helper to create and retain a
 partial first.
+After the parent commit returns a `_LiveDestinationScope`, perform one final
+descriptor-relative scope and formal-leaf absence revalidation immediately
+before calling the `.partial-*` creator. This is the artifact zero-write
+linearization point. Parent components created by the earlier commit retain
+their own mutation/receipt classification, but a failure here must prove that
+no artifact partial creator ran.
 
 After both proofs succeed, commit the artifact destination first. A missing
 result parent remains absent until artifact publication succeeds. Artifact
@@ -692,6 +698,11 @@ an unpredictable descriptor-relative temporary regular file with
 `O_NOFOLLOW|O_CREAT|O_EXCL`, enforces exact effective owner/group and mode `0600` before writing,
 performs stable content readback, fsyncs the file, publishes with an atomic no-replace rename,
 fsyncs the held parent, and terminally revalidates the external name and artifact separation.
+Pass a result-scope callback into the atomic JSON writer and invoke it after
+the writer's ordinary parent check but immediately before the
+`.RESULT.tmp-*` `O_EXCL` open. The callback must revalidate the committed scope
+and descriptor-relative public result leaf; its failure is the result
+zero-write linearization point and leaves no temporary result object.
 Before the result write begins, bind the reopened artifact to the successful
 creator payload's `descriptor_bound_destination` and exact prepared-tree creation receipt rather
 than accepting the reopened object as a new baseline. Require the held parent and artifact root
@@ -870,6 +881,14 @@ creation-receipt locator with `cleanup_state: preserved-or-incomplete`. If reten
 construction fails, keep the original failure primary and emit fixed inconclusive
 creation/descriptor/parent evidence. Do not delete by name when the leaf may have been replaced or
 moved.
+
+The `source_backup` contract must carry a final-public-name callback through
+the standalone payload writer. Invoke it immediately before the actual
+`.OUT.tmp-*` `O_EXCL` open, after any potentially long payload preparation,
+and descriptor-relatively revalidate the held parent plus `OUT`, `OUT-wal`,
+`OUT-shm`, and `OUT-journal`. This is the standalone zero-write linearization
+point; a failure creates no temporary output and retains cleanup evidence as a
+separate concern rather than inventing a created-file receipt.
 
 Pre-publication failure handling protects deletion target identity by deleting nothing through a
 mutable pathname. While the creation-time root and parent descriptors are still open, revalidate

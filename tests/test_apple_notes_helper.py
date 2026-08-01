@@ -26,6 +26,7 @@ from collections.abc import Iterator
 from contextlib import closing, contextmanager, redirect_stdout
 from pathlib import Path
 from types import ModuleType
+from typing import Callable
 from unittest import mock
 
 
@@ -2233,6 +2234,64 @@ raise SystemExit(2)
         self.assertEqual(result_stat.st_uid, os.geteuid())
         self.assertEqual(result_stat.st_gid, os.getegid())
 
+    def test_creator_result_revalidation_failure_precedes_temp_creation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            destination = root / "snapshot"
+            result_file = root / "snapshot-result.json"
+            callback_calls = 0
+
+            def fail_result_revalidation(
+                _scope: MODULE._LiveDestinationScope,
+            ) -> None:
+                nonlocal callback_calls
+                callback_calls += 1
+                raise MODULE.StoreSafetyError(
+                    "result-file-scope-inconclusive",
+                    "simulated final result-file revalidation failure",
+                    details={"mutation_performed": False},
+                )
+
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                mock.patch.object(
+                    MODULE,
+                    "_revalidate_creator_result_before_temp_create",
+                    side_effect=fail_result_revalidation,
+                ),
+                redirect_stdout(stdout),
+            ):
+                return_code = MODULE.main(
+                    [
+                        "copy-db",
+                        "--group-container",
+                        str(paths.group_container),
+                        "--app-container",
+                        str(paths.app_container),
+                        "--dest",
+                        str(destination),
+                        "--result-file",
+                        str(result_file),
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(return_code, 1)
+            self.assertEqual(callback_calls, 1)
+            self.assertEqual(payload["error_code"], "result-file-publication-failed")
+            self.assertEqual(
+                payload["details"]["underlying_error_code"],
+                "result-file-scope-inconclusive",
+            )
+            self.assertTrue(destination.is_dir())
+            self.assertFalse(result_file.exists())
+            self.assertEqual(list(root.glob(".snapshot-result.json.tmp-*")), [])
+
     def test_creator_result_rejects_prebind_artifact_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -3242,6 +3301,68 @@ raise SystemExit(2)
             self.assertTrue(destination.is_dir())
             self.assertEqual(list(destination.iterdir()), [])
             self.assertEqual(list(root.glob(".snapshot.partial-*")), [])
+
+    def test_artifact_creators_revalidate_formal_leaf_after_parent_commit(
+        self,
+    ) -> None:
+        for operation in ("copy", "stage"):
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+                source = root / "edited.sqlite"
+                self._create_db(source)
+                destination = root / f"{operation}-artifact"
+                original_commit = MODULE._commit_live_safe_destination_parent
+
+                @contextmanager
+                def inject_leaf_after_parent_commit(
+                    preflight: MODULE._LiveDestinationPreflight,
+                ) -> Iterator[MODULE._LiveDestinationScope]:
+                    with original_commit(preflight) as scope:
+                        scope.destination.mkdir()
+                        yield scope
+
+                partial_creator = mock.Mock(
+                    side_effect=AssertionError(
+                        "formal-leaf drift must fail before partial creation"
+                    )
+                )
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_commit_live_safe_destination_parent",
+                        side_effect=inject_leaf_after_parent_commit,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_create_bound_directory",
+                        partial_creator,
+                    ),
+                    mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    if operation == "copy":
+                        MODULE.copy_db(
+                            paths,
+                            dest=destination,
+                            require_notes_quit=False,
+                        )
+                    else:
+                        MODULE.stage_patch(source, destination, paths=paths)
+
+                self._assert_safety_code("destination-exists", raised)
+                self.assertFalse(raised.exception.details["mutation_performed"])
+                partial_creator.assert_not_called()
+                self.assertTrue(destination.is_dir())
+                self.assertEqual(list(destination.iterdir()), [])
+                self.assertEqual(
+                    list(root.glob(f".{destination.name}.partial-*")),
+                    [],
+                )
 
     def test_creator_cli_accepts_artifact_created_shared_parent_prefix(
         self,
@@ -12844,6 +12965,49 @@ raise SystemExit(2)
                 result["identity"],
             )
 
+    def test_standalone_writer_rechecks_all_public_names_before_temp_create(
+        self,
+    ) -> None:
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            with (
+                self.subTest(suffix=suffix or "main"),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                source = root / MODULE.NOTE_STORE_MAIN
+                output = root / "merged.sqlite"
+                raced_name = output.with_name(f"{output.name}{suffix}")
+                self._create_db(source)
+                original_revalidate = (
+                    MODULE._revalidate_standalone_public_names_before_temp_create
+                )
+                revalidation_calls = 0
+
+                def inject_on_writer_revalidation(
+                    destination_binding: MODULE._BoundDirectory,
+                    selected_output: Path,
+                ) -> None:
+                    nonlocal revalidation_calls
+                    revalidation_calls += 1
+                    if revalidation_calls == 2:
+                        raced_name.write_bytes(b"attacker-owned")
+                    original_revalidate(destination_binding, selected_output)
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_revalidate_standalone_public_names_before_temp_create",
+                        side_effect=inject_on_writer_revalidation,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE.merge_db(source, output)
+
+                self._assert_safety_code("destination-exists", raised)
+                self.assertEqual(revalidation_calls, 2)
+                self.assertEqual(raced_name.read_bytes(), b"attacker-owned")
+                self.assertEqual(list(root.glob(".merged.sqlite.tmp-*")), [])
+
     def test_standalone_publication_rejects_terminal_sidecar_races(
         self,
     ) -> None:
@@ -14720,11 +14884,13 @@ raise SystemExit(2)
                 def backup_source(
                     output: Path,
                     destination_binding: MODULE._BoundDirectory | None,
+                    pre_temp_create: Callable[[], None] | None,
                 ) -> dict[str, object]:
                     return MODULE._backup_sqlite_to_standalone(
                         source_store,
                         output,
                         destination_binding=destination_binding,
+                        pre_temp_create=pre_temp_create,
                     )
 
                 with self.assertRaises(MODULE.StoreSafetyError) as raised:
@@ -14793,11 +14959,13 @@ raise SystemExit(2)
                 def backup_source(
                     output: Path,
                     destination_binding: MODULE._BoundDirectory | None,
+                    pre_temp_create: Callable[[], None] | None,
                 ) -> dict[str, object]:
                     return MODULE._backup_sqlite_to_standalone(
                         source_store,
                         output,
                         destination_binding=destination_binding,
+                        pre_temp_create=pre_temp_create,
                     )
 
                 with self.assertRaises(MODULE.StoreSafetyError) as raised:
@@ -14870,12 +15038,14 @@ raise SystemExit(2)
                     def backup_source(
                         output: Path,
                         destination_binding: MODULE._BoundDirectory | None,
+                        pre_temp_create: Callable[[], None] | None,
                     ) -> dict[str, object]:
                         nonlocal creation_receipt, prepared_path, moved_created
                         result = MODULE._backup_sqlite_to_standalone(
                             source_store,
                             output,
                             destination_binding=destination_binding,
+                            pre_temp_create=pre_temp_create,
                         )
                         creation_receipt = result
                         prepared_path = output
@@ -14966,11 +15136,13 @@ raise SystemExit(2)
                 def backup_then_touch_mtime(
                     output: Path,
                     destination_binding: MODULE._BoundDirectory | None,
+                    pre_temp_create: Callable[[], None] | None,
                 ) -> dict[str, object]:
                     result = MODULE._backup_sqlite_to_standalone(
                         source_store,
                         output,
                         destination_binding=destination_binding,
+                        pre_temp_create=pre_temp_create,
                     )
                     observed = output.stat()
                     os.utime(
@@ -15024,12 +15196,14 @@ raise SystemExit(2)
                 output: Path,
                 *,
                 destination_binding: MODULE._BoundDirectory | None = None,
+                pre_temp_create: Callable[[], None] | None = None,
             ) -> dict[str, object]:
                 nonlocal prepared_path
                 result = original_backup(
                     source_store,
                     output,
                     destination_binding=destination_binding,
+                    pre_temp_create=pre_temp_create,
                 )
                 prepared_path = output
                 snapshot_main.chmod(0o640)
@@ -15087,12 +15261,14 @@ raise SystemExit(2)
                 def backup_source(
                     output: Path,
                     destination_binding: MODULE._BoundDirectory | None,
+                    pre_temp_create: Callable[[], None] | None,
                 ) -> dict[str, object]:
                     nonlocal backup_finished, creation_receipt, prepared_path
                     result = MODULE._backup_sqlite_to_standalone(
                         source_store,
                         output,
                         destination_binding=destination_binding,
+                        pre_temp_create=pre_temp_create,
                     )
                     creation_receipt = result
                     prepared_path = output
@@ -15187,11 +15363,13 @@ raise SystemExit(2)
                 def backup_source(
                     output: Path,
                     destination_binding: MODULE._BoundDirectory | None,
+                    pre_temp_create: Callable[[], None] | None,
                 ) -> dict[str, object]:
                     return MODULE._backup_sqlite_to_standalone(
                         source_store,
                         output,
                         destination_binding=destination_binding,
+                        pre_temp_create=pre_temp_create,
                     )
 
                 with (
@@ -17944,6 +18122,7 @@ raise SystemExit(2)
                 output: Path,
                 *,
                 destination_binding: MODULE._BoundDirectory | None = None,
+                pre_temp_create: Callable[[], None] | None = None,
             ) -> dict[str, object]:
                 if (
                     destination_binding is None
@@ -17953,6 +18132,7 @@ raise SystemExit(2)
                         payload,
                         output,
                         destination_binding=destination_binding,
+                        pre_temp_create=pre_temp_create,
                     )
 
                 def open_with_swap(
@@ -18004,6 +18184,7 @@ raise SystemExit(2)
                         payload,
                         output,
                         destination_binding=destination_binding,
+                        pre_temp_create=pre_temp_create,
                     )
 
             with mock.patch.object(
@@ -18892,6 +19073,7 @@ raise SystemExit(2)
                 output: Path,
                 *,
                 destination_binding: MODULE._BoundDirectory | None = None,
+                pre_temp_create: Callable[[], None] | None = None,
             ) -> dict[str, object]:
                 if (
                     destination_binding is None
@@ -18902,6 +19084,7 @@ raise SystemExit(2)
                         payload,
                         output,
                         destination_binding=destination_binding,
+                        pre_temp_create=pre_temp_create,
                     )
 
                 def open_with_swap(
@@ -18952,6 +19135,7 @@ raise SystemExit(2)
                         payload,
                         output,
                         destination_binding=destination_binding,
+                        pre_temp_create=pre_temp_create,
                     )
 
             with mock.patch.object(
