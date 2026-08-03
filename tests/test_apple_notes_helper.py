@@ -23015,6 +23015,91 @@ raise SystemExit(2)
             )
             path_connect.assert_not_called()
 
+    def test_query_note_tags_bounds_content_hashes_to_outer_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            standalone = root / "standalone.sqlite"
+            note_title = self._create_note_tags_db(standalone)
+            live_group = root / "live-group"
+            live_group.mkdir()
+            live_app = root / "live-app"
+            live_app.mkdir()
+            live_database = live_group / MODULE.NOTE_STORE_MAIN
+            self._create_db(live_database)
+            standalone_identity = (
+                standalone.stat().st_dev,
+                standalone.stat().st_ino,
+            )
+            live_identity = (
+                live_database.stat().st_dev,
+                live_database.stat().st_ino,
+            )
+            hash_counts: dict[tuple[int, int], int] = {}
+            verification_modes: list[bool] = []
+            extra_callback_hash_deltas: list[int] = []
+            original_hash = MODULE._hash_fd
+            original_verify_state = MODULE._verify_note_tags_input_state
+            original_query = MODULE._query_note_tags_from_image
+
+            def count_hashes(fd: int) -> str:
+                observed = os.fstat(fd)
+                identity = (observed.st_dev, observed.st_ino)
+                hash_counts[identity] = hash_counts.get(identity, 0) + 1
+                return original_hash(fd)
+
+            def record_verification_mode(
+                *args: object,
+                **kwargs: object,
+            ) -> None:
+                verification_modes.append(bool(kwargs["verify_content"]))
+                return original_verify_state(*args, **kwargs)
+
+            def query_after_extra_callbacks(
+                image: MODULE._DeserializedSQLiteImage,
+                database: Path,
+                title: str,
+            ) -> dict[str, object]:
+                before = sum(hash_counts.values())
+                for _ in range(12):
+                    image.verify_bound()
+                extra_callback_hash_deltas.append(sum(hash_counts.values()) - before)
+                return original_query(image, database, title)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_hash_fd",
+                    side_effect=count_hashes,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_verify_note_tags_input_state",
+                    side_effect=record_verification_mode,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_query_note_tags_from_image",
+                    side_effect=query_after_extra_callbacks,
+                ),
+            ):
+                result = MODULE.query_note_tags(
+                    standalone,
+                    note_title,
+                    paths=MODULE.NoteStorePaths(
+                        group_container=live_group,
+                        app_container=live_app,
+                    ),
+                )
+
+        self.assertEqual(result["note"]["pk"], 1677)
+        self.assertEqual(verification_modes[0], True)
+        self.assertEqual(verification_modes[-1], True)
+        self.assertEqual(verification_modes.count(True), 2)
+        self.assertGreaterEqual(verification_modes.count(False), 8)
+        self.assertEqual(extra_callback_hash_deltas, [0])
+        self.assertLessEqual(hash_counts[standalone_identity], 7)
+        self.assertLessEqual(hash_counts[live_identity], 11)
+
     def test_query_note_tags_rejects_symlink_input(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -23068,7 +23153,14 @@ raise SystemExit(2)
             database = root / "notes.sqlite"
             note_title = self._create_note_tags_db(database)
             original_query = MODULE._native_sqlite_query_rows
+            original_hash = MODULE._hash_fd
             query_count = 0
+            hash_count = 0
+
+            def count_hashes(fd: int) -> str:
+                nonlocal hash_count
+                hash_count += 1
+                return original_hash(fd)
 
             def mutate_after_first_query(
                 *args: object,
@@ -23091,11 +23183,17 @@ raise SystemExit(2)
                     "_native_sqlite_query_rows",
                     side_effect=mutate_after_first_query,
                 ),
+                mock.patch.object(
+                    MODULE,
+                    "_hash_fd",
+                    side_effect=count_hashes,
+                ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
                 self._query_note_tags_standalone_for_test(database, note_title)
 
         self._assert_safety_code("source-content-mismatch", raised)
+        self.assertLessEqual(hash_count, 7)
 
     def test_query_note_tags_rejects_mode_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -3640,6 +3640,7 @@ def _verify_bound_regular_file_with_stat(
     *,
     target: Path,
     stat_target: Callable[[], os.stat_result],
+    verify_content: bool = True,
 ) -> dict[str, Any]:
     if bound.trusted_alias is not None:
         _assert_trusted_alias_matches_path(bound.trusted_alias, target)
@@ -3702,27 +3703,32 @@ def _verify_bound_regular_file_with_stat(
     descriptor_before = stat_descriptor()
     path_before = stat_path()
     verify_properties(descriptor_before, path_before)
-    try:
-        first_sha256 = _hash_fd(bound.fd)
-    except OSError as exc:
-        raise _bound_file_revalidation_os_error(
-            target,
-            "hash the bound regular file",
-            exc,
-            codes,
-        ) from exc
-    descriptor_between = stat_descriptor()
-    path_between = stat_path()
-    verify_properties(descriptor_between, path_between)
-    try:
-        second_sha256 = _hash_fd(bound.fd)
-    except OSError as exc:
-        raise _bound_file_revalidation_os_error(
-            target,
-            "repeat the bound regular-file hash",
-            exc,
-            codes,
-        ) from exc
+    first_sha256 = bound.sha256
+    second_sha256 = bound.sha256
+    descriptor_between = descriptor_before
+    path_between = path_before
+    if verify_content:
+        try:
+            first_sha256 = _hash_fd(bound.fd)
+        except OSError as exc:
+            raise _bound_file_revalidation_os_error(
+                target,
+                "hash the bound regular file",
+                exc,
+                codes,
+            ) from exc
+        descriptor_between = stat_descriptor()
+        path_between = stat_path()
+        verify_properties(descriptor_between, path_between)
+        try:
+            second_sha256 = _hash_fd(bound.fd)
+        except OSError as exc:
+            raise _bound_file_revalidation_os_error(
+                target,
+                "repeat the bound regular-file hash",
+                exc,
+                codes,
+            ) from exc
     descriptor_after = stat_descriptor()
     path_after = stat_path()
     verify_properties(descriptor_after, path_after)
@@ -3730,8 +3736,11 @@ def _verify_bound_regular_file_with_stat(
         first_sha256 != bound.sha256
         or second_sha256 != bound.sha256
         or descriptor_before.st_size != bound.opened.st_size
+        or path_before.st_size != bound.opened.st_size
         or descriptor_between.st_size != bound.opened.st_size
+        or path_between.st_size != bound.opened.st_size
         or descriptor_after.st_size != bound.opened.st_size
+        or path_after.st_size != bound.opened.st_size
     ):
         raise StoreSafetyError(
             codes.content,
@@ -3739,19 +3748,24 @@ def _verify_bound_regular_file_with_stat(
         )
     before_metadata = _metadata(bound.opened)
     after_metadata = _metadata(descriptor_after)
-    result = {
-        "path": target,
-        "sha256": bound.sha256,
-        "size": descriptor_after.st_size,
-        "identity": _identity(descriptor_after),
-        "access_policy": _access_policy(descriptor_after),
-        "metadata": after_metadata,
-        "metadata_transitions": {
-            key: {"before": before_metadata[key], "after": after_metadata[key]}
-            for key in before_metadata
-            if before_metadata[key] != after_metadata[key]
-        },
-    }
+    result: dict[str, Any] = {"path": target}
+    if verify_content:
+        result["sha256"] = bound.sha256
+    result.update(
+        {
+            "size": descriptor_after.st_size,
+            "identity": _identity(descriptor_after),
+            "access_policy": _access_policy(descriptor_after),
+            "metadata": after_metadata,
+            "metadata_transitions": {
+                key: {"before": before_metadata[key], "after": after_metadata[key]}
+                for key in before_metadata
+                if before_metadata[key] != after_metadata[key]
+            },
+        }
+    )
+    if not verify_content:
+        result["content_verification"] = "not-performed-identity-access-size-only"
     if bound.trusted_alias is not None:
         result["trusted_alias"] = _verify_trusted_directory_alias(
             bound.trusted_alias,
@@ -3798,6 +3812,26 @@ def _verify_bound_regular_file_at(
             dir_fd=dir_fd,
             follow_symlinks=False,
         ),
+    )
+
+
+def _verify_bound_regular_file_properties_at(
+    bound: _BoundRegularFile,
+    codes: _FileProtectionCodes,
+    *,
+    dir_fd: int,
+    basename: str,
+) -> dict[str, Any]:
+    return _verify_bound_regular_file_with_stat(
+        bound,
+        codes,
+        target=bound.path,
+        stat_target=lambda: os.stat(
+            basename,
+            dir_fd=dir_fd,
+            follow_symlinks=False,
+        ),
+        verify_content=False,
     )
 
 
@@ -4507,6 +4541,8 @@ def _verify_bound_recovery_store(
 
 def _verify_bound_source_store(
     store: _BoundSourceStore,
+    *,
+    verify_content: bool = True,
 ) -> dict[str, Any]:
     """Revalidate only the reserved NoteStore namespace through the held FD."""
 
@@ -4522,8 +4558,13 @@ def _verify_bound_source_store(
             "SQLite main/WAL/SHM/rollback-journal membership changed while "
             "the descriptor-bound live store was in use",
         )
+    verify_file = (
+        _verify_bound_regular_file_at
+        if verify_content
+        else _verify_bound_regular_file_properties_at
+    )
     files = {
-        basename: _verify_bound_regular_file_at(
+        basename: verify_file(
             bound,
             SOURCE_FILE_CODES,
             dir_fd=store.directory.fd,
@@ -17703,7 +17744,7 @@ def _verify_note_tags_present_binding_continuity(
             dir_fd=ancestor.fd,
             follow_symlinks=False,
         )
-        live = _verify_bound_source_store(store)
+        live = _verify_bound_source_store(store, verify_content=False)
         ancestor_after = _verify_bound_source_directory(ancestor)
     except (OSError, StoreSafetyError) as exc:
         raise _note_tags_live_source_inconclusive_error(
@@ -17812,20 +17853,31 @@ def _assert_note_tags_input_not_live_store(
     parent: _BoundDirectory,
     database: _BoundRegularFile,
     live_source: _BoundSourceStore | _BoundAbsentNoteTagsLiveSource,
-) -> None:
+    *,
+    standalone: dict[str, Any] | None = None,
+    verify_content: bool = True,
+) -> dict[str, Any]:
     """Reject a lexical standalone path that aliases the held live main object."""
 
     if isinstance(live_source, _BoundAbsentNoteTagsLiveSource):
-        _verify_note_tags_absent_live_source(live_source)
-        return
-    standalone = _verify_bound_regular_file_at(
-        database,
-        SOURCE_FILE_CODES,
-        dir_fd=parent.fd,
-        basename=database.path.name,
-    )
+        return _verify_note_tags_absent_live_source(live_source)
+    if standalone is None:
+        verify_file = (
+            _verify_bound_regular_file_at
+            if verify_content
+            else _verify_bound_regular_file_properties_at
+        )
+        standalone = verify_file(
+            database,
+            SOURCE_FILE_CODES,
+            dir_fd=parent.fd,
+            basename=database.path.name,
+        )
     try:
-        live = _verify_bound_source_store(live_source)
+        live = _verify_bound_source_store(
+            live_source,
+            verify_content=verify_content,
+        )
     except (OSError, StoreSafetyError) as exc:
         raise _note_tags_live_source_inconclusive_error(
             live_source.directory.path / live_source.main_name,
@@ -17852,16 +17904,19 @@ def _assert_note_tags_input_not_live_store(
                 ],
             },
         )
+    return live
 
 
 def _verify_note_tags_standalone_input(
     parent: _BoundDirectory,
     database: _BoundRegularFile,
+    *,
+    verify_content: bool = True,
 ) -> dict[str, Any]:
     """Revalidate one held main file and prove its sidecar names absent."""
 
     _verify_bound_source_directory(parent)
-    main = _verify_bound_regular_file_at(
+    _verify_bound_regular_file_properties_at(
         database,
         SOURCE_FILE_CODES,
         dir_fd=parent.fd,
@@ -17902,7 +17957,12 @@ def _verify_note_tags_standalone_input(
                 },
             )
         _verify_bound_source_directory(parent)
-    main = _verify_bound_regular_file_at(
+    verify_file = (
+        _verify_bound_regular_file_at
+        if verify_content
+        else _verify_bound_regular_file_properties_at
+    )
+    main = verify_file(
         database,
         SOURCE_FILE_CODES,
         dir_fd=parent.fd,
@@ -17910,6 +17970,105 @@ def _verify_note_tags_standalone_input(
     )
     _verify_bound_source_directory(parent)
     return main
+
+
+def _verify_note_tags_input_state(
+    parent: _BoundDirectory,
+    database: _BoundRegularFile,
+    live_source: _BoundSourceStore | _BoundAbsentNoteTagsLiveSource,
+    *,
+    verify_content: bool,
+) -> None:
+    """Revalidate one complete note-tags input boundary or callback point."""
+
+    standalone_before = _verify_bound_regular_file_properties_at(
+        database,
+        SOURCE_FILE_CODES,
+        dir_fd=parent.fd,
+        basename=database.path.name,
+    )
+    _assert_note_tags_input_not_live_store(
+        parent,
+        database,
+        live_source,
+        standalone=standalone_before,
+        verify_content=verify_content,
+    )
+    standalone = _verify_note_tags_standalone_input(
+        parent,
+        database,
+        verify_content=verify_content,
+    )
+    _assert_note_tags_input_not_live_store(
+        parent,
+        database,
+        live_source,
+        standalone=standalone,
+        verify_content=False,
+    )
+
+
+@dataclass
+class _NoteTagsInputVerifier:
+    """Keep full hashes at consumption boundaries and callbacks lightweight."""
+
+    parent: _BoundDirectory
+    database: _BoundRegularFile
+    live_source: _BoundSourceStore | _BoundAbsentNoteTagsLiveSource
+    phase: str = "before-consumption"
+    boundary_content_receipt: tuple[tuple[str, str, int], ...] | None = None
+
+    def _require_phase(self, expected: str, operation: str) -> None:
+        if self.phase != expected:
+            raise StoreSafetyError(
+                "note-tags-query-failed",
+                "note-tags input verification entered an invalid phase while "
+                f"attempting to {operation}: expected {expected}, observed "
+                f"{self.phase}",
+            )
+
+    def start(self) -> None:
+        self._require_phase("before-consumption", "start SQLite consumption")
+        _verify_note_tags_input_state(
+            self.parent,
+            self.database,
+            self.live_source,
+            verify_content=True,
+        )
+        live_files = (
+            ()
+            if isinstance(self.live_source, _BoundAbsentNoteTagsLiveSource)
+            else tuple(self.live_source.files.values())
+        )
+        self.boundary_content_receipt = tuple(
+            (str(bound.path), bound.sha256, int(bound.opened.st_size))
+            for bound in (self.database, *live_files)
+        )
+        self.phase = "consuming"
+
+    def verify_callback(self) -> None:
+        self._require_phase("consuming", "revalidate an SQLite callback boundary")
+        if self.boundary_content_receipt is None:
+            raise StoreSafetyError(
+                "note-tags-query-failed",
+                "note-tags has no full-hash boundary receipt for callback revalidation",
+            )
+        _verify_note_tags_input_state(
+            self.parent,
+            self.database,
+            self.live_source,
+            verify_content=False,
+        )
+
+    def finish(self) -> None:
+        self._require_phase("consuming", "finish SQLite consumption")
+        _verify_note_tags_input_state(
+            self.parent,
+            self.database,
+            self.live_source,
+            verify_content=True,
+        )
+        self.phase = "finished"
 
 
 def _sqlite_text_expression(value: str, *, source_path: Path) -> str:
@@ -18060,23 +18219,19 @@ def query_note_tags(
                 )
             )
             live_source = _bind_note_tags_live_store(transaction, paths)
-
-            def verify_input() -> dict[str, Any]:
-                _assert_note_tags_input_not_live_store(
-                    parent,
-                    database,
-                    live_source,
-                )
-                return _verify_note_tags_standalone_input(parent, database)
-
-            verify_input()
+            input_verifier = _NoteTagsInputVerifier(
+                parent=parent,
+                database=database,
+                live_source=live_source,
+            )
+            input_verifier.start()
             query_error: Exception | None = None
             result: dict[str, Any] | None = None
             try:
                 with _deserialized_sqlite_image(
                     database,
                     db_path,
-                    verify_bound=verify_input,
+                    verify_bound=input_verifier.verify_callback,
                     error_code="note-tags-query-failed",
                     require_backup=False,
                     file_codes=SOURCE_FILE_CODES,
@@ -18089,7 +18244,7 @@ def query_note_tags(
             except Exception as exc:
                 query_error = exc
             try:
-                verify_input()
+                input_verifier.finish()
             except Exception as terminal_error:
                 if query_error is None:
                     raise

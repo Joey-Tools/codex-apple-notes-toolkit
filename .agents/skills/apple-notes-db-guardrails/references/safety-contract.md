@@ -238,6 +238,12 @@ main/WAL/SHM/rollback-journal membership before, during, and after SQLite
 consumption. If live binding or revalidation cannot safely exclude overlap,
 fail closed as `note-tags-live-source-inconclusive` rather than running the
 query.
+Run full same-descriptor SHA-256 verification at the initial and terminal
+SQLite-consumption boundaries. Intermediate SQLite callbacks reuse that held
+content receipt and revalidate object identity, access policy, baseline size,
+sidecar/live membership, and any initially absent live suffix without rereading
+the complete files. The terminal full hash remains authoritative for detecting
+a same-size in-place mutation during consumption.
 
 ## Integrity And Recovery
 
