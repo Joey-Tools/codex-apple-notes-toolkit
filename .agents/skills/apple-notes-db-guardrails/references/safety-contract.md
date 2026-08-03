@@ -463,14 +463,18 @@ uncertain parent/artifact mutation is omitted; a result transaction attempted
 after artifact publication also reports `artifact_mutation_performed: true`
 and `mutation_performed: true`.
 
-Never `mkdir` a missing destination component or private-partial target name directly. Under the
-already-held parent, require a trusted platform or supervisor creator to allocate an unpredictable
-`.apple-notes-create-<random>` directory with mode `0700` and return the already-open descriptor
-plus an `apple-notes-identity-bound-directory-creation/v1` proof. The proof must attest that the
-descriptor is the actual created object, that the namespace was exclusive through handoff, and
-must bind parent/directory identity and access policy. POSIX/Darwin `mkdir`, `mkdirat`, `mkdtemp`,
-and `mkdtempat_np` return no descriptor; `mkdir` followed by `open` therefore cannot establish
-created-object identity and is forbidden as a fallback.
+Never `mkdir` a missing destination component or private-partial target name directly from the DB
+worker. Under the already-held parent, require the packaged or caller-supplied supervisor to
+allocate an unpredictable `.apple-notes-create-<128-bit-random>` directory with mode `0700`, open
+that name with `O_DIRECTORY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`, and return the continuously held
+descriptor plus an `apple-notes-identity-bound-directory-creation/v2` proof. The proof binds the
+creation method, explicit threat model, parent/directory identity, and access policy. The packaged
+creator uses `mkdirat-randomized-openat-nofollow-revalidate` under a cooperative same-UID model:
+random-name creation, no-follow open, and FD/name/parent revalidation protect against accidental
+replacement and persistent drift, but do not claim isolation from a hostile same-UID process that
+can race or debug the supervisor. `namespace_race_excluded_by_model: true` is valid only inside
+that stated cooperative model. A stronger privileged or atomic creator may declare its own
+non-empty method and threat model through the same v2 proof.
 
 The packaged production launcher creates an already-connected `AF_UNIX`/`SOCK_DGRAM` socketpair,
 forks the bundled supervisor service, and launches the DB helper with the client descriptor
@@ -489,21 +493,20 @@ and helper module used by the compatibility API, parent/service protocol, and
 worker. Read-only and explicit-supervisor-FD commands dispatch through that
 already captured helper. Write-producing commands call that same supervisor
 module's `run_supervised`. For each creation, send one bounded
-`apple-notes-directory-creator-request/v1` datagram and the already-held parent descriptor with
+`apple-notes-directory-creator-request/v2` datagram and the already-held parent descriptor with
 `SCM_RIGHTS`. Bind the request nonce, operation, prefix, mode, effective UID, parent identity, and
-parent access policy. Accept only one bounded `apple-notes-directory-creator-response/v1`
+parent access policy. Accept only one bounded `apple-notes-directory-creator-response/v2`
 datagram with the same nonce. A status `created` response requires exactly one returned descriptor,
-a canonical staging basename, and the normal creation attestation. Current macOS and Linux public
-interfaces provide no atomic directory-create-and-return-FD primitive, so the bundled service is a
-capability gate rather than a creation authority: after request validation it returns the exact
-closed `unavailable-before-create` response with null basename/proof, zero returned descriptors,
-`mutation_performed: false`, `cleanup_state: not-needed`, and the canonical unsupported-primitive
-receipt. The client accepts that no-mutation claim only through canonical typed JSON equality and
-locally reconstructs the details; bool-as-int, unknown keys, any descriptor, basename, proof, or
-other near-match is a conservative possible-mutation transport failure. The service must not call
-`mkdir`, `mkdirat`, `mkdtemp`, `mkdtempat_np`, or `open` on this route. A caller-supplied inherited
-channel may still represent a stronger platform or privileged authority. A same-UID supervisor
-that merely calls `mkdir` and then reopens any name does not meet this contract.
+a canonical staging basename, and the v2 creation proof. The packaged service is a practical
+creation authority for the cooperative same-UID model: it revalidates the held parent, uses a
+CSPRNG basename, calls descriptor-relative `mkdir`, immediately opens no-follow, and compares the
+FD/name/parent identity and access policy before returning the FD with `SCM_RIGHTS`. Any failure
+after `mkdir` preserves the randomized name, transfers an available descriptor, and reports a
+structured uncertain recovery locator; it never performs name-based cleanup. The protocol retains
+the exact closed `unavailable-before-create` response for a creator that can prove it did not enter
+the mutation boundary. The client accepts that no-mutation claim only through canonical typed JSON
+equality; bool-as-int, unknown keys, any descriptor, basename, proof, or other near-match is a
+conservative possible-mutation transport failure.
 Before forking the service or spawning the independent-session worker, the launcher blocks
 `SIGHUP`, `SIGINT`, and `SIGTERM` and installs non-raising first-signal latches. Worker creation
 must use a close-all-except primitive after the child snapshot, never a parent-side open-FD
@@ -948,12 +951,21 @@ Keep patch preparation separate from live replacement.
 
 A writeback-grade backup must:
 
+- use the exact `apple-notes-snapshot/v4` schema; a v3 snapshot is not
+  writeback-grade and must fail closed rather than being inferred or upgraded;
 - be captured with `--require-notes-quit`;
 - retain its successful artifact-external manifest creation receipt;
 - record that Notes was not running;
 - still match its copied-file hashes;
 - recover successfully with full SQLite integrity;
-- bind the current live file set to the same source object identities, bytes, and access policies.
+- bind the current live file set to the same source object identities, bytes, and access policies;
+- carry an exact `apple-notes-live-source-binding/v1` receipt produced from the
+  same held capture store as the copied files. The receipt binds the requested
+  source root, terminal directory identity/access policy, complete ordered
+  canonical component chain, the no-symlink/reparse policy, and either the
+  complete registered Darwin alias receipt or explicit `null`. Directory
+  timestamps, link count, and unrelated raw flags are evidence only and do not
+  define the protected property.
 
 A patch stage must contain only:
 
@@ -968,6 +980,15 @@ byte capture and every identity, content, access-policy, or inconclusive
 revalidation inside that boundary must use the patch-stage
 `patch-file-*` / `patch-content-mismatch` taxonomy, not the prepared-output
 publication taxonomy.
+
+`preflight-writeback` and `verify-writeback` must hold the validated snapshot,
+validated patch stage, and live source store together. Establish one joint
+success linearization point while all three remain bound: revalidate both
+artifacts, revalidate the live directory/component/alias binding and selected
+file properties, complete the required comparison or recovery verification,
+and prove Notes remains quit. Descriptor teardown after that point is
+close-only. The receipt proves that point in time; it is not authorization for
+a later write and cannot eliminate a same-UID mutation immediately afterward.
 
 Never install a staged main database beside an old live WAL or SHM.
 Treat replacement of the main name and removal of live sidecar names as one whole-store semantic

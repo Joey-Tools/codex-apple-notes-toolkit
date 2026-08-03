@@ -23,6 +23,7 @@ import unicodedata
 import uuid
 from collections.abc import Collection, Mapping
 from contextlib import ExitStack, closing, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,8 +45,12 @@ NOTE_STORE_DISCOVERY_BASENAMES = (
 )
 SNAPSHOT_MANIFEST = "snapshot-manifest.json"
 PATCH_MANIFEST = "patch-manifest.json"
-SNAPSHOT_SCHEMA = "apple-notes-snapshot/v3"
+SNAPSHOT_SCHEMA = "apple-notes-snapshot/v4"
 PATCH_SCHEMA = "apple-notes-patch/v3"
+LIVE_SOURCE_BINDING_SCHEMA = "apple-notes-live-source-binding/v1"
+REGISTERED_DARWIN_ALIAS_BINDING_SCHEMA = (
+    "apple-notes-registered-darwin-alias-binding/v1"
+)
 MANIFEST_CREATION_RECEIPT_SCHEMA = "apple-notes-manifest-creation-receipt/v1"
 CHUNK_SIZE = 1024 * 1024
 MANIFEST_MAX_BYTES = 4 * 1024 * 1024
@@ -60,12 +65,16 @@ RENAME_EXCL = 0x00000004
 NOTES_PGREP_PATH = "/usr/bin/pgrep"
 NOTES_STATE_TIMEOUT_SECONDS = 2.0
 NOTES_STATE_TERMINATION_GRACE_SECONDS = 0.25
-DIRECTORY_CREATOR_REQUEST_SCHEMA = "apple-notes-directory-creator-request/v1"
-DIRECTORY_CREATOR_RESPONSE_SCHEMA = "apple-notes-directory-creator-response/v1"
+DIRECTORY_CREATOR_REQUEST_SCHEMA = "apple-notes-directory-creator-request/v2"
+DIRECTORY_CREATOR_RESPONSE_SCHEMA = "apple-notes-directory-creator-response/v2"
+DIRECTORY_CREATOR_PROOF_SCHEMA = "apple-notes-identity-bound-directory-creation/v2"
 DIRECTORY_CREATOR_UNAVAILABLE_STATUS = "unavailable-before-create"
-PACKAGED_DIRECTORY_CREATOR_AUTHORITY = (
+PACKAGED_DIRECTORY_CREATOR_AUTHORITY = "packaged-supervisor-cooperative-same-uid"
+PACKAGED_DIRECTORY_CREATOR_UNAVAILABLE_AUTHORITY = (
     "packaged-supervisor-platform-primitive-unavailable"
 )
+PACKAGED_DIRECTORY_CREATOR_METHOD = "mkdirat-randomized-openat-nofollow-revalidate"
+PACKAGED_DIRECTORY_CREATOR_THREAT_MODEL = "cooperative-same-uid"
 PACKAGED_DIRECTORY_CREATOR_UNSUPPORTED_PRIMITIVES = (
     "mkdir-then-open",
     "mkdirat-then-openat",
@@ -119,6 +128,58 @@ class StoreSafetyError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.details = details or {}
+
+
+_WRITEBACK_CLOSE_ONLY: ContextVar[bool] = ContextVar(
+    "apple_notes_writeback_close_only",
+    default=False,
+)
+
+
+def _writeback_close_only() -> bool:
+    """Return whether held writeback inputs passed their joint success point."""
+
+    return _WRITEBACK_CLOSE_ONLY.get()
+
+
+class _WritebackLinearizedTransaction:
+    """Hold every input until one explicit joint success point is committed."""
+
+    def __init__(self) -> None:
+        self._stack = ExitStack()
+        self.success_linearized = False
+
+    def enter_context(self, manager: Any) -> Any:
+        return self._stack.enter_context(manager)
+
+    def mark_joint_success(self) -> None:
+        if self.success_linearized:
+            raise RuntimeError("writeback joint success was already marked")
+        self.success_linearized = True
+
+    def close_success(self) -> None:
+        token = _WRITEBACK_CLOSE_ONLY.set(self.success_linearized)
+        try:
+            self._stack.close()
+        finally:
+            _WRITEBACK_CLOSE_ONLY.reset(token)
+
+    def close_failure(self, error: BaseException) -> None:
+        self._stack.__exit__(type(error), error, error.__traceback__)
+
+
+@contextmanager
+def _writeback_linearized_transaction() -> Iterator[_WritebackLinearizedTransaction]:
+    """Close held contexts without post-yield reads after a joint success point."""
+
+    transaction = _WritebackLinearizedTransaction()
+    try:
+        yield transaction
+    except BaseException as error:
+        transaction.close_failure(error)
+        raise
+    else:
+        transaction.close_success()
 
 
 @dataclass(frozen=True)
@@ -261,6 +322,15 @@ class _ValidatedSnapshotArtifact:
         [Path, _BoundDirectory | None, Callable[[], None] | None],
         dict[str, Any],
     ]
+    revalidate_artifact: Callable[[], None]
+
+
+@dataclass(frozen=True)
+class _ValidatedPatchStageArtifact:
+    public_result: dict[str, Any]
+    artifact_root: _BoundDirectory
+    database: _BoundRegularFile
+    revalidate_artifact: Callable[[], None]
 
 
 @dataclass(frozen=True)
@@ -444,13 +514,12 @@ SOURCE_FILE_CODES = _FileProtectionCodes(
 )
 
 
-# POSIX mkdir(2), mkdirat(2), and Darwin mkdtempat_np(3) return no directory
-# descriptor.  A later open cannot prove that it names the object created by
-# the earlier call.  The packaged supervisor therefore returns a closed
-# pre-creation capability receipt on currently supported platforms.  The
-# inherited AF_UNIX/SOCK_DGRAM channel remains available to a stronger external
-# authority that can return the actual created-object FD.  The helper never
-# reconnects by socket path or treats a local mkdir-then-open sequence as proof.
+# The packaged supervisor cooperatively creates one randomized child with
+# mkdirat(2), binds it immediately with no-follow openat(2), revalidates it, and
+# transfers the held created-object descriptor over inherited SCM_RIGHTS.  This
+# excludes accidental namespace collisions inside the cooperative same-UID
+# model; it does not defend against a malicious peer running under the same UID.
+# The helper never reconnects by socket path.
 # A provider that raises after entering its creation boundary must use
 # _IdentityBoundDirectoryCreationFailure and transfer any created name, open
 # descriptor, creation stat, proof, and recovery details.  Unstructured
@@ -985,7 +1054,7 @@ def _packaged_directory_creator_unavailable_details() -> dict[str, Any]:
         "mutation_performed": False,
         "cleanup_state": "not-needed",
         "retry_safe": False,
-        "creation_authority": PACKAGED_DIRECTORY_CREATOR_AUTHORITY,
+        "creation_authority": PACKAGED_DIRECTORY_CREATOR_UNAVAILABLE_AUTHORITY,
         "provider_install_state": "not-created",
         "recovery_locators": {
             "packaged_directory_supervisor": {
@@ -3532,7 +3601,8 @@ def _bind_directory_component_chain(
             canonical_path=current_path,
         )
         yield binding, missing_components
-        revalidate_chain()
+        if not _writeback_close_only():
+            revalidate_chain()
     finally:
         for fd in reversed(owned_fds):
             os.close(fd)
@@ -4205,15 +4275,16 @@ def _bind_directory_at(
     )
     try:
         yield binding
-        verify_parent()
-        _verify_bound_artifact_directory(
-            binding,
-            missing_code=missing_code,
-            identity_code=identity_code,
-            access_policy_code=access_policy_code,
-            inconclusive_code=inconclusive_code,
-            mismatch_code=identity_code,
-        )
+        if not _writeback_close_only():
+            verify_parent()
+            _verify_bound_artifact_directory(
+                binding,
+                missing_code=missing_code,
+                identity_code=identity_code,
+                access_policy_code=access_policy_code,
+                inconclusive_code=inconclusive_code,
+                mismatch_code=identity_code,
+            )
     finally:
         os.close(child_fd)
 
@@ -5227,19 +5298,24 @@ def _validate_identity_bound_directory_creation_result(
 
     proof = creation.proof
     required_proof = {
-        "schema": "apple-notes-identity-bound-directory-creation/v1",
+        "schema": DIRECTORY_CREATOR_PROOF_SCHEMA,
         "actual_created_object_descriptor_returned": True,
-        "namespace_exclusive_during_handoff": True,
+        "namespace_race_excluded_by_model": True,
     }
     if (
         any(proof.get(key) != value for key, value in required_proof.items())
         or not isinstance(proof.get("creation_authority"), str)
         or not proof["creation_authority"]
+        or not isinstance(proof.get("creation_method"), str)
+        or not proof["creation_method"]
+        or not isinstance(proof.get("threat_model"), str)
+        or not proof["threat_model"]
     ):
         raise StoreSafetyError(
             "directory-creation-identity-inconclusive",
             "The directory creator did not attest an actual-created-object FD "
-            f"and exclusive handoff namespace: {display_path}",
+            "and an explicit namespace threat model: "
+            f"{display_path}",
         )
 
     try:
@@ -5722,6 +5798,7 @@ def _create_and_install_directory_at(
     access_policy_code: str,
     inconclusive_code: str,
     collision_code: str,
+    pre_create: Callable[[], Any] | None = None,
 ) -> _CreatedDirectoryInstallation:
     """Create privately, bind first, then atomically install without replacement."""
 
@@ -5758,6 +5835,8 @@ def _create_and_install_directory_at(
             inconclusive_code=inconclusive_code,
         )
 
+        if pre_create is not None:
+            pre_create()
         creation = _create_identity_bound_directory_at(
             parent_fd,
             parent_opened,
@@ -5990,6 +6069,7 @@ def _create_bound_directory(
     *,
     retain_failure_receipt: bool = False,
     parent_binding: _BoundDirectory | None = None,
+    pre_create: Callable[[], Any] | None = None,
 ) -> Iterator[_BoundDirectory]:
     path = _absolute_path(path)
     with ExitStack() as resource_stack:
@@ -6031,6 +6111,7 @@ def _create_bound_directory(
             access_policy_code="prepared-directory-access-policy-mismatch",
             inconclusive_code="prepared-directory-revalidation-inconclusive",
             collision_code="prepared-directory-revalidation-inconclusive",
+            pre_create=pre_create,
         )
 
         fd = installation.fd
@@ -6323,7 +6404,7 @@ def _verify_bound_directory_namespace(
 def _retained_created_regular_file_details(
     parent: _BoundDirectory,
     file_fd: int,
-    created: os.stat_result,
+    created: os.stat_result | None,
     *,
     display_path: Path,
     candidate_basenames: Iterable[str],
@@ -6341,9 +6422,25 @@ def _retained_created_regular_file_details(
             "A namespace leaf can be replaced after observation. Recovery must "
             "match the descriptor receipt before any later destructive action."
         ),
-        "created_identity": _identity(created),
-        "created_access_policy": _access_policy(created),
     }
+    if created is None:
+        receipt.update(
+            {
+                "evidence_status": "inconclusive",
+                "creation_receipt_status": "unavailable",
+                "creation_receipt_reason": (
+                    "first-descriptor-stat-failed-after-exclusive-create"
+                ),
+            }
+        )
+    else:
+        receipt.update(
+            {
+                "creation_receipt_status": "recorded",
+                "created_identity": _identity(created),
+                "created_access_policy": _access_policy(created),
+            }
+        )
     try:
         parent_current = os.fstat(parent.fd)
     except OSError as exc:
@@ -6370,9 +6467,15 @@ def _retained_created_regular_file_details(
             "identity": _identity(file_current),
             "access_policy": _access_policy(file_current),
             "size": file_current.st_size,
-            "matches_created_identity": _same_identity(created, file_current),
         }
-        if not receipt["file_descriptor"]["matches_created_identity"]:
+        if created is not None:
+            receipt["file_descriptor"]["matches_created_identity"] = _same_identity(
+                created, file_current
+            )
+        if (
+            created is not None
+            and not receipt["file_descriptor"]["matches_created_identity"]
+        ):
             receipt["evidence_status"] = "inconclusive"
     receipt["content_evidence"] = (
         {
@@ -6399,12 +6502,13 @@ def _retained_created_regular_file_details(
                 {
                     "identity": _identity(observed),
                     "access_policy": _access_policy(observed),
-                    "matches_created_identity": _same_identity(
-                        created,
-                        observed,
-                    ),
                 }
             )
+            if created is not None:
+                row["matches_created_identity"] = _same_identity(
+                    created,
+                    observed,
+                )
         elif state == "unavailable":
             row["evidence_status"] = "inconclusive"
             namespace_inconclusive = True
@@ -6414,8 +6518,11 @@ def _retained_created_regular_file_details(
         "inconclusive" if namespace_inconclusive else "point-in-time-only"
     )
     return {
-        "cleanup_state": "retained",
+        "cleanup_state": (
+            "retained" if created is not None else "preserved-or-incomplete"
+        ),
         "cleanup_policy": "retain-never-stat-then-unlink",
+        "mutation_performed": True,
         "retry_safe": False,
         "recovery_locators": {
             "descriptor_bound_prepared_file": receipt,
@@ -7389,11 +7496,19 @@ def _copy_fd(
             "prepared-file-revalidation-inconclusive",
             f"Cannot exclusively create descriptor-bound copy {destination}: {exc}",
         ) from exc
-    created = os.fstat(out_fd)
+    created: os.stat_result | None = None
     verified_sha256: str | None = None
     digest = hashlib.sha256()
     copied_size = 0
     try:
+        try:
+            created = os.fstat(out_fd)
+        except OSError as exc:
+            raise StoreSafetyError(
+                "prepared-file-revalidation-inconclusive",
+                "Cannot inspect the exclusively created descriptor-bound copy "
+                f"before writing: {destination}: {exc}",
+            ) from exc
         _, expected_access_policy = _bind_created_regular_file_access_policy(
             out_fd,
             destination,
@@ -7974,7 +8089,8 @@ def _bind_source_store(main_path: Path) -> Iterator[_BoundSourceStore]:
         except Exception:
             raise
         else:
-            _verify_bound_source_store(store)
+            if not _writeback_close_only():
+                _verify_bound_source_store(store)
 
 
 def _capture_bound_source_store(
@@ -8169,9 +8285,17 @@ def _write_json_atomic(
             f"Cannot exclusively create bound manifest temporary file "
             f"{temp_path}: {exc}",
         ) from exc
-    created = os.fstat(fd)
+    created: os.stat_result | None = None
     verified_sha256: str | None = None
     try:
+        try:
+            created = os.fstat(fd)
+        except OSError as exc:
+            raise StoreSafetyError(
+                "prepared-file-revalidation-inconclusive",
+                "Cannot inspect the exclusively created manifest temporary "
+                f"file before writing: {temp_path}: {exc}",
+            ) from exc
         _, expected_access_policy = _bind_created_regular_file_access_policy(
             fd,
             temp_path,
@@ -8572,6 +8696,472 @@ def _assert_manifest_protection_receipt(
             access_policy_code,
             f"Access policy differs from the creation manifest: {label}",
         )
+
+
+def _normalized_source_component_path_binding(
+    value: Any,
+    *,
+    label: str,
+    strict_manifest: bool = False,
+    _depth: int = 0,
+) -> dict[str, Any]:
+    """Flatten one held component-chain receipt to protected properties only."""
+
+    if _depth > 8 or not isinstance(value, dict):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source component binding is malformed for {label}",
+        )
+    expected_schema = "apple-notes-component-path-binding/v1"
+    schema = value.get("schema")
+    if schema is not None and schema != expected_schema:
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source component schema is invalid for {label}",
+        )
+    if schema is None:
+        if strict_manifest:
+            raise StoreSafetyError(
+                "manifest-invalid",
+                f"Snapshot source component schema is missing for {label}",
+            )
+        nested = value.get("component_path_binding")
+        if not isinstance(nested, dict):
+            raise StoreSafetyError(
+                "manifest-invalid",
+                f"Snapshot source component binding is missing for {label}",
+            )
+        return _normalized_source_component_path_binding(
+            nested,
+            label=label,
+            strict_manifest=False,
+            _depth=_depth + 1,
+        )
+
+    expected_keys = {"schema", "components", "protected_properties"}
+    if value.get("held_root") is not None and not strict_manifest:
+        expected_keys.add("held_root")
+    if set(value) != expected_keys:
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source component fields are invalid for {label}",
+        )
+
+    protected_properties = value.get("protected_properties")
+    expected_properties = {
+        "object_identity": ["device", "inode", "file_type"],
+        "access_policy": ["mode", "uid", "gid", "flags"],
+        "link_policy": "no-symlink-or-reparse-component",
+    }
+    rows = value.get("components")
+    if protected_properties != expected_properties or not isinstance(rows, list):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source component binding contract is malformed for {label}",
+        )
+
+    prefix_rows: list[dict[str, Any]] = []
+    if value.get("held_root") is not None:
+        prefix = _normalized_source_component_path_binding(
+            value["held_root"],
+            label=f"{label} held root",
+            strict_manifest=False,
+            _depth=_depth + 1,
+        )
+        prefix_rows = list(prefix["components"])
+
+    normalized_rows: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"path", "identity", "access_policy"}
+            or type(row.get("path")) is not str
+        ):
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Snapshot source component receipt is malformed: "
+                f"{label} component {index}",
+            )
+        path = Path(row["path"])
+        if not path.is_absolute() or str(path) != row["path"]:
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Snapshot source component path is not canonical and absolute: "
+                f"{row['path']}",
+            )
+        protection = _manifest_protection_receipt(
+            row,
+            label=f"{label} component {index}",
+        )
+        if protection["identity"]["file_type"] != stat.S_IFDIR:
+            raise StoreSafetyError(
+                "manifest-invalid",
+                f"Snapshot source component is not a directory: {path}",
+            )
+        normalized_rows.append(
+            {
+                "path": str(path),
+                **protection,
+            }
+        )
+
+    combined: list[dict[str, Any]] = []
+    for row in (*prefix_rows, *normalized_rows):
+        if combined and row["path"] == combined[-1]["path"]:
+            if row != combined[-1]:
+                raise StoreSafetyError(
+                    "manifest-invalid",
+                    "Snapshot source component receipt repeats one path with "
+                    f"different protection evidence: {row['path']}",
+                )
+            continue
+        if combined and Path(row["path"]).parent != Path(combined[-1]["path"]):
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Snapshot source component binding is not one complete ordered "
+                f"absolute chain: {combined[-1]['path']} -> {row['path']}",
+            )
+        combined.append(row)
+    if not combined or combined[0]["path"] != "/":
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source component binding is not rooted at / for {label}",
+        )
+    return {
+        "schema": expected_schema,
+        "components": combined,
+        "protected_properties": expected_properties,
+    }
+
+
+def _normalized_source_trusted_alias_binding(
+    value: Any,
+    *,
+    label: str,
+    strict_manifest: bool = False,
+) -> dict[str, Any] | None:
+    """Normalize a registered Darwin alias receipt without directory metadata."""
+
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source trusted-alias binding is malformed for {label}",
+        )
+    runtime_keys = {
+        "alias",
+        "canonical_target",
+        "alias_parent_identity",
+        "alias_parent_access_policy",
+        "alias_entry_identity",
+        "alias_entry_access_policy",
+        "alias_target_text",
+        "canonical_target_receipt",
+    }
+    expected_keys = runtime_keys | ({"schema"} if strict_manifest else set())
+    expected_schema = (
+        REGISTERED_DARWIN_ALIAS_BINDING_SCHEMA if strict_manifest else None
+    )
+    if set(value) != expected_keys or value.get("schema") != expected_schema:
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source trusted-alias schema or fields are invalid for {label}",
+        )
+    string_fields = ("alias", "canonical_target", "alias_target_text")
+    if any(type(value.get(field)) is not str for field in string_fields):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source trusted-alias locator is malformed for {label}",
+        )
+    alias = Path(value["alias"])
+    canonical_target = Path(value["canonical_target"])
+    if (
+        not alias.is_absolute()
+        or not canonical_target.is_absolute()
+        or str(alias) != value["alias"]
+        or str(canonical_target) != value["canonical_target"]
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source trusted-alias paths are not canonical for {label}",
+        )
+    alias_parent = _manifest_protection_receipt(
+        {
+            "identity": value.get("alias_parent_identity"),
+            "access_policy": value.get("alias_parent_access_policy"),
+        },
+        label=f"{label} alias parent",
+    )
+    alias_entry = _manifest_protection_receipt(
+        {
+            "identity": value.get("alias_entry_identity"),
+            "access_policy": value.get("alias_entry_access_policy"),
+        },
+        label=f"{label} alias entry",
+    )
+    canonical_receipt = value.get("canonical_target_receipt")
+    if strict_manifest and (
+        not isinstance(canonical_receipt, dict)
+        or set(canonical_receipt)
+        != {"identity", "access_policy", "component_path_binding"}
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "Snapshot source trusted-alias canonical receipt fields are invalid "
+            f"for {label}",
+        )
+    canonical_protection = _manifest_protection_receipt(
+        canonical_receipt,
+        label=f"{label} canonical target",
+    )
+    if (
+        alias_parent["identity"]["file_type"] != stat.S_IFDIR
+        or alias_entry["identity"]["file_type"] != stat.S_IFLNK
+        or canonical_protection["identity"]["file_type"] != stat.S_IFDIR
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source trusted-alias object types are invalid for {label}",
+        )
+    canonical_components = _normalized_source_component_path_binding(
+        (
+            canonical_receipt.get("component_path_binding")
+            if isinstance(canonical_receipt, dict)
+            else None
+        ),
+        label=f"{label} canonical target",
+        strict_manifest=strict_manifest,
+    )
+    canonical_terminal = canonical_components["components"][-1]
+    if (
+        canonical_terminal["path"] != str(canonical_target)
+        or canonical_terminal["identity"] != canonical_protection["identity"]
+        or canonical_terminal["access_policy"] != canonical_protection["access_policy"]
+        or _alias_target_path(alias, value["alias_target_text"]) != canonical_target
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "Snapshot source trusted-alias target receipt is internally "
+            f"inconsistent for {label}",
+        )
+    return {
+        "schema": REGISTERED_DARWIN_ALIAS_BINDING_SCHEMA,
+        "alias": str(alias),
+        "canonical_target": str(canonical_target),
+        "alias_parent_identity": alias_parent["identity"],
+        "alias_parent_access_policy": alias_parent["access_policy"],
+        "alias_entry_identity": alias_entry["identity"],
+        "alias_entry_access_policy": alias_entry["access_policy"],
+        "alias_target_text": value["alias_target_text"],
+        "canonical_target_receipt": {
+            **canonical_protection,
+            "component_path_binding": canonical_components,
+        },
+    }
+
+
+def _live_source_binding_receipt(
+    source_root: Path,
+    directory_receipt: dict[str, Any],
+    *,
+    strict_manifest: bool = False,
+) -> dict[str, Any]:
+    """Project a held live directory receipt onto writeback-protected fields."""
+
+    source_root = _absolute_path(source_root)
+    requested_root, canonical_root, alias_spec = _trusted_alias_paths(source_root)
+    protection = _manifest_protection_receipt(
+        directory_receipt,
+        label="live source directory",
+    )
+    component_binding = _normalized_source_component_path_binding(
+        directory_receipt.get("component_path_binding"),
+        label="live source directory",
+        strict_manifest=strict_manifest,
+    )
+    terminal_component = component_binding["components"][-1]
+    if (
+        terminal_component["path"] != str(canonical_root)
+        or terminal_component["identity"] != protection["identity"]
+        or terminal_component["access_policy"] != protection["access_policy"]
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "Snapshot source component chain terminal receipt does not match "
+            f"the canonical live source directory: {canonical_root}",
+        )
+    trusted_alias = _normalized_source_trusted_alias_binding(
+        directory_receipt.get("trusted_alias"),
+        label="live source directory",
+        strict_manifest=strict_manifest,
+    )
+    if alias_spec is None:
+        if trusted_alias is not None:
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Snapshot source binding records an unregistered root alias",
+            )
+    elif (
+        trusted_alias is None
+        or trusted_alias["alias"] != str(alias_spec[0])
+        or trusted_alias["canonical_target"] != str(alias_spec[1])
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "Snapshot source binding does not record the registered root alias",
+        )
+    return {
+        "schema": LIVE_SOURCE_BINDING_SCHEMA,
+        "source_root": str(requested_root),
+        "directory_identity": protection["identity"],
+        "directory_access_policy": protection["access_policy"],
+        "component_path_binding": component_binding,
+        "trusted_alias_binding": trusted_alias,
+    }
+
+
+def _snapshot_manifest_source_binding(
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    value = manifest.get("source_binding")
+    required_keys = {
+        "schema",
+        "source_root",
+        "directory_identity",
+        "directory_access_policy",
+        "component_path_binding",
+        "trusted_alias_binding",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != required_keys
+        or value.get("schema") != LIVE_SOURCE_BINDING_SCHEMA
+        or type(value.get("source_root")) is not str
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "Snapshot manifest has no valid live source binding",
+        )
+    source_root = Path(value["source_root"])
+    if not source_root.is_absolute() or str(source_root) != value["source_root"]:
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "Snapshot manifest live source root is not canonical and absolute",
+        )
+    return _live_source_binding_receipt(
+        source_root,
+        {
+            "identity": value["directory_identity"],
+            "access_policy": value["directory_access_policy"],
+            "component_path_binding": value["component_path_binding"],
+            "trusted_alias": value["trusted_alias_binding"],
+        },
+        strict_manifest=True,
+    )
+
+
+def _source_binding_identity_projection(value: dict[str, Any]) -> dict[str, Any]:
+    alias = value["trusted_alias_binding"]
+    return {
+        "source_root": value["source_root"],
+        "directory_identity": value["directory_identity"],
+        "components": [
+            {
+                "path": row["path"],
+                "identity": row["identity"],
+            }
+            for row in value["component_path_binding"]["components"]
+        ],
+        "trusted_alias": (
+            None
+            if alias is None
+            else {
+                "alias": alias["alias"],
+                "canonical_target": alias["canonical_target"],
+                "alias_target_text": alias["alias_target_text"],
+                "alias_parent_identity": alias["alias_parent_identity"],
+                "alias_entry_identity": alias["alias_entry_identity"],
+                "canonical_target_identity": alias["canonical_target_receipt"][
+                    "identity"
+                ],
+                "canonical_target_components": [
+                    {
+                        "path": row["path"],
+                        "identity": row["identity"],
+                    }
+                    for row in alias["canonical_target_receipt"][
+                        "component_path_binding"
+                    ]["components"]
+                ],
+            }
+        ),
+    }
+
+
+def _source_binding_access_policy_projection(
+    value: dict[str, Any],
+) -> dict[str, Any]:
+    alias = value["trusted_alias_binding"]
+    return {
+        "directory_access_policy": value["directory_access_policy"],
+        "components": [
+            {
+                "path": row["path"],
+                "access_policy": row["access_policy"],
+            }
+            for row in value["component_path_binding"]["components"]
+        ],
+        "trusted_alias": (
+            None
+            if alias is None
+            else {
+                "alias_parent_access_policy": alias["alias_parent_access_policy"],
+                "alias_entry_access_policy": alias["alias_entry_access_policy"],
+                "canonical_target_access_policy": alias["canonical_target_receipt"][
+                    "access_policy"
+                ],
+                "canonical_target_components": [
+                    {
+                        "path": row["path"],
+                        "access_policy": row["access_policy"],
+                    }
+                    for row in alias["canonical_target_receipt"][
+                        "component_path_binding"
+                    ]["components"]
+                ],
+            }
+        ),
+    }
+
+
+def _compare_live_source_binding(
+    store: _BoundSourceStore,
+    baseline_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    baseline = _snapshot_manifest_source_binding(baseline_manifest)
+    current_directory = _verify_bound_source_store(store)["directory"]
+    current = _live_source_binding_receipt(
+        store.directory.path,
+        current_directory,
+    )
+    if _source_binding_identity_projection(
+        current
+    ) != _source_binding_identity_projection(baseline):
+        raise StoreSafetyError(
+            "baseline-identity-mismatch",
+            "Live source directory or component-chain identity differs from "
+            "the backup baseline",
+        )
+    if _source_binding_access_policy_projection(
+        current
+    ) != _source_binding_access_policy_projection(baseline):
+        raise StoreSafetyError(
+            "baseline-access-policy-mismatch",
+            "Live source directory or component-chain access policy differs "
+            "from the backup baseline",
+        )
+    return current
 
 
 def _load_bound_manifest(
@@ -9512,7 +10102,8 @@ def _bind_nearest_existing_directory_with_trusted_alias(
         )
         revalidate_scope()
         yield binding, missing_components
-        _verify_bound_directory_namespace(binding)
+        if not _writeback_close_only():
+            _verify_bound_directory_namespace(binding)
 
 
 @contextmanager
@@ -10393,12 +10984,15 @@ def _create_bound_artifact_partial_after_destination_revalidation(
 ) -> Iterator[_BoundDirectory]:
     """Revalidate the public leaf immediately before any partial creator runs."""
 
-    _revalidate_live_destination_name_absent(
-        scope,
-        exists_code="destination-exists",
-        inconclusive_code="snapshot-destination-scope-inconclusive",
-        label="Destination",
-    )
+    def revalidate_formal_leaf() -> None:
+        _revalidate_live_destination_name_absent(
+            scope,
+            exists_code="destination-exists",
+            inconclusive_code="snapshot-destination-scope-inconclusive",
+            label="Destination",
+        )
+
+    revalidate_formal_leaf()
     partial = scope.destination.parent / (
         f".{scope.destination.name}.partial-{uuid.uuid4().hex}"
     )
@@ -10406,6 +11000,7 @@ def _create_bound_artifact_partial_after_destination_revalidation(
         partial,
         retain_failure_receipt=True,
         parent_binding=scope.parent,
+        pre_create=revalidate_formal_leaf,
     ) as bound_partial:
         yield bound_partial
 
@@ -11331,16 +11926,22 @@ def _make_recovery_clone_from_bound(
     )
 
 
+def _validate_bound_database_recovery(
+    source_store: _BoundSourceStore,
+) -> dict[str, Any]:
+    evidence = {
+        "capture": _capture_bound_source_store(source_store),
+        "sidecars": _inspect_bound_sidecars(source_store),
+    }
+    _require_authoritative_wal(source_store, evidence)
+    evidence["sqlite_integrity"] = _bound_recovery_integrity(source_store)
+    _verify_bound_source_store(source_store)
+    return evidence
+
+
 def validate_database_recovery(src_main: Path) -> dict[str, Any]:
     with _bind_source_store(src_main) as source_store:
-        evidence = {
-            "capture": _capture_bound_source_store(source_store),
-            "sidecars": _inspect_bound_sidecars(source_store),
-        }
-        _require_authoritative_wal(source_store, evidence)
-        evidence["sqlite_integrity"] = _bound_recovery_integrity(source_store)
-        _verify_bound_source_store(source_store)
-        return evidence
+        return _validate_bound_database_recovery(source_store)
 
 
 def _fingerprint_file(path: Path) -> dict[str, Any]:
@@ -13877,9 +14478,17 @@ def _write_standalone_backup_payload(
             "prepared-file-revalidation-inconclusive",
             f"Cannot exclusively create standalone recovery output {output}: {exc}",
         ) from exc
-    created = os.fstat(output_fd)
+    created: os.stat_result | None = None
     verified_sha256: str | None = None
     try:
+        try:
+            created = os.fstat(output_fd)
+        except OSError as exc:
+            raise StoreSafetyError(
+                "prepared-file-revalidation-inconclusive",
+                "Cannot inspect the exclusively created standalone recovery "
+                f"output before writing: {output}: {exc}",
+            ) from exc
         _, expected_access_policy = _bind_created_regular_file_access_policy(
             output_fd,
             output,
@@ -13999,20 +14608,12 @@ def _backup_sqlite_to_standalone(
             destination_binding=destination_binding,
             pre_temp_create=pre_temp_create,
         )
-    source_receipt = _verify_bound_regular_file(source, PREPARED_FILE_CODES)
-    with _bind_recovery_store(source.path) as store:
-        _assert_bound_matches_receipt(
-            store.files[store.main_name],
-            source_receipt,
-        )
-        result = _backup_bound_store_to_standalone(
-            store,
-            output,
-            destination_binding=destination_binding,
-            pre_temp_create=pre_temp_create,
-        )
-    _verify_bound_regular_file(source, PREPARED_FILE_CODES)
-    return result
+    return _backup_bound_regular_to_standalone(
+        source,
+        output,
+        destination_binding=destination_binding,
+        pre_temp_create=pre_temp_create,
+    )
 
 
 def _recover_validated_clone_to_standalone(
@@ -14399,11 +15000,18 @@ def copy_db(
                     parent_binding=bound_root,
                 )
             )
-            captured = _capture_database_files(
-                paths.group_container / NOTE_STORE_MAIN,
-                store_dir,
-                destination_binding=bound_store,
-            )
+            with _bind_source_store(
+                paths.group_container / NOTE_STORE_MAIN
+            ) as source_store:
+                captured = _capture_bound_source_store(
+                    source_store,
+                    store_dir,
+                    destination_binding=bound_store,
+                )
+                source_binding = _live_source_binding_receipt(
+                    paths.group_container,
+                    _verify_bound_source_store(source_store)["directory"],
+                )
             _verify_bound_directory(bound_root)
             expected_names = {
                 str(record["basename"]): stat.S_IFREG for record in captured
@@ -14460,6 +15068,7 @@ def copy_db(
                 "schema": SNAPSHOT_SCHEMA,
                 "created_at": _utc_now(),
                 "source_root": str(paths.group_container),
+                "source_binding": source_binding,
                 "notes_running": notes_running,
                 "notes_quit_required": require_notes_quit,
                 "classification": (
@@ -14819,6 +15428,7 @@ def _validated_snapshot_artifact(
             artifact_kind="snapshot",
             manifest_name=SNAPSHOT_MANIFEST,
         )
+        source_binding = _snapshot_manifest_source_binding(manifest)
         creation_receipts = manifest.get("creation_receipts")
         if not isinstance(creation_receipts, dict):
             raise StoreSafetyError(
@@ -14995,40 +15605,43 @@ def _validated_snapshot_artifact(
                 pre_temp_create=pre_temp_create,
             )
 
-        _scan_exact_bound_directory_entries(
-            artifact_root,
-            {
-                "group.com.apple.notes": stat.S_IFDIR,
-                SNAPSHOT_MANIFEST: stat.S_IFREG,
-            },
-            missing_code="snapshot-missing",
-            identity_code="snapshot-directory-identity-mismatch",
-            access_policy_code="snapshot-directory-access-policy-mismatch",
-            inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
-            mismatch_code="snapshot-file-set-mismatch",
-        )
-        _scan_exact_bound_directory_entries(
-            store_binding,
-            expected_store_types,
-            missing_code="snapshot-missing",
-            identity_code="snapshot-directory-identity-mismatch",
-            access_policy_code="snapshot-directory-access-policy-mismatch",
-            inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
-            mismatch_code="snapshot-file-set-mismatch",
-        )
-        _verify_bound_regular_file_at(
-            manifest_bound,
-            SNAPSHOT_FILE_CODES,
-            dir_fd=artifact_root.fd,
-            basename=SNAPSHOT_MANIFEST,
-        )
-        for basename, bound_file in bound_files.items():
-            _verify_bound_regular_file_at(
-                bound_file,
-                SNAPSHOT_FILE_CODES,
-                dir_fd=store_binding.fd,
-                basename=basename,
+        def revalidate_artifact() -> None:
+            _scan_exact_bound_directory_entries(
+                artifact_root,
+                {
+                    "group.com.apple.notes": stat.S_IFDIR,
+                    SNAPSHOT_MANIFEST: stat.S_IFREG,
+                },
+                missing_code="snapshot-missing",
+                identity_code="snapshot-directory-identity-mismatch",
+                access_policy_code="snapshot-directory-access-policy-mismatch",
+                inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+                mismatch_code="snapshot-file-set-mismatch",
             )
+            _scan_exact_bound_directory_entries(
+                store_binding,
+                expected_store_types,
+                missing_code="snapshot-missing",
+                identity_code="snapshot-directory-identity-mismatch",
+                access_policy_code="snapshot-directory-access-policy-mismatch",
+                inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+                mismatch_code="snapshot-file-set-mismatch",
+            )
+            _verify_bound_regular_file_at(
+                manifest_bound,
+                SNAPSHOT_FILE_CODES,
+                dir_fd=artifact_root.fd,
+                basename=SNAPSHOT_MANIFEST,
+            )
+            for basename, bound_file in bound_files.items():
+                _verify_bound_regular_file_at(
+                    bound_file,
+                    SNAPSHOT_FILE_CODES,
+                    dir_fd=store_binding.fd,
+                    basename=basename,
+                )
+
+        revalidate_artifact()
         verified = [
             _verify_bound_regular_file_at(
                 bound_files[basename],
@@ -15061,6 +15674,7 @@ def _validated_snapshot_artifact(
                 "snapshot": snapshot_directory,
                 "store": store_directory,
             },
+            "live_source_binding": source_binding,
             "manifest": manifest_integrity,
             "files": verified,
         }
@@ -15082,41 +15696,10 @@ def _validated_snapshot_artifact(
             source_integrity=source_integrity,
             revalidate_recovery_clone=revalidate_recovery_clone,
             backup_recovery_clone=backup_recovery_clone,
+            revalidate_artifact=revalidate_artifact,
         )
-        _scan_exact_bound_directory_entries(
-            artifact_root,
-            {
-                "group.com.apple.notes": stat.S_IFDIR,
-                SNAPSHOT_MANIFEST: stat.S_IFREG,
-            },
-            missing_code="snapshot-missing",
-            identity_code="snapshot-directory-identity-mismatch",
-            access_policy_code="snapshot-directory-access-policy-mismatch",
-            inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
-            mismatch_code="snapshot-file-set-mismatch",
-        )
-        _scan_exact_bound_directory_entries(
-            store_binding,
-            expected_store_types,
-            missing_code="snapshot-missing",
-            identity_code="snapshot-directory-identity-mismatch",
-            access_policy_code="snapshot-directory-access-policy-mismatch",
-            inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
-            mismatch_code="snapshot-file-set-mismatch",
-        )
-        _verify_bound_regular_file_at(
-            manifest_bound,
-            SNAPSHOT_FILE_CODES,
-            dir_fd=artifact_root.fd,
-            basename=SNAPSHOT_MANIFEST,
-        )
-        for basename, bound_file in bound_files.items():
-            _verify_bound_regular_file_at(
-                bound_file,
-                SNAPSHOT_FILE_CODES,
-                dir_fd=store_binding.fd,
-                basename=basename,
-            )
+        if not _writeback_close_only():
+            revalidate_artifact()
 
 
 def validate_snapshot(
@@ -16229,24 +16812,20 @@ def stage_patch(
     }
 
 
-def validate_patch_stage(
-    stage_dir: Path,
+@contextmanager
+def _validated_patch_stage_artifact(
+    stage_dir: Path | _PatchArtifactPaths,
     manifest_creation_receipt: dict[str, Any] | None = None,
     *,
     manifest_creation_receipt_file: Path | None = None,
-    _command_cwd: str | None = None,
-) -> dict[str, Any]:
-    command_cwd = os.getcwd() if _command_cwd is None else _command_cwd
-    requested_stage = _absolute_path_from_cwd(stage_dir, command_cwd)
-    requested_receipt = _optional_absolute_path_from_cwd(
-        manifest_creation_receipt_file,
-        command_cwd,
-    )
-    artifact_paths = _patch_artifact_paths(
-        requested_stage,
-        cwd=command_cwd,
-    )
+) -> Iterator[_ValidatedPatchStageArtifact]:
+    """Bind a patch stage until its consumer and terminal checks complete."""
+
+    artifact_paths = _patch_artifact_paths(stage_dir)
     stage_dir = artifact_paths.root
+    manifest_creation_receipt_file = _optional_absolute_path(
+        manifest_creation_receipt_file
+    )
     expected_stage_types = {
         NOTE_STORE_MAIN: stat.S_IFREG,
         PATCH_MANIFEST: stat.S_IFREG,
@@ -16261,7 +16840,7 @@ def validate_patch_stage(
         external_receipt = _manifest_creation_receipt_for_bound_artifact(
             artifact_root,
             manifest_creation_receipt=manifest_creation_receipt,
-            manifest_creation_receipt_file=requested_receipt,
+            manifest_creation_receipt_file=manifest_creation_receipt_file,
             artifact_kind="patch-stage",
             artifact_schema=PATCH_SCHEMA,
             manifest_name=PATCH_MANIFEST,
@@ -16366,15 +16945,31 @@ def validate_patch_stage(
             parent=artifact_root,
             file_codes=PATCH_FILE_CODES,
         )
-        _scan_exact_bound_directory_entries(
-            artifact_root,
-            expected_stage_types,
-            missing_code="stage-missing",
-            identity_code="stage-directory-identity-mismatch",
-            access_policy_code="stage-directory-access-policy-mismatch",
-            inconclusive_code=PATCH_FILE_CODES.inconclusive,
-            mismatch_code="patch-file-set-mismatch",
-        )
+
+        def revalidate_artifact() -> None:
+            _scan_exact_bound_directory_entries(
+                artifact_root,
+                expected_stage_types,
+                missing_code="stage-missing",
+                identity_code="stage-directory-identity-mismatch",
+                access_policy_code="stage-directory-access-policy-mismatch",
+                inconclusive_code=PATCH_FILE_CODES.inconclusive,
+                mismatch_code="patch-file-set-mismatch",
+            )
+            _verify_bound_regular_file_at(
+                manifest_bound,
+                PATCH_FILE_CODES,
+                dir_fd=artifact_root.fd,
+                basename=PATCH_MANIFEST,
+            )
+            _verify_bound_regular_file_at(
+                database_bound,
+                PATCH_FILE_CODES,
+                dir_fd=artifact_root.fd,
+                basename=NOTE_STORE_MAIN,
+            )
+
+        revalidate_artifact()
         database_integrity = _verify_bound_regular_file_at(
             database_bound,
             PATCH_FILE_CODES,
@@ -16387,7 +16982,7 @@ def validate_patch_stage(
             dir_fd=artifact_root.fd,
             basename=PATCH_MANIFEST,
         )
-        return {
+        public_result = {
             "stage_dir": stage_dir,
             "manifest": manifest,
             "manifest_creation_receipt": external_receipt,
@@ -16410,10 +17005,49 @@ def validate_patch_stage(
                 "database": database_integrity,
             },
         }
+        yield _ValidatedPatchStageArtifact(
+            public_result=public_result,
+            artifact_root=artifact_root,
+            database=database_bound,
+            revalidate_artifact=revalidate_artifact,
+        )
+        if not _writeback_close_only():
+            revalidate_artifact()
 
 
-def fingerprint_note_store(paths: NoteStorePaths) -> dict[str, Any]:
-    records = _capture_database_files(paths.group_container / NOTE_STORE_MAIN)
+def validate_patch_stage(
+    stage_dir: Path,
+    manifest_creation_receipt: dict[str, Any] | None = None,
+    *,
+    manifest_creation_receipt_file: Path | None = None,
+    _command_cwd: str | None = None,
+) -> dict[str, Any]:
+    command_cwd = os.getcwd() if _command_cwd is None else _command_cwd
+    requested_stage = _absolute_path_from_cwd(stage_dir, command_cwd)
+    requested_receipt = _optional_absolute_path_from_cwd(
+        manifest_creation_receipt_file,
+        command_cwd,
+    )
+    artifact_paths = _patch_artifact_paths(
+        requested_stage,
+        cwd=command_cwd,
+    )
+    result: dict[str, Any] | None = None
+    with _validated_patch_stage_artifact(
+        artifact_paths,
+        manifest_creation_receipt,
+        manifest_creation_receipt_file=requested_receipt,
+    ) as artifact:
+        result = artifact.public_result
+    assert result is not None
+    return result
+
+
+def _fingerprint_bound_note_store(
+    paths: NoteStorePaths,
+    source_store: _BoundSourceStore,
+) -> dict[str, Any]:
+    records = _capture_bound_source_store(source_store)
     return {
         "source_root": paths.group_container,
         "files": [
@@ -16429,6 +17063,11 @@ def fingerprint_note_store(paths: NoteStorePaths) -> dict[str, Any]:
             "access_policy": ["mode", "uid", "gid", "flags"],
         },
     }
+
+
+def fingerprint_note_store(paths: NoteStorePaths) -> dict[str, Any]:
+    with _bind_source_store(paths.group_container / NOTE_STORE_MAIN) as source_store:
+        return _fingerprint_bound_note_store(paths, source_store)
 
 
 def _source_manifest_map(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -16451,6 +17090,11 @@ def _source_manifest_map(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     required_source_fields = {"sha256", "size", "identity", "access_policy"}
     if any(
         not required_source_fields.issubset(source)
+        or type(source.get("sha256")) is not str
+        or len(source["sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in source["sha256"])
+        or type(source.get("size")) is not int
+        or source["size"] < 0
         or not isinstance(source["identity"], dict)
         or not isinstance(source["access_policy"], dict)
         for source in result.values()
@@ -16544,62 +17188,77 @@ def preflight_writeback(
         raise StoreSafetyError(
             "notes-running", "Notes.app must stay quit for writeback preflight"
         )
-    backup = validate_snapshot(
-        backup_dir,
-        backup_manifest_creation_receipt,
-        manifest_creation_receipt_file=requested_backup_receipt,
-        _command_cwd=command_cwd,
-    )
-    manifest = backup["manifest"]
-    if (
-        manifest.get("notes_running") is not False
-        or manifest.get("notes_quit_required") is not True
-    ):
-        raise StoreSafetyError(
-            "backup-not-writeback-grade",
-            "Backup was not captured with Notes quit and --require-notes-quit",
+    result: dict[str, Any] | None = None
+    with _writeback_linearized_transaction() as transaction:
+        backup_artifact = transaction.enter_context(
+            _validated_snapshot_artifact(
+                _snapshot_artifact_paths(backup_dir),
+                backup_manifest_creation_receipt,
+                manifest_creation_receipt_file=requested_backup_receipt,
+            )
         )
-    if Path(str(manifest.get("source_root"))) != paths.group_container:
-        raise StoreSafetyError(
-            "backup-source-mismatch",
-            "Backup source root does not match the selected live store",
+        stage_artifact = transaction.enter_context(
+            _validated_patch_stage_artifact(
+                _patch_artifact_paths(stage_dir),
+                stage_manifest_creation_receipt,
+                manifest_creation_receipt_file=requested_stage_receipt,
+            )
         )
-    stage = validate_patch_stage(
-        stage_dir,
-        stage_manifest_creation_receipt,
-        manifest_creation_receipt_file=requested_stage_receipt,
-        _command_cwd=command_cwd,
-    )
-    live = fingerprint_note_store(paths)
-    _compare_live_to_baseline(live, manifest)
-    if notes_is_running():
-        raise StoreSafetyError(
-            "notes-started-during-preflight",
-            "Notes.app started during writeback preflight",
+        live_store = transaction.enter_context(
+            _bind_source_store(paths.group_container / NOTE_STORE_MAIN)
         )
-    current_names = sorted(_fingerprint_map(live))
-    return {
-        "ready_for_explicit_writeback": True,
-        "live_mutation_performed": False,
-        "backup_dir": backup_dir,
-        "stage_dir": stage_dir,
-        "live_source_root": paths.group_container,
-        "live_files": current_names,
-        "stage_sha256": stage["fingerprint"]["sha256"],
-        "manifest_creation_receipts": {
-            "backup": backup["manifest_creation_receipt"],
-            "stage": stage["manifest_creation_receipt"],
-        },
-        "required_whole_store_boundary": {
-            "install": [NOTE_STORE_MAIN],
-            "remove_or_restore_as_one_boundary": [
-                name for name in current_names if name != NOTE_STORE_MAIN
-            ],
-            "multi_file_atomic_swap_available": False,
-            "notes_must_remain_quit": True,
-            "retain_backup_until_user_acceptance": True,
-        },
-    }
+        backup = backup_artifact.public_result
+        manifest = backup["manifest"]
+        if (
+            manifest.get("notes_running") is not False
+            or manifest.get("notes_quit_required") is not True
+        ):
+            raise StoreSafetyError(
+                "backup-not-writeback-grade",
+                "Backup was not captured with Notes quit and --require-notes-quit",
+            )
+        if Path(str(manifest.get("source_root"))) != paths.group_container:
+            raise StoreSafetyError(
+                "backup-source-mismatch",
+                "Backup source root does not match the selected live store",
+            )
+        backup_artifact.revalidate_artifact()
+        stage_artifact.revalidate_artifact()
+        _compare_live_source_binding(live_store, manifest)
+        live = _fingerprint_bound_note_store(paths, live_store)
+        _compare_live_to_baseline(live, manifest)
+        if notes_is_running():
+            raise StoreSafetyError(
+                "notes-started-during-preflight",
+                "Notes.app started during writeback preflight",
+            )
+        stage = stage_artifact.public_result
+        current_names = sorted(_fingerprint_map(live))
+        result = {
+            "ready_for_explicit_writeback": True,
+            "live_mutation_performed": False,
+            "backup_dir": backup_dir,
+            "stage_dir": stage_dir,
+            "live_source_root": paths.group_container,
+            "live_files": current_names,
+            "stage_sha256": stage["fingerprint"]["sha256"],
+            "manifest_creation_receipts": {
+                "backup": backup["manifest_creation_receipt"],
+                "stage": stage["manifest_creation_receipt"],
+            },
+            "required_whole_store_boundary": {
+                "install": [NOTE_STORE_MAIN],
+                "remove_or_restore_as_one_boundary": [
+                    name for name in current_names if name != NOTE_STORE_MAIN
+                ],
+                "multi_file_atomic_swap_available": False,
+                "notes_must_remain_quit": True,
+                "retain_backup_until_user_acceptance": True,
+            },
+        }
+        transaction.mark_joint_success()
+    assert result is not None
+    return result
 
 
 def verify_writeback(
@@ -16636,122 +17295,384 @@ def verify_writeback(
         raise StoreSafetyError(
             "notes-running", "Notes.app must stay quit for writeback verification"
         )
-    backup = validate_snapshot(
-        backup_dir,
-        backup_manifest_creation_receipt,
-        manifest_creation_receipt_file=requested_backup_receipt,
-        _command_cwd=command_cwd,
-    )
-    baseline_manifest = backup["manifest"]
-    if (
-        baseline_manifest.get("notes_running") is not False
-        or baseline_manifest.get("notes_quit_required") is not True
-    ):
-        raise StoreSafetyError(
-            "backup-not-writeback-grade",
-            "Backup was not captured with Notes quit and --require-notes-quit",
+    result: dict[str, Any] | None = None
+    with _writeback_linearized_transaction() as transaction:
+        backup_artifact = transaction.enter_context(
+            _validated_snapshot_artifact(
+                _snapshot_artifact_paths(backup_dir),
+                backup_manifest_creation_receipt,
+                manifest_creation_receipt_file=requested_backup_receipt,
+            )
         )
-    if Path(str(baseline_manifest.get("source_root"))) != paths.group_container:
-        raise StoreSafetyError(
-            "backup-source-mismatch",
-            "Backup source root does not match the selected live store",
+        stage_artifact = transaction.enter_context(
+            _validated_patch_stage_artifact(
+                _patch_artifact_paths(stage_dir),
+                stage_manifest_creation_receipt,
+                manifest_creation_receipt_file=requested_stage_receipt,
+            )
         )
-    stage = validate_patch_stage(
-        stage_dir,
-        stage_manifest_creation_receipt,
-        manifest_creation_receipt_file=requested_stage_receipt,
-        _command_cwd=command_cwd,
-    )
-    live = validate_database_recovery(paths.group_container / NOTE_STORE_MAIN)
-    current = {record["basename"]: record["source"] for record in live["capture"]}
-    if set(current) != {NOTE_STORE_MAIN}:
-        raise StoreSafetyError(
-            "post-writeback-file-set-mismatch",
-            "Post-writeback live store contains missing or stale WAL/SHM files",
+        live_store = transaction.enter_context(
+            _bind_source_store(paths.group_container / NOTE_STORE_MAIN)
         )
-    baseline_main = _source_manifest_map(baseline_manifest)[NOTE_STORE_MAIN]
-    if current[NOTE_STORE_MAIN]["identity"] == baseline_main["identity"]:
-        raise StoreSafetyError(
-            "post-writeback-identity-mismatch",
-            "Live NoteStore.sqlite was not replaced as a whole object",
-        )
-    staged_fingerprint = stage["fingerprint"]
-    if (
-        current[NOTE_STORE_MAIN]["sha256"] != staged_fingerprint["sha256"]
-        or current[NOTE_STORE_MAIN]["size"] != staged_fingerprint["size"]
-    ):
-        raise StoreSafetyError(
-            "post-writeback-content-mismatch",
-            "Live NoteStore.sqlite does not match the staged patch",
-        )
-    if current[NOTE_STORE_MAIN]["access_policy"] != baseline_main["access_policy"]:
-        raise StoreSafetyError(
-            "post-writeback-access-policy-mismatch",
-            "Live NoteStore.sqlite did not preserve the baseline access policy",
-        )
-    if notes_is_running():
-        raise StoreSafetyError(
-            "notes-started-during-verification",
-            "Notes.app started during writeback verification",
-        )
-    return {
-        "writeback_verified": True,
-        "notes_running": False,
-        "live_source_root": paths.group_container,
-        "backup_dir": backup_dir,
-        "stage_dir": stage_dir,
-        "sha256": staged_fingerprint["sha256"],
-        "sqlite_validation": live["sqlite_integrity"],
-        "sidecars_absent": True,
-        "manifest_creation_receipts": {
-            "backup": backup["manifest_creation_receipt"],
-            "stage": stage["manifest_creation_receipt"],
-        },
-    }
+        backup = backup_artifact.public_result
+        baseline_manifest = backup["manifest"]
+        if (
+            baseline_manifest.get("notes_running") is not False
+            or baseline_manifest.get("notes_quit_required") is not True
+        ):
+            raise StoreSafetyError(
+                "backup-not-writeback-grade",
+                "Backup was not captured with Notes quit and --require-notes-quit",
+            )
+        if Path(str(baseline_manifest.get("source_root"))) != paths.group_container:
+            raise StoreSafetyError(
+                "backup-source-mismatch",
+                "Backup source root does not match the selected live store",
+            )
+        backup_artifact.revalidate_artifact()
+        stage_artifact.revalidate_artifact()
+        _compare_live_source_binding(live_store, baseline_manifest)
+        live = _validate_bound_database_recovery(live_store)
+        current = {record["basename"]: record["source"] for record in live["capture"]}
+        if set(current) != {NOTE_STORE_MAIN}:
+            raise StoreSafetyError(
+                "post-writeback-file-set-mismatch",
+                "Post-writeback live store contains missing or stale WAL/SHM files",
+            )
+        baseline_main = _source_manifest_map(baseline_manifest)[NOTE_STORE_MAIN]
+        if current[NOTE_STORE_MAIN]["identity"] == baseline_main["identity"]:
+            raise StoreSafetyError(
+                "post-writeback-identity-mismatch",
+                "Live NoteStore.sqlite was not replaced as a whole object",
+            )
+        stage = stage_artifact.public_result
+        staged_fingerprint = stage["fingerprint"]
+        if (
+            current[NOTE_STORE_MAIN]["sha256"] != staged_fingerprint["sha256"]
+            or current[NOTE_STORE_MAIN]["size"] != staged_fingerprint["size"]
+        ):
+            raise StoreSafetyError(
+                "post-writeback-content-mismatch",
+                "Live NoteStore.sqlite does not match the staged patch",
+            )
+        if current[NOTE_STORE_MAIN]["access_policy"] != baseline_main["access_policy"]:
+            raise StoreSafetyError(
+                "post-writeback-access-policy-mismatch",
+                "Live NoteStore.sqlite did not preserve the baseline access policy",
+            )
+        if notes_is_running():
+            raise StoreSafetyError(
+                "notes-started-during-verification",
+                "Notes.app started during writeback verification",
+            )
+        result = {
+            "writeback_verified": True,
+            "notes_running": False,
+            "live_source_root": paths.group_container,
+            "backup_dir": backup_dir,
+            "stage_dir": stage_dir,
+            "sha256": staged_fingerprint["sha256"],
+            "sqlite_validation": live["sqlite_integrity"],
+            "sidecars_absent": True,
+            "manifest_creation_receipts": {
+                "backup": backup["manifest_creation_receipt"],
+                "stage": stage["manifest_creation_receipt"],
+            },
+        }
+        transaction.mark_joint_success()
+    assert result is not None
+    return result
 
 
-def query_note_tags(db_path: Path, note_title: str) -> dict[str, Any]:
-    with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
-        conn.row_factory = sqlite3.Row
-        note_row = conn.execute(
-            """
-            SELECT Z_PK, ZIDENTIFIER, ZTITLE1, ZNOTEDATA
-            FROM ZICCLOUDSYNCINGOBJECT
-            WHERE ZTITLE1 = ?
-            """,
-            (note_title,),
-        ).fetchone()
-        if note_row is None:
-            raise RuntimeError(f"Note not found in database: {note_title}")
-        tag_rows = conn.execute(
-            """
-            SELECT Z_PK, ZIDENTIFIER, ZNOTE1, ZALTTEXT, ZTOKENCONTENTIDENTIFIER, ZTYPEUTI1
-            FROM ZICCLOUDSYNCINGOBJECT
-            WHERE ZNOTE1 = ?
-              AND ZTYPEUTI1 = 'com.apple.notes.inlinetextattachment.hashtag'
-            ORDER BY Z_PK
-            """,
-            (note_row["Z_PK"],),
-        ).fetchall()
+def _assert_note_tags_database_outside_live_containers(db_path: Path) -> None:
+    normalized_name = unicodedata.normalize("NFD", db_path.name).casefold()
+    if normalized_name.endswith(("-wal", "-shm", "-journal")):
+        raise StoreSafetyError(
+            "note-tags-sidecar-input",
+            "note-tags accepts a standalone main database, not a SQLite "
+            f"sidecar path: {db_path}",
+            details={"database": str(db_path)},
+        )
+    database_forms = _trusted_alias_scope_forms(db_path)
+    for live_container in (GROUP_CONTAINER, APP_CONTAINER):
+        for database_form, database_path in database_forms:
+            database_parts = _normalized_scope_parts(database_path)
+            for live_form, live_path in _trusted_alias_scope_forms(live_container):
+                live_parts = _normalized_scope_parts(live_path)
+                if database_parts[: len(live_parts)] != live_parts:
+                    continue
+                raise StoreSafetyError(
+                    "note-tags-live-container",
+                    "note-tags accepts only a recovered standalone database, "
+                    f"not an Apple Notes live-container path: {db_path}",
+                    details={
+                        "database": str(db_path),
+                        "database_scope_form": database_form,
+                        "database_scope_path": str(database_path),
+                        "live_container_scope_form": live_form,
+                        "live_container_scope_path": str(live_path),
+                    },
+                )
+
+
+def _verify_note_tags_standalone_input(
+    parent: _BoundDirectory,
+    database: _BoundRegularFile,
+) -> dict[str, Any]:
+    """Revalidate one held main file and prove its sidecar names absent."""
+
+    _verify_bound_source_directory(parent)
+    main = _verify_bound_regular_file_at(
+        database,
+        SOURCE_FILE_CODES,
+        dir_fd=parent.fd,
+        basename=database.path.name,
+    )
+    for _pass_index in range(2):
+        _verify_bound_source_directory(parent)
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar_name = f"{database.path.name}{suffix}"
+            sidecar_path = database.path.with_name(sidecar_name)
+            try:
+                observed = os.stat(
+                    sidecar_name,
+                    dir_fd=parent.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            except PermissionError as exc:
+                raise StoreSafetyError(
+                    "note-tags-sidecar-unreadable",
+                    f"Cannot prove standalone sidecar absence: {sidecar_path}: {exc}",
+                ) from exc
+            except OSError as exc:
+                raise StoreSafetyError(
+                    "note-tags-sidecar-revalidation-inconclusive",
+                    f"Cannot revalidate standalone sidecar absence: "
+                    f"{sidecar_path}: {exc}",
+                ) from exc
+            raise StoreSafetyError(
+                "note-tags-sidecar-present",
+                "note-tags requires a sidecar-free standalone database: "
+                f"{sidecar_path}",
+                details={
+                    "database": str(database.path),
+                    "sidecar": str(sidecar_path),
+                    "sidecar_file_type": stat.S_IFMT(observed.st_mode),
+                },
+            )
+        _verify_bound_source_directory(parent)
+    main = _verify_bound_regular_file_at(
+        database,
+        SOURCE_FILE_CODES,
+        dir_fd=parent.fd,
+        basename=database.path.name,
+    )
+    _verify_bound_source_directory(parent)
+    return main
+
+
+def _sqlite_text_expression(value: str, *, source_path: Path) -> str:
+    try:
+        encoded = value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise StoreSafetyError(
+            "note-tags-query-failed",
+            f"Note title is not valid Unicode for SQLite: {source_path}",
+        ) from exc
+    return f"CAST(X'{encoded.hex()}' AS TEXT)"
+
+
+def _note_tags_integer(
+    value: str | None,
+    *,
+    field: str,
+    source_path: Path,
+    optional: bool = False,
+) -> int | None:
+    if value is None:
+        if optional:
+            return None
+        raise StoreSafetyError(
+            "note-tags-query-failed",
+            f"SQLite returned a null {field} value for {source_path}",
+        )
+    try:
+        return int(value, 10)
+    except ValueError as exc:
+        raise StoreSafetyError(
+            "note-tags-query-failed",
+            f"SQLite returned an invalid {field} value for {source_path}",
+        ) from exc
+
+
+def _query_note_tags_from_image(
+    image: _DeserializedSQLiteImage,
+    db_path: Path,
+    note_title: str,
+) -> dict[str, Any]:
+    title_expression = _sqlite_text_expression(note_title, source_path=db_path)
+    note_rows = _native_sqlite_query_rows(
+        image,
+        """
+        SELECT Z_PK, ZIDENTIFIER, ZTITLE1, ZNOTEDATA
+        FROM ZICCLOUDSYNCINGOBJECT
+        WHERE ZTITLE1 = """
+        + title_expression
+        + """
+        ORDER BY Z_PK
+        LIMIT 1
+        """,
+        db_path,
+        error_code="note-tags-query-failed",
+    )
+    if not note_rows:
+        raise StoreSafetyError(
+            "note-tags-query-failed",
+            f"Note not found in database: {note_title}",
+        )
+    note_row = note_rows[0]
+    if len(note_row) != 4:
+        raise StoreSafetyError(
+            "note-tags-query-failed",
+            f"SQLite returned an incomplete note row for {db_path}",
+        )
+    note_pk = _note_tags_integer(
+        note_row[0],
+        field="note primary key",
+        source_path=db_path,
+    )
+    assert note_pk is not None
+    tag_rows = _native_sqlite_query_rows(
+        image,
+        """
+        SELECT Z_PK, ZIDENTIFIER, ZNOTE1, ZALTTEXT,
+               ZTOKENCONTENTIDENTIFIER, ZTYPEUTI1
+        FROM ZICCLOUDSYNCINGOBJECT
+        WHERE ZNOTE1 = """
+        + str(note_pk)
+        + """
+          AND ZTYPEUTI1 = 'com.apple.notes.inlinetextattachment.hashtag'
+        ORDER BY Z_PK
+        """,
+        db_path,
+        error_code="note-tags-query-failed",
+    )
+    if any(len(row) != 6 for row in tag_rows):
+        raise StoreSafetyError(
+            "note-tags-query-failed",
+            f"SQLite returned an incomplete tag row for {db_path}",
+        )
     return {
         "note": {
-            "pk": note_row["Z_PK"],
-            "identifier": note_row["ZIDENTIFIER"],
-            "title": note_row["ZTITLE1"],
-            "note_data_pk": note_row["ZNOTEDATA"],
+            "pk": note_pk,
+            "identifier": note_row[1],
+            "title": note_row[2],
+            "note_data_pk": _note_tags_integer(
+                note_row[3],
+                field="note-data primary key",
+                source_path=db_path,
+                optional=True,
+            ),
         },
         "tags": [
             {
-                "pk": row["Z_PK"],
-                "identifier": row["ZIDENTIFIER"],
-                "note_fk": row["ZNOTE1"],
-                "tag_text": row["ZALTTEXT"],
-                "tag_token": row["ZTOKENCONTENTIDENTIFIER"],
-                "type_uti": row["ZTYPEUTI1"],
+                "pk": _note_tags_integer(
+                    row[0],
+                    field="tag primary key",
+                    source_path=db_path,
+                ),
+                "identifier": row[1],
+                "note_fk": _note_tags_integer(
+                    row[2],
+                    field="tag note foreign key",
+                    source_path=db_path,
+                ),
+                "tag_text": row[3],
+                "tag_token": row[4],
+                "type_uti": row[5],
             }
             for row in tag_rows
         ],
     }
+
+
+def query_note_tags(db_path: Path, note_title: str) -> dict[str, Any]:
+    db_path = _absolute_path(db_path)
+    _assert_note_tags_database_outside_live_containers(db_path)
+    parent: _BoundDirectory | None = None
+    try:
+        with _bind_existing_directory_with_trusted_alias(db_path.parent) as parent:
+            with _bind_regular_file_at(
+                db_path,
+                parent,
+                SOURCE_FILE_CODES,
+            ) as database:
+
+                def verify_input() -> dict[str, Any]:
+                    return _verify_note_tags_standalone_input(parent, database)
+
+                verify_input()
+                query_error: Exception | None = None
+                result: dict[str, Any] | None = None
+                try:
+                    with _deserialized_sqlite_image(
+                        database,
+                        db_path,
+                        verify_bound=verify_input,
+                        error_code="note-tags-query-failed",
+                        require_backup=False,
+                        file_codes=SOURCE_FILE_CODES,
+                    ) as image:
+                        result = _query_note_tags_from_image(
+                            image,
+                            db_path,
+                            note_title,
+                        )
+                except Exception as exc:
+                    query_error = exc
+                try:
+                    verify_input()
+                except Exception as terminal_error:
+                    if query_error is None:
+                        raise
+                    secondary = _sqlite_secondary_failure_evidence(
+                        query_error,
+                        phase="note-tags-query-or-setup",
+                    )
+                    if isinstance(terminal_error, StoreSafetyError):
+                        terminal_error.details = dict(terminal_error.details)
+                        terminal_error.details["note_tags_query_secondary_failure"] = (
+                            secondary
+                        )
+                        raise terminal_error from query_error
+                    raise StoreSafetyError(
+                        "source-revalidation-inconclusive",
+                        "note-tags terminal input revalidation failed for "
+                        f"{db_path}: {_sqlite_exception_text(terminal_error)}",
+                        details={
+                            "note_tags_query_secondary_failure": secondary,
+                            "terminal_revalidation_failure": (
+                                _sqlite_exception_evidence(terminal_error)
+                            ),
+                        },
+                    ) from terminal_error
+                if query_error is not None:
+                    raise query_error
+                assert result is not None
+                return result
+    except StoreSafetyError as exc:
+        if parent is not None and exc.code in {
+            "directory-identity-mismatch",
+            "directory-access-policy-mismatch",
+            "prepared-directory-missing",
+            "prepared-directory-identity-mismatch",
+            "prepared-directory-access-policy-mismatch",
+            "prepared-directory-revalidation-inconclusive",
+        }:
+            raise _source_directory_revalidation_error(parent, exc) from exc
+        raise
 
 
 def _paths_from_args(

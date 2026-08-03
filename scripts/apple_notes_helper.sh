@@ -31,9 +31,10 @@ Notes:
   - DB-heavy subcommands delegate to the helper packaged with apple-notes-db-guardrails.
   - Use copy-db/stage-patch --result-file to atomically create the successful
     JSON outside the artifact for every consuming command.
-  - Write-producing DB commands automatically launch the packaged pre-creation
-    capability gate. It currently fails closed when directory creation is needed;
-    an explicitly inherited supervisor FD remains available to a stronger authority.
+  - Write-producing DB commands automatically launch the packaged cooperative
+    same-UID directory supervisor. It randomizes and descriptor-binds the created
+    private directory before transferring its FD, but does not isolate a hostile
+    same-UID debugger or namespace racer.
   - No subcommand mutates the live Notes store; writeback remains an explicit separate phase.
   - In Codex, prefer this wrapper under an approved/escalated prefix when Notes automation is needed.
 EOF
@@ -143,13 +144,31 @@ main() {
   case "$1" in
     probe-notes)
       shift
+      if [[ $# -ne 0 ]]; then
+        printf 'Unsupported probe-notes argument: %s\n' "$1" >&2
+        return 2
+      fi
+      local notes_running
+      local folders
+      notes_running="$(notes_running_json)"
+      if ! folders="$(folders_json)"; then
+        return 1
+      fi
       printf '{\n  "notes_running": %s,\n  "automation_ok": true,\n  "folders": %s\n}\n' \
-        "$(notes_running_json)" \
-        "$(folders_json)"
+        "$notes_running" \
+        "$folders"
       ;;
     list-folders)
       shift
-      printf '{\n  "folders": %s\n}\n' "$(folders_json)"
+      if [[ $# -ne 0 ]]; then
+        printf 'Unsupported list-folders argument: %s\n' "$1" >&2
+        return 2
+      fi
+      local folders
+      if ! folders="$(folders_json)"; then
+        return 1
+      fi
+      printf '{\n  "folders": %s\n}\n' "$folders"
       ;;
     show-note-prefix)
       shift

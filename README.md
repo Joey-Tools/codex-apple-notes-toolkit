@@ -29,15 +29,17 @@ write. Existing destination and live-container paths are bound one no-follow
 component at a time; initially absent live containers retain their nearest
 existing ancestor and missing suffix through creation and terminal checks.
 Missing destination components and private partials are first created at
-randomized owner-private staging names only through a trusted creator that
-returns the already-open object descriptor and an exclusive-handoff
-attestation. A later `open` after `mkdir` is never accepted as creation proof.
+randomized owner-private staging names through a supervisor that returns a
+continuously held object descriptor and a v2 proof naming the creation method
+and threat model instead of claiming universal namespace exclusion.
 The packaged launcher creates an inherited, already-connected
 `AF_UNIX`/`SOCK_DGRAM` supervisor channel and starts the DB helper with
-`--directory-creator-fd`. Current macOS and Linux public APIs provide no atomic
-directory-create-and-return-FD primitive, so the packaged service validates
-the request and returns a closed `unavailable-before-create` receipt without
-calling `mkdir`/`open` or sending a directory descriptor. The shell wrapper
+`--directory-creator-fd`. The packaged service uses a CSPRNG staging name,
+descriptor-relative `mkdir`, immediate no-follow directory open, and repeated
+FD/name/parent identity and access-policy validation before returning the FD.
+This makes snapshot/stage usable under an explicitly cooperative same-UID
+model; it does not defend against a hostile same-UID debugger or namespace
+racer. The shell wrapper
 and the legacy-compatible `scripts/apple_notes_helper.py`
 entrypoint select this production launcher automatically for write-producing
 commands; callers may still provide a stronger inherited supervisor channel.
@@ -74,13 +76,12 @@ These capture guarantees begin only after the compatibility wrapper's own
 source is already executing. They neither authenticate nor revalidate that
 already-running wrapper object nor defend process memory against a malicious
 same-UID process with debugging or `ptrace` access.
-It transfers the held parent FD with `SCM_RIGHTS`; a stronger external
-authority may return the actual created-object FD plus a request-bound
-attestation, while the packaged capability refusal returns none. The client
-accepts the packaged no-mutation receipt only in its exact typed closed form;
-malformed near-matches remain conservative possible-mutation failures. It
-never reconnects by socket path. Without a stronger authority, creation fails
-before filesystem mutation with `directory-creation-identity-inconclusive`.
+It transfers the held parent FD with `SCM_RIGHTS`; the packaged or stronger
+external authority returns the actual opened directory FD plus a request-bound
+attestation. A creator may claim `unavailable-before-create` only in the exact
+typed closed form with no basename, proof, descriptor, or mutation. Malformed
+near-matches remain conservative possible-mutation failures. The transport
+never reconnects by socket path.
 A held object is installed at the target name with atomic no-replace rename.
 Identity and access policy are revalidated around carried scope checks; failed
 installs retain structured evidence instead of using a racy name-based
@@ -109,6 +110,14 @@ temporary file descriptors, not named temporary or recovery-clone
 directories. Its private standalone `.tmp-*` database is descriptor-bound and
 matched to its creation receipt before the second source revalidation; every
 pre-publication failure retains structured cleanup and recovery evidence.
+Snapshot v4 also records an exact live-source binding from that same held
+capture: the requested root, terminal directory identity/access policy,
+complete canonical component chain, no-symlink policy, and registered Darwin
+alias receipt or explicit null. Writeback preflight and verification bind the
+snapshot, patch stage, and live store together and establish one common
+point-in-time success boundary before close-only descriptor teardown. A v3
+snapshot is not writeback-grade, and a preflight receipt never authorizes a
+later live-store mutation.
 Snapshot/stage API and CLI inputs use one absolute lexical path policy for the
 root and every derived member, so relative paths cannot split parent authority.
 The API path object and CLI adapter likewise freeze both live-container inputs
@@ -169,5 +178,5 @@ under [`docs/project_journal/`](docs/project_journal/).
 ```bash
 bash -n scripts/apple_notes_helper.sh scripts/apple_notes_osascript_context_probe.sh
 shellcheck scripts/apple_notes_helper.sh scripts/apple_notes_osascript_context_probe.sh
-python3 -m unittest tests.test_apple_notes_helper
+python3 -m unittest discover -s tests -p 'test_*.py'
 ```

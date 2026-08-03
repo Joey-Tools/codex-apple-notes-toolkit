@@ -13,7 +13,7 @@
 - Darwin access policy tracks only immutable, append-only, Data Vault, restricted, and no-unlink flags; other raw file flags remain metadata evidence.
 - Manifest and external-receipt JSON parsing has fixed nesting and integer-digit limits with stable safety-error classifications.
 - File and directory publication use a monotonic commit latch before post-rename evidence work.
-- Write-producing wrapper commands automatically launch a packaged pre-creation capability gate. It performs no directory mutation on current macOS/Linux runtimes; the inherited-FD interface remains available for stronger external authorities.
+- Write-producing wrapper commands automatically launch the packaged cooperative same-UID directory supervisor. It creates a randomized private name descriptor-relatively, binds the returned directory, parent, and public name before transferring the directory FD, and fails conservatively without claiming isolation from a malicious same-UID peer.
 - The legacy Python compatibility entrypoint is import-safe, retains its public exports, and routes every write-producing CLI command through that same supervisor.
 - Required-quit snapshots recheck Notes at the final pre-rename and immediate post-publication boundaries; a late restart quarantines the exact published object and cannot produce a writeback-grade receipt.
 - A visible quarantine rename is not reported as verified or retained until directory policy, parent durability, complete-tree, and terminal-alias proofs all succeed.
@@ -21,6 +21,14 @@
 - Artifact, standalone, and creator-result writers now define their zero-write
   linearization point at the final held-parent/public-name revalidation
   immediately before the first `.partial-*` or `.tmp-*` creator can run.
+- Snapshot v4 binds the live NoteStore root, terminal directory identity and
+  access policy, complete canonical component chain, no-symlink policy, and
+  registered Darwin alias receipt from the same held source capture used for
+  the database files.
+- Writeback preflight and verification keep the snapshot, patch stage, and
+  live source bindings open through one joint comparison, Notes probe, and
+  terminal revalidation point before descriptor teardown; their receipts are
+  point-in-time evidence rather than authorization for a later write.
 - Cross-root creator result files bind their artifact and result alias scopes independently, and committed result receipts survive late scope teardown failures.
 - Newly created copied, JSON, and standalone files retain a pre-write identity and access-policy baseline through content and publication validation.
 - Structured, malformed, unstructured, and transport-evidence-construction creator failures retain conservative recovery evidence and close every owned or received FD.

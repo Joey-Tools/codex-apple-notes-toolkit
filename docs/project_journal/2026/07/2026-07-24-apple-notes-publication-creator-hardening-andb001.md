@@ -3,7 +3,7 @@ id: 20260724-andb001
 title: Apple Notes Publication And Creator Failure Hardening
 status: active
 created: 2026-07-24
-updated: 2026-08-01
+updated: 2026-08-03
 branch: codex/apple-db-hardening
 pr: https://github.com/Joey-Tools/codex-apple-notes-toolkit/pull/3
 supersedes: []
@@ -19,9 +19,15 @@ superseded_by:
   scope, standalone public-name set, and creator result scope revalidate at
   their actual temporary-object creation boundaries.
 - Closed the follow-up production gap by adding a packaged inherited-supervisor creator protocol and conservative malformed-result ownership handling.
-- Closed the packaged-supervisor same-UID replacement gap by turning the
-  bundled service into a strict pre-creation capability gate while retaining
-  the inherited-FD protocol for stronger external authorities.
+- Replaced the impractical no-create capability gate with a packaged
+  cooperative same-UID supervisor that randomizes the private name, creates
+  descriptor-relatively under a controlled umask, binds the returned
+  directory/name/parent properties, and transfers the directory FD without
+  claiming isolation from a malicious same-UID peer.
+- Upgraded snapshots to the exact v4 live-source binding contract and kept
+  snapshot, patch-stage, and live-store descriptors held through one joint
+  writeback comparison, Notes probe, and terminal revalidation point before
+  descriptor teardown.
 - Closed the final fresh-review gaps in anonymous recovered-image binding, exact SQLite header normalization, and structured native SQLite cleanup.
 - Closed the formal single-review gaps in shell-redirection receipt creation, post-write access-policy baselines, and ctypes row-callback exception propagation.
 - Closed the final formal follow-up gaps in cross-root creator-result alias binding, post-result-commit teardown classification, and standalone pre-write access-policy binding.
@@ -253,11 +259,32 @@ superseded_by:
 - Container child samples enforce a complete 64-entry and 4-KiB raw-name
   budget, stop on overflow, and sort only the bounded set before retaining five
   names.
+- Snapshot manifests now require `apple-notes-snapshot/v4` and an exact
+  `apple-notes-live-source-binding/v1` receipt produced from the same held
+  capture store as the database files. The receipt binds the requested live
+  root, terminal directory identity/access policy, ordered canonical
+  component chain, no-symlink/reparse policy, and registered Darwin alias or
+  explicit null while excluding benign directory timestamp, link-count, and
+  unrelated raw-flag churn. Snapshot v3 remains non-writeback-grade and fails
+  closed at the schema gate.
+- Writeback preflight and verification share one `ExitStack` for the validated
+  snapshot, validated patch stage, and held live source, then establish one
+  joint success linearization point while all three remain bound. Persistent
+  backup, stage, live-file, container-identity, or container-access-policy
+  replacement before that point fails closed; benign unrelated child churn
+  remains outside the selected protected properties. The resulting receipt is
+  point-in-time evidence and cannot authorize a later write without a new
+  write transaction and revalidation.
+- Note-tag snapshotting and native serialization consume descriptor-bound
+  database inputs, reject live-path/sidecar escape, and revalidate at the
+  terminal boundary. Creator zero-write checks run immediately before the
+  provider call, and exclusive writers retain conservative recovery evidence
+  when their first post-create identity read fails.
 
 ## Next Steps
 
-- Finalize this canonical zero-write slice with full regression, static,
-  named-single, exact-secret, and CI evidence.
+- Freeze the final signed head, run named review and exact-secret admission,
+  push the canonical PR update, and require current-head CI before landing.
 - Propagate the landed canonical checkout and digest to the private overlay so
   packaging can add the canonical sync rule/inventory and update the
   work-report integration without duplicating this helper.
@@ -858,3 +885,36 @@ superseded_by:
   Python `3.14.3` and `3.9.6` bytecode compilation with isolated caches;
   `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
   `git diff --check`.
+- Cooperative-supervisor, snapshot-v4, and joint-writeback follow-up:
+  `2026-08-03` working tree based on
+  `8e065d651c14112274cb4dee0e22b24136c81627`.
+- The packaged supervisor now creates one CSPRNG-named owner-private directory
+  descriptor-relatively, no-follow opens it, and binds the FD/name/parent
+  identity and access policy before `SCM_RIGHTS` transfer. This is a practical
+  cooperative same-UID model, not isolation from a malicious debugger or
+  namespace racer running under the same UID.
+- Snapshot manifests now use exact `apple-notes-snapshot/v4` and carry the
+  strict `apple-notes-live-source-binding/v1` receipt from the same held source
+  capture. Reanchored malformed schema wrappers, missing alias schema, unknown
+  fields, malformed SHA-256/size, terminal replacement, nonterminal ancestor
+  identity/access-policy drift, registered-alias replacement, and persistent
+  sidecar changes fail closed; unrelated child and ancestor sibling churn stays
+  benign because it does not change the selected properties.
+- Writeback preflight and verification now establish one explicit success
+  linearization point while the backup, patch stage, and live source remain
+  jointly bound. The final artifact/live/Notes checks occur before that point;
+  teardown is close-only and performs no new filesystem reads. The receipt is
+  point-in-time evidence and intentionally does not claim stability against a
+  same-UID change after the joint point.
+- Focused writeback regressions: Python `3.13.0` passed all `16` tests in
+  `13.306s`. The complete helper module passed `368` tests with two
+  sandbox-scoped fixed-`/usr/bin/pgrep` skips in `58.436s`.
+- Final repository discovery: Python `3.13.0` passed all `378` tests with two
+  skips in `66.459s`; system Python `3.9.6` passed the same `378` tests with two
+  skips in `73.500s`.
+- Final static gates: Ruff `0.13.2` check and format check over all changed
+  Python; `bash -n`; ShellCheck `0.11.0`; project-journal validation; and
+  `git diff --check`. The system skill validator could not import its local
+  PyYAML dependency, so a no-install Ruby `YAML.safe_load` fallback checked the
+  same frontmatter name/description/key constraints, parsed
+  `agents/openai.yaml`, and verified all packaged runtime/reference resources.

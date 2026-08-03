@@ -24,6 +24,7 @@ import unicodedata
 import unittest
 from collections.abc import Iterator
 from contextlib import closing, contextmanager, redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 from typing import Callable
@@ -248,10 +249,12 @@ class AppleNotesHelperTests(unittest.TestCase):
                 fd=fd,
                 opened=opened,
                 proof={
-                    "schema": ("apple-notes-identity-bound-directory-creation/v1"),
+                    "schema": MODULE.DIRECTORY_CREATOR_PROOF_SCHEMA,
                     "creation_authority": "test-only-synthetic-platform-provider",
                     "actual_created_object_descriptor_returned": True,
-                    "namespace_exclusive_during_handoff": True,
+                    "creation_method": "test-controlled-create-and-open",
+                    "threat_model": "test-controlled-namespace",
+                    "namespace_race_excluded_by_model": True,
                     "parent_identity": MODULE._identity(parent),
                     "parent_access_policy": MODULE._access_policy(parent),
                     "directory_identity": MODULE._identity(opened),
@@ -330,14 +333,14 @@ class AppleNotesHelperTests(unittest.TestCase):
                             "status": "created",
                             "basename": basename,
                             "proof": {
-                                "schema": (
-                                    "apple-notes-identity-bound-directory-creation/v1"
-                                ),
+                                "schema": MODULE.DIRECTORY_CREATOR_PROOF_SCHEMA,
                                 "creation_authority": (
                                     "test-supervisor-inherited-fd-protocol"
                                 ),
                                 "actual_created_object_descriptor_returned": True,
-                                "namespace_exclusive_during_handoff": True,
+                                "creation_method": "test-controlled-create-and-open",
+                                "threat_model": "test-controlled-namespace",
+                                "namespace_race_excluded_by_model": True,
                                 "parent_identity": MODULE._identity(parent),
                                 "parent_access_policy": (MODULE._access_policy(parent)),
                                 "directory_identity": MODULE._identity(opened),
@@ -418,10 +421,12 @@ class AppleNotesHelperTests(unittest.TestCase):
                     "status": "failed-after-create",
                     "basename": basename,
                     "proof": {
-                        "schema": ("apple-notes-identity-bound-directory-creation/v1"),
+                        "schema": MODULE.DIRECTORY_CREATOR_PROOF_SCHEMA,
                         "creation_authority": ("test-supervisor-create-then-fail"),
                         "actual_created_object_descriptor_returned": True,
-                        "namespace_exclusive_during_handoff": True,
+                        "creation_method": "test-controlled-create-and-open",
+                        "threat_model": "test-controlled-namespace",
+                        "namespace_race_excluded_by_model": True,
                         "parent_identity": MODULE._identity(parent),
                         "parent_access_policy": MODULE._access_policy(parent),
                         "directory_identity": MODULE._identity(opened),
@@ -453,7 +458,7 @@ class AppleNotesHelperTests(unittest.TestCase):
 
     @staticmethod
     def _serve_packaged_directory_creator_once(server_fd: int) -> None:
-        """Serve one request through the real packaged capability gate."""
+        """Serve one request through the real packaged creation authority."""
 
         with socket.socket(fileno=server_fd) as supervisor:
             supervisor.settimeout(10.0)
@@ -634,6 +639,35 @@ class AppleNotesHelperTests(unittest.TestCase):
             stage_manifest_creation_receipt=self._stage_manifest_receipts[stage_dir],
         )
 
+    def _prepare_writeback_fixture(
+        self,
+        root: Path,
+        *,
+        install_stage: bool,
+        paths: MODULE.NoteStorePaths | None = None,
+    ) -> tuple[MODULE.NoteStorePaths, Path, Path, Path]:
+        paths = self._make_paths(root) if paths is None else paths
+        live = paths.group_container / MODULE.NOTE_STORE_MAIN
+        self._create_db(live, value="before")
+        baseline_mode = stat.S_IMODE(live.stat().st_mode)
+        edited = root / "edited.sqlite"
+        self._create_db(edited, value="after")
+        backup_dir = root / "backup"
+        stage_dir = root / "stage"
+        with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+            self._copy_db(
+                paths,
+                dest=backup_dir,
+                require_notes_quit=True,
+            )
+            self._stage_patch(edited, stage_dir)
+        if install_stage:
+            replacement = root / "installed-stage.sqlite"
+            shutil.copyfile(stage_dir / MODULE.NOTE_STORE_MAIN, replacement)
+            replacement.chmod(baseline_mode)
+            os.replace(replacement, live)
+        return paths, live, backup_dir, stage_dir
+
     def _reanchor_manifest_for_test(
         self,
         artifact_dir: Path,
@@ -700,6 +734,49 @@ raise SystemExit(2)
             conn.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY, value TEXT)")
             conn.execute("INSERT INTO sample(value) VALUES (?)", (value,))
             conn.commit()
+
+    def _create_note_tags_db(self, path: Path) -> str:
+        note_title = "2026.03.06 (Fri) Example Note"
+        with closing(sqlite3.connect(path)) as conn:
+            conn.execute(
+                """
+                CREATE TABLE ZICCLOUDSYNCINGOBJECT (
+                    Z_PK INTEGER PRIMARY KEY,
+                    ZIDENTIFIER TEXT,
+                    ZTITLE1 TEXT,
+                    ZNOTEDATA INTEGER,
+                    ZNOTE1 INTEGER,
+                    ZALTTEXT TEXT,
+                    ZTOKENCONTENTIDENTIFIER TEXT,
+                    ZTYPEUTI1 TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO ZICCLOUDSYNCINGOBJECT
+                (Z_PK, ZIDENTIFIER, ZTITLE1, ZNOTEDATA)
+                VALUES (1677, 'note-id', ?, 653)
+                """,
+                (note_title,),
+            )
+            conn.execute(
+                """
+                INSERT INTO ZICCLOUDSYNCINGOBJECT
+                (Z_PK, ZIDENTIFIER, ZNOTE1, ZALTTEXT,
+                 ZTOKENCONTENTIDENTIFIER, ZTYPEUTI1)
+                VALUES
+                (1686, 'tag-id-1', 1677, '#example-tag-one',
+                 'example-tag-one',
+                 'com.apple.notes.inlinetextattachment.hashtag'),
+                (1687, 'tag-id-2', 1677, '#example-tag-two',
+                 'example-tag-two',
+                 'com.apple.notes.inlinetextattachment.hashtag')
+                """
+            )
+            conn.commit()
+        path.chmod(0o600)
+        return note_title
 
     @contextmanager
     def _bind_direct_main_only_source_store(
@@ -956,7 +1033,9 @@ raise SystemExit(2)
         self.assertTrue(manifest_exists)
         self.assertTrue(database_exists)
 
-    def test_shell_wrapper_packaged_supervisor_fails_before_creation(self) -> None:
+    def test_shell_wrapper_packaged_supervisor_creates_outputs_under_restrictive_umask(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             paths = self._make_paths(root)
@@ -1003,17 +1082,11 @@ raise SystemExit(2)
 
         self.assertEqual(
             stage_result.returncode,
-            1,
+            0,
             msg=stage_result.stdout + stage_result.stderr,
         )
-        self.assertEqual(
-            stage_payload["error_code"],
-            "directory-creation-identity-inconclusive",
-        )
-        self.assertFalse(stage_exists)
-        self.assertFalse(stage.exists())
-        self.assertFalse(stage_payload["details"]["mutation_performed"])
-        self.assertEqual(stage_payload["details"]["cleanup_state"], "not-needed")
+        self.assertEqual(Path(stage_payload["stage_dir"]), stage)
+        self.assertTrue(stage_exists)
         self.assertEqual(supervisor_residue, [])
 
         # The fixed pgrep probe is deliberately fail-closed. Exercise copy-db
@@ -1059,17 +1132,11 @@ raise SystemExit(2)
             ).is_file()
         self.assertEqual(
             copy_result.returncode,
-            1,
+            0,
             msg=copy_result.stdout + copy_result.stderr,
         )
-        self.assertEqual(
-            copy_payload["error_code"],
-            "directory-creation-identity-inconclusive",
-        )
-        self.assertFalse(snapshot_exists)
-        self.assertFalse(snapshot.exists())
-        self.assertFalse(copy_payload["details"]["mutation_performed"])
-        self.assertEqual(copy_payload["details"]["cleanup_state"], "not-needed")
+        self.assertEqual(Path(copy_payload["dest"]), snapshot)
+        self.assertTrue(snapshot_exists)
 
     def test_packaged_directory_supervisor_bounds_signal_teardown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2102,7 +2169,7 @@ raise SystemExit(2)
                 SUPERVISOR_MODULE.WAIT_STATUS_UNAVAILABLE,
             )
 
-    def test_packaged_supervisor_fails_before_same_uid_mkdir_open_replacement(
+    def test_packaged_supervisor_returns_bound_directory_under_cooperative_model(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2112,7 +2179,7 @@ raise SystemExit(2)
                 socket.AF_UNIX,
                 socket.SOCK_DGRAM,
             )
-            request_id = "same-uid-mkdir-open-replacement"
+            request_id = "packaged-cooperative-creation"
             parent = os.fstat(parent_fd)
             request = json.dumps(
                 {
@@ -2127,44 +2194,14 @@ raise SystemExit(2)
                 },
                 separators=(",", ":"),
             ).encode("utf-8")
-            original_mkdir = os.mkdir
-            original_open = os.open
-
-            def replace_after_mkdir(
-                name: str,
-                mode: int = 0o777,
-                *,
-                dir_fd: int | None = None,
-            ) -> None:
-                assert dir_fd is not None
-                original_mkdir(name, mode=mode, dir_fd=dir_fd)
-                os.rename(
-                    name,
-                    "attacker-parked-created-object",
-                    src_dir_fd=dir_fd,
-                    dst_dir_fd=dir_fd,
-                )
-                original_mkdir(name, mode=0o700, dir_fd=dir_fd)
-
+            received: list[int] = []
             try:
-                with (
-                    mock.patch.object(
-                        SUPERVISOR_MODULE.os,
-                        "mkdir",
-                        side_effect=replace_after_mkdir,
-                    ) as mkdir,
-                    mock.patch.object(
-                        SUPERVISOR_MODULE.os,
-                        "open",
-                        side_effect=original_open,
-                    ) as open_directory,
-                ):
-                    SUPERVISOR_MODULE._serve_one_request(
-                        server,
-                        request,
-                        [os.dup(parent_fd)],
-                        SUPERVISOR_MODULE.HELPER,
-                    )
+                SUPERVISOR_MODULE._serve_one_request(
+                    server,
+                    request,
+                    [os.dup(parent_fd)],
+                    SUPERVISOR_MODULE.HELPER,
+                )
                 payload, ancillary, flags, _ = client.recvmsg(
                     MODULE.DIRECTORY_CREATOR_MAX_MESSAGE_BYTES,
                     socket.CMSG_SPACE(
@@ -2172,29 +2209,45 @@ raise SystemExit(2)
                         * MODULE.DIRECTORY_CREATOR_MAX_RECEIVED_FDS
                     ),
                 )
+                received = MODULE._received_rights_descriptors(ancillary)
+                self.assertEqual(len(received), 1)
+                response = json.loads(payload.decode("utf-8"))
+                created = os.fstat(received[0])
+                named = os.stat(
+                    response["basename"],
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                root_entries = [entry.name for entry in root.iterdir()]
             finally:
+                MODULE._close_descriptors(received)
                 client.close()
                 server.close()
                 os.close(parent_fd)
-            root_entries = list(root.iterdir())
 
-        mkdir.assert_not_called()
-        open_directory.assert_not_called()
         self.assertEqual(flags, 0)
-        self.assertEqual(MODULE._received_rights_descriptors(ancillary), [])
-        response = json.loads(payload.decode("utf-8"))
+        self.assertEqual(response["schema"], MODULE.DIRECTORY_CREATOR_RESPONSE_SCHEMA)
+        self.assertEqual(response["request_id"], request_id)
+        self.assertEqual(response["status"], "created")
+        self.assertTrue(response["basename"].startswith(".apple-notes-create-"))
+        self.assertEqual(root_entries, [response["basename"]])
+        self.assertTrue(MODULE._same_identity(created, named))
+        self.assertEqual(stat.S_IMODE(created.st_mode), 0o700)
+        self.assertEqual(created.st_uid, os.geteuid())
+        proof = response["proof"]
+        self.assertEqual(proof["schema"], MODULE.DIRECTORY_CREATOR_PROOF_SCHEMA)
         self.assertEqual(
-            response,
-            {
-                "schema": MODULE.DIRECTORY_CREATOR_RESPONSE_SCHEMA,
-                "request_id": request_id,
-                "status": MODULE.DIRECTORY_CREATOR_UNAVAILABLE_STATUS,
-                "basename": None,
-                "proof": None,
-                "details": MODULE._packaged_directory_creator_unavailable_details(),
-            },
+            proof["creation_authority"],
+            MODULE.PACKAGED_DIRECTORY_CREATOR_AUTHORITY,
         )
-        self.assertEqual(root_entries, [])
+        self.assertEqual(
+            proof["creation_method"], MODULE.PACKAGED_DIRECTORY_CREATOR_METHOD
+        )
+        self.assertEqual(
+            proof["threat_model"], MODULE.PACKAGED_DIRECTORY_CREATOR_THREAT_MODEL
+        )
+        self.assertTrue(proof["actual_created_object_descriptor_returned"])
+        self.assertTrue(proof["namespace_race_excluded_by_model"])
 
     def test_creator_cli_safely_publishes_external_result_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3364,6 +3417,72 @@ raise SystemExit(2)
                     [],
                 )
 
+    def test_artifact_creators_revalidate_formal_leaf_at_provider_boundary(
+        self,
+    ) -> None:
+        for operation in ("copy", "stage"):
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths = self._make_paths(root)
+                self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+                source = root / "edited.sqlite"
+                self._create_db(source)
+                destination = root / f"{operation}-artifact"
+                original_verify = MODULE._verify_directory_creation_parent
+                verification_count = 0
+
+                def inject_leaf_inside_creation_window(
+                    *args: object,
+                    **kwargs: object,
+                ) -> None:
+                    nonlocal verification_count
+                    original_verify(*args, **kwargs)
+                    verification_count += 1
+                    if verification_count == 2:
+                        destination.mkdir()
+
+                provider = mock.Mock(
+                    side_effect=AssertionError(
+                        "formal-leaf drift must fail before provider creation"
+                    )
+                )
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_verify_directory_creation_parent",
+                        side_effect=inject_leaf_inside_creation_window,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_IDENTITY_BOUND_DIRECTORY_CREATOR",
+                        provider,
+                    ),
+                    mock.patch.object(MODULE, "notes_is_running", return_value=False),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    if operation == "copy":
+                        MODULE.copy_db(
+                            paths,
+                            dest=destination,
+                            require_notes_quit=False,
+                        )
+                    else:
+                        MODULE.stage_patch(source, destination, paths=paths)
+
+                self.assertGreaterEqual(verification_count, 2)
+                self._assert_safety_code("destination-exists", raised)
+                self.assertFalse(raised.exception.details["mutation_performed"])
+                provider.assert_not_called()
+                self.assertTrue(destination.is_dir())
+                self.assertEqual(list(destination.iterdir()), [])
+                self.assertEqual(
+                    list(root.glob(f".{destination.name}.partial-*")),
+                    [],
+                )
+
     def test_creator_cli_accepts_artifact_created_shared_parent_prefix(
         self,
     ) -> None:
@@ -3702,9 +3821,7 @@ raise SystemExit(2)
                             ),
                             "basename": ".apple-notes-create-\ud800",
                             "proof": {
-                                "schema": (
-                                    "apple-notes-identity-bound-directory-creation/v1"
-                                ),
+                                "schema": MODULE.DIRECTORY_CREATOR_PROOF_SCHEMA,
                                 "creation_authority": "provider\ud800",
                             },
                         },
@@ -5728,7 +5845,7 @@ raise SystemExit(2)
             )
             self.assertIsNone(recovery["creation_proof"])
 
-    def test_packaged_supervisor_capability_failure_is_precreation_end_to_end(
+    def test_packaged_supervisor_creation_is_installed_end_to_end(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5748,6 +5865,7 @@ raise SystemExit(2)
             service = threading.Thread(target=serve_once, daemon=True)
             service.start()
             parent_fd = os.open(root, MODULE._directory_open_flags())
+            installation: MODULE._CreatedDirectoryInstallation | None = None
             try:
                 with (
                     MODULE.directory_creator_supervisor(client.fileno()),
@@ -5756,9 +5874,8 @@ raise SystemExit(2)
                         "_IDENTITY_BOUND_DIRECTORY_CREATOR",
                         MODULE._supervisor_identity_bound_directory_creator,
                     ),
-                    self.assertRaises(MODULE.StoreSafetyError) as raised,
                 ):
-                    MODULE._create_and_install_directory_at(
+                    installation = MODULE._create_and_install_directory_at(
                         parent_fd,
                         os.fstat(parent_fd),
                         "installed",
@@ -5774,36 +5891,33 @@ raise SystemExit(2)
                         collision_code="prepared-directory-identity-mismatch",
                     )
             finally:
+                if installation is not None:
+                    os.close(installation.fd)
                 os.close(parent_fd)
                 client.close()
                 service.join(timeout=10.0)
 
             self.assertFalse(service.is_alive())
             self.assertEqual(service_errors, [])
-            self._assert_safety_code(
-                "directory-creation-identity-inconclusive",
-                raised,
-            )
-            self.assertEqual(list(root.iterdir()), [])
-            details = raised.exception.details
-            self.assertFalse(details["mutation_performed"])
-            self.assertFalse(details["retry_safe"])
-            self.assertEqual(details["cleanup_state"], "not-needed")
+            self.assertIsNotNone(installation)
+            assert installation is not None
+            self.assertEqual([entry.name for entry in root.iterdir()], ["installed"])
+            installed = os.stat(root / "installed", follow_symlinks=False)
+            self.assertTrue(MODULE._same_identity(installation.opened, installed))
+            self.assertEqual(stat.S_IMODE(installed.st_mode), 0o700)
+            proof = installation.receipt["creation_proof"]
             self.assertEqual(
-                details["creation_authority"],
+                proof["creation_authority"],
                 MODULE.PACKAGED_DIRECTORY_CREATOR_AUTHORITY,
             )
-            self.assertEqual(details["provider_install_state"], "not-created")
-            capability = details["recovery_locators"]["packaged_directory_supervisor"]
             self.assertEqual(
-                capability["protected_property"],
-                "exact-created-object-descriptor",
+                proof["threat_model"],
+                MODULE.PACKAGED_DIRECTORY_CREATOR_THREAT_MODEL,
             )
-            self.assertFalse(capability["creation_boundary_entered"])
-            install = details["recovery_locators"]["created_directory_install"]
-            self.assertEqual(install["install_state"], "not-created")
-            self.assertFalse(install["mutation_performed"])
-            self.assertIsNone(install["creation_proof"])
+            self.assertEqual(
+                installation.receipt["directory_entry_durability"]["status"],
+                "verified",
+            )
 
     def test_malformed_precreation_unavailable_response_is_conservative(
         self,
@@ -5941,10 +6055,12 @@ raise SystemExit(2)
                     fd=transferred_fd,
                     opened=opened,
                     proof={
-                        "schema": ("apple-notes-identity-bound-directory-creation/v1"),
+                        "schema": MODULE.DIRECTORY_CREATOR_PROOF_SCHEMA,
                         "creation_authority": "test-create-then-fail-provider",
                         "actual_created_object_descriptor_returned": True,
-                        "namespace_exclusive_during_handoff": True,
+                        "creation_method": "test-controlled-create-and-open",
+                        "threat_model": "test-controlled-namespace",
+                        "namespace_race_excluded_by_model": True,
                         "parent_identity": MODULE._identity(parent),
                         "parent_access_policy": MODULE._access_policy(parent),
                         "directory_identity": MODULE._identity(opened),
@@ -6234,10 +6350,12 @@ raise SystemExit(2)
                     fd=returned_fd,
                     opened=opened,
                     proof={
-                        "schema": ("apple-notes-identity-bound-directory-creation/v1"),
+                        "schema": MODULE.DIRECTORY_CREATOR_PROOF_SCHEMA,
                         "creation_authority": "test-provider-race",
                         "actual_created_object_descriptor_returned": True,
-                        "namespace_exclusive_during_handoff": True,
+                        "creation_method": "test-controlled-create-and-open",
+                        "threat_model": "test-controlled-namespace",
+                        "namespace_race_excluded_by_model": True,
                         "parent_identity": MODULE._identity(parent),
                         "parent_access_policy": MODULE._access_policy(parent),
                         "directory_identity": MODULE._identity(opened),
@@ -10566,6 +10684,119 @@ raise SystemExit(2)
                     self.assertEqual(len(retained_names), 1)
                     self.assertTrue((root / retained_names[0]).is_file())
 
+    def test_exclusive_writers_close_and_retain_leaf_when_first_fstat_fails(
+        self,
+    ) -> None:
+        for writer in ("copy", "manifest", "standalone"):
+            with (
+                self.subTest(writer=writer),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                source = root / "source.bin"
+                source.write_bytes(b"source-payload")
+                destination = root / f"{writer}.output"
+                original_open = MODULE.os.open
+                original_fstat = MODULE.os.fstat
+                writer_fd: int | None = None
+                failed_first_fstat = False
+
+                def record_exclusive_open(
+                    selected: object,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal writer_fd
+                    if dir_fd is None:
+                        opened_fd = original_open(selected, flags, mode)
+                    else:
+                        opened_fd = original_open(
+                            selected,
+                            flags,
+                            mode,
+                            dir_fd=dir_fd,
+                        )
+                    if flags & os.O_CREAT and flags & os.O_EXCL:
+                        self.assertIsNone(writer_fd)
+                        writer_fd = opened_fd
+                    return opened_fd
+
+                def fail_first_created_descriptor_stat(fd: int) -> os.stat_result:
+                    nonlocal failed_first_fstat
+                    if fd == writer_fd and not failed_first_fstat:
+                        failed_first_fstat = True
+                        raise OSError(errno.EIO, "simulated first fstat failure")
+                    return original_fstat(fd)
+
+                with MODULE._bind_existing_directory(root) as binding:
+                    source_fd = os.open(source, os.O_RDONLY)
+                    try:
+                        with (
+                            mock.patch.object(
+                                MODULE.os,
+                                "open",
+                                side_effect=record_exclusive_open,
+                            ),
+                            mock.patch.object(
+                                MODULE.os,
+                                "fstat",
+                                side_effect=fail_first_created_descriptor_stat,
+                            ),
+                            mock.patch.object(MODULE, "_write_all") as write_all,
+                            self.assertRaises(MODULE.StoreSafetyError) as raised,
+                        ):
+                            if writer == "copy":
+                                MODULE._copy_fd(
+                                    source_fd,
+                                    destination,
+                                    destination_binding=binding,
+                                )
+                            elif writer == "manifest":
+                                MODULE._write_json_atomic(
+                                    destination,
+                                    {"status": "not-written"},
+                                    parent_binding=binding,
+                                )
+                            else:
+                                MODULE._write_standalone_backup_payload(
+                                    b"not-written",
+                                    destination,
+                                    destination_binding=binding,
+                                )
+                    finally:
+                        os.close(source_fd)
+
+                self.assertTrue(failed_first_fstat)
+                self.assertIsNotNone(writer_fd)
+                assert writer_fd is not None
+                with self.assertRaises(OSError) as closed:
+                    original_fstat(writer_fd)
+                self.assertEqual(closed.exception.errno, errno.EBADF)
+                write_all.assert_not_called()
+                self._assert_safety_code(
+                    "prepared-file-revalidation-inconclusive",
+                    raised,
+                )
+                details = raised.exception.details
+                self.assertTrue(details["mutation_performed"])
+                self.assertFalse(details["retry_safe"])
+                self.assertEqual(
+                    details["cleanup_state"],
+                    "preserved-or-incomplete",
+                )
+                locator = details["recovery_locators"]["descriptor_bound_prepared_file"]
+                self.assertEqual(locator["creation_receipt_status"], "unavailable")
+                self.assertNotIn("created_identity", locator)
+                retained_names = [
+                    name
+                    for name, observation in locator["namespace_observations"].items()
+                    if observation["status"] == "present"
+                ]
+                self.assertEqual(len(retained_names), 1)
+                self.assertTrue((root / retained_names[0]).is_file())
+
     def test_copy_rejects_chmod_during_write_against_creation_policy(
         self,
     ) -> None:
@@ -13641,6 +13872,47 @@ raise SystemExit(2)
                     )
                 ]
         self.assertEqual(values, ["checkpointed", "wal-only"])
+
+    def test_bound_regular_backup_dispatch_never_rediscovers_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "validated.sqlite"
+            output = root / "output.sqlite"
+            self._create_db(source)
+            callback = mock.Mock()
+            expected = {"dispatch": "descriptor-bound-standalone"}
+            with MODULE._bind_regular_file(
+                source,
+                MODULE.PREPARED_FILE_CODES,
+            ) as bound:
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_backup_bound_regular_to_standalone",
+                        return_value=expected,
+                    ) as descriptor_backup,
+                    mock.patch.object(
+                        MODULE,
+                        "_bind_recovery_store",
+                        side_effect=AssertionError(
+                            "bound standalone input must not rediscover sidecars"
+                        ),
+                    ) as rediscover,
+                ):
+                    result = MODULE._backup_sqlite_to_standalone(
+                        bound,
+                        output,
+                        pre_temp_create=callback,
+                    )
+
+            self.assertIs(result, expected)
+            descriptor_backup.assert_called_once_with(
+                bound,
+                output,
+                destination_binding=None,
+                pre_temp_create=callback,
+            )
+            rediscover.assert_not_called()
 
     def test_wal_header_rejects_database_header_page_size_sentinel(self) -> None:
         prefix = struct.pack(
@@ -21205,6 +21477,860 @@ raise SystemExit(2)
                     )
         self._assert_safety_code("post-writeback-access-policy-mismatch", raised)
 
+    def test_snapshot_v4_records_complete_live_source_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            edited = root / "edited.sqlite"
+            self._create_db(edited, value="edited")
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=True,
+                )
+            stage = self._stage_patch(edited, root / "stage")
+            manifest = json.loads(
+                Path(snapshot["manifest"]).read_text(encoding="utf-8")
+            )
+            patch_manifest = json.loads(
+                Path(stage["manifest"]).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(manifest["schema"], "apple-notes-snapshot/v4")
+        self.assertEqual(patch_manifest["schema"], "apple-notes-patch/v3")
+        binding = manifest["source_binding"]
+        self.assertEqual(
+            set(binding),
+            {
+                "schema",
+                "source_root",
+                "directory_identity",
+                "directory_access_policy",
+                "component_path_binding",
+                "trusted_alias_binding",
+            },
+        )
+        self.assertEqual(
+            binding["schema"],
+            "apple-notes-live-source-binding/v1",
+        )
+        self.assertEqual(binding["source_root"], str(paths.group_container))
+        self.assertEqual(
+            set(binding["directory_identity"]),
+            {"device", "inode", "file_type"},
+        )
+        self.assertEqual(
+            set(binding["directory_access_policy"]),
+            {"mode", "uid", "gid", "flags"},
+        )
+        component_binding = binding["component_path_binding"]
+        self.assertEqual(
+            component_binding["protected_properties"],
+            {
+                "object_identity": ["device", "inode", "file_type"],
+                "access_policy": ["mode", "uid", "gid", "flags"],
+                "link_policy": "no-symlink-or-reparse-component",
+            },
+        )
+        components = component_binding["components"]
+        _, canonical_root, alias_spec = MODULE._trusted_alias_paths(
+            paths.group_container
+        )
+        self.assertEqual(components[0]["path"], "/")
+        self.assertEqual(components[-1]["path"], str(canonical_root))
+        for previous, current in zip(components, components[1:]):
+            self.assertEqual(Path(current["path"]).parent, Path(previous["path"]))
+        for row in components:
+            self.assertEqual(set(row), {"path", "identity", "access_policy"})
+            self.assertEqual(
+                set(row["identity"]),
+                {"device", "inode", "file_type"},
+            )
+            self.assertEqual(
+                set(row["access_policy"]),
+                {"mode", "uid", "gid", "flags"},
+            )
+        serialized_binding = json.dumps(binding, sort_keys=True)
+        for report_only_field in (
+            "metadata",
+            "mtime_ns",
+            "ctime_ns",
+            "link_count",
+            "platform_flags",
+        ):
+            self.assertNotIn(f'"{report_only_field}"', serialized_binding)
+        alias_binding = binding["trusted_alias_binding"]
+        if alias_spec is None:
+            self.assertIsNone(alias_binding)
+        else:
+            self.assertIsInstance(alias_binding, dict)
+            assert isinstance(alias_binding, dict)
+            self.assertEqual(alias_binding["alias"], str(alias_spec[0]))
+            self.assertEqual(
+                alias_binding["canonical_target"],
+                str(alias_spec[1]),
+            )
+            self.assertEqual(
+                alias_binding["schema"],
+                "apple-notes-registered-darwin-alias-binding/v1",
+            )
+
+    def test_writeback_rejects_v3_snapshot_without_live_source_binding(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths, _, backup_dir, stage_dir = self._prepare_writeback_fixture(
+                root,
+                install_stage=False,
+            )
+            manifest_path = backup_dir / MODULE.SNAPSHOT_MANIFEST
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["schema"] = "apple-notes-snapshot/v3"
+            manifest.pop("source_binding")
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            self._reanchor_manifest_for_test(
+                backup_dir,
+                artifact_kind="snapshot",
+            )
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                for operation in ("preflight", "verify"):
+                    with (
+                        self.subTest(operation=operation),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        if operation == "preflight":
+                            self._preflight_writeback(
+                                paths,
+                                backup_dir=backup_dir,
+                                stage_dir=stage_dir,
+                            )
+                        else:
+                            self._verify_writeback(
+                                paths,
+                                backup_dir=backup_dir,
+                                stage_dir=stage_dir,
+                            )
+                    self._assert_safety_code("manifest-schema-mismatch", raised)
+
+    def test_snapshot_v4_rejects_reanchored_malformed_source_binding(self) -> None:
+        for malformed_kind in (
+            "component-schema-wrapper",
+            "component-extra-field",
+            "alias-missing-schema",
+            "source-binding-extra-field",
+        ):
+            with (
+                self.subTest(malformed=malformed_kind),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                _, _, backup_dir, _ = self._prepare_writeback_fixture(
+                    root,
+                    install_stage=False,
+                )
+                manifest_path = backup_dir / MODULE.SNAPSHOT_MANIFEST
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                binding = manifest["source_binding"]
+                if malformed_kind == "component-schema-wrapper":
+                    binding["component_path_binding"] = {
+                        "schema": "evil-component-path-binding/v1",
+                        "component_path_binding": binding["component_path_binding"],
+                    }
+                elif malformed_kind == "component-extra-field":
+                    binding["component_path_binding"]["components"][0]["unexpected"] = (
+                        True
+                    )
+                elif malformed_kind == "alias-missing-schema":
+                    binding["trusted_alias_binding"] = {}
+                else:
+                    binding["unexpected"] = True
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                self._reanchor_manifest_for_test(
+                    backup_dir,
+                    artifact_kind="snapshot",
+                )
+
+                with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                    self._validate_snapshot(backup_dir)
+                self._assert_safety_code("manifest-invalid", raised)
+
+    def test_writeback_rejects_malformed_snapshot_source_hash_and_size(
+        self,
+    ) -> None:
+        malformed_values = (
+            ("sha256", 7),
+            ("sha256", "A" * 64),
+            ("size", True),
+            ("size", -1),
+        )
+        for field, malformed_value in malformed_values:
+            with (
+                self.subTest(field=field, value=repr(malformed_value)),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths, _, backup_dir, stage_dir = self._prepare_writeback_fixture(
+                    root,
+                    install_stage=False,
+                )
+                manifest_path = backup_dir / MODULE.SNAPSHOT_MANIFEST
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest["files"][0]["source"][field] = malformed_value
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                self._reanchor_manifest_for_test(
+                    backup_dir,
+                    artifact_kind="snapshot",
+                )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    self._preflight_writeback(
+                        paths,
+                        backup_dir=backup_dir,
+                        stage_dir=stage_dir,
+                    )
+                self._assert_safety_code("manifest-invalid", raised)
+
+    def test_writeback_joint_revalidation_catches_cross_input_replacement(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "backup",
+                "_validated_snapshot_artifact",
+                "backup",
+                "snapshot-directory-identity-mismatch",
+            ),
+            (
+                "stage",
+                "_validated_snapshot_artifact",
+                "stage",
+                "stage-directory-identity-mismatch",
+            ),
+            (
+                "live",
+                "_validated_patch_stage_artifact",
+                "live",
+                "source-identity-mismatch",
+            ),
+        )
+        for operation in ("preflight", "verify"):
+            for injection_kind, helper_name, target_kind, expected_code in cases:
+                with (
+                    self.subTest(operation=operation, injection=injection_kind),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    root = Path(temp_dir)
+                    paths, _, backup_dir, stage_dir = self._prepare_writeback_fixture(
+                        root,
+                        install_stage=operation == "verify",
+                    )
+                    target = {
+                        "backup": backup_dir,
+                        "stage": stage_dir,
+                        "live": paths.group_container,
+                    }[target_kind]
+                    parked = root / f"parked-{target_kind}"
+                    original_helper = getattr(MODULE, helper_name)
+                    replaced = False
+
+                    @contextmanager
+                    def replace_during_joint_revalidation(
+                        *args: object,
+                        **kwargs: object,
+                    ) -> Iterator[object]:
+                        nonlocal replaced
+                        with original_helper(*args, **kwargs) as artifact:
+                            original_revalidate = artifact.revalidate_artifact
+
+                            def revalidate_with_replacement() -> None:
+                                nonlocal replaced
+                                if not replaced:
+                                    target.rename(parked)
+                                    target.mkdir(mode=0o700)
+                                    replaced = True
+                                original_revalidate()
+
+                            yield replace(
+                                artifact,
+                                revalidate_artifact=revalidate_with_replacement,
+                            )
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            helper_name,
+                            side_effect=replace_during_joint_revalidation,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "notes_is_running",
+                            return_value=False,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        if operation == "preflight":
+                            self._preflight_writeback(
+                                paths,
+                                backup_dir=backup_dir,
+                                stage_dir=stage_dir,
+                            )
+                        else:
+                            self._verify_writeback(
+                                paths,
+                                backup_dir=backup_dir,
+                                stage_dir=stage_dir,
+                            )
+
+                    self.assertTrue(replaced)
+                    self._assert_safety_code(expected_code, raised)
+
+    def test_writeback_joint_success_has_close_only_teardown(self) -> None:
+        for operation in ("preflight", "verify"):
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths, _, backup_dir, stage_dir = self._prepare_writeback_fixture(
+                    root,
+                    install_stage=operation == "verify",
+                )
+                post_joint = False
+                original_mark = (
+                    MODULE._WritebackLinearizedTransaction.mark_joint_success
+                )
+                original_stat = MODULE.os.stat
+                original_fstat = MODULE.os.fstat
+                original_readlink = MODULE.os.readlink
+
+                def mark_joint_success(
+                    transaction: MODULE._WritebackLinearizedTransaction,
+                ) -> None:
+                    nonlocal post_joint
+                    original_mark(transaction)
+                    post_joint = True
+
+                def reject_post_joint_read(
+                    operation_name: str,
+                    original: Callable[..., object],
+                ) -> Callable[..., object]:
+                    def checked(*args: object, **kwargs: object) -> object:
+                        if post_joint:
+                            raise AssertionError(
+                                f"filesystem read after joint success: {operation_name}"
+                            )
+                        return original(*args, **kwargs)
+
+                    return checked
+
+                with (
+                    mock.patch.object(
+                        MODULE._WritebackLinearizedTransaction,
+                        "mark_joint_success",
+                        mark_joint_success,
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "stat",
+                        side_effect=reject_post_joint_read("stat", original_stat),
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "fstat",
+                        side_effect=reject_post_joint_read("fstat", original_fstat),
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "readlink",
+                        side_effect=reject_post_joint_read(
+                            "readlink",
+                            original_readlink,
+                        ),
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ),
+                ):
+                    if operation == "preflight":
+                        result = self._preflight_writeback(
+                            paths,
+                            backup_dir=backup_dir,
+                            stage_dir=stage_dir,
+                        )
+                        self.assertTrue(result["ready_for_explicit_writeback"])
+                    else:
+                        result = self._verify_writeback(
+                            paths,
+                            backup_dir=backup_dir,
+                            stage_dir=stage_dir,
+                        )
+                        self.assertTrue(result["writeback_verified"])
+                self.assertTrue(post_joint)
+
+    def test_writeback_rejects_notes_start_before_joint_success(self) -> None:
+        for operation, expected_code in (
+            ("preflight", "notes-started-during-preflight"),
+            ("verify", "notes-started-during-verification"),
+        ):
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths, _, backup_dir, stage_dir = self._prepare_writeback_fixture(
+                    root,
+                    install_stage=operation == "verify",
+                )
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        side_effect=(False, True),
+                    ) as notes_probe,
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    if operation == "preflight":
+                        self._preflight_writeback(
+                            paths,
+                            backup_dir=backup_dir,
+                            stage_dir=stage_dir,
+                        )
+                    else:
+                        self._verify_writeback(
+                            paths,
+                            backup_dir=backup_dir,
+                            stage_dir=stage_dir,
+                        )
+                self.assertEqual(notes_probe.call_count, 2)
+                self._assert_safety_code(expected_code, raised)
+
+    def test_writeback_rejects_replaced_group_with_same_live_file_inode(
+        self,
+    ) -> None:
+        for operation in ("preflight", "verify"):
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths, live, backup_dir, stage_dir = self._prepare_writeback_fixture(
+                    root,
+                    install_stage=operation == "verify",
+                )
+                live_identity = MODULE._identity(live.stat())
+                group_mode = stat.S_IMODE(paths.group_container.stat().st_mode)
+                parked = root / "parked-group"
+                paths.group_container.rename(parked)
+                paths.group_container.mkdir(mode=group_mode)
+                paths.group_container.chmod(group_mode)
+                (parked / MODULE.NOTE_STORE_MAIN).rename(live)
+                self.assertEqual(MODULE._identity(live.stat()), live_identity)
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    if operation == "preflight":
+                        self._preflight_writeback(
+                            paths,
+                            backup_dir=backup_dir,
+                            stage_dir=stage_dir,
+                        )
+                    else:
+                        self._verify_writeback(
+                            paths,
+                            backup_dir=backup_dir,
+                            stage_dir=stage_dir,
+                        )
+                self._assert_safety_code("baseline-identity-mismatch", raised)
+
+    def test_writeback_rejects_group_container_access_policy_drift(self) -> None:
+        for operation in ("preflight", "verify"):
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths, _, backup_dir, stage_dir = self._prepare_writeback_fixture(
+                    root,
+                    install_stage=operation == "verify",
+                )
+                baseline_mode = stat.S_IMODE(paths.group_container.stat().st_mode)
+                changed_mode = 0o700 if baseline_mode != 0o700 else 0o750
+                paths.group_container.chmod(changed_mode)
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    if operation == "preflight":
+                        self._preflight_writeback(
+                            paths,
+                            backup_dir=backup_dir,
+                            stage_dir=stage_dir,
+                        )
+                    else:
+                        self._verify_writeback(
+                            paths,
+                            backup_dir=backup_dir,
+                            stage_dir=stage_dir,
+                        )
+                self._assert_safety_code(
+                    "baseline-access-policy-mismatch",
+                    raised,
+                )
+
+    def test_writeback_allows_benign_group_container_child_churn(self) -> None:
+        for operation in ("preflight", "verify"):
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                paths, _, backup_dir, stage_dir = self._prepare_writeback_fixture(
+                    root,
+                    install_stage=operation == "verify",
+                )
+                transient_file = paths.group_container / "unrelated-file"
+                transient_directory = paths.group_container / "unrelated-directory"
+                transient_file.write_bytes(b"transient")
+                transient_file.unlink()
+                transient_directory.mkdir()
+                with mock.patch.object(
+                    MODULE,
+                    "notes_is_running",
+                    return_value=False,
+                ):
+                    if operation == "preflight":
+                        result = self._preflight_writeback(
+                            paths,
+                            backup_dir=backup_dir,
+                            stage_dir=stage_dir,
+                        )
+                        self.assertTrue(result["ready_for_explicit_writeback"])
+                    else:
+                        result = self._verify_writeback(
+                            paths,
+                            backup_dir=backup_dir,
+                            stage_dir=stage_dir,
+                        )
+                        self.assertTrue(result["writeback_verified"])
+                self.assertTrue(transient_directory.is_dir())
+                transient_directory.rmdir()
+
+    def test_writeback_binds_nonterminal_live_ancestor_properties(self) -> None:
+        for operation in ("preflight", "verify"):
+            for mutation, expected_code in (
+                ("identity", "baseline-identity-mismatch"),
+                ("access-policy", "baseline-access-policy-mismatch"),
+            ):
+                with (
+                    self.subTest(operation=operation, mutation=mutation),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    root = Path(temp_dir)
+                    live_parent = root / "live-parent"
+                    live_parent.mkdir()
+                    group = live_parent / "group"
+                    group.mkdir()
+                    app = root / "app"
+                    app.mkdir()
+                    paths = MODULE.NoteStorePaths(
+                        group_container=group,
+                        app_container=app,
+                    )
+                    paths, live, backup_dir, stage_dir = (
+                        self._prepare_writeback_fixture(
+                            root,
+                            install_stage=operation == "verify",
+                            paths=paths,
+                        )
+                    )
+                    group_identity = MODULE._identity(group.stat())
+                    live_identity = MODULE._identity(live.stat())
+                    if mutation == "identity":
+                        parent_mode = stat.S_IMODE(live_parent.stat().st_mode)
+                        parked = root / "parked-live-parent"
+                        live_parent.rename(parked)
+                        live_parent.mkdir(mode=parent_mode)
+                        live_parent.chmod(parent_mode)
+                        (parked / "group").rename(group)
+                        self.assertEqual(MODULE._identity(group.stat()), group_identity)
+                        self.assertEqual(MODULE._identity(live.stat()), live_identity)
+                    else:
+                        baseline_mode = stat.S_IMODE(live_parent.stat().st_mode)
+                        changed_mode = 0o700 if baseline_mode != 0o700 else 0o750
+                        live_parent.chmod(changed_mode)
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "notes_is_running",
+                            return_value=False,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        if operation == "preflight":
+                            self._preflight_writeback(
+                                paths,
+                                backup_dir=backup_dir,
+                                stage_dir=stage_dir,
+                            )
+                        else:
+                            self._verify_writeback(
+                                paths,
+                                backup_dir=backup_dir,
+                                stage_dir=stage_dir,
+                            )
+                    self._assert_safety_code(expected_code, raised)
+
+    def test_writeback_allows_nonterminal_live_ancestor_sibling_churn(
+        self,
+    ) -> None:
+        for operation in ("preflight", "verify"):
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                live_parent = root / "live-parent"
+                live_parent.mkdir()
+                group = live_parent / "group"
+                group.mkdir()
+                app = root / "app"
+                app.mkdir()
+                paths = MODULE.NoteStorePaths(
+                    group_container=group,
+                    app_container=app,
+                )
+                paths, _, backup_dir, stage_dir = self._prepare_writeback_fixture(
+                    root,
+                    install_stage=operation == "verify",
+                    paths=paths,
+                )
+                sibling = live_parent / "unrelated-sibling"
+                sibling.mkdir()
+                with mock.patch.object(
+                    MODULE,
+                    "notes_is_running",
+                    return_value=False,
+                ):
+                    if operation == "preflight":
+                        result = self._preflight_writeback(
+                            paths,
+                            backup_dir=backup_dir,
+                            stage_dir=stage_dir,
+                        )
+                        self.assertTrue(result["ready_for_explicit_writeback"])
+                    else:
+                        result = self._verify_writeback(
+                            paths,
+                            backup_dir=backup_dir,
+                            stage_dir=stage_dir,
+                        )
+                        self.assertTrue(result["writeback_verified"])
+                self.assertTrue(sibling.is_dir())
+
+    def test_writeback_binds_registered_alias_entry_identity(self) -> None:
+        for operation in ("preflight", "verify"):
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir).resolve()
+                canonical = root / "canonical"
+                canonical.mkdir()
+                alias = root / "alias"
+                alias.symlink_to(canonical, target_is_directory=True)
+                group = canonical / "group"
+                group.mkdir()
+                app = root / "app"
+                app.mkdir()
+                paths = MODULE.NoteStorePaths(
+                    group_container=alias / "group",
+                    app_container=app,
+                )
+                alias_registry = ((alias, canonical),)
+                with mock.patch.object(
+                    MODULE,
+                    "_trusted_directory_alias_registry",
+                    return_value=alias_registry,
+                ):
+                    paths, _, backup_dir, stage_dir = self._prepare_writeback_fixture(
+                        root,
+                        install_stage=operation == "verify",
+                        paths=paths,
+                    )
+                    with mock.patch.object(
+                        MODULE,
+                        "notes_is_running",
+                        return_value=False,
+                    ):
+                        if operation == "preflight":
+                            accepted = self._preflight_writeback(
+                                paths,
+                                backup_dir=backup_dir,
+                                stage_dir=stage_dir,
+                            )
+                            self.assertTrue(accepted["ready_for_explicit_writeback"])
+                        else:
+                            accepted = self._verify_writeback(
+                                paths,
+                                backup_dir=backup_dir,
+                                stage_dir=stage_dir,
+                            )
+                            self.assertTrue(accepted["writeback_verified"])
+
+                    alias.unlink()
+                    alias.symlink_to(canonical, target_is_directory=True)
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "notes_is_running",
+                            return_value=False,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        if operation == "preflight":
+                            self._preflight_writeback(
+                                paths,
+                                backup_dir=backup_dir,
+                                stage_dir=stage_dir,
+                            )
+                        else:
+                            self._verify_writeback(
+                                paths,
+                                backup_dir=backup_dir,
+                                stage_dir=stage_dir,
+                            )
+                self._assert_safety_code("baseline-identity-mismatch", raised)
+
+    def test_writeback_terminal_live_revalidation_preserves_taxonomy(self) -> None:
+        profiles = (
+            (
+                "missing",
+                "prepared-directory-identity-mismatch",
+                FileNotFoundError(errno.ENOENT, "simulated missing source"),
+                "source-missing-after-read",
+            ),
+            (
+                "unreadable",
+                "prepared-directory-revalidation-inconclusive",
+                PermissionError(errno.EACCES, "simulated unreadable source"),
+                "source-revalidation-unreadable",
+            ),
+            (
+                "inconclusive",
+                "prepared-directory-revalidation-inconclusive",
+                OSError(errno.EIO, "simulated source revalidation failure"),
+                "source-revalidation-inconclusive",
+            ),
+        )
+        for operation in ("preflight", "verify"):
+            for fault_name, generic_code, causal_error, expected_code in profiles:
+                with (
+                    self.subTest(operation=operation, fault=fault_name),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    root = Path(temp_dir)
+                    paths, live, backup_dir, stage_dir = (
+                        self._prepare_writeback_fixture(
+                            root,
+                            install_stage=operation == "verify",
+                        )
+                    )
+                    original_compare = MODULE._compare_live_source_binding
+                    original_verify_directory = MODULE._verify_bound_directory_namespace
+                    joint_live_revalidation = False
+                    fault_injected = False
+
+                    def mark_joint_live_revalidation(
+                        store: MODULE._BoundSourceStore,
+                        manifest: dict[str, object],
+                    ) -> dict[str, object]:
+                        nonlocal joint_live_revalidation
+                        joint_live_revalidation = True
+                        try:
+                            return original_compare(store, manifest)
+                        finally:
+                            joint_live_revalidation = False
+
+                    def fail_joint_live_directory_revalidation(
+                        binding: MODULE._BoundDirectory,
+                    ) -> dict[str, object]:
+                        nonlocal fault_injected
+                        if (
+                            joint_live_revalidation
+                            and not fault_injected
+                            and binding.path == live.parent
+                        ):
+                            fault_injected = True
+                            try:
+                                raise causal_error
+                            except OSError as cause:
+                                raise MODULE.StoreSafetyError(
+                                    generic_code,
+                                    "simulated generic live-source joint "
+                                    "revalidation failure",
+                                ) from cause
+                        return original_verify_directory(binding)
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_compare_live_source_binding",
+                            side_effect=mark_joint_live_revalidation,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_verify_bound_directory_namespace",
+                            side_effect=fail_joint_live_directory_revalidation,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "notes_is_running",
+                            return_value=False,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        if operation == "preflight":
+                            self._preflight_writeback(
+                                paths,
+                                backup_dir=backup_dir,
+                                stage_dir=stage_dir,
+                            )
+                        else:
+                            self._verify_writeback(
+                                paths,
+                                backup_dir=backup_dir,
+                                stage_dir=stage_dir,
+                            )
+
+                    self.assertTrue(fault_injected)
+                    self._assert_safety_code(expected_code, raised)
+                    self.assertFalse(
+                        raised.exception.code.startswith("prepared-directory-")
+                    )
+
     def test_recovery_validation_and_publication_use_no_named_temp_directories(
         self,
     ) -> None:
@@ -21449,44 +22575,323 @@ raise SystemExit(2)
     def test_query_note_tags_reads_expected_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "notes.sqlite"
-            with closing(sqlite3.connect(db_path)) as conn:
-                conn.execute(
-                    """
-                    CREATE TABLE ZICCLOUDSYNCINGOBJECT (
-                        Z_PK INTEGER PRIMARY KEY,
-                        ZIDENTIFIER TEXT,
-                        ZTITLE1 TEXT,
-                        ZNOTEDATA INTEGER,
-                        ZNOTE1 INTEGER,
-                        ZALTTEXT TEXT,
-                        ZTOKENCONTENTIDENTIFIER TEXT,
-                        ZTYPEUTI1 TEXT
-                    )
-                    """
-                )
-                conn.execute(
-                    """
-                    INSERT INTO ZICCLOUDSYNCINGOBJECT
-                    (Z_PK, ZIDENTIFIER, ZTITLE1, ZNOTEDATA)
-                    VALUES (1677, 'note-id', '2026.03.06 (Fri) Example Note', 653)
-                    """
-                )
-                conn.execute(
-                    """
-                    INSERT INTO ZICCLOUDSYNCINGOBJECT
-                    (Z_PK, ZIDENTIFIER, ZNOTE1, ZALTTEXT, ZTOKENCONTENTIDENTIFIER, ZTYPEUTI1)
-                    VALUES
-                    (1686, 'tag-id-1', 1677, '#example-tag-one', 'example-tag-one', 'com.apple.notes.inlinetextattachment.hashtag'),
-                    (1687, 'tag-id-2', 1677, '#example-tag-two', 'example-tag-two', 'com.apple.notes.inlinetextattachment.hashtag')
-                    """
-                )
-                conn.commit()
-            result = MODULE.query_note_tags(db_path, "2026.03.06 (Fri) Example Note")
+            note_title = self._create_note_tags_db(db_path)
+            with mock.patch.object(
+                MODULE.sqlite3,
+                "connect",
+                side_effect=AssertionError(
+                    "note-tags must not reopen the mutable database path"
+                ),
+            ) as path_connect:
+                result = MODULE.query_note_tags(db_path, note_title)
             self.assertEqual(result["note"]["pk"], 1677)
             self.assertEqual(
                 [row["tag_text"] for row in result["tags"]],
                 ["#example-tag-one", "#example-tag-two"],
             )
+            path_connect.assert_not_called()
+
+    def test_query_note_tags_rejects_symlink_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database = root / "notes.sqlite"
+            note_title = self._create_note_tags_db(database)
+            link = root / "linked.sqlite"
+            link.symlink_to(database.name)
+
+            with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                MODULE.query_note_tags(link, note_title)
+
+        self._assert_safety_code("source-identity-mismatch", raised)
+
+    def test_query_note_tags_rejects_replacement_after_held_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database = root / "notes.sqlite"
+            note_title = self._create_note_tags_db(database)
+            original_query = MODULE._native_sqlite_query_rows
+            query_count = 0
+
+            def replace_after_first_query(
+                *args: object,
+                **kwargs: object,
+            ) -> list[list[str | None]]:
+                nonlocal query_count
+                rows = original_query(*args, **kwargs)
+                query_count += 1
+                if query_count == 1:
+                    replacement = root / "replacement.sqlite"
+                    replacement.write_bytes(database.read_bytes())
+                    replacement.chmod(0o600)
+                    os.replace(replacement, database)
+                return rows
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_native_sqlite_query_rows",
+                    side_effect=replace_after_first_query,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.query_note_tags(database, note_title)
+
+        self._assert_safety_code("source-identity-mismatch", raised)
+
+    def test_query_note_tags_rejects_in_place_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database = root / "notes.sqlite"
+            note_title = self._create_note_tags_db(database)
+            original_query = MODULE._native_sqlite_query_rows
+            query_count = 0
+
+            def mutate_after_first_query(
+                *args: object,
+                **kwargs: object,
+            ) -> list[list[str | None]]:
+                nonlocal query_count
+                rows = original_query(*args, **kwargs)
+                query_count += 1
+                if query_count == 1:
+                    payload = database.read_bytes()
+                    offset = payload.index(b"example-tag-one")
+                    with database.open("r+b") as handle:
+                        handle.seek(offset)
+                        handle.write(b"Example-tag-one")
+                return rows
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_native_sqlite_query_rows",
+                    side_effect=mutate_after_first_query,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.query_note_tags(database, note_title)
+
+        self._assert_safety_code("source-content-mismatch", raised)
+
+    def test_query_note_tags_rejects_mode_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database = root / "notes.sqlite"
+            note_title = self._create_note_tags_db(database)
+            original_query = MODULE._native_sqlite_query_rows
+            query_count = 0
+
+            def chmod_after_first_query(
+                *args: object,
+                **kwargs: object,
+            ) -> list[list[str | None]]:
+                nonlocal query_count
+                rows = original_query(*args, **kwargs)
+                query_count += 1
+                if query_count == 1:
+                    database.chmod(0o400)
+                return rows
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_native_sqlite_query_rows",
+                    side_effect=chmod_after_first_query,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.query_note_tags(database, note_title)
+
+        self._assert_safety_code("source-access-policy-mismatch", raised)
+
+    def test_query_note_tags_terminally_revalidates_after_sqlite_setup_failure(
+        self,
+    ) -> None:
+        attacks = (
+            ("replacement", "source-identity-mismatch"),
+            ("content", "source-content-mismatch"),
+            ("access", "source-access-policy-mismatch"),
+        )
+        for attack, expected_code in attacks:
+            with (
+                self.subTest(attack=attack),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                database = root / "notes.sqlite"
+                note_title = self._create_note_tags_db(database)
+
+                def fail_sqlite_setup(*_args: object, **_kwargs: object) -> None:
+                    if attack == "replacement":
+                        replacement = root / "replacement.sqlite"
+                        replacement.write_bytes(database.read_bytes())
+                        replacement.chmod(0o600)
+                        os.replace(replacement, database)
+                    elif attack == "content":
+                        payload = database.read_bytes()
+                        offset = payload.index(b"example-tag-one")
+                        with database.open("r+b") as handle:
+                            handle.seek(offset)
+                            handle.write(b"Example-tag-one")
+                    else:
+                        database.chmod(0o400)
+                    raise MODULE.StoreSafetyError(
+                        "note-tags-query-failed",
+                        "simulated native SQLite setup failure",
+                    )
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_load_native_sqlite_api",
+                        side_effect=fail_sqlite_setup,
+                    ),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE.query_note_tags(database, note_title)
+
+                self._assert_safety_code(expected_code, raised)
+                secondary = raised.exception.details[
+                    "note_tags_query_secondary_failure"
+                ]
+                self.assertEqual(
+                    secondary["error_code"],
+                    "note-tags-query-failed",
+                )
+
+    def test_query_note_tags_rejects_standalone_sidecars(self) -> None:
+        for suffix in ("-wal", "-shm", "-journal"):
+            with (
+                self.subTest(suffix=suffix),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                database = root / "notes.sqlite"
+                note_title = self._create_note_tags_db(database)
+                database.with_name(f"{database.name}{suffix}").write_bytes(b"sidecar")
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_deserialized_sqlite_image",
+                        side_effect=AssertionError(
+                            "sidecars must be rejected before SQLite consumption"
+                        ),
+                    ) as deserialize,
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE.query_note_tags(database, note_title)
+
+                self._assert_safety_code("note-tags-sidecar-present", raised)
+                deserialize.assert_not_called()
+
+    def test_query_note_tags_rejects_sidecar_as_database_input(self) -> None:
+        for suffix in ("-wal", "-shm", "-journal", "-WAL", "-SHM", "-JOURNAL"):
+            with self.subTest(suffix=suffix):
+                with self.assertRaises(MODULE.StoreSafetyError) as raised:
+                    MODULE.query_note_tags(
+                        Path(f"/private/tmp/standalone.sqlite{suffix}"),
+                        "Example",
+                    )
+                self._assert_safety_code("note-tags-sidecar-input", raised)
+
+    def test_query_note_tags_rejects_sidecar_appearing_during_query(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database = root / "notes.sqlite"
+            note_title = self._create_note_tags_db(database)
+            original_query = MODULE._native_sqlite_query_rows
+            query_count = 0
+
+            def add_sidecar_after_first_query(
+                *args: object,
+                **kwargs: object,
+            ) -> list[list[str | None]]:
+                nonlocal query_count
+                rows = original_query(*args, **kwargs)
+                query_count += 1
+                if query_count == 1:
+                    database.with_name(f"{database.name}-wal").write_bytes(b"late")
+                return rows
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_native_sqlite_query_rows",
+                    side_effect=add_sidecar_after_first_query,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.query_note_tags(database, note_title)
+
+        self._assert_safety_code("note-tags-sidecar-present", raised)
+
+    def test_query_note_tags_second_pass_catches_late_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database = root / "notes.sqlite"
+            note_title = self._create_note_tags_db(database)
+            original_stat = MODULE.os.stat
+            injected = False
+
+            def inject_wal_after_shm_observation(
+                selected: object,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal injected
+                try:
+                    return original_stat(selected, *args, **kwargs)
+                finally:
+                    if (
+                        not injected
+                        and os.fspath(selected) == f"{database.name}-shm"
+                        and kwargs.get("dir_fd") is not None
+                    ):
+                        injected = True
+                        database.with_name(f"{database.name}-wal").write_bytes(b"late")
+
+            with (
+                mock.patch.object(
+                    MODULE.os,
+                    "stat",
+                    side_effect=inject_wal_after_shm_observation,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_deserialized_sqlite_image",
+                    side_effect=AssertionError(
+                        "the second sidecar pass must fail before SQLite"
+                    ),
+                ) as deserialize,
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.query_note_tags(database, note_title)
+
+        self.assertTrue(injected)
+        self._assert_safety_code("note-tags-sidecar-present", raised)
+        deserialize.assert_not_called()
+
+    def test_query_note_tags_rejects_live_container_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            live_container = Path(temp_dir) / "group.com.apple.notes"
+            live_container.mkdir()
+            database = live_container / MODULE.NOTE_STORE_MAIN
+            note_title = self._create_note_tags_db(database)
+            with (
+                mock.patch.object(MODULE, "GROUP_CONTAINER", live_container),
+                mock.patch.object(
+                    MODULE,
+                    "_bind_existing_directory_with_trusted_alias",
+                    side_effect=AssertionError(
+                        "live-container input must fail before descriptor binding"
+                    ),
+                ) as bind_parent,
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.query_note_tags(database, note_title)
+
+        self._assert_safety_code("note-tags-live-container", raised)
+        bind_parent.assert_not_called()
 
 
 if __name__ == "__main__":

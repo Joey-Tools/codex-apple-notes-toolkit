@@ -42,6 +42,7 @@ SUPERVISOR_SHUTDOWN_GRACE_SECONDS = 0.5
 WORKER_SHUTDOWN_GRACE_SECONDS = 0.5
 SUPERVISOR_POLL_SECONDS = 0.1
 DESTINATION_PREFIX = ".apple-notes-create-"
+DIRECTORY_CREATION_ATTEMPTS = 16
 TERMINATION_SIGNALS = frozenset(
     {
         signal.SIGHUP,
@@ -487,6 +488,82 @@ def _validate_request(
     return request, opened
 
 
+def _packaged_creation_proof(
+    helper_module: ModuleType,
+    *,
+    parent_opened: os.stat_result,
+    directory_opened: os.stat_result,
+) -> dict[str, object]:
+    """Describe the practical creation guarantee without overstating isolation."""
+
+    return {
+        "schema": helper_module.DIRECTORY_CREATOR_PROOF_SCHEMA,
+        "creation_authority": helper_module.PACKAGED_DIRECTORY_CREATOR_AUTHORITY,
+        "creation_method": helper_module.PACKAGED_DIRECTORY_CREATOR_METHOD,
+        "threat_model": helper_module.PACKAGED_DIRECTORY_CREATOR_THREAT_MODEL,
+        "actual_created_object_descriptor_returned": True,
+        "namespace_race_excluded_by_model": True,
+        "parent_identity": helper_module._identity(parent_opened),
+        "parent_access_policy": helper_module._access_policy(parent_opened),
+        "directory_identity": helper_module._identity(directory_opened),
+        "directory_access_policy": helper_module._access_policy(directory_opened),
+    }
+
+
+def _packaged_creation_failure_details(
+    helper_module: ModuleType,
+    *,
+    mutation_performed: bool,
+    basename: str | None,
+    directory_fd: int | None,
+    stage: str,
+) -> dict[str, object]:
+    """Return bounded recovery evidence for a failed packaged creation."""
+
+    locator: dict[str, object] = {
+        "schema": "apple-notes-packaged-directory-supervisor-recovery/v2",
+        "protected_property": "created-directory-object-identity",
+        "stage": stage,
+        "creation_method": helper_module.PACKAGED_DIRECTORY_CREATOR_METHOD,
+        "threat_model": helper_module.PACKAGED_DIRECTORY_CREATOR_THREAT_MODEL,
+        "staging_basename": basename,
+        "descriptor_return_available": directory_fd is not None,
+        "automatic_cleanup_attempted": False,
+    }
+    if directory_fd is not None:
+        try:
+            observed = os.fstat(directory_fd)
+        except OSError:
+            locator["descriptor_identity_status"] = "unavailable"
+        else:
+            locator.update(
+                {
+                    "descriptor_identity_status": "observed",
+                    "directory_identity": helper_module._identity(observed),
+                    "directory_access_policy": helper_module._access_policy(observed),
+                }
+            )
+    details: dict[str, object] = {
+        "mutation_performed": mutation_performed,
+        "cleanup_state": (
+            "preserved-no-identity-safe-directory-unlink"
+            if mutation_performed
+            else "not-needed"
+        ),
+        "retry_safe": False,
+        "creation_authority": helper_module.PACKAGED_DIRECTORY_CREATOR_AUTHORITY,
+        "provider_install_state": (
+            "staging-created-unverified" if mutation_performed else "not-created"
+        ),
+        "recovery_locators": {
+            "packaged_directory_supervisor": locator,
+        },
+    }
+    if basename is not None:
+        details["provider_staging_basename"] = basename
+    return details
+
+
 def _serve_one_request(
     channel: socket.socket,
     payload: bytes,
@@ -495,28 +572,93 @@ def _serve_one_request(
 ) -> None:
     request_id: str | None = None
     parent_fd: int | None = None
+    directory_fd: int | None = None
+    basename: str | None = None
+    proof: dict[str, object] | None = None
+    mutation_performed = False
+    failure_stage = "request-validation"
     try:
         if len(parent_descriptors) != 1:
             raise ValueError("directory supervisor expected exactly one parent FD")
         parent_fd = parent_descriptors.pop()
-        request, _ = _validate_request(payload, parent_fd, helper_module)
+        request, parent_opened = _validate_request(payload, parent_fd, helper_module)
         request_id = str(request["request_id"])
+        failure_stage = "randomized-directory-create"
+        for _ in range(DIRECTORY_CREATION_ATTEMPTS):
+            candidate = f"{DESTINATION_PREFIX}{os.urandom(16).hex()}"
+            previous_umask = os.umask(0o077)
+            try:
+                try:
+                    os.mkdir(candidate, mode=0o700, dir_fd=parent_fd)
+                finally:
+                    os.umask(previous_umask)
+            except FileExistsError:
+                continue
+            basename = candidate
+            mutation_performed = True
+            break
+        if basename is None:
+            raise FileExistsError(
+                "randomized directory creation exhausted its bounded attempts"
+            )
 
-        # No supported platform API atomically creates a directory and returns
-        # the descriptor for that exact object.  Fail before mkdir rather than
-        # make a probabilistic same-UID exclusion claim.
+        failure_stage = "created-directory-open"
+        directory_fd = os.open(
+            basename,
+            helper_module._directory_open_flags(),
+            dir_fd=parent_fd,
+        )
+        os.set_inheritable(directory_fd, False)
+        descriptor_before = os.fstat(directory_fd)
+        named = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+        descriptor_after = os.fstat(directory_fd)
+        parent_after = os.fstat(parent_fd)
+        expected_uid = int(request["expected_uid"])
+        expected_access = helper_module._access_policy(descriptor_after)
+        if (
+            not stat.S_ISDIR(descriptor_before.st_mode)
+            or not stat.S_ISDIR(named.st_mode)
+            or not stat.S_ISDIR(descriptor_after.st_mode)
+            or stat.S_ISLNK(named.st_mode)
+            or helper_module._is_reparse_point(named)
+            or not helper_module._same_identity(descriptor_before, named)
+            or not helper_module._same_identity(named, descriptor_after)
+            or not helper_module._same_identity(parent_opened, parent_after)
+            or stat.S_IMODE(descriptor_after.st_mode) != 0o700
+            or descriptor_after.st_uid != expected_uid
+            or helper_module._access_policy(descriptor_before) != expected_access
+            or helper_module._access_policy(named) != expected_access
+            or helper_module._access_policy(parent_opened)
+            != helper_module._access_policy(parent_after)
+        ):
+            raise RuntimeError(
+                "created directory identity or access policy changed before handoff"
+            )
+
+        failure_stage = "created-directory-response"
+        proof = _packaged_creation_proof(
+            helper_module,
+            parent_opened=parent_after,
+            directory_opened=descriptor_after,
+        )
         _send_response(
             channel,
             {
                 "schema": helper_module.DIRECTORY_CREATOR_RESPONSE_SCHEMA,
                 "request_id": request_id,
-                "status": helper_module.DIRECTORY_CREATOR_UNAVAILABLE_STATUS,
-                "basename": None,
-                "proof": None,
-                "details": (
-                    helper_module._packaged_directory_creator_unavailable_details()
-                ),
+                "status": "created",
+                "basename": basename,
+                "proof": proof,
+                "details": {
+                    "creation_method": (
+                        helper_module.PACKAGED_DIRECTORY_CREATOR_METHOD
+                    ),
+                    "threat_model": (
+                        helper_module.PACKAGED_DIRECTORY_CREATOR_THREAT_MODEL
+                    ),
+                },
             },
+            directory_fd=directory_fd,
         )
     except BaseException:
         if request_id is not None:
@@ -526,17 +668,31 @@ def _serve_one_request(
                     {
                         "schema": helper_module.DIRECTORY_CREATOR_RESPONSE_SCHEMA,
                         "request_id": request_id,
-                        "status": helper_module.DIRECTORY_CREATOR_UNAVAILABLE_STATUS,
-                        "basename": None,
-                        "proof": None,
-                        "details": (
-                            helper_module._packaged_directory_creator_unavailable_details()
+                        "status": (
+                            "failed-after-create"
+                            if mutation_performed
+                            else "failed-before-create"
+                        ),
+                        "basename": basename,
+                        "proof": proof,
+                        "details": _packaged_creation_failure_details(
+                            helper_module,
+                            mutation_performed=mutation_performed,
+                            basename=basename,
+                            directory_fd=directory_fd,
+                            stage=failure_stage,
                         ),
                     },
+                    directory_fd=directory_fd,
                 )
             except BaseException:
                 pass
     finally:
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
         if parent_fd is not None:
             try:
                 os.close(parent_fd)
