@@ -465,6 +465,16 @@ class _BoundSourceStore:
     membership: tuple[str, ...]
 
 
+@dataclass
+class _BoundAbsentNoteTagsLiveSource:
+    """One initially absent live path held through its nearest ancestor."""
+
+    path: Path
+    ancestor: _BoundDirectory
+    missing_components: tuple[str, ...]
+    initial_missing_error_code: str
+
+
 @dataclass(frozen=True)
 class _SnapshotArtifactPaths:
     root: Path
@@ -17496,35 +17506,317 @@ def _assert_note_tags_database_outside_live_containers(
                 )
 
 
+def _note_tags_live_source_inconclusive_error(
+    live_path: Path,
+    message: str,
+    *,
+    cause: BaseException | None = None,
+    underlying_error_code: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> StoreSafetyError:
+    merged_details: dict[str, Any] = {}
+    if isinstance(cause, StoreSafetyError):
+        merged_details.update(cause.details)
+        underlying_error_code = underlying_error_code or cause.code
+    elif isinstance(cause, PermissionError):
+        underlying_error_code = (
+            underlying_error_code or "source-revalidation-unreadable"
+        )
+    elif isinstance(cause, FileNotFoundError):
+        underlying_error_code = underlying_error_code or "source-missing-after-read"
+    elif isinstance(cause, OSError):
+        underlying_error_code = (
+            underlying_error_code or "source-revalidation-inconclusive"
+        )
+    if details is not None:
+        merged_details.update(details)
+    merged_details["live_database"] = str(live_path)
+    merged_details["underlying_error_code"] = (
+        underlying_error_code or "source-revalidation-inconclusive"
+    )
+    return StoreSafetyError(
+        "note-tags-live-source-inconclusive",
+        message,
+        details=merged_details,
+    )
+
+
+@contextmanager
+def _bind_note_tags_live_parent(
+    live_path: Path,
+) -> Iterator[tuple[_BoundDirectory, tuple[str, ...]]]:
+    """Keep live-parent setup and teardown inside the note-tags taxonomy."""
+
+    body_error: BaseException | None = None
+    try:
+        with _bind_nearest_existing_directory_with_trusted_alias(
+            live_path.parent,
+            allow_missing=True,
+        ) as binding:
+            try:
+                yield binding
+            except BaseException as exc:
+                body_error = exc
+                raise
+    except (OSError, StoreSafetyError) as exc:
+        if exc is body_error or (
+            isinstance(exc, StoreSafetyError)
+            and exc.code == "note-tags-live-source-inconclusive"
+        ):
+            raise
+        raise _note_tags_live_source_inconclusive_error(
+            live_path,
+            "Cannot bind or revalidate the nearest existing ancestor of the "
+            f"live NoteStore path: {live_path}: {exc}",
+            cause=exc,
+            details={"live_source_phase": "parent-component-binding"},
+        ) from exc
+
+
+@contextmanager
+def _bind_note_tags_present_live_store(
+    live_path: Path,
+) -> Iterator[_BoundSourceStore]:
+    """Keep present live-store setup and teardown inside the note-tags taxonomy."""
+
+    body_error: BaseException | None = None
+    try:
+        with _bind_source_store(live_path) as store:
+            try:
+                yield store
+            except BaseException as exc:
+                body_error = exc
+                raise
+    except (OSError, StoreSafetyError) as exc:
+        if exc is body_error or (
+            isinstance(exc, StoreSafetyError)
+            and exc.code == "note-tags-live-source-inconclusive"
+        ):
+            raise
+        raise _note_tags_live_source_inconclusive_error(
+            live_path,
+            "Cannot safely bind or revalidate the initially present live "
+            f"NoteStore: {live_path}: {exc}",
+            cause=exc,
+            details={"live_source_phase": "present-store-binding"},
+        ) from exc
+
+
+def _verify_note_tags_live_ancestor(
+    binding: _BoundAbsentNoteTagsLiveSource,
+    phase: str,
+) -> dict[str, Any]:
+    details = {
+        "initial_missing_error_code": binding.initial_missing_error_code,
+        "nearest_existing_ancestor": str(binding.ancestor.path),
+        "missing_components": list(binding.missing_components),
+        "live_source_phase": phase,
+    }
+    try:
+        return _verify_bound_source_directory(binding.ancestor)
+    except (OSError, StoreSafetyError) as exc:
+        raise _note_tags_live_source_inconclusive_error(
+            binding.path,
+            "Cannot revalidate the held ancestor of the initially absent live "
+            f"NoteStore path: {binding.path}: {exc}",
+            cause=exc,
+            details=details,
+        ) from exc
+
+
+def _verify_note_tags_absent_live_source(
+    binding: _BoundAbsentNoteTagsLiveSource,
+) -> dict[str, Any]:
+    """Prove the first missing component still excludes the complete suffix."""
+
+    details = {
+        "initial_missing_error_code": binding.initial_missing_error_code,
+        "nearest_existing_ancestor": str(binding.ancestor.path),
+        "missing_components": list(binding.missing_components),
+        "live_source_phase": "absence-revalidation",
+    }
+    ancestor_before = _verify_note_tags_live_ancestor(
+        binding,
+        "before-live-source-absence",
+    )
+    try:
+        observed = os.stat(
+            binding.missing_components[0],
+            dir_fd=binding.ancestor.fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        ancestor_after = _verify_note_tags_live_ancestor(
+            binding,
+            "after-live-source-absence",
+        )
+        return {
+            "status": "absent",
+            "ancestor_before": ancestor_before,
+            "ancestor_after": ancestor_after,
+            **details,
+        }
+    except PermissionError as exc:
+        raise _note_tags_live_source_inconclusive_error(
+            binding.path,
+            "Cannot prove that the initially absent live NoteStore path "
+            f"remains absent because its namespace is unreadable: "
+            f"{binding.path}: {exc}",
+            cause=exc,
+            details={**details, "live_source_revalidation_state": "unreadable"},
+        ) from exc
+    except OSError as exc:
+        raise _note_tags_live_source_inconclusive_error(
+            binding.path,
+            "Cannot conclusively revalidate the initially absent live "
+            f"NoteStore path: {binding.path}: {exc}",
+            cause=exc,
+            details={**details, "live_source_revalidation_state": "inconclusive"},
+        ) from exc
+    raise _note_tags_live_source_inconclusive_error(
+        binding.path,
+        "The initially absent live NoteStore path appeared while note-tags "
+        f"was running: {binding.path}",
+        underlying_error_code="source-identity-mismatch",
+        details={
+            **details,
+            "live_source_revalidation_state": "present",
+            "appeared_component": binding.missing_components[0],
+            "appeared_component_identity": _identity(observed),
+            "appeared_component_access_policy": _access_policy(observed),
+        },
+    )
+
+
+def _verify_note_tags_present_binding_continuity(
+    live_path: Path,
+    ancestor: _BoundDirectory,
+    initial_leaf: os.stat_result,
+    store: _BoundSourceStore,
+) -> None:
+    """Connect the first present observation to the held live-store object."""
+
+    try:
+        ancestor_before = _verify_bound_source_directory(ancestor)
+        current_leaf = os.stat(
+            live_path.name,
+            dir_fd=ancestor.fd,
+            follow_symlinks=False,
+        )
+        live = _verify_bound_source_store(store)
+        ancestor_after = _verify_bound_source_directory(ancestor)
+    except (OSError, StoreSafetyError) as exc:
+        raise _note_tags_live_source_inconclusive_error(
+            live_path,
+            "Cannot connect the initially present live NoteStore observation "
+            f"to its held store binding: {live_path}: {exc}",
+            cause=exc,
+            details={"live_source_phase": "present-binding-continuity"},
+        ) from exc
+    live_main = live["files"][NOTE_STORE_MAIN]
+    if (
+        not stat.S_ISREG(initial_leaf.st_mode)
+        or not stat.S_ISREG(current_leaf.st_mode)
+        or not _same_identity(initial_leaf, current_leaf)
+        or live_main["identity"] != _identity(initial_leaf)
+        or ancestor_before["identity"] != live["directory"]["identity"]
+        or ancestor_after["identity"] != live["directory"]["identity"]
+    ):
+        raise _note_tags_live_source_inconclusive_error(
+            live_path,
+            "The initially present live NoteStore changed object identity "
+            f"before its held binding was established: {live_path}",
+            underlying_error_code="source-identity-mismatch",
+            details={"live_source_phase": "present-binding-continuity"},
+        )
+    if (
+        _access_policy(initial_leaf) != _access_policy(current_leaf)
+        or live_main["access_policy"] != _access_policy(initial_leaf)
+        or ancestor_before["access_policy"] != live["directory"]["access_policy"]
+        or ancestor_after["access_policy"] != live["directory"]["access_policy"]
+    ):
+        raise _note_tags_live_source_inconclusive_error(
+            live_path,
+            "The initially present live NoteStore changed access policy "
+            f"before its held binding was established: {live_path}",
+            underlying_error_code="source-access-policy-mismatch",
+            details={"live_source_phase": "present-binding-continuity"},
+        )
+
+
 def _bind_note_tags_live_store(
     transaction: ExitStack,
     paths: NoteStorePaths,
-) -> _BoundSourceStore | None:
-    """Bind the live NoteStore when present so external hard links cannot escape."""
+) -> _BoundSourceStore | _BoundAbsentNoteTagsLiveSource:
+    """Bind a present live store or retain proof that its path was absent."""
+
+    live_path = _absolute_path(paths.group_container / NOTE_STORE_MAIN)
+    ancestor, missing_parent_components = transaction.enter_context(
+        _bind_note_tags_live_parent(live_path)
+    )
+    if missing_parent_components:
+        binding = _BoundAbsentNoteTagsLiveSource(
+            path=live_path,
+            ancestor=ancestor,
+            missing_components=(*missing_parent_components, live_path.name),
+            initial_missing_error_code="prepared-directory-missing",
+        )
+        _verify_note_tags_absent_live_source(binding)
+        return binding
 
     try:
-        return transaction.enter_context(
-            _bind_source_store(paths.group_container / NOTE_STORE_MAIN)
+        _verify_bound_source_directory(ancestor)
+        initial_leaf = os.stat(
+            live_path.name,
+            dir_fd=ancestor.fd,
+            follow_symlinks=False,
         )
-    except StoreSafetyError as exc:
-        if exc.code in {"prepared-directory-missing", "source-missing"}:
-            return None
-        raise StoreSafetyError(
-            "note-tags-live-source-inconclusive",
-            "Cannot safely exclude object-identity overlap with the live "
-            f"NoteStore: {paths.group_container / NOTE_STORE_MAIN}: {exc}",
-            details={**exc.details, "underlying_error_code": exc.code},
+        _verify_bound_source_directory(ancestor)
+    except FileNotFoundError:
+        binding = _BoundAbsentNoteTagsLiveSource(
+            path=live_path,
+            ancestor=ancestor,
+            missing_components=(live_path.name,),
+            initial_missing_error_code="source-missing",
+        )
+        _verify_note_tags_absent_live_source(binding)
+        return binding
+    except PermissionError as exc:
+        raise _note_tags_live_source_inconclusive_error(
+            live_path,
+            f"Cannot inspect the live NoteStore leaf: {live_path}: {exc}",
+            cause=exc,
+            underlying_error_code="source-unreadable",
+            details={"live_source_phase": "initial-leaf-observation"},
         ) from exc
+    except (OSError, StoreSafetyError) as exc:
+        raise _note_tags_live_source_inconclusive_error(
+            live_path,
+            "Cannot establish the initial live NoteStore namespace state: "
+            f"{live_path}: {exc}",
+            cause=exc,
+            details={"live_source_phase": "initial-leaf-observation"},
+        ) from exc
+
+    store = transaction.enter_context(_bind_note_tags_present_live_store(live_path))
+    _verify_note_tags_present_binding_continuity(
+        live_path,
+        ancestor,
+        initial_leaf,
+        store,
+    )
+    return store
 
 
 def _assert_note_tags_input_not_live_store(
     parent: _BoundDirectory,
     database: _BoundRegularFile,
-    live_store: _BoundSourceStore | None,
+    live_source: _BoundSourceStore | _BoundAbsentNoteTagsLiveSource,
 ) -> None:
     """Reject a lexical standalone path that aliases the held live main object."""
 
-    if live_store is None:
+    if isinstance(live_source, _BoundAbsentNoteTagsLiveSource):
+        _verify_note_tags_absent_live_source(live_source)
         return
     standalone = _verify_bound_regular_file_at(
         database,
@@ -17533,13 +17825,14 @@ def _assert_note_tags_input_not_live_store(
         basename=database.path.name,
     )
     try:
-        live = _verify_bound_source_store(live_store)
-    except StoreSafetyError as exc:
-        raise StoreSafetyError(
-            "note-tags-live-source-inconclusive",
+        live = _verify_bound_source_store(live_source)
+    except (OSError, StoreSafetyError) as exc:
+        raise _note_tags_live_source_inconclusive_error(
+            live_source.directory.path / live_source.main_name,
             "The held live NoteStore changed while note-tags excluded "
-            f"object-identity overlap: {live_store.directory.path}: {exc}",
-            details={**exc.details, "underlying_error_code": exc.code},
+            f"object-identity overlap: {live_source.directory.path}: {exc}",
+            cause=exc,
+            details={"live_source_phase": "present-store-revalidation"},
         ) from exc
     live_main = live["files"][NOTE_STORE_MAIN]
     if standalone["identity"] == live_main["identity"]:
@@ -17550,7 +17843,9 @@ def _assert_note_tags_input_not_live_store(
             "to the live NoteStore.sqlite object",
             details={
                 "database": str(database.path),
-                "live_database": str(live_store.directory.path / live_store.main_name),
+                "live_database": str(
+                    live_source.directory.path / live_source.main_name
+                ),
                 "live_file_set": live_names,
                 "live_sidecars_present": [
                     name for name in live_names if name != NOTE_STORE_MAIN
@@ -17764,16 +18059,15 @@ def query_note_tags(
                     SOURCE_FILE_CODES,
                 )
             )
-            live_store = _bind_note_tags_live_store(transaction, paths)
+            live_source = _bind_note_tags_live_store(transaction, paths)
 
             def verify_input() -> dict[str, Any]:
-                result = _verify_note_tags_standalone_input(parent, database)
                 _assert_note_tags_input_not_live_store(
                     parent,
                     database,
-                    live_store,
+                    live_source,
                 )
-                return result
+                return _verify_note_tags_standalone_input(parent, database)
 
             verify_input()
             query_error: Exception | None = None

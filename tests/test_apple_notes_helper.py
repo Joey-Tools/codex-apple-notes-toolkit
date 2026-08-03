@@ -23354,6 +23354,230 @@ raise SystemExit(2)
             )
             deserialize.assert_not_called()
 
+    def test_query_note_tags_rejects_missing_live_main_appearing_as_hardlink(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_group = root / "live-group"
+            live_group.mkdir()
+            live_app = root / "live-app"
+            live_app.mkdir()
+            live_database = live_group / MODULE.NOTE_STORE_MAIN
+            standalone = root / "standalone.sqlite"
+            note_title = self._create_note_tags_db(standalone)
+            original_query = MODULE._query_note_tags_from_image
+            linked = False
+
+            def link_live_main_after_query(
+                *args: object,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                nonlocal linked
+                result = original_query(*args, **kwargs)
+                os.link(standalone, live_database)
+                linked = True
+                return result
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_query_note_tags_from_image",
+                    side_effect=link_live_main_after_query,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.query_note_tags(
+                    standalone,
+                    note_title,
+                    paths=MODULE.NoteStorePaths(
+                        group_container=live_group,
+                        app_container=live_app,
+                    ),
+                )
+
+        self.assertTrue(linked)
+        self._assert_safety_code("note-tags-live-source-inconclusive", raised)
+        self.assertEqual(
+            raised.exception.details["initial_missing_error_code"],
+            "source-missing",
+        )
+        self.assertEqual(
+            raised.exception.details["underlying_error_code"],
+            "source-identity-mismatch",
+        )
+
+    def test_query_note_tags_terminally_rejects_missing_live_path_appearing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_group = root / "missing-live-root" / "live-group"
+            live_app = root / "live-app"
+            live_app.mkdir()
+            live_database = live_group / MODULE.NOTE_STORE_MAIN
+            standalone = root / "standalone.sqlite"
+            note_title = self._create_note_tags_db(standalone)
+            original_deserialize = MODULE._deserialized_sqlite_image
+            linked = False
+
+            @contextmanager
+            def publish_live_path_after_image(
+                *args: object,
+                **kwargs: object,
+            ) -> Iterator[MODULE._DeserializedSQLiteImage]:
+                nonlocal linked
+                with original_deserialize(*args, **kwargs) as image:
+                    yield image
+                live_group.mkdir(parents=True)
+                os.link(standalone, live_database)
+                linked = True
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_deserialized_sqlite_image",
+                    side_effect=publish_live_path_after_image,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.query_note_tags(
+                    standalone,
+                    note_title,
+                    paths=MODULE.NoteStorePaths(
+                        group_container=live_group,
+                        app_container=live_app,
+                    ),
+                )
+
+        self.assertTrue(linked)
+        self._assert_safety_code("note-tags-live-source-inconclusive", raised)
+        self.assertEqual(
+            raised.exception.details["initial_missing_error_code"],
+            "prepared-directory-missing",
+        )
+        self.assertEqual(
+            raised.exception.details["underlying_error_code"],
+            "source-identity-mismatch",
+        )
+        self.assertEqual(
+            raised.exception.details["missing_components"][-1],
+            MODULE.NOTE_STORE_MAIN,
+        )
+
+    def test_query_note_tags_preserves_unreadable_missing_live_source_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_group = root / "live-group"
+            live_group.mkdir()
+            live_app = root / "live-app"
+            live_app.mkdir()
+            standalone = root / "standalone.sqlite"
+            note_title = self._create_note_tags_db(standalone)
+            original_stat = MODULE.os.stat
+            live_main_observations = 0
+
+            def deny_live_main_revalidation(
+                selected: object,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal live_main_observations
+                if (
+                    os.fspath(selected) == MODULE.NOTE_STORE_MAIN
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    live_main_observations += 1
+                    if live_main_observations >= 3:
+                        raise PermissionError(
+                            errno.EACCES,
+                            "simulated unreadable missing live source",
+                        )
+                return original_stat(selected, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    MODULE.os,
+                    "stat",
+                    side_effect=deny_live_main_revalidation,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.query_note_tags(
+                    standalone,
+                    note_title,
+                    paths=MODULE.NoteStorePaths(
+                        group_container=live_group,
+                        app_container=live_app,
+                    ),
+                )
+
+        self.assertGreaterEqual(live_main_observations, 3)
+        self._assert_safety_code("note-tags-live-source-inconclusive", raised)
+        self.assertEqual(
+            raised.exception.details["underlying_error_code"],
+            "source-revalidation-unreadable",
+        )
+
+    def test_query_note_tags_does_not_rebaseline_late_source_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_group = root / "live-group"
+            live_group.mkdir()
+            live_app = root / "live-app"
+            live_app.mkdir()
+            live_database = live_group / MODULE.NOTE_STORE_MAIN
+            self._create_db(live_database)
+            standalone = root / "standalone.sqlite"
+            note_title = self._create_note_tags_db(standalone)
+            original_discover = MODULE._discover_database_files_at
+            discovery_count = 0
+
+            def remove_live_main_after_initial_discovery(
+                *args: object,
+                **kwargs: object,
+            ) -> list[Path]:
+                nonlocal discovery_count
+                discovered = original_discover(*args, **kwargs)
+                discovery_count += 1
+                if discovery_count == 1:
+                    live_database.unlink()
+                return discovered
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_discover_database_files_at",
+                    side_effect=remove_live_main_after_initial_discovery,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_deserialized_sqlite_image",
+                    side_effect=AssertionError(
+                        "a late source-missing state must fail before SQLite"
+                    ),
+                ) as deserialize,
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.query_note_tags(
+                    standalone,
+                    note_title,
+                    paths=MODULE.NoteStorePaths(
+                        group_container=live_group,
+                        app_container=live_app,
+                    ),
+                )
+
+        self.assertEqual(discovery_count, 1)
+        self._assert_safety_code("note-tags-live-source-inconclusive", raised)
+        self.assertEqual(
+            raised.exception.details["underlying_error_code"],
+            "source-missing-after-read",
+        )
+        deserialize.assert_not_called()
+
     def test_query_note_tags_rejects_live_wal_membership_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
