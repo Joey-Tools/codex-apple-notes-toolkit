@@ -140,7 +140,9 @@ python3 "$SKILL_DIR/scripts/apple_notes_directory_supervisor.py" \
 ```
 
 Run queries only against a validated, recovered standalone database, never the
-live container:
+live container. The command binds the configured live NoteStore throughout
+the query and rejects an external hard link to live `NoteStore.sqlite`, even
+when the supplied pathname is lexically outside both live containers:
 
 ```bash
 python3 "$SKILL_DIR/scripts/apple_notes_db.py" note-tags \
@@ -152,6 +154,13 @@ Recovery consumes the held main/WAL/SHM set, produces a sidecar-free database,
 and requires full SQLite integrity validation before publication. It does not
 make a live cross-file snapshot transactional; authoritative recovery still
 requires Notes to remain quit.
+
+`validate-snapshot` and `recover-snapshot` retain exact read-only compatibility
+with an externally anchored snapshot v3 manifest. Snapshot v3 is never
+writeback-grade and must not be inferred, rewritten, or upgraded to v4; a v3
+manifest that carries the v4-only `source_binding` field is invalid. Use the
+returned `snapshot_schema` and `writeback_grade` fields as the authoritative
+classification rather than the raw historical manifest `classification`.
 
 ## Stage And Preflight A Patch
 
@@ -189,9 +198,13 @@ python3 "$SKILL_DIR/scripts/apple_notes_db.py" preflight-writeback \
 ```
 
 The backup must use snapshot v4 and bind the complete live source directory
-chain. Success is point-in-time evidence from one joint backup/stage/live
-revalidation while all descriptors remain held; it does not authorize a later
-write or remove the need for a fresh write transaction boundary.
+chain. Validate the backup and reject a non-v4 schema before opening or
+validating the patch stage or live store. After the final Notes process probe,
+success requires one more complete
+backup/stage/live revalidation and then immediately marks the joint success
+point while all descriptors remain held. Teardown after that point is
+close-only. This point-in-time evidence does not authorize a later write or
+remove the need for a fresh write transaction boundary.
 
 Present the exact whole-store replacement and recovery plan before requesting
 write authorization.

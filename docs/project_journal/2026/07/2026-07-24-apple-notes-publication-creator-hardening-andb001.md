@@ -918,3 +918,44 @@ superseded_by:
   PyYAML dependency, so a no-install Ruby `YAML.safe_load` fallback checked the
   same frontmatter name/description/key constraints, parsed
   `agents/openai.yaml`, and verified all packaged runtime/reference resources.
+
+### Final writeback review follow-up (`2026-08-03`)
+
+- Follow-up base: `ddb4168ad71790e4a191accf55d8b07a574af4da`.
+- Preflight and verification now rerun the complete held backup/stage/live
+  validation after the final Notes probe and immediately before joint success;
+  close-only teardown tests forbid subsequent stat, open, read, seek,
+  readlink, or directory-scan operations.
+- Exact externally anchored snapshot v3 remains accepted for read-only
+  validation/recovery, while both writeback gates reject it as
+  `backup-not-writeback-grade` without heuristic v4 upgrade. A v3 manifest
+  carrying v4-only `source_binding` is invalid; normalized validation/recovery
+  results expose authoritative `snapshot_schema` and `writeback_grade`; and
+  the v4 gate precedes every stage/live open or validation.
+- `note-tags` holds the configured live store alongside the standalone input,
+  rejects external hard links to live `NoteStore.sqlite`, and keeps live
+  main/WAL/SHM membership under terminal revalidation.
+- Generic pre-open `EIO`/`ESTALE` from both absolute and descriptor-relative
+  source helpers now remains `source-revalidation-inconclusive`, including in
+  `probe-db-access` rows.
+- The existing v4 source component-chain receipt and the existing
+  first-`fstat` recovery handling for all three `O_EXCL` writers were audited
+  against the review report; their exact regression methods remain passing.
+- CI keeps the existing required Ubuntu `test` job and adds full native macOS
+  discovery on Python 3.9 and current 3.x. Hosted results remain pending the
+  next pushed head; no hosted run is claimed here.
+- Final focused P1/P2 regression set: Python `3.13.0` passed all `13` methods
+  in `8.577s`; system Python `3.9.6` passed the same set in `9.888s`. The
+  sandbox-skipped compatibility publication test also passed separately
+  outside the sandbox on both runtimes (`0.929s` and `0.855s`).
+- Final full repository discovery: Python `3.13.0` passed all `387` tests with
+  two sandbox-scoped fixed-`/usr/bin/pgrep` skips in `96.088s`. The system
+  Python `3.9.6` single-process run reached the final portion before the host
+  filesystem fell to `238 MiB` free and returned only `ENOSPC` temporary-file
+  errors; a bounded fresh-process rerun then passed the identical discovered
+  set of `387` test IDs across `16` chunks, with the same two skips. No
+  unrelated temporary or user artifact was deleted to manufacture space.
+- Static gates: full-repository Ruff check; changed-Python Ruff format check;
+  isolated Python `3.13.0` and `3.9.6` bytecode compilation; `bash -n`;
+  ShellCheck `0.11.0`; `actionlint`; skill validation through isolated PyYAML;
+  project-journal validation; and `git diff --check`.

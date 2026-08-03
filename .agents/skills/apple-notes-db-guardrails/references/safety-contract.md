@@ -65,9 +65,10 @@ Hidden, no-dump, opaque, compression, tracking, archived, firmlink, and File
 Provider/dataless flag transitions are reported as metadata when the protected
 properties stay stable. Do not accept a fresh pathname open as proof about the
 object that supplied earlier validation evidence.
-The v3 snapshot and patch manifests persist creation-time identity and access-policy receipts for
-their root directories and database files; snapshots also persist the nested store-directory
-receipt. Their successful creator results separately return an
+Snapshot v3/v4 manifests and patch v3 manifests persist creation-time identity
+and access-policy receipts for their root directories and database files;
+snapshots also persist the nested store-directory receipt. Their successful
+creator results separately return an
 `apple-notes-manifest-creation-receipt/v1` object containing the manifest's exact SHA-256, size,
 identity, and access policy. The caller must preserve that result outside the artifact. Validators
 bind the artifact root once before loading the external receipt. The receipt externality proof and
@@ -77,6 +78,17 @@ object or child descriptors opened relative to it. No artifact consumer may reop
 pathname after the receipt load. Compare the external receipt with the descriptor-relative held
 manifest before parsing or trusting any manifest field. Reject v1/v2 manifests and missing
 receipts rather than silently deriving an anchor from current artifact bytes.
+An exact snapshot v3 manifest paired with an exact external v3 creation
+receipt remains eligible only for `validate-snapshot` and `recover-snapshot`.
+It has no live-source-binding field, is never writeback-grade, and must not be
+inferred or upgraded to v4. Writeback admission requires exact v4 on both the
+held manifest and its external receipt. Reject any v3 manifest that contains
+the v4-only `source_binding` field, even when both v3 schema anchors are exact.
+Read-only validation returns authoritative `snapshot_schema` and
+`writeback_grade`; recovery propagates both under `snapshot_validation`.
+Derive grade only from exact v4, a valid internally matched source binding,
+and exact Notes-quit capture properties. Never infer it from the raw manifest
+`classification` string.
 After that anchor check, require snapshot `files` to be a non-empty JSON array of exact objects and
 validate every `basename` as an exact string in the closed NoteStore allowlist before constructing
 any set, mapping, hash key, or path from those values. A list, object, null, boolean, unsupported
@@ -101,7 +113,8 @@ identity, content, and access-policy comparison failures keep their dedicated co
 Apply that source mapping to post-open descriptor, descriptor-relative path, content-hash, and
 held-parent checks. Apply it before open as well: a discovered member's dedicated re-stat and the
 bound regular-file helper's descriptor-relative pre-open `stat` or `open` use the same source
-classifier. This source-specific rule must not change a snapshot, patch, or prepared-file caller's
+classifier; do not emit a separate undocumented generic-open failure class.
+This source-specific rule must not change a snapshot, patch, or prepared-file caller's
 own inconclusive code. A rollback journal keeps the top-level `rollback-journal-present` policy
 result while its structured `reason_code` records the source-specific missing, unreadable, or
 inconclusive cause. When a generic prepared-directory error wraps an OS error, inspect its explicit
@@ -214,6 +227,17 @@ recovery payload, and let SQLite rebuild the WAL index from the main database an
 
 Reject an invalid WAL even when the main database alone opens successfully.
 Ignoring a malformed or mismatched WAL can silently discard committed Notes changes.
+
+`note-tags` accepts only a sidecar-free standalone input. In addition to
+lexical live-container exclusion, bind the configured live NoteStore through
+its complete held component chain when it exists, then compare the held input
+identity with the held live main identity. Reject proved overlap as
+`note-tags-live-object`, including an external hard link whose pathname is
+outside the live containers. Revalidate both the standalone input and the live
+main/WAL/SHM/rollback-journal membership before, during, and after SQLite
+consumption. If live binding or revalidation cannot safely exclude overlap,
+fail closed as `note-tags-live-source-inconclusive` rather than running the
+query.
 
 ## Integrity And Recovery
 
@@ -983,12 +1007,19 @@ publication taxonomy.
 
 `preflight-writeback` and `verify-writeback` must hold the validated snapshot,
 validated patch stage, and live source store together. Establish one joint
-success linearization point while all three remain bound: revalidate both
-artifacts, revalidate the live directory/component/alias binding and selected
-file properties, complete the required comparison or recovery verification,
-and prove Notes remains quit. Descriptor teardown after that point is
-close-only. The receipt proves that point in time; it is not authorization for
-a later write and cannot eliminate a same-UID mutation immediately afterward.
+success linearization point while all three remain bound. Complete the
+required comparison or recovery verification and final Notes-quit probe, then
+revalidate both artifacts plus the live directory/component/alias binding and
+selected file properties one final time. Immediately mark joint success after
+that full revalidation, with no intervening filesystem read. Descriptor
+teardown after that point is close-only. The receipt proves that point in time;
+it is not authorization for a later write and cannot eliminate a same-UID
+mutation immediately afterward.
+
+Validate the backup first and apply the exact-v4 writeback-grade gate before
+opening or validating either the patch stage or live store. A v3 backup must
+therefore return `backup-not-writeback-grade` even when the stage or live path
+is independently missing, malformed, or unreadable.
 
 Never install a staged main database beside an old live WAL or SHM.
 Treat replacement of the main name and removal of live sidecar names as one whole-store semantic
@@ -1022,6 +1053,7 @@ The helper emits stable error codes, including:
 - `source-revalidation-inconclusive`;
 - `source-identity-mismatch`, `source-content-mismatch`;
 - `source-access-policy-mismatch`;
+- `note-tags-live-object`, `note-tags-live-source-inconclusive`;
 - `store-file-set-mismatch`;
 - `rollback-journal-present`;
 - `directory-creation-identity-inconclusive`;

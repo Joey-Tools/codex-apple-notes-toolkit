@@ -26,9 +26,19 @@
   registered Darwin alias receipt from the same held source capture used for
   the database files.
 - Writeback preflight and verification keep the snapshot, patch stage, and
-  live source bindings open through one joint comparison, Notes probe, and
-  terminal revalidation point before descriptor teardown; their receipts are
-  point-in-time evidence rather than authorization for a later write.
+  live source bindings open through one joint comparison and Notes probe, then
+  fully revalidate all three immediately before the success point;
+  descriptor teardown is close-only and their receipts are point-in-time
+  evidence rather than authorization for a later write.
+- Exactly anchored snapshot v3 artifacts remain read-only validation/recovery
+  inputs but are never writeback-grade or implicitly upgraded to v4; v3/v4
+  hybrids are rejected, normalized results expose authoritative schema/grade,
+  and the v4 gate runs before stage/live validation.
+- `note-tags` holds the configured live store alongside its standalone input
+  and rejects an external hard link to live `NoteStore.sqlite`, while live
+  WAL/SHM membership remains under revalidation.
+- CI preserves the required Ubuntu `test` context and adds full native macOS
+  discovery on Python 3.9 and current 3.x.
 - Cross-root creator result files bind their artifact and result alias scopes independently, and committed result receipts survive late scope teardown failures.
 - Newly created copied, JSON, and standalone files retain a pre-write identity and access-policy baseline through content and publication validation.
 - Structured, malformed, unstructured, and transport-evidence-construction creator failures retain conservative recovery evidence and close every owned or received FD.

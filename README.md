@@ -114,10 +114,17 @@ Snapshot v4 also records an exact live-source binding from that same held
 capture: the requested root, terminal directory identity/access policy,
 complete canonical component chain, no-symlink policy, and registered Darwin
 alias receipt or explicit null. Writeback preflight and verification bind the
-snapshot, patch stage, and live store together and establish one common
-point-in-time success boundary before close-only descriptor teardown. A v3
-snapshot is not writeback-grade, and a preflight receipt never authorizes a
-later live-store mutation.
+snapshot, patch stage, and live store together. After the final Notes process
+probe, they fully revalidate all three held inputs and immediately establish
+one common point-in-time success boundary before close-only descriptor
+teardown. An exactly anchored v3 snapshot remains accepted by read-only
+validation and recovery, but it is never writeback-grade and is never
+heuristically upgraded; a v3/v4 hybrid carrying `source_binding` is rejected.
+Validation and recovery serialize authoritative `snapshot_schema` and
+`writeback_grade` fields from the validated schema, source binding, and
+Notes-quit properties rather than trusting historical `classification` text.
+Writeback rejects a non-v4 backup before opening the patch stage or live store.
+A preflight receipt never authorizes a later live-store mutation.
 Snapshot/stage API and CLI inputs use one absolute lexical path policy for the
 root and every derived member, so relative paths cannot split parent authority.
 The API path object and CLI adapter likewise freeze both live-container inputs
@@ -154,6 +161,12 @@ raw-name/type maps across both passes. `merge-db` retains the legacy
 `merged_db` JSON key alongside `standalone_db`. The toolkit does not mutate
 the live Notes store.
 
+`note-tags` also holds and repeatedly revalidates the configured live
+NoteStore while consuming its standalone input. A lexical path outside the
+live container is still rejected when its held object identity proves that it
+is an external hard link to live `NoteStore.sqlite`; live WAL/SHM membership
+changes fail closed instead of being treated as standalone-query evidence.
+
 Creator result-file publication similarly latches its exact terminal receipt:
 late result-scope teardown failures report the artifact mutation, committed
 result-file state, receipt, and non-retryable classification. Standalone
@@ -180,3 +193,8 @@ bash -n scripts/apple_notes_helper.sh scripts/apple_notes_osascript_context_prob
 shellcheck scripts/apple_notes_helper.sh scripts/apple_notes_osascript_context_probe.sh
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
+
+CI preserves the required Ubuntu `test` job, including ShellCheck, and also
+runs full test discovery on macOS with Python 3.9 and the current 3.x release
+so Darwin publication and trusted-root-alias behavior execute on their native
+platform.

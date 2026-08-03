@@ -45,7 +45,9 @@ NOTE_STORE_DISCOVERY_BASENAMES = (
 )
 SNAPSHOT_MANIFEST = "snapshot-manifest.json"
 PATCH_MANIFEST = "patch-manifest.json"
+SNAPSHOT_SCHEMA_V3 = "apple-notes-snapshot/v3"
 SNAPSHOT_SCHEMA = "apple-notes-snapshot/v4"
+READ_ONLY_SNAPSHOT_SCHEMAS = (SNAPSHOT_SCHEMA_V3, SNAPSHOT_SCHEMA)
 PATCH_SCHEMA = "apple-notes-patch/v3"
 LIVE_SOURCE_BINDING_SCHEMA = "apple-notes-live-source-binding/v1"
 REGISTERED_DARWIN_ALIAS_BINDING_SCHEMA = (
@@ -3127,8 +3129,10 @@ def _open_regular_readonly(path: Path) -> tuple[int, os.stat_result]:
             "source-unreadable", f"Source cannot be opened: {path}"
         ) from exc
     except OSError as exc:
-        raise StoreSafetyError(
-            "source-open-failed", f"Cannot safely open source file {path}: {exc}"
+        raise _source_revalidation_os_error(
+            path,
+            "safely open the source before descriptor binding",
+            exc,
         ) from exc
 
     try:
@@ -3206,9 +3210,10 @@ def _open_regular_readonly_at(
             "source-unreadable", f"Source cannot be opened: {display_path}"
         ) from exc
     except OSError as exc:
-        raise StoreSafetyError(
-            "source-open-failed",
-            f"Cannot safely open descriptor-relative source {display_path}: {exc}",
+        raise _source_revalidation_os_error(
+            display_path,
+            "safely open the descriptor-relative source before binding",
+            exc,
         ) from exc
     try:
         try:
@@ -8497,9 +8502,18 @@ def _normalized_manifest_creation_receipt(
     value: Any,
     *,
     artifact_kind: str,
-    artifact_schema: str,
+    artifact_schema: str | Collection[str],
     manifest_name: str,
 ) -> dict[str, Any]:
+    allowed_artifact_schemas = (
+        (artifact_schema,)
+        if isinstance(artifact_schema, str)
+        else tuple(artifact_schema)
+    )
+    if not allowed_artifact_schemas or any(
+        type(candidate) is not str for candidate in allowed_artifact_schemas
+    ):
+        raise RuntimeError("Artifact schema policy must contain exact strings")
     if value is None:
         raise StoreSafetyError(
             "manifest-creation-receipt-required",
@@ -8528,7 +8542,7 @@ def _normalized_manifest_creation_receipt(
         set(value) != expected_outer_keys
         or value.get("schema") != MANIFEST_CREATION_RECEIPT_SCHEMA
         or value.get("artifact_kind") != artifact_kind
-        or value.get("artifact_schema") != artifact_schema
+        or value.get("artifact_schema") not in allowed_artifact_schemas
         or value.get("manifest_name") != manifest_name
     ):
         raise StoreSafetyError(
@@ -8573,7 +8587,7 @@ def _normalized_manifest_creation_receipt(
     return {
         "schema": MANIFEST_CREATION_RECEIPT_SCHEMA,
         "artifact_kind": artifact_kind,
-        "artifact_schema": artifact_schema,
+        "artifact_schema": value["artifact_schema"],
         "manifest_name": manifest_name,
         "manifest": {
             "sha256": sha256,
@@ -9058,6 +9072,22 @@ def _snapshot_manifest_source_binding(
             "trusted_alias": value["trusted_alias_binding"],
         },
         strict_manifest=True,
+    )
+
+
+def _snapshot_manifest_writeback_grade(
+    manifest: dict[str, Any],
+    source_binding: dict[str, Any] | None,
+) -> bool:
+    """Report grade from validated properties, never the manifest classification."""
+
+    return (
+        manifest.get("schema") == SNAPSHOT_SCHEMA
+        and source_binding is not None
+        and type(manifest.get("source_root")) is str
+        and manifest["source_root"] == source_binding["source_root"]
+        and manifest.get("notes_running") is False
+        and manifest.get("notes_quit_required") is True
     )
 
 
@@ -15381,7 +15411,7 @@ def _validated_snapshot_artifact(
             manifest_creation_receipt=manifest_creation_receipt,
             manifest_creation_receipt_file=manifest_creation_receipt_file,
             artifact_kind="snapshot",
-            artifact_schema=SNAPSHOT_SCHEMA,
+            artifact_schema=READ_ONLY_SNAPSHOT_SCHEMAS,
             manifest_name=SNAPSHOT_MANIFEST,
         )
         snapshot_directory = _scan_exact_bound_directory_entries(
@@ -15420,7 +15450,7 @@ def _validated_snapshot_artifact(
         manifest = _load_bound_manifest(
             manifest_bound,
             SNAPSHOT_FILE_CODES,
-            SNAPSHOT_SCHEMA,
+            external_receipt["artifact_schema"],
             parent=artifact_root,
         )
         _assert_manifest_external_anchor_declaration(
@@ -15428,7 +15458,21 @@ def _validated_snapshot_artifact(
             artifact_kind="snapshot",
             manifest_name=SNAPSHOT_MANIFEST,
         )
-        source_binding = _snapshot_manifest_source_binding(manifest)
+        snapshot_schema = manifest["schema"]
+        if snapshot_schema == SNAPSHOT_SCHEMA_V3 and "source_binding" in manifest:
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Snapshot v3 must not contain the v4-only live source binding",
+            )
+        source_binding = (
+            _snapshot_manifest_source_binding(manifest)
+            if snapshot_schema == SNAPSHOT_SCHEMA
+            else None
+        )
+        writeback_grade = _snapshot_manifest_writeback_grade(
+            manifest,
+            source_binding,
+        )
         creation_receipts = manifest.get("creation_receipts")
         if not isinstance(creation_receipts, dict):
             raise StoreSafetyError(
@@ -15674,12 +15718,15 @@ def _validated_snapshot_artifact(
                 "snapshot": snapshot_directory,
                 "store": store_directory,
             },
-            "live_source_binding": source_binding,
             "manifest": manifest_integrity,
             "files": verified,
         }
+        if source_binding is not None:
+            source_integrity["live_source_binding"] = source_binding
         public_result = {
             "snapshot_dir": snapshot_dir,
+            "snapshot_schema": snapshot_schema,
+            "writeback_grade": writeback_grade,
             "manifest": manifest,
             "manifest_creation_receipt": external_receipt,
             "verified_files": verified,
@@ -16168,7 +16215,7 @@ def _load_external_manifest_creation_receipt(
     *,
     artifact_root: _BoundDirectory,
     artifact_kind: str,
-    artifact_schema: str,
+    artifact_schema: str | Collection[str],
     manifest_name: str,
 ) -> dict[str, Any]:
     """Read one stable caller-preserved receipt from outside its artifact."""
@@ -16292,7 +16339,7 @@ def _manifest_creation_receipt_for_bound_artifact(
     manifest_creation_receipt: dict[str, Any] | None,
     manifest_creation_receipt_file: Path | None,
     artifact_kind: str,
-    artifact_schema: str,
+    artifact_schema: str | Collection[str],
     manifest_name: str,
 ) -> dict[str, Any]:
     if (
@@ -16518,6 +16565,8 @@ def recover_snapshot(
             result = {
                 "snapshot_dir": snapshot_dir,
                 "snapshot_validation": {
+                    "snapshot_schema": validation["snapshot_schema"],
+                    "writeback_grade": validation["writeback_grade"],
                     "sqlite_validation": validation["sqlite_validation"],
                     "sidecar_consistency": validation["sidecar_consistency"],
                     "source_integrity": artifact.source_integrity,
@@ -17154,6 +17203,15 @@ def _compare_live_to_baseline(
             )
 
 
+def _require_writeback_grade_snapshot_schema(manifest: dict[str, Any]) -> None:
+    if manifest.get("schema") != SNAPSHOT_SCHEMA:
+        raise StoreSafetyError(
+            "backup-not-writeback-grade",
+            "Writeback requires an exact snapshot v4 manifest with its strict "
+            "live source binding; read-only v3 snapshots cannot be upgraded",
+        )
+
+
 def preflight_writeback(
     paths: NoteStorePaths,
     *,
@@ -17197,18 +17255,9 @@ def preflight_writeback(
                 manifest_creation_receipt_file=requested_backup_receipt,
             )
         )
-        stage_artifact = transaction.enter_context(
-            _validated_patch_stage_artifact(
-                _patch_artifact_paths(stage_dir),
-                stage_manifest_creation_receipt,
-                manifest_creation_receipt_file=requested_stage_receipt,
-            )
-        )
-        live_store = transaction.enter_context(
-            _bind_source_store(paths.group_container / NOTE_STORE_MAIN)
-        )
         backup = backup_artifact.public_result
         manifest = backup["manifest"]
+        _require_writeback_grade_snapshot_schema(manifest)
         if (
             manifest.get("notes_running") is not False
             or manifest.get("notes_quit_required") is not True
@@ -17222,16 +17271,26 @@ def preflight_writeback(
                 "backup-source-mismatch",
                 "Backup source root does not match the selected live store",
             )
-        backup_artifact.revalidate_artifact()
-        stage_artifact.revalidate_artifact()
-        _compare_live_source_binding(live_store, manifest)
-        live = _fingerprint_bound_note_store(paths, live_store)
-        _compare_live_to_baseline(live, manifest)
-        if notes_is_running():
-            raise StoreSafetyError(
-                "notes-started-during-preflight",
-                "Notes.app started during writeback preflight",
+        stage_artifact = transaction.enter_context(
+            _validated_patch_stage_artifact(
+                _patch_artifact_paths(stage_dir),
+                stage_manifest_creation_receipt,
+                manifest_creation_receipt_file=requested_stage_receipt,
             )
+        )
+        live_store = transaction.enter_context(
+            _bind_source_store(paths.group_container / NOTE_STORE_MAIN)
+        )
+
+        def revalidate_joint_inputs() -> dict[str, Any]:
+            backup_artifact.revalidate_artifact()
+            stage_artifact.revalidate_artifact()
+            _compare_live_source_binding(live_store, manifest)
+            current_live = _fingerprint_bound_note_store(paths, live_store)
+            _compare_live_to_baseline(current_live, manifest)
+            return current_live
+
+        live = revalidate_joint_inputs()
         stage = stage_artifact.public_result
         current_names = sorted(_fingerprint_map(live))
         result = {
@@ -17256,6 +17315,12 @@ def preflight_writeback(
                 "retain_backup_until_user_acceptance": True,
             },
         }
+        if notes_is_running():
+            raise StoreSafetyError(
+                "notes-started-during-preflight",
+                "Notes.app started during writeback preflight",
+            )
+        revalidate_joint_inputs()
         transaction.mark_joint_success()
     assert result is not None
     return result
@@ -17304,18 +17369,9 @@ def verify_writeback(
                 manifest_creation_receipt_file=requested_backup_receipt,
             )
         )
-        stage_artifact = transaction.enter_context(
-            _validated_patch_stage_artifact(
-                _patch_artifact_paths(stage_dir),
-                stage_manifest_creation_receipt,
-                manifest_creation_receipt_file=requested_stage_receipt,
-            )
-        )
-        live_store = transaction.enter_context(
-            _bind_source_store(paths.group_container / NOTE_STORE_MAIN)
-        )
         backup = backup_artifact.public_result
         baseline_manifest = backup["manifest"]
+        _require_writeback_grade_snapshot_schema(baseline_manifest)
         if (
             baseline_manifest.get("notes_running") is not False
             or baseline_manifest.get("notes_quit_required") is not True
@@ -17329,42 +17385,58 @@ def verify_writeback(
                 "backup-source-mismatch",
                 "Backup source root does not match the selected live store",
             )
-        backup_artifact.revalidate_artifact()
-        stage_artifact.revalidate_artifact()
-        _compare_live_source_binding(live_store, baseline_manifest)
-        live = _validate_bound_database_recovery(live_store)
-        current = {record["basename"]: record["source"] for record in live["capture"]}
-        if set(current) != {NOTE_STORE_MAIN}:
-            raise StoreSafetyError(
-                "post-writeback-file-set-mismatch",
-                "Post-writeback live store contains missing or stale WAL/SHM files",
+        stage_artifact = transaction.enter_context(
+            _validated_patch_stage_artifact(
+                _patch_artifact_paths(stage_dir),
+                stage_manifest_creation_receipt,
+                manifest_creation_receipt_file=requested_stage_receipt,
             )
+        )
+        live_store = transaction.enter_context(
+            _bind_source_store(paths.group_container / NOTE_STORE_MAIN)
+        )
         baseline_main = _source_manifest_map(baseline_manifest)[NOTE_STORE_MAIN]
-        if current[NOTE_STORE_MAIN]["identity"] == baseline_main["identity"]:
-            raise StoreSafetyError(
-                "post-writeback-identity-mismatch",
-                "Live NoteStore.sqlite was not replaced as a whole object",
-            )
         stage = stage_artifact.public_result
         staged_fingerprint = stage["fingerprint"]
-        if (
-            current[NOTE_STORE_MAIN]["sha256"] != staged_fingerprint["sha256"]
-            or current[NOTE_STORE_MAIN]["size"] != staged_fingerprint["size"]
-        ):
-            raise StoreSafetyError(
-                "post-writeback-content-mismatch",
-                "Live NoteStore.sqlite does not match the staged patch",
-            )
-        if current[NOTE_STORE_MAIN]["access_policy"] != baseline_main["access_policy"]:
-            raise StoreSafetyError(
-                "post-writeback-access-policy-mismatch",
-                "Live NoteStore.sqlite did not preserve the baseline access policy",
-            )
-        if notes_is_running():
-            raise StoreSafetyError(
-                "notes-started-during-verification",
-                "Notes.app started during writeback verification",
-            )
+
+        def revalidate_joint_inputs() -> dict[str, Any]:
+            backup_artifact.revalidate_artifact()
+            stage_artifact.revalidate_artifact()
+            _compare_live_source_binding(live_store, baseline_manifest)
+            current_live = _validate_bound_database_recovery(live_store)
+            current = {
+                record["basename"]: record["source"]
+                for record in current_live["capture"]
+            }
+            if set(current) != {NOTE_STORE_MAIN}:
+                raise StoreSafetyError(
+                    "post-writeback-file-set-mismatch",
+                    "Post-writeback live store contains missing or stale WAL/SHM files",
+                )
+            if current[NOTE_STORE_MAIN]["identity"] == baseline_main["identity"]:
+                raise StoreSafetyError(
+                    "post-writeback-identity-mismatch",
+                    "Live NoteStore.sqlite was not replaced as a whole object",
+                )
+            if (
+                current[NOTE_STORE_MAIN]["sha256"] != staged_fingerprint["sha256"]
+                or current[NOTE_STORE_MAIN]["size"] != staged_fingerprint["size"]
+            ):
+                raise StoreSafetyError(
+                    "post-writeback-content-mismatch",
+                    "Live NoteStore.sqlite does not match the staged patch",
+                )
+            if (
+                current[NOTE_STORE_MAIN]["access_policy"]
+                != baseline_main["access_policy"]
+            ):
+                raise StoreSafetyError(
+                    "post-writeback-access-policy-mismatch",
+                    "Live NoteStore.sqlite did not preserve the baseline access policy",
+                )
+            return current_live
+
+        live = revalidate_joint_inputs()
         result = {
             "writeback_verified": True,
             "notes_running": False,
@@ -17379,12 +17451,21 @@ def verify_writeback(
                 "stage": stage["manifest_creation_receipt"],
             },
         }
+        if notes_is_running():
+            raise StoreSafetyError(
+                "notes-started-during-verification",
+                "Notes.app started during writeback verification",
+            )
+        revalidate_joint_inputs()
         transaction.mark_joint_success()
     assert result is not None
     return result
 
 
-def _assert_note_tags_database_outside_live_containers(db_path: Path) -> None:
+def _assert_note_tags_database_outside_live_containers(
+    db_path: Path,
+    paths: NoteStorePaths,
+) -> None:
     normalized_name = unicodedata.normalize("NFD", db_path.name).casefold()
     if normalized_name.endswith(("-wal", "-shm", "-journal")):
         raise StoreSafetyError(
@@ -17394,7 +17475,7 @@ def _assert_note_tags_database_outside_live_containers(db_path: Path) -> None:
             details={"database": str(db_path)},
         )
     database_forms = _trusted_alias_scope_forms(db_path)
-    for live_container in (GROUP_CONTAINER, APP_CONTAINER):
+    for live_container in (paths.group_container, paths.app_container):
         for database_form, database_path in database_forms:
             database_parts = _normalized_scope_parts(database_path)
             for live_form, live_path in _trusted_alias_scope_forms(live_container):
@@ -17413,6 +17494,69 @@ def _assert_note_tags_database_outside_live_containers(db_path: Path) -> None:
                         "live_container_scope_path": str(live_path),
                     },
                 )
+
+
+def _bind_note_tags_live_store(
+    transaction: ExitStack,
+    paths: NoteStorePaths,
+) -> _BoundSourceStore | None:
+    """Bind the live NoteStore when present so external hard links cannot escape."""
+
+    try:
+        return transaction.enter_context(
+            _bind_source_store(paths.group_container / NOTE_STORE_MAIN)
+        )
+    except StoreSafetyError as exc:
+        if exc.code in {"prepared-directory-missing", "source-missing"}:
+            return None
+        raise StoreSafetyError(
+            "note-tags-live-source-inconclusive",
+            "Cannot safely exclude object-identity overlap with the live "
+            f"NoteStore: {paths.group_container / NOTE_STORE_MAIN}: {exc}",
+            details={**exc.details, "underlying_error_code": exc.code},
+        ) from exc
+
+
+def _assert_note_tags_input_not_live_store(
+    parent: _BoundDirectory,
+    database: _BoundRegularFile,
+    live_store: _BoundSourceStore | None,
+) -> None:
+    """Reject a lexical standalone path that aliases the held live main object."""
+
+    if live_store is None:
+        return
+    standalone = _verify_bound_regular_file_at(
+        database,
+        SOURCE_FILE_CODES,
+        dir_fd=parent.fd,
+        basename=database.path.name,
+    )
+    try:
+        live = _verify_bound_source_store(live_store)
+    except StoreSafetyError as exc:
+        raise StoreSafetyError(
+            "note-tags-live-source-inconclusive",
+            "The held live NoteStore changed while note-tags excluded "
+            f"object-identity overlap: {live_store.directory.path}: {exc}",
+            details={**exc.details, "underlying_error_code": exc.code},
+        ) from exc
+    live_main = live["files"][NOTE_STORE_MAIN]
+    if standalone["identity"] == live_main["identity"]:
+        live_names = list(live["membership"])
+        raise StoreSafetyError(
+            "note-tags-live-object",
+            "note-tags refuses a standalone-looking path that is a hard link "
+            "to the live NoteStore.sqlite object",
+            details={
+                "database": str(database.path),
+                "live_database": str(live_store.directory.path / live_store.main_name),
+                "live_file_set": live_names,
+                "live_sidecars_present": [
+                    name for name in live_names if name != NOTE_STORE_MAIN
+                ],
+            },
+        )
 
 
 def _verify_note_tags_standalone_input(
@@ -17598,70 +17742,88 @@ def _query_note_tags_from_image(
     }
 
 
-def query_note_tags(db_path: Path, note_title: str) -> dict[str, Any]:
+def query_note_tags(
+    db_path: Path,
+    note_title: str,
+    *,
+    paths: NoteStorePaths | None = None,
+) -> dict[str, Any]:
     db_path = _absolute_path(db_path)
-    _assert_note_tags_database_outside_live_containers(db_path)
+    paths = paths or NoteStorePaths()
+    _assert_note_tags_database_outside_live_containers(db_path, paths)
     parent: _BoundDirectory | None = None
     try:
-        with _bind_existing_directory_with_trusted_alias(db_path.parent) as parent:
-            with _bind_regular_file_at(
-                db_path,
-                parent,
-                SOURCE_FILE_CODES,
-            ) as database:
+        with ExitStack() as transaction:
+            parent = transaction.enter_context(
+                _bind_existing_directory_with_trusted_alias(db_path.parent)
+            )
+            database = transaction.enter_context(
+                _bind_regular_file_at(
+                    db_path,
+                    parent,
+                    SOURCE_FILE_CODES,
+                )
+            )
+            live_store = _bind_note_tags_live_store(transaction, paths)
 
-                def verify_input() -> dict[str, Any]:
-                    return _verify_note_tags_standalone_input(parent, database)
-
-                verify_input()
-                query_error: Exception | None = None
-                result: dict[str, Any] | None = None
-                try:
-                    with _deserialized_sqlite_image(
-                        database,
-                        db_path,
-                        verify_bound=verify_input,
-                        error_code="note-tags-query-failed",
-                        require_backup=False,
-                        file_codes=SOURCE_FILE_CODES,
-                    ) as image:
-                        result = _query_note_tags_from_image(
-                            image,
-                            db_path,
-                            note_title,
-                        )
-                except Exception as exc:
-                    query_error = exc
-                try:
-                    verify_input()
-                except Exception as terminal_error:
-                    if query_error is None:
-                        raise
-                    secondary = _sqlite_secondary_failure_evidence(
-                        query_error,
-                        phase="note-tags-query-or-setup",
-                    )
-                    if isinstance(terminal_error, StoreSafetyError):
-                        terminal_error.details = dict(terminal_error.details)
-                        terminal_error.details["note_tags_query_secondary_failure"] = (
-                            secondary
-                        )
-                        raise terminal_error from query_error
-                    raise StoreSafetyError(
-                        "source-revalidation-inconclusive",
-                        "note-tags terminal input revalidation failed for "
-                        f"{db_path}: {_sqlite_exception_text(terminal_error)}",
-                        details={
-                            "note_tags_query_secondary_failure": secondary,
-                            "terminal_revalidation_failure": (
-                                _sqlite_exception_evidence(terminal_error)
-                            ),
-                        },
-                    ) from terminal_error
-                if query_error is not None:
-                    raise query_error
-                assert result is not None
+            def verify_input() -> dict[str, Any]:
+                result = _verify_note_tags_standalone_input(parent, database)
+                _assert_note_tags_input_not_live_store(
+                    parent,
+                    database,
+                    live_store,
+                )
                 return result
+
+            verify_input()
+            query_error: Exception | None = None
+            result: dict[str, Any] | None = None
+            try:
+                with _deserialized_sqlite_image(
+                    database,
+                    db_path,
+                    verify_bound=verify_input,
+                    error_code="note-tags-query-failed",
+                    require_backup=False,
+                    file_codes=SOURCE_FILE_CODES,
+                ) as image:
+                    result = _query_note_tags_from_image(
+                        image,
+                        db_path,
+                        note_title,
+                    )
+            except Exception as exc:
+                query_error = exc
+            try:
+                verify_input()
+            except Exception as terminal_error:
+                if query_error is None:
+                    raise
+                secondary = _sqlite_secondary_failure_evidence(
+                    query_error,
+                    phase="note-tags-query-or-setup",
+                )
+                if isinstance(terminal_error, StoreSafetyError):
+                    terminal_error.details = dict(terminal_error.details)
+                    terminal_error.details["note_tags_query_secondary_failure"] = (
+                        secondary
+                    )
+                    raise terminal_error from query_error
+                raise StoreSafetyError(
+                    "source-revalidation-inconclusive",
+                    "note-tags terminal input revalidation failed for "
+                    f"{db_path}: {_sqlite_exception_text(terminal_error)}",
+                    details={
+                        "note_tags_query_secondary_failure": secondary,
+                        "terminal_revalidation_failure": (
+                            _sqlite_exception_evidence(terminal_error)
+                        ),
+                    },
+                ) from terminal_error
+            if query_error is not None:
+                raise query_error
+            assert result is not None
+            return result
     except StoreSafetyError as exc:
         if parent is not None and exc.code in {
             "directory-identity-mismatch",
@@ -18922,6 +19084,7 @@ def build_parser() -> argparse.ArgumentParser:
         "note-tags",
         help="Read hashtag rows for a note title from a DB copy.",
     )
+    _add_container_options(tags_parser)
     tags_parser.add_argument("--db", type=Path, required=True)
     tags_parser.add_argument("--title", required=True)
 
@@ -19155,6 +19318,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 query_note_tags(
                     _absolute_path_from_cwd(args.db, command_cwd),
                     args.title,
+                    paths=_paths_from_args(args, cwd=command_cwd),
                 )
             )
         elif args.command == "fingerprint-db":

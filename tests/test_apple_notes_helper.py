@@ -673,14 +673,15 @@ class AppleNotesHelperTests(unittest.TestCase):
         artifact_dir: Path,
         *,
         artifact_kind: str,
+        artifact_schema: str | None = None,
     ) -> dict[str, object]:
         if artifact_kind == "snapshot":
             manifest_name = MODULE.SNAPSHOT_MANIFEST
-            artifact_schema = MODULE.SNAPSHOT_SCHEMA
+            artifact_schema = artifact_schema or MODULE.SNAPSHOT_SCHEMA
             registry = self._snapshot_manifest_receipts
         elif artifact_kind == "patch-stage":
             manifest_name = MODULE.PATCH_MANIFEST
-            artifact_schema = MODULE.PATCH_SCHEMA
+            artifact_schema = artifact_schema or MODULE.PATCH_SCHEMA
             registry = self._stage_manifest_receipts
         else:
             self.fail(f"Unsupported artifact kind: {artifact_kind}")
@@ -700,6 +701,23 @@ class AppleNotesHelperTests(unittest.TestCase):
         )
         registry[artifact_dir] = receipt
         return receipt
+
+    def _convert_snapshot_to_v3_for_test(
+        self,
+        snapshot_dir: Path,
+    ) -> dict[str, object]:
+        """Build one exact externally anchored v3 fixture from the v3 layout."""
+
+        manifest_path = snapshot_dir / MODULE.SNAPSHOT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["schema"] = MODULE.SNAPSHOT_SCHEMA_V3
+        manifest.pop("source_binding")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        return self._reanchor_manifest_for_test(
+            snapshot_dir,
+            artifact_kind="snapshot",
+            artifact_schema=MODULE.SNAPSHOT_SCHEMA_V3,
+        )
 
     def _write_fake_osascript(self, path: Path) -> None:
         path.write_text(
@@ -777,6 +795,24 @@ raise SystemExit(2)
             conn.commit()
         path.chmod(0o600)
         return note_title
+
+    def _query_note_tags_standalone_for_test(
+        self,
+        database: Path,
+        note_title: str,
+    ) -> dict[str, object]:
+        live_group = database.parent / "test-live-group"
+        live_app = database.parent / "test-live-app"
+        live_group.mkdir(exist_ok=True)
+        live_app.mkdir(exist_ok=True)
+        return MODULE.query_note_tags(
+            database,
+            note_title,
+            paths=MODULE.NoteStorePaths(
+                group_container=live_group,
+                app_container=live_app,
+            ),
+        )
 
     @contextmanager
     def _bind_direct_main_only_source_store(
@@ -4635,7 +4671,7 @@ raise SystemExit(2)
         self.assertEqual(Path(payload["merged_db"]), output)
         self.assertEqual(Path(payload["standalone_db"]), output)
 
-    def test_compatibility_copy_cli_packaged_supervisor_fails_before_creation(
+    def test_compatibility_copy_cli_packaged_supervisor_publishes_snapshot(
         self,
     ) -> None:
         process_probe = subprocess.run(
@@ -4676,20 +4712,35 @@ raise SystemExit(2)
             copied = (
                 destination / "group.com.apple.notes" / MODULE.NOTE_STORE_MAIN
             ).is_file()
+            manifest = (
+                json.loads(
+                    (destination / MODULE.SNAPSHOT_MANIFEST).read_text(encoding="utf-8")
+                )
+                if copied
+                else {}
+            )
 
         self.assertEqual(
             result.returncode,
-            1,
+            0,
             msg=result.stdout + result.stderr,
         )
+        self.assertTrue(copied)
+        self.assertEqual(Path(payload["dest"]), destination)
+        self.assertEqual(payload["notes_running"], process_probe.returncode == 0)
+        self.assertEqual(manifest["schema"], MODULE.SNAPSHOT_SCHEMA)
         self.assertEqual(
-            payload["error_code"],
-            "directory-creation-identity-inconclusive",
+            payload["manifest_creation_receipt"]["artifact_schema"],
+            MODULE.SNAPSHOT_SCHEMA,
         )
-        self.assertFalse(copied)
-        self.assertFalse(destination.exists())
-        self.assertFalse(payload["details"]["mutation_performed"])
-        self.assertEqual(payload["details"]["cleanup_state"], "not-needed")
+        self.assertEqual(
+            Path(payload["descriptor_bound_destination"]["display_path"]),
+            destination,
+        )
+        self.assertEqual(
+            payload["descriptor_bound_destination"]["tree_verification"],
+            "descriptor-revalidated-after-rename",
+        )
 
     def test_merge_default_output_is_external_to_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -8448,6 +8499,111 @@ raise SystemExit(2)
                     "source-revalidation-unreadable",
                     raised,
                 )
+
+    def test_source_preopen_generic_errors_use_revalidation_taxonomy(self) -> None:
+        fault_numbers = (
+            MODULE.errno.EIO,
+            getattr(MODULE.errno, "ESTALE", MODULE.errno.EIO),
+        )
+        for helper in ("absolute", "descriptor-relative"):
+            for fault_number in fault_numbers:
+                with (
+                    self.subTest(helper=helper, fault_number=fault_number),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    root = Path(temp_dir)
+                    source = root / MODULE.NOTE_STORE_MAIN
+                    self._create_db(source)
+                    if helper == "absolute":
+                        with (
+                            mock.patch.object(
+                                MODULE.os,
+                                "open",
+                                side_effect=OSError(
+                                    fault_number,
+                                    "simulated source open failure",
+                                ),
+                            ),
+                            self.assertRaises(MODULE.StoreSafetyError) as raised,
+                        ):
+                            MODULE._open_regular_readonly(source)
+                    else:
+                        with MODULE._bind_existing_directory_with_trusted_alias(
+                            root
+                        ) as parent:
+                            with (
+                                mock.patch.object(
+                                    MODULE.os,
+                                    "open",
+                                    side_effect=OSError(
+                                        fault_number,
+                                        "simulated descriptor-relative open failure",
+                                    ),
+                                ),
+                                self.assertRaises(MODULE.StoreSafetyError) as raised,
+                            ):
+                                MODULE._open_regular_readonly_at(
+                                    parent,
+                                    source.name,
+                                    display_path=source,
+                                )
+
+                    self._assert_safety_code(
+                        "source-revalidation-inconclusive",
+                        raised,
+                    )
+
+    def test_probe_records_preopen_generic_errors_as_inconclusive(self) -> None:
+        fault_numbers = (
+            MODULE.errno.EIO,
+            getattr(MODULE.errno, "ESTALE", MODULE.errno.EIO),
+        )
+        for fault_number in fault_numbers:
+            with (
+                self.subTest(fault_number=fault_number),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                paths = self._make_paths(Path(temp_dir))
+                source = paths.group_container / MODULE.NOTE_STORE_MAIN
+                self._create_db(source)
+                original_open = MODULE.os.open
+
+                def fail_source_open(
+                    target: object,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    if (
+                        dir_fd is not None
+                        and os.fspath(target) == MODULE.NOTE_STORE_MAIN
+                    ):
+                        raise OSError(
+                            fault_number,
+                            "simulated descriptor-relative source open failure",
+                        )
+                    return original_open(target, flags, mode, dir_fd=dir_fd)
+
+                with mock.patch.object(
+                    MODULE.os,
+                    "open",
+                    side_effect=fail_source_open,
+                ):
+                    result = MODULE.probe_db_access(paths)
+
+                source_record = next(
+                    record
+                    for record in result["note_store_files"]
+                    if Path(record["path"]) == source
+                )
+                self.assertTrue(source_record["exists"])
+                self.assertFalse(source_record["readable"])
+                self.assertEqual(
+                    source_record["error_code"],
+                    "source-revalidation-inconclusive",
+                )
+                self.assertNotIn("size", source_record)
 
     def test_bound_source_file_post_open_errors_close_fd_and_preserve_errno(
         self,
@@ -21497,9 +21653,12 @@ raise SystemExit(2)
             patch_manifest = json.loads(
                 Path(stage["manifest"]).read_text(encoding="utf-8")
             )
+            validation = self._validate_snapshot(Path(snapshot["dest"]))
 
         self.assertEqual(manifest["schema"], "apple-notes-snapshot/v4")
         self.assertEqual(patch_manifest["schema"], "apple-notes-patch/v3")
+        self.assertEqual(validation["snapshot_schema"], MODULE.SNAPSHOT_SCHEMA)
+        self.assertTrue(validation["writeback_grade"])
         binding = manifest["source_binding"]
         self.assertEqual(
             set(binding),
@@ -21577,24 +21736,128 @@ raise SystemExit(2)
                 "apple-notes-registered-darwin-alias-binding/v1",
             )
 
-    def test_writeback_rejects_v3_snapshot_without_live_source_binding(
+    def test_snapshot_v4_read_only_capture_reports_not_writeback_grade(
         self,
     ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self._make_paths(root)
+            self._create_db(paths.group_container / MODULE.NOTE_STORE_MAIN)
+            with mock.patch.object(MODULE, "notes_is_running", return_value=False):
+                snapshot = self._copy_db(
+                    paths,
+                    dest=root / "snapshot",
+                    require_notes_quit=False,
+                )
+            validation = self._validate_snapshot(Path(snapshot["dest"]))
+
+        self.assertEqual(validation["snapshot_schema"], MODULE.SNAPSHOT_SCHEMA)
+        self.assertFalse(validation["writeback_grade"])
+        self.assertEqual(
+            validation["manifest"]["classification"],
+            "read-only-snapshot",
+        )
+
+    def test_v3_snapshot_remains_read_only_validatable_and_recoverable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths, _, backup_dir, _ = self._prepare_writeback_fixture(
+                root,
+                install_stage=False,
+            )
+            receipt = self._convert_snapshot_to_v3_for_test(backup_dir)
+            recovered = root / "recovered-v3.sqlite"
+
+            validation = MODULE.validate_snapshot(backup_dir, receipt)
+            recovery = MODULE.recover_snapshot(
+                backup_dir,
+                recovered,
+                receipt,
+                paths=paths,
+            )
+
+            self.assertEqual(
+                validation["manifest"]["schema"],
+                MODULE.SNAPSHOT_SCHEMA_V3,
+            )
+            self.assertEqual(
+                validation["manifest"]["classification"],
+                "writeback-baseline",
+            )
+            self.assertEqual(
+                validation["snapshot_schema"],
+                MODULE.SNAPSHOT_SCHEMA_V3,
+            )
+            self.assertFalse(validation["writeback_grade"])
+            self.assertNotIn(
+                "live_source_binding",
+                validation["source_integrity"],
+            )
+            self.assertEqual(
+                receipt["artifact_schema"],
+                MODULE.SNAPSHOT_SCHEMA_V3,
+            )
+            self.assertEqual(
+                recovery["snapshot_validation"]["sqlite_validation"]["result"],
+                "ok",
+            )
+            self.assertEqual(
+                recovery["snapshot_validation"]["snapshot_schema"],
+                MODULE.SNAPSHOT_SCHEMA_V3,
+            )
+            self.assertFalse(recovery["snapshot_validation"]["writeback_grade"])
+            with closing(sqlite3.connect(recovered)) as connection:
+                self.assertEqual(
+                    connection.execute("SELECT value FROM sample").fetchone(),
+                    ("before",),
+                )
+
+    def test_v3_snapshot_rejects_hybrid_v4_source_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths, _, backup_dir, _ = self._prepare_writeback_fixture(
+                root,
+                install_stage=False,
+            )
+            manifest_path = backup_dir / MODULE.SNAPSHOT_MANIFEST
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertIn("source_binding", manifest)
+            manifest["schema"] = MODULE.SNAPSHOT_SCHEMA_V3
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            receipt = self._reanchor_manifest_for_test(
+                backup_dir,
+                artifact_kind="snapshot",
+                artifact_schema=MODULE.SNAPSHOT_SCHEMA_V3,
+            )
+
+            for operation in ("validate", "recover"):
+                output = root / f"hybrid-{operation}.sqlite"
+                with (
+                    self.subTest(operation=operation),
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    if operation == "validate":
+                        MODULE.validate_snapshot(backup_dir, receipt)
+                    else:
+                        MODULE.recover_snapshot(
+                            backup_dir,
+                            output,
+                            receipt,
+                            paths=paths,
+                        )
+                self._assert_safety_code("manifest-invalid", raised)
+                self.assertFalse(output.exists())
+
+    def test_writeback_rejects_exact_anchored_v3_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             paths, _, backup_dir, stage_dir = self._prepare_writeback_fixture(
                 root,
                 install_stage=False,
             )
-            manifest_path = backup_dir / MODULE.SNAPSHOT_MANIFEST
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["schema"] = "apple-notes-snapshot/v3"
-            manifest.pop("source_binding")
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            self._reanchor_manifest_for_test(
-                backup_dir,
-                artifact_kind="snapshot",
-            )
+            self._convert_snapshot_to_v3_for_test(backup_dir)
             with mock.patch.object(MODULE, "notes_is_running", return_value=False):
                 for operation in ("preflight", "verify"):
                     with (
@@ -21613,7 +21876,74 @@ raise SystemExit(2)
                                 backup_dir=backup_dir,
                                 stage_dir=stage_dir,
                             )
-                    self._assert_safety_code("manifest-schema-mismatch", raised)
+                    self._assert_safety_code("backup-not-writeback-grade", raised)
+
+    def test_v3_writeback_grade_precedes_stage_and_live_validation(self) -> None:
+        for operation in ("preflight", "verify"):
+            for target in ("stage", "live"):
+                for invalid_state in ("missing", "not-directory"):
+                    with (
+                        self.subTest(
+                            operation=operation,
+                            target=target,
+                            invalid_state=invalid_state,
+                        ),
+                        tempfile.TemporaryDirectory() as temp_dir,
+                    ):
+                        root = Path(temp_dir)
+                        paths, _, backup_dir, stage_dir = (
+                            self._prepare_writeback_fixture(
+                                root,
+                                install_stage=operation == "verify",
+                            )
+                        )
+                        self._convert_snapshot_to_v3_for_test(backup_dir)
+                        invalid_path = (
+                            stage_dir if target == "stage" else paths.group_container
+                        )
+                        invalid_path.rename(root / f"retained-{target}")
+                        if invalid_state == "not-directory":
+                            invalid_path.write_bytes(b"not a directory")
+
+                        with (
+                            mock.patch.object(
+                                MODULE,
+                                "notes_is_running",
+                                return_value=False,
+                            ),
+                            mock.patch.object(
+                                MODULE,
+                                "_validated_patch_stage_artifact",
+                                wraps=MODULE._validated_patch_stage_artifact,
+                            ) as stage_validation,
+                            mock.patch.object(
+                                MODULE,
+                                "_bind_source_store",
+                                wraps=MODULE._bind_source_store,
+                            ) as live_binding,
+                            self.assertRaises(MODULE.StoreSafetyError) as raised,
+                        ):
+                            kwargs = {
+                                "backup_dir": backup_dir,
+                                "stage_dir": stage_dir,
+                                "backup_manifest_creation_receipt": (
+                                    self._snapshot_manifest_receipts[backup_dir]
+                                ),
+                                "stage_manifest_creation_receipt": (
+                                    self._stage_manifest_receipts[stage_dir]
+                                ),
+                            }
+                            if operation == "preflight":
+                                MODULE.preflight_writeback(paths, **kwargs)
+                            else:
+                                MODULE.verify_writeback(paths, **kwargs)
+
+                        self._assert_safety_code(
+                            "backup-not-writeback-grade",
+                            raised,
+                        )
+                        stage_validation.assert_not_called()
+                        live_binding.assert_not_called()
 
     def test_snapshot_v4_rejects_reanchored_malformed_source_binding(self) -> None:
         for malformed_kind in (
@@ -21812,6 +22142,10 @@ raise SystemExit(2)
                 original_stat = MODULE.os.stat
                 original_fstat = MODULE.os.fstat
                 original_readlink = MODULE.os.readlink
+                original_open = MODULE.os.open
+                original_read = MODULE.os.read
+                original_lseek = MODULE.os.lseek
+                original_scandir = MODULE.os.scandir
 
                 def mark_joint_success(
                     transaction: MODULE._WritebackLinearizedTransaction,
@@ -21855,6 +22189,29 @@ raise SystemExit(2)
                         side_effect=reject_post_joint_read(
                             "readlink",
                             original_readlink,
+                        ),
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "open",
+                        side_effect=reject_post_joint_read("open", original_open),
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "read",
+                        side_effect=reject_post_joint_read("read", original_read),
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "lseek",
+                        side_effect=reject_post_joint_read("lseek", original_lseek),
+                    ),
+                    mock.patch.object(
+                        MODULE.os,
+                        "scandir",
+                        side_effect=reject_post_joint_read(
+                            "scandir",
+                            original_scandir,
                         ),
                     ),
                     mock.patch.object(
@@ -21915,6 +22272,69 @@ raise SystemExit(2)
                         )
                 self.assertEqual(notes_probe.call_count, 2)
                 self._assert_safety_code(expected_code, raised)
+
+    def test_writeback_revalidates_all_inputs_after_final_notes_probe(self) -> None:
+        cases = (
+            ("backup", "snapshot-directory-identity-mismatch"),
+            ("stage", "stage-directory-identity-mismatch"),
+            ("live", "source-identity-mismatch"),
+        )
+        for operation in ("preflight", "verify"):
+            for target_kind, expected_code in cases:
+                with (
+                    self.subTest(operation=operation, target=target_kind),
+                    tempfile.TemporaryDirectory() as temp_dir,
+                ):
+                    root = Path(temp_dir)
+                    paths, _, backup_dir, stage_dir = self._prepare_writeback_fixture(
+                        root,
+                        install_stage=operation == "verify",
+                    )
+                    target = {
+                        "backup": backup_dir,
+                        "stage": stage_dir,
+                        "live": paths.group_container,
+                    }[target_kind]
+                    parked = root / f"retained-during-notes-{target_kind}"
+                    target_mode = stat.S_IMODE(target.stat().st_mode)
+                    probe_count = 0
+                    replaced = False
+
+                    def mutate_during_final_notes_probe() -> bool:
+                        nonlocal probe_count, replaced
+                        probe_count += 1
+                        if probe_count == 2:
+                            target.rename(parked)
+                            target.mkdir(mode=target_mode)
+                            target.chmod(target_mode)
+                            replaced = True
+                        return False
+
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "notes_is_running",
+                            side_effect=mutate_during_final_notes_probe,
+                        ),
+                        self.assertRaises(MODULE.StoreSafetyError) as raised,
+                    ):
+                        if operation == "preflight":
+                            self._preflight_writeback(
+                                paths,
+                                backup_dir=backup_dir,
+                                stage_dir=stage_dir,
+                            )
+                        else:
+                            self._verify_writeback(
+                                paths,
+                                backup_dir=backup_dir,
+                                stage_dir=stage_dir,
+                            )
+
+                    self.assertEqual(probe_count, 2)
+                    self.assertTrue(replaced)
+                    self.assertTrue(parked.is_dir())
+                    self._assert_safety_code(expected_code, raised)
 
     def test_writeback_rejects_replaced_group_with_same_live_file_inode(
         self,
@@ -22200,7 +22620,8 @@ raise SystemExit(2)
                             )
                             self.assertTrue(accepted["writeback_verified"])
 
-                    alias.unlink()
+                    retained_alias = root / "retained-original-alias"
+                    alias.rename(retained_alias)
                     alias.symlink_to(canonical, target_is_directory=True)
                     with (
                         mock.patch.object(
@@ -22583,7 +23004,10 @@ raise SystemExit(2)
                     "note-tags must not reopen the mutable database path"
                 ),
             ) as path_connect:
-                result = MODULE.query_note_tags(db_path, note_title)
+                result = self._query_note_tags_standalone_for_test(
+                    db_path,
+                    note_title,
+                )
             self.assertEqual(result["note"]["pk"], 1677)
             self.assertEqual(
                 [row["tag_text"] for row in result["tags"]],
@@ -22634,7 +23058,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.query_note_tags(database, note_title)
+                self._query_note_tags_standalone_for_test(database, note_title)
 
         self._assert_safety_code("source-identity-mismatch", raised)
 
@@ -22669,7 +23093,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.query_note_tags(database, note_title)
+                self._query_note_tags_standalone_for_test(database, note_title)
 
         self._assert_safety_code("source-content-mismatch", raised)
 
@@ -22700,7 +23124,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.query_note_tags(database, note_title)
+                self._query_note_tags_standalone_for_test(database, note_title)
 
         self._assert_safety_code("source-access-policy-mismatch", raised)
 
@@ -22748,7 +23172,10 @@ raise SystemExit(2)
                     ),
                     self.assertRaises(MODULE.StoreSafetyError) as raised,
                 ):
-                    MODULE.query_note_tags(database, note_title)
+                    self._query_note_tags_standalone_for_test(
+                        database,
+                        note_title,
+                    )
 
                 self._assert_safety_code(expected_code, raised)
                 secondary = raised.exception.details[
@@ -22779,7 +23206,10 @@ raise SystemExit(2)
                     ) as deserialize,
                     self.assertRaises(MODULE.StoreSafetyError) as raised,
                 ):
-                    MODULE.query_note_tags(database, note_title)
+                    self._query_note_tags_standalone_for_test(
+                        database,
+                        note_title,
+                    )
 
                 self._assert_safety_code("note-tags-sidecar-present", raised)
                 deserialize.assert_not_called()
@@ -22821,7 +23251,7 @@ raise SystemExit(2)
                 ),
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.query_note_tags(database, note_title)
+                self._query_note_tags_standalone_for_test(database, note_title)
 
         self._assert_safety_code("note-tags-sidecar-present", raised)
 
@@ -22865,20 +23295,122 @@ raise SystemExit(2)
                 ) as deserialize,
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.query_note_tags(database, note_title)
+                self._query_note_tags_standalone_for_test(database, note_title)
 
         self.assertTrue(injected)
         self._assert_safety_code("note-tags-sidecar-present", raised)
         deserialize.assert_not_called()
 
+    def test_query_note_tags_rejects_external_hardlink_to_live_wal_store(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_group = root / "live-group"
+            live_group.mkdir()
+            live_app = root / "live-app"
+            live_app.mkdir()
+            live_database = live_group / MODULE.NOTE_STORE_MAIN
+            note_title = self._create_note_tags_db(live_database)
+            external_hardlink = root / "standalone-looking.sqlite"
+
+            with closing(sqlite3.connect(live_database)) as live_connection:
+                self.assertEqual(
+                    live_connection.execute("PRAGMA journal_mode = WAL").fetchone(),
+                    ("wal",),
+                )
+                live_connection.execute(
+                    "UPDATE ZICCLOUDSYNCINGOBJECT SET ZTITLE1 = ZTITLE1 || ' ' "
+                    "WHERE Z_PK = 1677"
+                )
+                live_connection.commit()
+                live_wal = live_database.with_name(f"{MODULE.NOTE_STORE_MAIN}-wal")
+                self.assertTrue(live_wal.is_file())
+                os.link(live_database, external_hardlink)
+
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_deserialized_sqlite_image",
+                        side_effect=AssertionError(
+                            "live hard links must fail before SQLite consumption"
+                        ),
+                    ) as deserialize,
+                    self.assertRaises(MODULE.StoreSafetyError) as raised,
+                ):
+                    MODULE.query_note_tags(
+                        external_hardlink,
+                        note_title,
+                        paths=MODULE.NoteStorePaths(
+                            group_container=live_group,
+                            app_container=live_app,
+                        ),
+                    )
+
+            self._assert_safety_code("note-tags-live-object", raised)
+            self.assertIn(
+                f"{MODULE.NOTE_STORE_MAIN}-wal",
+                raised.exception.details["live_sidecars_present"],
+            )
+            deserialize.assert_not_called()
+
+    def test_query_note_tags_rejects_live_wal_membership_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_group = root / "live-group"
+            live_group.mkdir()
+            live_app = root / "live-app"
+            live_app.mkdir()
+            live_database = live_group / MODULE.NOTE_STORE_MAIN
+            self._create_db(live_database)
+            standalone = root / "standalone.sqlite"
+            note_title = self._create_note_tags_db(standalone)
+            live_wal = live_database.with_name(f"{MODULE.NOTE_STORE_MAIN}-wal")
+            injected = False
+
+            def inject_live_wal(
+                _image: MODULE._DeserializedSQLiteImage,
+                _database: Path,
+                _note_title: str,
+            ) -> dict[str, object]:
+                nonlocal injected
+                live_wal.write_bytes(b"late live WAL membership")
+                injected = True
+                return {"note": {}, "tags": []}
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_query_note_tags_from_image",
+                    side_effect=inject_live_wal,
+                ),
+                self.assertRaises(MODULE.StoreSafetyError) as raised,
+            ):
+                MODULE.query_note_tags(
+                    standalone,
+                    note_title,
+                    paths=MODULE.NoteStorePaths(
+                        group_container=live_group,
+                        app_container=live_app,
+                    ),
+                )
+
+        self.assertTrue(injected)
+        self._assert_safety_code("note-tags-live-source-inconclusive", raised)
+        self.assertEqual(
+            raised.exception.details["underlying_error_code"],
+            "store-file-set-mismatch",
+        )
+
     def test_query_note_tags_rejects_live_container_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             live_container = Path(temp_dir) / "group.com.apple.notes"
             live_container.mkdir()
+            app_container = Path(temp_dir) / "com.apple.Notes"
+            app_container.mkdir()
             database = live_container / MODULE.NOTE_STORE_MAIN
             note_title = self._create_note_tags_db(database)
             with (
-                mock.patch.object(MODULE, "GROUP_CONTAINER", live_container),
                 mock.patch.object(
                     MODULE,
                     "_bind_existing_directory_with_trusted_alias",
@@ -22888,7 +23420,14 @@ raise SystemExit(2)
                 ) as bind_parent,
                 self.assertRaises(MODULE.StoreSafetyError) as raised,
             ):
-                MODULE.query_note_tags(database, note_title)
+                MODULE.query_note_tags(
+                    database,
+                    note_title,
+                    paths=MODULE.NoteStorePaths(
+                        group_container=live_container,
+                        app_container=app_container,
+                    ),
+                )
 
         self._assert_safety_code("note-tags-live-container", raised)
         bind_parent.assert_not_called()
