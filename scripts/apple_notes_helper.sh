@@ -2,6 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_DIR="${SCRIPT_DIR}/../.agents/skills/apple-notes-db-guardrails"
+DB_HELPER="${SKILL_DIR}/scripts/apple_notes_db.py"
+DIRECTORY_SUPERVISOR="${SKILL_DIR}/scripts/apple_notes_directory_supervisor.py"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 OSASCRIPT_BIN="${OSASCRIPT_BIN:-/usr/bin/osascript}"
 
@@ -12,14 +15,27 @@ Usage:
   bash scripts/apple_notes_helper.sh list-folders
   bash scripts/apple_notes_helper.sh show-note-prefix --folder FOLDER --prefix PREFIX
   bash scripts/apple_notes_helper.sh probe-db-access
-  bash scripts/apple_notes_helper.sh copy-db [--dest PATH] [--require-notes-quit]
-  bash scripts/apple_notes_helper.sh merge-db --src PATH [--out PATH]
+  bash scripts/apple_notes_helper.sh copy-db [--dest PATH] [--result-file PATH] [--require-notes-quit] [--directory-creator-fd FD]
+  bash scripts/apple_notes_helper.sh merge-db --src PATH [--out PATH] [--directory-creator-fd FD]
+  bash scripts/apple_notes_helper.sh validate-snapshot --snapshot-dir PATH --manifest-creation-receipt-file PATH
+  bash scripts/apple_notes_helper.sh recover-snapshot --snapshot-dir PATH --out PATH --manifest-creation-receipt-file PATH [--directory-creator-fd FD]
+  bash scripts/apple_notes_helper.sh stage-patch --src PATH --dest PATH [--result-file PATH] [--directory-creator-fd FD]
+  bash scripts/apple_notes_helper.sh validate-patch-stage --stage-dir PATH --manifest-creation-receipt-file PATH
+  bash scripts/apple_notes_helper.sh preflight-writeback --backup-dir PATH --stage-dir PATH --backup-manifest-creation-receipt-file PATH --stage-manifest-creation-receipt-file PATH
+  bash scripts/apple_notes_helper.sh verify-writeback --backup-dir PATH --stage-dir PATH --backup-manifest-creation-receipt-file PATH --stage-manifest-creation-receipt-file PATH
   bash scripts/apple_notes_helper.sh note-tags --db PATH --title TITLE
   bash scripts/apple_notes_helper.sh fingerprint-db
 
 Notes:
   - Notes app-level preflight is performed via osascript inside this wrapper.
-  - DB-heavy subcommands delegate to python3 scripts/apple_notes_helper.py.
+  - DB-heavy subcommands delegate to the helper packaged with apple-notes-db-guardrails.
+  - Use copy-db/stage-patch --result-file to atomically create the successful
+    JSON outside the artifact for every consuming command.
+  - Write-producing DB commands automatically launch the packaged cooperative
+    same-UID directory supervisor. It randomizes and descriptor-binds the created
+    private directory before transferring its FD, but does not isolate a hostile
+    same-UID debugger or namespace racer.
+  - No subcommand mutates the live Notes store; writeback remains an explicit separate phase.
   - In Codex, prefer this wrapper under an approved/escalated prefix when Notes automation is needed.
 EOF
 }
@@ -128,20 +144,56 @@ main() {
   case "$1" in
     probe-notes)
       shift
+      if [[ $# -ne 0 ]]; then
+        printf 'Unsupported probe-notes argument: %s\n' "$1" >&2
+        return 2
+      fi
+      local notes_running
+      local folders
+      notes_running="$(notes_running_json)"
+      if ! folders="$(folders_json)"; then
+        return 1
+      fi
       printf '{\n  "notes_running": %s,\n  "automation_ok": true,\n  "folders": %s\n}\n' \
-        "$(notes_running_json)" \
-        "$(folders_json)"
+        "$notes_running" \
+        "$folders"
       ;;
     list-folders)
       shift
-      printf '{\n  "folders": %s\n}\n' "$(folders_json)"
+      if [[ $# -ne 0 ]]; then
+        printf 'Unsupported list-folders argument: %s\n' "$1" >&2
+        return 2
+      fi
+      local folders
+      if ! folders="$(folders_json)"; then
+        return 1
+      fi
+      printf '{\n  "folders": %s\n}\n' "$folders"
       ;;
     show-note-prefix)
       shift
       show_note_prefix "$@"
       ;;
-    probe-db-access|copy-db|merge-db|note-tags|fingerprint-db)
-      exec "$PYTHON_BIN" "$SCRIPT_DIR/apple_notes_helper.py" "$@"
+    copy-db|merge-db|recover-snapshot|stage-patch)
+      local has_directory_creator_fd="false"
+      local argument
+      for argument in "$@"; do
+        case "$argument" in
+          --directory-creator-fd|--directory-creator-fd=*)
+            has_directory_creator_fd="true"
+            ;;
+        esac
+      done
+      if [[ "$has_directory_creator_fd" == "true" ]]; then
+        exec "$PYTHON_BIN" "$DB_HELPER" "$@"
+      fi
+      exec "$PYTHON_BIN" "$DIRECTORY_SUPERVISOR" \
+        --helper "$DB_HELPER" \
+        --python "$PYTHON_BIN" \
+        -- "$@"
+      ;;
+    probe-db-access|validate-snapshot|validate-patch-stage|preflight-writeback|verify-writeback|note-tags|fingerprint-db)
+      exec "$PYTHON_BIN" "$DB_HELPER" "$@"
       ;;
     -h|--help|help)
       usage

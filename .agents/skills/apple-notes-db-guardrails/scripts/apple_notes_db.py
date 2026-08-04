@@ -1,0 +1,19802 @@
+#!/usr/bin/env python3
+"""Audit, recover, stage, and verify Apple Notes SQLite stores safely."""
+
+from __future__ import annotations
+
+import argparse
+import array
+import ctypes
+import ctypes.util
+import errno
+import hashlib
+import json
+import os
+import signal
+import socket
+import sqlite3
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import unicodedata
+import uuid
+from collections.abc import Collection, Mapping
+from contextlib import ExitStack, closing, contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator, Union
+
+
+GROUP_CONTAINER = Path.home() / "Library/Group Containers/group.com.apple.notes"
+APP_CONTAINER = Path.home() / "Library/Containers/com.apple.Notes"
+NOTE_STORE_MAIN = "NoteStore.sqlite"
+NOTE_STORE_ROLLBACK_JOURNAL = f"{NOTE_STORE_MAIN}-journal"
+NOTE_STORE_BASENAMES = (
+    NOTE_STORE_MAIN,
+    f"{NOTE_STORE_MAIN}-wal",
+    f"{NOTE_STORE_MAIN}-shm",
+)
+NOTE_STORE_DISCOVERY_BASENAMES = (
+    *NOTE_STORE_BASENAMES,
+    NOTE_STORE_ROLLBACK_JOURNAL,
+)
+SNAPSHOT_MANIFEST = "snapshot-manifest.json"
+PATCH_MANIFEST = "patch-manifest.json"
+SNAPSHOT_SCHEMA_V3 = "apple-notes-snapshot/v3"
+SNAPSHOT_SCHEMA = "apple-notes-snapshot/v4"
+READ_ONLY_SNAPSHOT_SCHEMAS = (SNAPSHOT_SCHEMA_V3, SNAPSHOT_SCHEMA)
+PATCH_SCHEMA = "apple-notes-patch/v3"
+LIVE_SOURCE_BINDING_SCHEMA = "apple-notes-live-source-binding/v1"
+REGISTERED_DARWIN_ALIAS_BINDING_SCHEMA = (
+    "apple-notes-registered-darwin-alias-binding/v1"
+)
+MANIFEST_CREATION_RECEIPT_SCHEMA = "apple-notes-manifest-creation-receipt/v1"
+CHUNK_SIZE = 1024 * 1024
+MANIFEST_MAX_BYTES = 4 * 1024 * 1024
+MANIFEST_JSON_MAX_DEPTH = 64
+MANIFEST_JSON_MAX_INTEGER_DIGITS = 128
+BOUND_DIRECTORY_SCAN_MAX_ENTRIES = 64
+BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES = 4 * 1024
+WAL_MAGIC_NUMBERS = {0x377F0682, 0x377F0683}
+WAL_VERSION = 3007000
+RENAME_NOREPLACE = 1
+RENAME_EXCL = 0x00000004
+NOTES_PGREP_PATH = "/usr/bin/pgrep"
+NOTES_STATE_TIMEOUT_SECONDS = 2.0
+NOTES_STATE_TERMINATION_GRACE_SECONDS = 0.25
+DIRECTORY_CREATOR_REQUEST_SCHEMA = "apple-notes-directory-creator-request/v2"
+DIRECTORY_CREATOR_RESPONSE_SCHEMA = "apple-notes-directory-creator-response/v2"
+DIRECTORY_CREATOR_PROOF_SCHEMA = "apple-notes-identity-bound-directory-creation/v2"
+DIRECTORY_CREATOR_UNAVAILABLE_STATUS = "unavailable-before-create"
+PACKAGED_DIRECTORY_CREATOR_AUTHORITY = "packaged-supervisor-cooperative-same-uid"
+PACKAGED_DIRECTORY_CREATOR_UNAVAILABLE_AUTHORITY = (
+    "packaged-supervisor-platform-primitive-unavailable"
+)
+PACKAGED_DIRECTORY_CREATOR_METHOD = "mkdirat-randomized-openat-nofollow-revalidate"
+PACKAGED_DIRECTORY_CREATOR_THREAT_MODEL = "cooperative-same-uid"
+PACKAGED_DIRECTORY_CREATOR_UNSUPPORTED_PRIMITIVES = (
+    "mkdir-then-open",
+    "mkdirat-then-openat",
+    "mkdtemp-then-open",
+    "mkdtempat_np-then-openat",
+)
+DIRECTORY_CREATOR_MAX_MESSAGE_BYTES = 64 * 1024
+DIRECTORY_CREATOR_MAX_RECEIVED_FDS = 8
+DIRECTORY_CREATOR_TIMEOUT_SECONDS = 5.0
+DIRECTORY_CREATOR_PROVIDER_MAX_LOCATORS = 16
+DIRECTORY_CREATOR_PROVIDER_MAX_JSON_DEPTH = 4
+DIRECTORY_CREATOR_PROVIDER_MAX_JSON_ITEMS = 32
+DIRECTORY_CREATOR_PROVIDER_MAX_JSON_NODES = 256
+DIRECTORY_CREATOR_PROVIDER_MAX_KEY_CHARS = 128
+DIRECTORY_CREATOR_PROVIDER_MAX_STRING_CHARS = 2048
+_DARWIN_ACCESS_POLICY_FLAG_BITS = {
+    "UF_IMMUTABLE": 0x00000002,
+    "UF_APPEND": 0x00000004,
+    "UF_DATAVAULT": 0x00000080,
+    "SF_IMMUTABLE": 0x00020000,
+    "SF_APPEND": 0x00040000,
+    "SF_RESTRICTED": 0x00080000,
+    "SF_NOUNLINK": 0x00100000,
+}
+DARWIN_ACCESS_POLICY_FLAG_MASK = sum(_DARWIN_ACCESS_POLICY_FLAG_BITS.values())
+SQLITE_OK = 0
+SQLITE_ABORT = 4
+SQLITE_DONE = 101
+SQLITE_OPEN_READWRITE = 0x00000002
+SQLITE_OPEN_CREATE = 0x00000004
+SQLITE_DESERIALIZE_READONLY = 4
+_SQLITE_EXEC_CALLBACK = ctypes.CFUNCTYPE(
+    ctypes.c_int,
+    ctypes.c_void_p,
+    ctypes.c_int,
+    ctypes.POINTER(ctypes.c_char_p),
+    ctypes.POINTER(ctypes.c_char_p),
+)
+
+
+class StoreSafetyError(RuntimeError):
+    """A classified safety failure that must not be treated as absence."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
+
+
+_WRITEBACK_CLOSE_ONLY: ContextVar[bool] = ContextVar(
+    "apple_notes_writeback_close_only",
+    default=False,
+)
+
+
+def _writeback_close_only() -> bool:
+    """Return whether held writeback inputs passed their joint success point."""
+
+    return _WRITEBACK_CLOSE_ONLY.get()
+
+
+class _WritebackLinearizedTransaction:
+    """Hold every input until one explicit joint success point is committed."""
+
+    def __init__(self) -> None:
+        self._stack = ExitStack()
+        self.success_linearized = False
+
+    def enter_context(self, manager: Any) -> Any:
+        return self._stack.enter_context(manager)
+
+    def mark_joint_success(self) -> None:
+        if self.success_linearized:
+            raise RuntimeError("writeback joint success was already marked")
+        self.success_linearized = True
+
+    def close_success(self) -> None:
+        token = _WRITEBACK_CLOSE_ONLY.set(self.success_linearized)
+        try:
+            self._stack.close()
+        finally:
+            _WRITEBACK_CLOSE_ONLY.reset(token)
+
+    def close_failure(self, error: BaseException) -> None:
+        self._stack.__exit__(type(error), error, error.__traceback__)
+
+
+@contextmanager
+def _writeback_linearized_transaction() -> Iterator[_WritebackLinearizedTransaction]:
+    """Close held contexts without post-yield reads after a joint success point."""
+
+    transaction = _WritebackLinearizedTransaction()
+    try:
+        yield transaction
+    except BaseException as error:
+        transaction.close_failure(error)
+        raise
+    else:
+        transaction.close_success()
+
+
+@dataclass(frozen=True)
+class NoteStorePaths:
+    group_container: Path = GROUP_CONTAINER
+    app_container: Path = APP_CONTAINER
+
+    def __post_init__(self) -> None:
+        """Freeze both public container inputs to one lexical absolute policy."""
+
+        values = {
+            field_name: os.fspath(getattr(self, field_name))
+            for field_name in ("group_container", "app_container")
+        }
+        cwd = (
+            None
+            if all(os.path.isabs(value) for value in values.values())
+            else os.getcwd()
+        )
+        for field_name in ("group_container", "app_container"):
+            value = values[field_name]
+            absolute = Path(
+                os.path.normpath(value if cwd is None else os.path.join(cwd, value))
+            )
+            object.__setattr__(self, field_name, absolute)
+
+    def note_store_files(self) -> list[Path]:
+        return [self.group_container / name for name in NOTE_STORE_DISCOVERY_BASENAMES]
+
+
+@dataclass
+class _OpenedSource:
+    path: Path
+    fd: int
+    before: os.stat_result
+    parent_fd: int | None = None
+    parent_opened: os.stat_result | None = None
+    parent_revalidate: Callable[[], dict[str, Any] | None] | None = None
+    first_sha256: str | None = None
+    copied: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _FileProtectionCodes:
+    missing: str
+    identity: str
+    content: str
+    access_policy: str
+    inconclusive: str
+
+
+@dataclass
+class _BoundRegularFile:
+    path: Path
+    fd: int
+    opened: os.stat_result
+    sha256: str
+    parent_opened: os.stat_result | None = None
+    parent_fd: int | None = None
+    before_write: Callable[[], dict[str, Any] | None] | None = None
+    trusted_alias: _TrustedDirectoryAlias | None = None
+
+
+@dataclass(frozen=True)
+class _NativeSQLiteApi:
+    library: Any
+    open_v2: Any
+    close: Any
+    error_message: Any
+    malloc64: Any
+    sqlite_free: Any
+    deserialize: Any
+    exec_sql: Any
+    backup_init: Any
+    backup_step: Any
+    backup_finish: Any
+    serialize: Any
+
+
+@dataclass(frozen=True)
+class _DeserializedSQLiteImage:
+    api: _NativeSQLiteApi
+    database: ctypes.c_void_p
+    buffer: int
+    byte_count: int
+    sha256: str
+    bound: _BoundRegularFile
+    verify_bound: Callable[[], Any]
+
+
+@dataclass
+class _BoundDirectory:
+    path: Path
+    fd: int
+    opened: os.stat_result
+    parent_opened: os.stat_result
+    parent_fd: int | None = None
+    before_write: Callable[[], dict[str, Any] | None] | None = None
+    path_revalidate: Callable[[], dict[str, Any] | None] | None = None
+    namespace_basename: str | None = None
+    trusted_alias: _TrustedDirectoryAlias | None = None
+    canonical_path: Path | None = None
+    creation_install_receipt: dict[str, Any] | None = None
+
+
+@dataclass
+class _BoundRecoveryStore:
+    directory: _BoundDirectory
+    main_name: str
+    files: dict[str, _BoundRegularFile]
+    entry_types: dict[str, int]
+    file_codes: _FileProtectionCodes | None = None
+    file_set_mismatch_code: str = "prepared-file-set-mismatch"
+
+
+@dataclass(frozen=True)
+class _RecoveryStoreReceipt:
+    directory_identity: dict[str, int]
+    directory_access_policy: dict[str, int]
+    entry_types: dict[str, int]
+    files: dict[str, dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class _RecoveryClone:
+    main_path: Path
+    evidence: dict[str, Any]
+    receipt: _RecoveryStoreReceipt
+
+
+@dataclass(frozen=True)
+class _ValidatedSnapshotArtifact:
+    public_result: dict[str, Any]
+    artifact_root: _BoundDirectory
+    recovered_main: Path
+    recovery_evidence: dict[str, Any]
+    source_integrity: dict[str, Any]
+    revalidate_recovery_clone: Callable[[], None]
+    backup_recovery_clone: Callable[
+        [Path, _BoundDirectory | None, Callable[[], None] | None],
+        dict[str, Any],
+    ]
+    revalidate_artifact: Callable[[], None]
+
+
+@dataclass(frozen=True)
+class _ValidatedPatchStageArtifact:
+    public_result: dict[str, Any]
+    artifact_root: _BoundDirectory
+    database: _BoundRegularFile
+    revalidate_artifact: Callable[[], None]
+
+
+@dataclass(frozen=True)
+class _LiveDestinationScope:
+    requested_destination: Path
+    destination: Path
+    parent: _BoundDirectory
+    revalidate: Callable[[], dict[str, Any]]
+    trusted_alias: _TrustedDirectoryAlias | None
+    parent_creation_mutation_performed: bool = False
+
+
+@dataclass
+class _CreatorResultDestination:
+    artifact: Path
+    result_file: Path
+    artifact_payload: dict[str, Any] | None = None
+    scope: _LiveDestinationScope | None = None
+    publication_receipt: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _LiveDestinationPreflight:
+    requested_destination: Path
+    canonical_destination: Path
+    ancestor: _BoundDirectory
+    missing_parent_components: tuple[str, ...]
+    live_bindings: list[dict[str, Any]]
+    live_containers: tuple[Path, ...]
+    trusted_alias: _TrustedDirectoryAlias | None
+    revalidate: Callable[[], dict[str, Any]]
+
+
+@dataclass
+class _CreatorDestinationPreflights:
+    artifact: _LiveDestinationPreflight
+    result: _LiveDestinationPreflight | None
+    published_artifact_payload: dict[str, Any] | None = None
+    result_destination: _CreatorResultDestination | None = None
+
+
+@dataclass(frozen=True)
+class _CreatorArtifactReceiptContract:
+    parent: dict[str, Any]
+    root: dict[str, Any]
+    directories: dict[Path, dict[str, Any]]
+    files: dict[Path, dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class _TrustedDirectoryAlias:
+    alias: Path
+    target: Path
+    alias_parent_fd: int
+    alias_parent_opened: os.stat_result
+    alias_entry_opened: os.stat_result
+    alias_target_text: str
+    target_binding: _BoundDirectory
+
+
+@dataclass(frozen=True)
+class _HeldDirectoryComponent:
+    path: Path
+    basename: str | None
+    fd: int
+    opened: os.stat_result
+    parent_fd: int | None
+    parent_opened: os.stat_result | None
+    creation_install_receipt: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _CreatedDirectoryInstallation:
+    fd: int
+    opened: os.stat_result
+    receipt: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _IdentityBoundDirectoryCreation:
+    """One directory whose creator returned its already-open descriptor."""
+
+    basename: str
+    fd: int
+    opened: os.stat_result
+    proof: dict[str, Any]
+
+
+class _IdentityBoundDirectoryCreationFailure(RuntimeError):
+    """Transfer create-then-fail evidence and descriptor ownership to the helper."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        staging_basename: str | None = None,
+        fd: int | None = None,
+        opened: os.stat_result | None = None,
+        proof: dict[str, Any] | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.staging_basename = staging_basename
+        self.fd = fd
+        self.opened = opened
+        self.proof = proof
+        self.details = dict(details) if isinstance(details, dict) else {}
+
+
+class _IdentityBoundDirectoryCreatorUnavailable(RuntimeError):
+    """Report that no trusted creation capability entered a mutation boundary."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.details = dict(details) if isinstance(details, dict) else {}
+
+
+@dataclass
+class _BoundSourceStore:
+    """One live/caller store held through its complete directory component chain."""
+
+    directory: _BoundDirectory
+    main_name: str
+    files: dict[str, _BoundRegularFile]
+    membership: tuple[str, ...]
+
+
+@dataclass
+class _BoundAbsentNoteTagsLiveSource:
+    """One initially absent live path held through its nearest ancestor."""
+
+    path: Path
+    ancestor: _BoundDirectory
+    missing_components: tuple[str, ...]
+    initial_missing_error_code: str
+
+
+@dataclass(frozen=True)
+class _SnapshotArtifactPaths:
+    root: Path
+    manifest: Path
+    store: Path
+
+
+@dataclass(frozen=True)
+class _PatchArtifactPaths:
+    root: Path
+    manifest: Path
+    database: Path
+
+
+SNAPSHOT_FILE_CODES = _FileProtectionCodes(
+    missing="snapshot-missing",
+    identity="snapshot-file-identity-mismatch",
+    content="snapshot-content-mismatch",
+    access_policy="snapshot-file-access-policy-mismatch",
+    inconclusive="snapshot-file-revalidation-inconclusive",
+)
+PATCH_FILE_CODES = _FileProtectionCodes(
+    missing="stage-missing",
+    identity="patch-file-identity-mismatch",
+    content="patch-content-mismatch",
+    access_policy="patch-file-access-policy-mismatch",
+    inconclusive="patch-file-revalidation-inconclusive",
+)
+PREPARED_FILE_CODES = _FileProtectionCodes(
+    missing="prepared-file-missing",
+    identity="prepared-file-identity-mismatch",
+    content="prepared-file-content-mismatch",
+    access_policy="prepared-file-access-policy-mismatch",
+    inconclusive="prepared-file-revalidation-inconclusive",
+)
+MANIFEST_RECEIPT_FILE_CODES = _FileProtectionCodes(
+    missing="manifest-creation-receipt-missing",
+    identity="manifest-creation-receipt-file-identity-mismatch",
+    content="manifest-creation-receipt-file-content-mismatch",
+    access_policy="manifest-creation-receipt-file-access-policy-mismatch",
+    inconclusive="manifest-creation-receipt-file-revalidation-inconclusive",
+)
+SOURCE_FILE_CODES = _FileProtectionCodes(
+    missing="source-missing-after-read",
+    identity="source-identity-mismatch",
+    content="source-content-mismatch",
+    access_policy="source-access-policy-mismatch",
+    inconclusive="source-revalidation-inconclusive",
+)
+
+
+# The packaged supervisor cooperatively creates one randomized child with
+# mkdirat(2), binds it immediately with no-follow openat(2), revalidates it, and
+# transfers the held created-object descriptor over inherited SCM_RIGHTS.  This
+# excludes accidental namespace collisions inside the cooperative same-UID
+# model; it does not defend against a malicious peer running under the same UID.
+# The helper never reconnects by socket path.
+# A provider that raises after entering its creation boundary must use
+# _IdentityBoundDirectoryCreationFailure and transfer any created name, open
+# descriptor, creation stat, proof, and recovery details.  Unstructured
+# provider failures are conservatively treated as possibly post-mutation.
+_DIRECTORY_CREATOR_SUPERVISOR_FD: int | None = None
+_IDENTITY_BOUND_DIRECTORY_CREATOR: (
+    Callable[[int, str], _IdentityBoundDirectoryCreation] | None
+)
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Unsupported JSON value: {value!r}")
+
+
+def emit_json(payload: Any) -> None:
+    json.dump(payload, sys.stdout, indent=2, ensure_ascii=True, default=_json_default)
+    sys.stdout.write("\n")
+
+
+def _merge_recovery_details(
+    primary: dict[str, Any],
+    additional: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge recovery evidence without weakening a conservative conclusion."""
+
+    merged = dict(primary)
+    merged.update(
+        {
+            key: value
+            for key, value in additional.items()
+            if key
+            not in {
+                "cleanup_state",
+                "mutation_performed",
+                "publication_state",
+                "recovery_locators",
+                "retry_safe",
+            }
+        }
+    )
+    locators = dict(primary.get("recovery_locators", {}))
+    locators.update(additional.get("recovery_locators", {}))
+    if locators:
+        merged["recovery_locators"] = locators
+
+    if "mutation_performed" in primary or "mutation_performed" in additional:
+        merged["mutation_performed"] = bool(primary.get("mutation_performed")) or bool(
+            additional.get("mutation_performed")
+        )
+
+    if "retry_safe" in primary or "retry_safe" in additional:
+        retry_claims = [
+            bool(details["retry_safe"])
+            for details in (primary, additional)
+            if "retry_safe" in details
+        ]
+        merged["retry_safe"] = all(retry_claims)
+
+    publication_rank = {
+        "not-started": 0,
+        "uncommitted": 1,
+        "committed": 2,
+        "uncertain": 3,
+    }
+    publication_states = [
+        str(details["publication_state"])
+        for details in (primary, additional)
+        if details.get("publication_state") is not None
+    ]
+    if publication_states:
+        merged["publication_state"] = max(
+            publication_states,
+            key=lambda state: publication_rank.get(state, 3),
+        )
+
+    cleanup_rank = {
+        "not-needed": 0,
+        "complete": 0,
+        "retained": 1,
+        "preserved-no-identity-safe-directory-unlink": 2,
+        "preserved-or-incomplete": 3,
+        "inconclusive": 4,
+    }
+    cleanup_states = [
+        str(details["cleanup_state"])
+        for details in (primary, additional)
+        if details.get("cleanup_state") is not None
+    ]
+    if cleanup_states:
+        merged["cleanup_state"] = max(
+            cleanup_states,
+            key=lambda state: cleanup_rank.get(state, 4),
+        )
+    return merged
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _timestamped_tmp_dir(prefix: str) -> Path:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+    return Path("/tmp") / f"{prefix}-{timestamp}-{uuid.uuid4().hex[:8]}"
+
+
+def _stat_ns(value: os.stat_result, field: str) -> int:
+    exact = getattr(value, f"st_{field}_ns", None)
+    if exact is not None:
+        return int(exact)
+    return int(getattr(value, f"st_{field}") * 1_000_000_000)
+
+
+def _identity(value: os.stat_result) -> dict[str, int]:
+    return {
+        "device": value.st_dev,
+        "inode": value.st_ino,
+        "file_type": stat.S_IFMT(value.st_mode),
+    }
+
+
+def _access_policy(value: os.stat_result) -> dict[str, int]:
+    return {
+        "mode": stat.S_IMODE(value.st_mode),
+        "uid": value.st_uid,
+        "gid": value.st_gid,
+        "flags": int(getattr(value, "st_flags", 0)) & DARWIN_ACCESS_POLICY_FLAG_MASK,
+    }
+
+
+def _metadata(value: os.stat_result) -> dict[str, int]:
+    return {
+        "mtime_ns": _stat_ns(value, "mtime"),
+        "ctime_ns": _stat_ns(value, "ctime"),
+        "link_count": value.st_nlink,
+        "platform_flags": int(getattr(value, "st_flags", 0)),
+    }
+
+
+def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return _identity(left) == _identity(right)
+
+
+@contextmanager
+def directory_creator_supervisor(supervisor_fd: int) -> Iterator[None]:
+    """Route identity-bound creation through one inherited supervisor channel."""
+
+    if (
+        not isinstance(supervisor_fd, int)
+        or isinstance(supervisor_fd, bool)
+        or supervisor_fd < 0
+    ):
+        raise ValueError("directory creator supervisor FD must be non-negative")
+    global _DIRECTORY_CREATOR_SUPERVISOR_FD
+    previous = _DIRECTORY_CREATOR_SUPERVISOR_FD
+    if previous is not None:
+        raise RuntimeError("a directory creator supervisor is already active")
+    owned_fd = os.dup(supervisor_fd)
+    try:
+        os.set_inheritable(owned_fd, False)
+    except BaseException:
+        os.close(owned_fd)
+        raise
+    _DIRECTORY_CREATOR_SUPERVISOR_FD = owned_fd
+    try:
+        yield
+    finally:
+        _DIRECTORY_CREATOR_SUPERVISOR_FD = previous
+        os.close(owned_fd)
+
+
+def _received_rights_descriptors(
+    ancillary: list[tuple[int, int, bytes]],
+) -> list[int]:
+    descriptors: list[int] = []
+    item_size = array.array("i").itemsize
+    for level, kind, payload in ancillary:
+        if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
+            continue
+        usable = len(payload) - (len(payload) % item_size)
+        if usable == 0:
+            continue
+        received = array.array("i")
+        received.frombytes(payload[:usable])
+        descriptors.extend(int(fd) for fd in received)
+    return descriptors
+
+
+def _close_descriptors(descriptors: Iterable[int]) -> bool:
+    cleanup_complete = True
+    for descriptor in descriptors:
+        try:
+            os.close(descriptor)
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                cleanup_complete = False
+    return cleanup_complete
+
+
+def _is_utf8_unicode_scalar_string(value: object) -> bool:
+    """Return whether one exact string contains only UTF-8-encodable scalars."""
+
+    if type(value) is not str:
+        return False
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _normalize_directory_creator_locator_json(
+    value: object,
+    *,
+    depth: int,
+    remaining_nodes: list[int],
+) -> tuple[bool, Any]:
+    """Copy one provider locator through a bounded closed JSON type grammar."""
+
+    if remaining_nodes[0] <= 0:
+        return False, None
+    remaining_nodes[0] -= 1
+    if value is None or type(value) in {bool, int}:
+        return True, value
+    if type(value) is str:
+        if (
+            not _is_utf8_unicode_scalar_string(value)
+            or len(value) > DIRECTORY_CREATOR_PROVIDER_MAX_STRING_CHARS
+        ):
+            return False, None
+        return True, value
+    if depth >= DIRECTORY_CREATOR_PROVIDER_MAX_JSON_DEPTH:
+        return False, None
+    if type(value) is list:
+        if len(value) > DIRECTORY_CREATOR_PROVIDER_MAX_JSON_ITEMS:
+            return False, None
+        normalized_items: list[Any] = []
+        for item in value:
+            accepted, normalized = _normalize_directory_creator_locator_json(
+                item,
+                depth=depth + 1,
+                remaining_nodes=remaining_nodes,
+            )
+            if not accepted:
+                return False, None
+            normalized_items.append(normalized)
+        return True, normalized_items
+    if type(value) is dict:
+        if len(value) > DIRECTORY_CREATOR_PROVIDER_MAX_JSON_ITEMS:
+            return False, None
+        normalized_object: dict[str, Any] = {}
+        for key, item in value.items():
+            if (
+                type(key) is not str
+                or not key
+                or len(key) > DIRECTORY_CREATOR_PROVIDER_MAX_KEY_CHARS
+                or not _is_utf8_unicode_scalar_string(key)
+            ):
+                return False, None
+            accepted, normalized = _normalize_directory_creator_locator_json(
+                item,
+                depth=depth + 1,
+                remaining_nodes=remaining_nodes,
+            )
+            if not accepted:
+                return False, None
+            normalized_object[key] = normalized
+        return True, normalized_object
+    return False, None
+
+
+def _normalize_directory_creator_provider_details(
+    value: object,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Normalize untrusted provider details through one closed bounded schema."""
+
+    receipt: dict[str, Any] = {
+        "schema": "apple-notes-directory-creator-provider-details-normalization/v1",
+        "input_type": type(value).__name__[:128],
+        "accepted_fields": [],
+        "accepted_evidence_fields": [],
+        "ignored_fields": [],
+        "rejected_fields": [],
+        "accepted_locator_count": 0,
+        "rejected_locator_count": 0,
+    }
+    if value is None:
+        receipt["status"] = "absent"
+        return {}, receipt
+    if type(value) is not dict:
+        receipt["status"] = "rejected"
+        receipt["rejected_fields"] = ["details:not-object"]
+        return {}, receipt
+    if len(value) > DIRECTORY_CREATOR_PROVIDER_MAX_JSON_ITEMS:
+        receipt["status"] = "rejected"
+        receipt["rejected_fields"] = ["details:too-many-fields"]
+        return {}, receipt
+
+    normalized: dict[str, Any] = {}
+    accepted_fields: list[str] = receipt["accepted_fields"]
+    rejected_fields: list[str] = receipt["rejected_fields"]
+    known_fields = {
+        "cleanup_state",
+        "creation_authority",
+        "mutation_performed",
+        "provider_install_state",
+        "provider_staging_basename",
+        "publication_state",
+        "recovery_locators",
+        "retry_safe",
+    }
+    ignored_fields: list[str] = []
+    for key in value:
+        if type(key) is not str:
+            if "details:non-string-key" not in rejected_fields:
+                rejected_fields.append("details:non-string-key")
+            continue
+        if (
+            not key
+            or len(key) > DIRECTORY_CREATOR_PROVIDER_MAX_KEY_CHARS
+            or not _is_utf8_unicode_scalar_string(key)
+        ):
+            if "details:invalid-field-name" not in rejected_fields:
+                rejected_fields.append("details:invalid-field-name")
+            continue
+        if key not in known_fields:
+            ignored_fields.append(key)
+    receipt["ignored_fields"] = sorted(ignored_fields)[
+        :DIRECTORY_CREATOR_PROVIDER_MAX_JSON_ITEMS
+    ]
+
+    for field in ("mutation_performed", "retry_safe"):
+        if field not in value:
+            continue
+        if type(value[field]) is bool:
+            normalized[field] = value[field]
+            accepted_fields.append(field)
+        else:
+            rejected_fields.append(f"{field}:not-boolean")
+
+    for field in (
+        "creation_authority",
+        "provider_install_state",
+        "provider_staging_basename",
+    ):
+        if field not in value:
+            continue
+        field_value = value[field]
+        if (
+            type(field_value) is str
+            and field_value
+            and len(field_value) <= DIRECTORY_CREATOR_PROVIDER_MAX_STRING_CHARS
+            and _is_utf8_unicode_scalar_string(field_value)
+        ):
+            normalized[field] = field_value
+            accepted_fields.append(field)
+        else:
+            rejected_fields.append(f"{field}:invalid-string")
+
+    cleanup_state = value.get("cleanup_state")
+    if "cleanup_state" in value:
+        if _is_utf8_unicode_scalar_string(cleanup_state) and cleanup_state in {
+            "complete",
+            "inconclusive",
+            "not-needed",
+            "preserved-no-identity-safe-directory-unlink",
+            "preserved-or-incomplete",
+            "retained",
+        }:
+            normalized["cleanup_state"] = cleanup_state
+            accepted_fields.append("cleanup_state")
+        else:
+            rejected_fields.append("cleanup_state:invalid-value")
+
+    publication_state = value.get("publication_state")
+    if "publication_state" in value:
+        provider_scoped_evidence: dict[str, Any] = {
+            "top_level_merge": "forbidden",
+        }
+        if _is_utf8_unicode_scalar_string(publication_state) and publication_state in {
+            "committed",
+            "not-started",
+            "uncertain",
+            "uncommitted",
+        }:
+            provider_scoped_evidence.update(
+                {
+                    "status": "accepted-unverified-claim",
+                    "claim": publication_state,
+                }
+            )
+            receipt["accepted_evidence_fields"].append("publication_state")
+        else:
+            provider_scoped_evidence["status"] = "rejected"
+            rejected_fields.append("publication_state:invalid-value")
+        receipt["provider_scoped_evidence"] = {
+            "publication_state": provider_scoped_evidence,
+        }
+
+    if "recovery_locators" in value:
+        locator_value = value["recovery_locators"]
+        normalized_locators: dict[str, Any] = {}
+        if type(locator_value) is not dict:
+            rejected_fields.append("recovery_locators:not-object")
+            receipt["rejected_locator_count"] = 1
+        elif len(locator_value) > DIRECTORY_CREATOR_PROVIDER_MAX_LOCATORS:
+            rejected_fields.append("recovery_locators:too-many")
+            receipt["rejected_locator_count"] = len(locator_value)
+        else:
+            for locator_name, locator in locator_value.items():
+                valid_name = (
+                    type(locator_name) is str
+                    and bool(locator_name)
+                    and len(locator_name) <= DIRECTORY_CREATOR_PROVIDER_MAX_KEY_CHARS
+                    and _is_utf8_unicode_scalar_string(locator_name)
+                )
+                if not valid_name or type(locator) is not dict:
+                    receipt["rejected_locator_count"] += 1
+                    rejected_fields.append("recovery_locators:invalid-entry")
+                    continue
+                accepted, normalized_locator = (
+                    _normalize_directory_creator_locator_json(
+                        locator,
+                        depth=0,
+                        remaining_nodes=[DIRECTORY_CREATOR_PROVIDER_MAX_JSON_NODES],
+                    )
+                )
+                if not accepted:
+                    receipt["rejected_locator_count"] += 1
+                    rejected_fields.append(
+                        "recovery_locators:"
+                        f"{locator_name[:DIRECTORY_CREATOR_PROVIDER_MAX_KEY_CHARS]}"
+                        ":invalid-value"
+                    )
+                    continue
+                normalized_locators[locator_name] = normalized_locator
+            if normalized_locators:
+                normalized["recovery_locators"] = normalized_locators
+                accepted_fields.append("recovery_locators")
+                receipt["accepted_locator_count"] = len(normalized_locators)
+
+    has_rejections = bool(
+        receipt["ignored_fields"]
+        or receipt["rejected_fields"]
+        or receipt["rejected_locator_count"]
+    )
+    receipt["status"] = "normalized-with-rejections" if has_rejections else "accepted"
+    return normalized, receipt
+
+
+def _normalize_directory_creator_response_evidence(
+    response: dict[str, Any] | None,
+) -> tuple[
+    str | None,
+    str | None,
+    str | None,
+    dict[str, Any] | None,
+    object,
+    dict[str, Any],
+]:
+    """Normalize provider response evidence before it reaches recovery output."""
+
+    receipt: dict[str, Any] = {
+        "schema": "apple-notes-directory-creator-response-normalization/v1",
+        "accepted_fields": [],
+        "rejected_fields": [],
+    }
+    if response is None:
+        receipt["status"] = "absent"
+        return None, None, None, None, None, receipt
+
+    accepted_fields: list[str] = receipt["accepted_fields"]
+    rejected_fields: list[str] = receipt["rejected_fields"]
+
+    response_schema_value = response.get("schema")
+    response_schema = None
+    if response_schema_value is not None:
+        if (
+            _is_utf8_unicode_scalar_string(response_schema_value)
+            and len(response_schema_value)
+            <= DIRECTORY_CREATOR_PROVIDER_MAX_STRING_CHARS
+        ):
+            response_schema = response_schema_value
+            accepted_fields.append("schema")
+        else:
+            rejected_fields.append("schema:invalid-string")
+
+    response_basename = response.get("basename")
+    reported_basename = None
+    recoverable_basename = None
+    if response_basename is not None:
+        if _is_utf8_unicode_scalar_string(response_basename):
+            reported_basename = response_basename[:256]
+            accepted_fields.append("basename")
+            if len(response_basename) <= 255:
+                recoverable_basename = response_basename
+            else:
+                rejected_fields.append("basename:too-long-for-recovery")
+        else:
+            rejected_fields.append("basename:invalid-string")
+
+    proof_value = response.get("proof")
+    normalized_proof = None
+    if proof_value is not None:
+        accepted_proof, candidate_proof = _normalize_directory_creator_locator_json(
+            proof_value,
+            depth=0,
+            remaining_nodes=[DIRECTORY_CREATOR_PROVIDER_MAX_JSON_NODES],
+        )
+        if accepted_proof and type(candidate_proof) is dict:
+            normalized_proof = candidate_proof
+            accepted_fields.append("proof")
+        else:
+            rejected_fields.append("proof:invalid-closed-json")
+
+    receipt["status"] = "normalized-with-rejections" if rejected_fields else "accepted"
+    return (
+        response_schema,
+        reported_basename,
+        recoverable_basename,
+        normalized_proof,
+        response.get("details"),
+        receipt,
+    )
+
+
+def _packaged_directory_creator_unavailable_details() -> dict[str, Any]:
+    """Return the exact no-mutation capability receipt shared with the launcher."""
+
+    return {
+        "mutation_performed": False,
+        "cleanup_state": "not-needed",
+        "retry_safe": False,
+        "creation_authority": PACKAGED_DIRECTORY_CREATOR_UNAVAILABLE_AUTHORITY,
+        "provider_install_state": "not-created",
+        "recovery_locators": {
+            "packaged_directory_supervisor": {
+                "schema": ("apple-notes-packaged-directory-supervisor-capability/v1"),
+                "protected_property": "exact-created-object-descriptor",
+                "stage": "platform-capability-preflight",
+                "platform": sys.platform,
+                "creation_boundary_entered": False,
+                "unsupported_primitives": list(
+                    PACKAGED_DIRECTORY_CREATOR_UNSUPPORTED_PRIMITIVES
+                ),
+            }
+        },
+    }
+
+
+def _validate_precreation_unavailable_response(
+    response: dict[str, Any],
+    *,
+    request_id: str,
+    received_descriptor_count: int,
+) -> dict[str, Any] | None:
+    """Accept only the packaged supervisor's exact closed no-mutation receipt."""
+
+    if response.get("status") != DIRECTORY_CREATOR_UNAVAILABLE_STATUS:
+        return None
+    expected_details = _packaged_directory_creator_unavailable_details()
+    try:
+        provider_details_json = json.dumps(
+            response.get("details"),
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        expected_details_json = json.dumps(
+            expected_details,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return None
+    if (
+        set(response)
+        != {
+            "schema",
+            "request_id",
+            "status",
+            "basename",
+            "proof",
+            "details",
+        }
+        or response.get("schema") != DIRECTORY_CREATOR_RESPONSE_SCHEMA
+        or response.get("request_id") != request_id
+        or response.get("basename") is not None
+        or response.get("proof") is not None
+        or received_descriptor_count != 0
+        or provider_details_json != expected_details_json
+    ):
+        return None
+    return expected_details
+
+
+def _directory_creator_transport_failure_base_details(
+    *,
+    request_id: str,
+    stage: str,
+    response_schema: str | None,
+    reported_basename: str | None,
+    recoverable_basename: str | None,
+    received_descriptor_count: int,
+    descriptor_ownership_transferred: bool,
+    provider_response_normalization: dict[str, Any],
+    provider_details_normalization: dict[str, Any],
+    evidence_construction_error_type: str | None = None,
+) -> dict[str, Any]:
+    locator: dict[str, Any] = {
+        "schema": "apple-notes-directory-creator-transport-failure/v1",
+        "protected_property": "creation-identity-inconclusive",
+        "request_schema": DIRECTORY_CREATOR_REQUEST_SCHEMA,
+        "response_schema": response_schema,
+        "request_id": request_id,
+        "stage": stage,
+        "request_started": True,
+        "received_descriptor_count": received_descriptor_count,
+        "descriptor_ownership_transferred": descriptor_ownership_transferred,
+        "provider_reported_staging_basename": reported_basename,
+        "provider_response_normalization": provider_response_normalization,
+        "provider_details_normalization": provider_details_normalization,
+        "evidence_construction_status": (
+            "failed-closed"
+            if evidence_construction_error_type is not None
+            else "complete"
+        ),
+        "automatic_cleanup_attempted": False,
+    }
+    if evidence_construction_error_type is not None:
+        locator["evidence_construction_error_type"] = evidence_construction_error_type
+        locator["received_descriptor_cleanup_state"] = "pending"
+        locator["evidence_status"] = "inconclusive"
+    return {
+        "mutation_performed": True,
+        "publication_state": "uncertain",
+        "cleanup_state": "inconclusive",
+        "retry_safe": False,
+        "creation_authority": "inherited-supervisor-channel",
+        "provider_install_state": "supervisor-request-started",
+        "provider_staging_basename": recoverable_basename,
+        "recovery_locators": {
+            "directory_creator_supervisor": locator,
+        },
+    }
+
+
+def _build_directory_creator_transport_failure_details(
+    *,
+    provider_details: object,
+    request_id: str,
+    stage: str,
+    response_schema: str | None,
+    reported_basename: str | None,
+    recoverable_basename: str | None,
+    received_descriptor_count: int,
+    provider_response_normalization: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Build transport evidence without allowing an ordinary exception to escape."""
+
+    normalization: dict[str, Any] = {
+        "schema": "apple-notes-directory-creator-provider-details-normalization/v1",
+        "status": "not-started",
+    }
+    try:
+        normalized_provider, normalization = (
+            _normalize_directory_creator_provider_details(provider_details)
+        )
+        local_details = _directory_creator_transport_failure_base_details(
+            request_id=request_id,
+            stage=stage,
+            response_schema=response_schema,
+            reported_basename=reported_basename,
+            recoverable_basename=recoverable_basename,
+            received_descriptor_count=received_descriptor_count,
+            descriptor_ownership_transferred=received_descriptor_count > 0,
+            provider_response_normalization=provider_response_normalization,
+            provider_details_normalization=normalization,
+        )
+        return (
+            _merge_recovery_details(normalized_provider, local_details),
+            True,
+        )
+    except Exception as exc:
+        return (
+            _directory_creator_transport_failure_base_details(
+                request_id=request_id,
+                stage=stage,
+                response_schema=response_schema,
+                reported_basename=reported_basename,
+                recoverable_basename=recoverable_basename,
+                received_descriptor_count=received_descriptor_count,
+                descriptor_ownership_transferred=False,
+                provider_response_normalization=provider_response_normalization,
+                provider_details_normalization=normalization,
+                evidence_construction_error_type=type(exc).__name__[:128],
+            ),
+            False,
+        )
+
+
+def _supervisor_identity_bound_directory_creator(
+    parent_fd: int,
+    prefix: str,
+) -> _IdentityBoundDirectoryCreation:
+    """Request one continuously held created-directory FD from a supervisor."""
+
+    configured_fd = _DIRECTORY_CREATOR_SUPERVISOR_FD
+    if configured_fd is None:
+        raise _IdentityBoundDirectoryCreatorUnavailable(
+            "No inherited directory-creator supervisor channel is configured.",
+            details={
+                "creation_authority": "supervisor-channel-unavailable",
+                "supported_interface": (
+                    "inherited-connected-af-unix-sock-dgram-scm-rights"
+                ),
+                "request_started": False,
+            },
+        )
+
+    try:
+        configured = os.fstat(configured_fd)
+        if not stat.S_ISSOCK(configured.st_mode):
+            raise OSError(errno.ENOTSOCK, "configured descriptor is not a socket")
+        supervisor = socket.fromfd(
+            configured_fd,
+            socket.AF_UNIX,
+            socket.SOCK_DGRAM,
+        )
+    except (OSError, ValueError) as exc:
+        raise _IdentityBoundDirectoryCreatorUnavailable(
+            f"The inherited directory-creator supervisor channel is unusable: {exc}",
+            details={
+                "creation_authority": "supervisor-channel-invalid",
+                "supported_interface": (
+                    "inherited-connected-af-unix-sock-dgram-scm-rights"
+                ),
+                "request_started": False,
+                "error_type": type(exc).__name__,
+                "errno": getattr(exc, "errno", None),
+            },
+        ) from exc
+
+    request_started = False
+    received_descriptors: list[int] = []
+    response: dict[str, Any] | None = None
+    request_id = uuid.uuid4().hex
+
+    def after_request_failure(message: str, *, stage: str) -> None:
+        (
+            response_schema,
+            reported_basename,
+            recoverable_basename,
+            provider_proof,
+            provider_details,
+            response_normalization,
+        ) = _normalize_directory_creator_response_evidence(
+            response,
+        )
+        descriptor_count = len(received_descriptors)
+        details, descriptor_transfer_safe = (
+            _build_directory_creator_transport_failure_details(
+                provider_details=provider_details,
+                request_id=request_id,
+                stage=stage,
+                response_schema=response_schema,
+                reported_basename=reported_basename,
+                recoverable_basename=recoverable_basename,
+                received_descriptor_count=descriptor_count,
+                provider_response_normalization=response_normalization,
+            )
+        )
+        if not descriptor_transfer_safe:
+            cleanup_complete = _close_descriptors(received_descriptors)
+            received_descriptors.clear()
+            transport_locator = details["recovery_locators"][
+                "directory_creator_supervisor"
+            ]
+            transport_locator["received_descriptor_cleanup_state"] = (
+                "complete" if cleanup_complete else "inconclusive"
+            )
+
+        transferred_fd = (
+            received_descriptors[0]
+            if descriptor_transfer_safe and received_descriptors
+            else None
+        )
+        failure = _IdentityBoundDirectoryCreationFailure(
+            message,
+            staging_basename=recoverable_basename,
+            fd=transferred_fd,
+            proof=provider_proof,
+            details=details,
+        )
+        if transferred_fd is not None:
+            del received_descriptors[0]
+        raise failure
+
+    try:
+        with supervisor:
+            socket_type = supervisor.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+            peer = supervisor.getpeername()
+            if socket_type != socket.SOCK_DGRAM or not isinstance(
+                peer,
+                (str, bytes),
+            ):
+                raise _IdentityBoundDirectoryCreatorUnavailable(
+                    "The inherited directory-creator channel is not a connected "
+                    "AF_UNIX/SOCK_DGRAM socket.",
+                    details={
+                        "creation_authority": "supervisor-channel-invalid",
+                        "supported_interface": (
+                            "inherited-connected-af-unix-sock-dgram-scm-rights"
+                        ),
+                        "request_started": False,
+                        "socket_type": socket_type,
+                    },
+                )
+            supervisor.settimeout(DIRECTORY_CREATOR_TIMEOUT_SECONDS)
+            parent_opened = os.fstat(parent_fd)
+            request = json.dumps(
+                {
+                    "schema": DIRECTORY_CREATOR_REQUEST_SCHEMA,
+                    "request_id": request_id,
+                    "operation": "create-owner-private-directory",
+                    "prefix": prefix,
+                    "mode": 0o700,
+                    "expected_uid": (
+                        os.geteuid() if hasattr(os, "geteuid") else parent_opened.st_uid
+                    ),
+                    "parent_identity": _identity(parent_opened),
+                    "parent_access_policy": _access_policy(parent_opened),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            request_started = True
+            sent = supervisor.sendmsg(
+                [request],
+                [
+                    (
+                        socket.SOL_SOCKET,
+                        socket.SCM_RIGHTS,
+                        array.array("i", [parent_fd]),
+                    ),
+                ],
+            )
+            if sent != len(request):
+                after_request_failure(
+                    "The directory-creator supervisor request was truncated.",
+                    stage="request-send",
+                )
+            payload, ancillary, flags, _ = supervisor.recvmsg(
+                DIRECTORY_CREATOR_MAX_MESSAGE_BYTES,
+                socket.CMSG_SPACE(
+                    array.array("i").itemsize * DIRECTORY_CREATOR_MAX_RECEIVED_FDS
+                ),
+            )
+            received_descriptors.extend(_received_rights_descriptors(ancillary))
+            if flags & (
+                getattr(socket, "MSG_TRUNC", 0) | getattr(socket, "MSG_CTRUNC", 0)
+            ):
+                after_request_failure(
+                    "The directory-creator supervisor response was truncated.",
+                    stage="response-receive",
+                )
+            try:
+                decoded = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                after_request_failure(
+                    f"The directory-creator supervisor returned malformed JSON: {exc}",
+                    stage="response-decode",
+                )
+            if not isinstance(decoded, dict):
+                after_request_failure(
+                    "The directory-creator supervisor response is not an object.",
+                    stage="response-validate",
+                )
+            response = decoded
+            if (
+                response.get("schema") != DIRECTORY_CREATOR_RESPONSE_SCHEMA
+                or response.get("request_id") != request_id
+            ):
+                after_request_failure(
+                    "The directory-creator supervisor response is not bound to "
+                    "the current request.",
+                    stage="response-validate",
+                )
+            if response.get("status") == DIRECTORY_CREATOR_UNAVAILABLE_STATUS:
+                unavailable_details = _validate_precreation_unavailable_response(
+                    response,
+                    request_id=request_id,
+                    received_descriptor_count=len(received_descriptors),
+                )
+                if unavailable_details is None:
+                    after_request_failure(
+                        "The directory-creator supervisor returned a malformed "
+                        "pre-creation capability receipt.",
+                        stage="response-validate",
+                    )
+                raise _IdentityBoundDirectoryCreatorUnavailable(
+                    "The packaged directory-creator supervisor has no platform "
+                    "primitive that can atomically return the exact newly "
+                    "created directory descriptor.",
+                    details=unavailable_details,
+                )
+            if response.get("status") != "created":
+                after_request_failure(
+                    "The directory-creator supervisor did not return a created "
+                    "directory.",
+                    stage="supervisor-result",
+                )
+            if len(received_descriptors) != 1:
+                after_request_failure(
+                    "The directory-creator supervisor must return exactly one "
+                    "created-directory descriptor.",
+                    stage="response-rights",
+                )
+            response_basename = response.get("basename")
+            if (
+                not _is_utf8_unicode_scalar_string(response_basename)
+                or len(response_basename) > 255
+            ):
+                after_request_failure(
+                    "The directory-creator supervisor returned an invalid "
+                    "staging basename.",
+                    stage="response-validate",
+                )
+            accepted_proof, normalized_proof = (
+                _normalize_directory_creator_locator_json(
+                    response.get("proof"),
+                    depth=0,
+                    remaining_nodes=[DIRECTORY_CREATOR_PROVIDER_MAX_JSON_NODES],
+                )
+            )
+            if not accepted_proof or type(normalized_proof) is not dict:
+                after_request_failure(
+                    "The directory-creator supervisor returned invalid "
+                    "closed-JSON proof evidence.",
+                    stage="response-validate",
+                )
+            directory_fd = received_descriptors[0]
+            os.set_inheritable(directory_fd, False)
+            opened = os.fstat(directory_fd)
+            creation = _IdentityBoundDirectoryCreation(
+                basename=response_basename,
+                fd=directory_fd,
+                opened=opened,
+                proof=normalized_proof,
+            )
+            received_descriptors.clear()
+            return creation
+    except _IdentityBoundDirectoryCreatorUnavailable:
+        raise
+    except _IdentityBoundDirectoryCreationFailure:
+        raise
+    except Exception as exc:
+        if not request_started:
+            raise _IdentityBoundDirectoryCreatorUnavailable(
+                f"The directory-creator supervisor request could not start: {exc}",
+                details={
+                    "creation_authority": "supervisor-channel-invalid",
+                    "request_started": False,
+                    "error_type": type(exc).__name__,
+                    "errno": getattr(exc, "errno", None),
+                },
+            ) from exc
+        after_request_failure(
+            "The directory-creator supervisor transaction failed after entering "
+            f"the request-send boundary: {exc}",
+            stage="supervisor-transaction",
+        )
+        raise AssertionError("unreachable")
+    finally:
+        _close_descriptors(received_descriptors)
+
+
+_IDENTITY_BOUND_DIRECTORY_CREATOR = _supervisor_identity_bound_directory_creator
+
+
+def _bound_directory_basename(binding: _BoundDirectory) -> str:
+    return binding.namespace_basename or binding.path.name
+
+
+def _absolute_path_from_cwd(path: Path, cwd: str) -> Path:
+    """Freeze one public path lexically against an already captured CWD."""
+
+    return Path(os.path.normpath(os.path.join(cwd, os.fspath(path))))
+
+
+def _absolute_path(path: Path) -> Path:
+    """Normalize one public path lexically without following filesystem aliases."""
+
+    value = os.fspath(path)
+    if os.path.isabs(value):
+        return Path(os.path.normpath(value))
+    return _absolute_path_from_cwd(path, os.getcwd())
+
+
+def _optional_absolute_path_from_cwd(
+    path: Path | None,
+    cwd: str,
+) -> Path | None:
+    return None if path is None else _absolute_path_from_cwd(path, cwd)
+
+
+def _optional_absolute_path(path: Path | None) -> Path | None:
+    return None if path is None else _absolute_path(path)
+
+
+def _snapshot_artifact_paths(
+    path: Path | _SnapshotArtifactPaths,
+    *,
+    cwd: str | None = None,
+) -> _SnapshotArtifactPaths:
+    if isinstance(path, _SnapshotArtifactPaths):
+        return path
+    root = _absolute_path(path) if cwd is None else _absolute_path_from_cwd(path, cwd)
+    return _SnapshotArtifactPaths(
+        root=root,
+        manifest=root / SNAPSHOT_MANIFEST,
+        store=root / "group.com.apple.notes",
+    )
+
+
+def _patch_artifact_paths(
+    path: Path | _PatchArtifactPaths,
+    *,
+    cwd: str | None = None,
+) -> _PatchArtifactPaths:
+    if isinstance(path, _PatchArtifactPaths):
+        return path
+    root = _absolute_path(path) if cwd is None else _absolute_path_from_cwd(path, cwd)
+    return _PatchArtifactPaths(
+        root=root,
+        manifest=root / PATCH_MANIFEST,
+        database=root / NOTE_STORE_MAIN,
+    )
+
+
+def _bound_directory_canonical_path(binding: _BoundDirectory) -> Path:
+    return binding.canonical_path or binding.path
+
+
+def _is_reparse_point(value: os.stat_result) -> bool:
+    attributes = int(getattr(value, "st_file_attributes", 0))
+    marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    return bool(marker and attributes & marker)
+
+
+def _lexists(path: Path) -> bool:
+    return os.path.lexists(os.fspath(path))
+
+
+def _rename_directory_no_replace_syscall_at(
+    parent_fd: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    """Invoke the platform's atomic no-replace directory rename."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source_name)
+    destination_bytes = os.fsencode(destination_name)
+    if sys.platform == "darwin":
+        renameatx_np = getattr(libc, "renameatx_np", None)
+        if renameatx_np is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "renameatx_np is unavailable; refusing a non-atomic publication",
+            )
+        renameatx_np.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            parent_fd,
+            source_bytes,
+            parent_fd,
+            destination_bytes,
+            RENAME_EXCL,
+        )
+    elif sys.platform.startswith("linux"):
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "renameat2 is unavailable; refusing a non-atomic publication",
+            )
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            parent_fd,
+            source_bytes,
+            parent_fd,
+            destination_bytes,
+            RENAME_NOREPLACE,
+        )
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            f"Atomic no-replace directory publication is unsupported on {sys.platform}",
+        )
+
+    if result != 0:
+        error_number = ctypes.get_errno() or errno.EIO
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            source_name,
+            destination_name,
+        )
+
+
+def _rename_directory_no_replace_at(
+    parent_fd: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    """Atomically publish one prepared directory within a bound parent."""
+
+    _rename_directory_no_replace_syscall_at(
+        parent_fd,
+        source_name,
+        destination_name,
+    )
+
+
+def _install_created_directory_no_replace_at(
+    parent_fd: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    """Atomically install one already-bound newly created directory."""
+
+    _rename_directory_no_replace_syscall_at(
+        parent_fd,
+        source_name,
+        destination_name,
+    )
+
+
+def _rename_file_no_replace_at(
+    parent_fd: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    """Atomically rename one file within a bound parent without replacement."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source_name)
+    destination_bytes = os.fsencode(destination_name)
+    if sys.platform == "darwin":
+        renameatx_np = getattr(libc, "renameatx_np", None)
+        if renameatx_np is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "renameatx_np is unavailable; refusing a non-atomic publication",
+            )
+        renameatx_np.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            parent_fd,
+            source_bytes,
+            parent_fd,
+            destination_bytes,
+            RENAME_EXCL,
+        )
+    elif sys.platform.startswith("linux"):
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "renameat2 is unavailable; refusing a non-atomic publication",
+            )
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            parent_fd,
+            source_bytes,
+            parent_fd,
+            destination_bytes,
+            RENAME_NOREPLACE,
+        )
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            f"Atomic no-replace file publication is unsupported on {sys.platform}",
+        )
+
+    if result != 0:
+        error_number = ctypes.get_errno() or errno.EIO
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            source_name,
+            destination_name,
+        )
+
+
+def _observe_path(path: Path) -> tuple[str, os.stat_result | None]:
+    try:
+        value = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return "absent", None
+    except Exception:
+        return "unavailable", None
+    return "present", value
+
+
+def _observe_bound_name(
+    parent_fd: int,
+    basename: str,
+) -> tuple[str, os.stat_result | None]:
+    try:
+        value = os.stat(
+            basename,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return "absent", None
+    except Exception:
+        return "unavailable", None
+    return "present", value
+
+
+def _descriptor_bound_directory_destination_receipt(
+    binding: _BoundDirectory,
+    destination: Path,
+    *,
+    tree_receipt: dict[str, Any] | None,
+    tree_verification: str,
+    terminal_error: str | None = None,
+) -> dict[str, Any]:
+    if binding.parent_fd is None:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Bound directory has no parent descriptor: {binding.path}",
+        )
+    parent = _verify_bound_parent_descriptor(
+        binding.parent_fd,
+        binding.parent_opened,
+        display_path=destination.parent,
+        identity_code="prepared-directory-identity-mismatch",
+        access_policy_code="prepared-directory-access-policy-mismatch",
+        inconclusive_code="prepared-directory-revalidation-inconclusive",
+    )
+    directory = _verify_bound_directory_at(
+        binding,
+        parent_fd=binding.parent_fd,
+        basename=destination.name,
+        display_path=destination,
+    )
+    receipt: dict[str, Any] = {
+        "display_path": str(destination),
+        "verification": "bound-parent-and-directory-match-creation-receipts",
+        "namespace_note": (
+            "The display path may no longer resolve if its ancestor namespace "
+            "was replaced after descriptor-bound publication"
+        ),
+        "parent_identity": _identity(parent),
+        "parent_access_policy": _access_policy(parent),
+        "directory_identity": directory["identity"],
+        "directory_access_policy": directory["access_policy"],
+        "tree_verification": tree_verification,
+    }
+    if tree_receipt is not None:
+        receipt["tree_receipt"] = tree_receipt
+    if terminal_error is not None:
+        receipt["terminal_validation_error"] = terminal_error
+    return receipt
+
+
+def _descriptor_bound_directory_recovery_evidence(
+    binding: _BoundDirectory,
+    *,
+    source: Path,
+    destination: Path,
+    source_observation: tuple[str, os.stat_result | None] | None,
+    destination_observation: tuple[str, os.stat_result | None] | None,
+    tree_receipt: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return descriptor-only recovery evidence without trusting either path."""
+
+    evidence: dict[str, Any] = {
+        "evidence_status": "checked",
+        "prepared_display_path": str(source),
+        "destination_display_path": str(destination),
+        "namespace_note": (
+            "Display paths are advisory; the parent and prepared root evidence "
+            "below comes from descriptors retained since creation"
+        ),
+        "target_tree": {
+            "verification": "creation-receipt-last-verified-before-publication",
+            "receipt": tree_receipt,
+        },
+    }
+    observations: dict[str, Any] = {}
+    unavailable = False
+    for label, observation in (
+        ("prepared_name", source_observation),
+        ("destination_name", destination_observation),
+    ):
+        if observation is None:
+            observations[label] = {
+                "status": "not-observed",
+                "evidence_status": "inconclusive",
+            }
+            unavailable = True
+            continue
+        state, value = observation
+        row: dict[str, Any] = {"status": state}
+        if state == "present" and value is not None:
+            row["identity"] = _identity(value)
+            row["access_policy"] = _access_policy(value)
+        elif state == "unavailable":
+            row["evidence_status"] = "inconclusive"
+            unavailable = True
+        observations[label] = row
+    evidence["namespace_observations"] = observations
+    try:
+        if binding.parent_fd is None:
+            raise OSError(errno.EBADF, "bound parent descriptor is unavailable")
+        parent = os.fstat(binding.parent_fd)
+        prepared_root = os.fstat(binding.fd)
+    except Exception as exc:
+        evidence["evidence_status"] = "inconclusive"
+        evidence["descriptor_error"] = str(exc)
+        evidence["descriptor_error_type"] = type(exc).__name__
+        evidence["descriptor_errno"] = getattr(exc, "errno", None)
+        return evidence
+    evidence["parent"] = {
+        "identity": _identity(parent),
+        "access_policy": _access_policy(parent),
+        "matches_creation_receipt": (
+            _same_identity(parent, binding.parent_opened)
+            and _access_policy(parent) == _access_policy(binding.parent_opened)
+        ),
+    }
+    evidence["prepared_root"] = {
+        "identity": _identity(prepared_root),
+        "access_policy": _access_policy(prepared_root),
+        "matches_creation_receipt": (
+            _same_identity(prepared_root, binding.opened)
+            and _access_policy(prepared_root) == _access_policy(binding.opened)
+        ),
+    }
+    if (
+        unavailable
+        or not evidence["parent"]["matches_creation_receipt"]
+        or not evidence["prepared_root"]["matches_creation_receipt"]
+    ):
+        evidence["evidence_status"] = "inconclusive"
+    return evidence
+
+
+def _descriptor_bound_prepared_directory_retry_receipt(
+    binding: _BoundDirectory,
+    *,
+    source: Path,
+    destination: Path,
+    tree_receipt_builder: Callable[[str], dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Prove a failed directory rename left one complete retryable tree."""
+
+    if binding.parent_fd is None:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Prepared directory has no parent descriptor: {source}",
+        )
+    if tree_receipt_builder is None:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            "Directory retry safety requires a complete descriptor-bound tree "
+            f"receipt builder: {source}",
+        )
+    parent = _verify_bound_parent_descriptor(
+        binding.parent_fd,
+        binding.parent_opened,
+        display_path=source.parent,
+        identity_code="prepared-directory-identity-mismatch",
+        access_policy_code="prepared-directory-access-policy-mismatch",
+        inconclusive_code="prepared-directory-revalidation-inconclusive",
+    )
+    tree_receipt = tree_receipt_builder(source.name)
+    root = _verify_bound_directory_at(
+        binding,
+        parent_fd=binding.parent_fd,
+        basename=source.name,
+        display_path=source,
+    )
+    parent = _verify_bound_parent_descriptor(
+        binding.parent_fd,
+        binding.parent_opened,
+        display_path=source.parent,
+        identity_code="prepared-directory-identity-mismatch",
+        access_policy_code="prepared-directory-access-policy-mismatch",
+        inconclusive_code="prepared-directory-revalidation-inconclusive",
+    )
+    target_state, target_observed = _observe_bound_name(
+        binding.parent_fd,
+        destination.name,
+    )
+    parent = _verify_bound_parent_descriptor(
+        binding.parent_fd,
+        binding.parent_opened,
+        display_path=source.parent,
+        identity_code="prepared-directory-identity-mismatch",
+        access_policy_code="prepared-directory-access-policy-mismatch",
+        inconclusive_code="prepared-directory-revalidation-inconclusive",
+    )
+    target_receipt: dict[str, Any] = {
+        "display_path": str(destination),
+        "basename": destination.name,
+        "state": target_state,
+        "verification": "terminal-descriptor-relative-no-follow-observation",
+        "parent_identity": _identity(parent),
+        "evidence_status": (
+            "inconclusive" if target_state == "unavailable" else "checked"
+        ),
+    }
+    if target_state == "present" and target_observed is not None:
+        target_receipt["identity"] = _identity(target_observed)
+        target_receipt["access_policy"] = _access_policy(target_observed)
+    return {
+        "display_path": str(source),
+        "verification": (
+            "bound-parent-root-tree-content-and-access-match-creation-receipts"
+        ),
+        "parent_identity": _identity(parent),
+        "parent_access_policy": _access_policy(parent),
+        "root_identity": root["identity"],
+        "root_access_policy": root["access_policy"],
+        "tree_receipt": tree_receipt,
+        "target": target_receipt,
+    }
+
+
+def _pre_rename_directory_publication_details(
+    binding: _BoundDirectory,
+    *,
+    source: Path,
+    destination: Path,
+    prepared_tree_receipt: dict[str, Any] | None,
+    tree_receipt_builder: Callable[[str], dict[str, Any]] | None,
+) -> tuple[str, dict[str, Any]]:
+    """Classify namespace evidence before this process invokes rename."""
+
+    if binding.parent_fd is None:
+        return (
+            "uncommitted",
+            _publication_details(
+                "uncommitted",
+                prepared=None,
+                destination=destination,
+                retry_safe=False,
+            ),
+        )
+    source_observation = _observe_bound_name(binding.parent_fd, source.name)
+    destination_observation = _observe_bound_name(
+        binding.parent_fd,
+        destination.name,
+    )
+    evidence = _descriptor_bound_directory_recovery_evidence(
+        binding,
+        source=source,
+        destination=destination,
+        source_observation=source_observation,
+        destination_observation=destination_observation,
+        tree_receipt=prepared_tree_receipt,
+    )
+    source_state, _ = source_observation
+    destination_state, destination_stat = destination_observation
+    prepared_is_at_destination = (
+        source_state == "absent"
+        and destination_state == "present"
+        and destination_stat is not None
+        and _same_identity(binding.opened, destination_stat)
+    )
+    namespace_observation_unavailable = (
+        source_state == "unavailable" or destination_state == "unavailable"
+    )
+    descriptor_bound_destination: dict[str, Any] | None = None
+    if prepared_is_at_destination:
+        try:
+            descriptor_bound_destination = (
+                _descriptor_bound_directory_destination_receipt(
+                    binding,
+                    destination,
+                    tree_receipt=prepared_tree_receipt,
+                    tree_verification="creation-receipt-last-verified-before-rename",
+                )
+            )
+            if tree_receipt_builder is not None:
+                try:
+                    descriptor_bound_destination["tree_receipt"] = tree_receipt_builder(
+                        destination.name
+                    )
+                    descriptor_bound_destination["tree_verification"] = (
+                        "descriptor-revalidated-before-local-rename"
+                    )
+                except Exception as tree_exc:
+                    descriptor_bound_destination["tree_revalidation_error"] = str(
+                        tree_exc
+                    )
+        except Exception:
+            descriptor_bound_destination = None
+    state = (
+        "uncertain"
+        if prepared_is_at_destination or namespace_observation_unavailable
+        else "uncommitted"
+    )
+    return (
+        state,
+        _publication_details(
+            state,
+            prepared=None,
+            destination=destination,
+            retry_safe=False,
+            descriptor_bound_destination=descriptor_bound_destination,
+            descriptor_bound_prepared_root=evidence,
+        ),
+    )
+
+
+def _terminal_installed_path_stats(
+    destination: Path,
+    *,
+    trusted_alias: _TrustedDirectoryAlias | None,
+    missing_code: str,
+    inconclusive_code: str,
+) -> tuple[
+    os.stat_result,
+    os.stat_result,
+    os.stat_result,
+    os.stat_result,
+    dict[str, Any] | None,
+]:
+    """Bind one public path through only an exact trusted root alias."""
+
+    requested, _, alias_spec = _trusted_alias_paths(destination)
+    alias_receipt: dict[str, Any] | None = None
+    if alias_spec is not None:
+        if trusted_alias is None:
+            raise StoreSafetyError(
+                inconclusive_code,
+                "The installed destination uses a trusted platform alias, but "
+                "the original authorization binding was not carried to the "
+                f"terminal boundary: {requested}",
+            )
+        _assert_trusted_alias_matches_path(trusted_alias, requested)
+        alias_receipt = _verify_trusted_directory_alias(
+            trusted_alias,
+            destination=requested,
+        )
+    elif trusted_alias is not None:
+        raise StoreSafetyError(
+            inconclusive_code,
+            "The terminal destination escaped the trusted platform alias that "
+            f"authorized publication: {requested}",
+        )
+    try:
+        with _bind_existing_directory_with_trusted_alias(
+            requested.parent,
+            trusted_alias=trusted_alias,
+        ) as parent_binding:
+            parent_before = os.fstat(parent_binding.fd)
+            parent_descriptor = os.fstat(parent_binding.fd)
+            leaf = os.stat(
+                requested.name,
+                dir_fd=parent_binding.fd,
+                follow_symlinks=False,
+            )
+            parent_after = os.fstat(parent_binding.fd)
+            if parent_binding.trusted_alias is not None:
+                alias_receipt = _verify_trusted_directory_alias(
+                    parent_binding.trusted_alias,
+                    destination=requested,
+                )
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            missing_code,
+            f"The installed destination path is missing: {requested}",
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            inconclusive_code,
+            "Cannot terminally bind the installed destination path: "
+            f"{requested}: {exc}",
+        ) from exc
+    except StoreSafetyError as exc:
+        code = (
+            missing_code
+            if exc.code == "prepared-directory-missing"
+            else inconclusive_code
+        )
+        raise StoreSafetyError(
+            code,
+            "Cannot terminally bind the installed destination through its "
+            f"component path: {requested}: {exc}",
+            details=exc.details,
+        ) from exc
+    except Exception as exc:
+        raise StoreSafetyError(
+            inconclusive_code,
+            f"Cannot terminally revalidate the installed destination: "
+            f"{requested}: {exc}",
+        ) from exc
+    return parent_before, parent_descriptor, parent_after, leaf, alias_receipt
+
+
+def _verify_installed_directory_path(
+    binding: _BoundDirectory,
+    destination: Path,
+) -> dict[str, Any] | None:
+    """Terminally prove that the public path names the bound directory."""
+
+    parent_before, parent_descriptor, parent_after, leaf, alias_receipt = (
+        _terminal_installed_path_stats(
+            destination,
+            trusted_alias=binding.trusted_alias,
+            missing_code="prepared-directory-identity-mismatch",
+            inconclusive_code="prepared-directory-revalidation-inconclusive",
+        )
+    )
+    if (
+        not stat.S_ISDIR(parent_before.st_mode)
+        or not stat.S_ISDIR(parent_descriptor.st_mode)
+        or not stat.S_ISDIR(parent_after.st_mode)
+        or not _same_identity(binding.parent_opened, parent_before)
+        or not _same_identity(parent_before, parent_descriptor)
+        or not _same_identity(parent_descriptor, parent_after)
+        or not stat.S_ISDIR(leaf.st_mode)
+        or not _same_identity(binding.opened, leaf)
+    ):
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            "The installed path parent or directory does not match the "
+            f"descriptor-bound publication receipts: {destination}",
+        )
+    if (
+        _access_policy(binding.parent_opened) != _access_policy(parent_before)
+        or _access_policy(parent_before) != _access_policy(parent_descriptor)
+        or _access_policy(parent_descriptor) != _access_policy(parent_after)
+        or _access_policy(binding.opened) != _access_policy(leaf)
+    ):
+        raise StoreSafetyError(
+            "prepared-directory-access-policy-mismatch",
+            f"The installed path parent or directory changed access policy: "
+            f"{destination}",
+        )
+    return alias_receipt
+
+
+def _publish_directory_no_replace(
+    source: Path,
+    destination: Path,
+    *,
+    binding: _BoundDirectory | None = None,
+    before_rename: Callable[[], None] | None = None,
+    prepared_tree_receipt: dict[str, Any] | None = None,
+    descriptor_tree_receipt_builder: (Callable[[str], dict[str, Any]] | None) = None,
+    publication_guard: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if binding is None or binding.parent_fd is None:
+        raise StoreSafetyError(
+            "destination-install-failed",
+            "Directory publication requires creation-time source and parent "
+            f"descriptors: {source}",
+            details=_publication_details(
+                "uncommitted",
+                prepared=None,
+                destination=destination,
+                retry_safe=False,
+            ),
+        )
+    if source.parent != destination.parent or source.parent != binding.path.parent:
+        raise StoreSafetyError(
+            "destination-install-failed",
+            "Descriptor-relative directory publication requires one bound parent: "
+            f"source={source}, destination={destination}",
+            details=_publication_details(
+                "uncommitted",
+                prepared=None,
+                destination=destination,
+                retry_safe=False,
+            ),
+        )
+    parent_fd = binding.parent_fd
+    try:
+        _verify_bound_parent_descriptor(
+            parent_fd,
+            binding.parent_opened,
+            display_path=source.parent,
+            identity_code="prepared-directory-identity-mismatch",
+            access_policy_code="prepared-directory-access-policy-mismatch",
+            inconclusive_code="prepared-directory-revalidation-inconclusive",
+        )
+        _verify_bound_directory_at(
+            binding,
+            parent_fd=parent_fd,
+            basename=source.name,
+            display_path=source,
+        )
+        source_before = os.fstat(binding.fd)
+        source_identity = _identity(source_before)
+        source_access_policy = _access_policy(source_before)
+        if before_rename is not None:
+            before_rename()
+        if binding.before_write is not None:
+            binding.before_write()
+        _verify_bound_parent_descriptor(
+            parent_fd,
+            binding.parent_opened,
+            display_path=source.parent,
+            identity_code="prepared-directory-identity-mismatch",
+            access_policy_code="prepared-directory-access-policy-mismatch",
+            inconclusive_code="prepared-directory-revalidation-inconclusive",
+        )
+        _verify_bound_directory_at(
+            binding,
+            parent_fd=parent_fd,
+            basename=source.name,
+            display_path=source,
+        )
+    except StoreSafetyError as exc:
+        publication_state, publication_details = (
+            _pre_rename_directory_publication_details(
+                binding,
+                source=source,
+                destination=destination,
+                prepared_tree_receipt=prepared_tree_receipt,
+                tree_receipt_builder=descriptor_tree_receipt_builder,
+            )
+        )
+        details = _merge_recovery_details(
+            publication_details,
+            exc.details,
+        )
+        details["publication_state"] = publication_state
+        details["retry_safe"] = False
+        if publication_state == "uncertain":
+            raise StoreSafetyError(
+                "destination-install-uncertain",
+                "The directory publication outcome cannot be established "
+                "before this process invoked the publication rename; preserve "
+                f"the descriptor-bound recovery evidence: {destination}: {exc}",
+                details=details,
+            ) from exc
+        exc.details = details
+        raise
+    except OSError as exc:
+        publication_state, details = _pre_rename_directory_publication_details(
+            binding,
+            source=source,
+            destination=destination,
+            prepared_tree_receipt=prepared_tree_receipt,
+            tree_receipt_builder=descriptor_tree_receipt_builder,
+        )
+        details["publication_state"] = publication_state
+        details["retry_safe"] = False
+        if publication_state == "uncertain":
+            raise StoreSafetyError(
+                "destination-install-uncertain",
+                "The directory publication outcome cannot be established "
+                "before this process invoked the publication rename, and "
+                f"validation also failed: {destination}: {exc}",
+                details=details,
+            ) from exc
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            "Directory publication failed before the rename syscall while "
+            f"validating the prepared tree: {source}: {exc}",
+            details=details,
+        ) from exc
+
+    try:
+        _rename_directory_no_replace_at(
+            parent_fd,
+            source.name,
+            destination.name,
+        )
+    except OSError as exc:
+        source_state, source_after = _observe_bound_name(parent_fd, source.name)
+        destination_state, destination_after = _observe_bound_name(
+            parent_fd,
+            destination.name,
+        )
+        committed = (
+            source_state == "absent"
+            and destination_state == "present"
+            and destination_after is not None
+            and _identity(destination_after) == source_identity
+        )
+        if committed:
+            _latch_publication_commit(publication_guard)
+        descriptor_bound_prepared_root = _descriptor_bound_directory_recovery_evidence(
+            binding,
+            source=source,
+            destination=destination,
+            source_observation=(source_state, source_after),
+            destination_observation=(
+                destination_state,
+                destination_after,
+            ),
+            tree_receipt=prepared_tree_receipt,
+        )
+        if committed:
+            descriptor_bound_destination: dict[str, Any] | None = None
+            try:
+                descriptor_bound_destination = (
+                    _descriptor_bound_directory_destination_receipt(
+                        binding,
+                        destination,
+                        tree_receipt=prepared_tree_receipt,
+                        tree_verification=(
+                            "creation-receipt-last-verified-before-rename"
+                        ),
+                    )
+                )
+                if descriptor_tree_receipt_builder is not None:
+                    try:
+                        descriptor_bound_destination["tree_receipt"] = (
+                            descriptor_tree_receipt_builder(destination.name)
+                        )
+                        descriptor_bound_destination["tree_verification"] = (
+                            "descriptor-revalidated-after-rename"
+                        )
+                    except Exception as tree_exc:
+                        descriptor_bound_destination["tree_revalidation_error"] = str(
+                            tree_exc
+                        )
+            except Exception:
+                descriptor_bound_destination = None
+            if publication_guard is not None:
+                publication_guard["descriptor_bound_destination"] = (
+                    descriptor_bound_destination
+                )
+            raise StoreSafetyError(
+                "destination-install-uncertain",
+                "The destination contains the prepared directory, but the "
+                f"publication syscall reported an error: {destination}: {exc}",
+                details=_publication_details(
+                    "uncertain",
+                    prepared=None,
+                    destination=destination,
+                    retry_safe=False,
+                    descriptor_bound_destination=descriptor_bound_destination,
+                    descriptor_bound_prepared_root=(descriptor_bound_prepared_root),
+                ),
+            ) from exc
+        if (
+            exc.errno in {errno.EEXIST, errno.ENOTEMPTY}
+            and source_state == "present"
+            and source_after is not None
+            and _identity(source_after) == source_identity
+            and destination_state == "present"
+        ):
+            raise StoreSafetyError(
+                "destination-exists",
+                f"Destination appeared before atomic installation: {destination}",
+                details=_publication_details(
+                    "uncommitted",
+                    prepared=None,
+                    destination=destination,
+                    retry_safe=False,
+                    descriptor_bound_prepared_root=(descriptor_bound_prepared_root),
+                ),
+            ) from exc
+        if (
+            source_state == "present"
+            and source_after is not None
+            and _identity(source_after) == source_identity
+            and destination_state == "absent"
+        ):
+            try:
+                prepared_retry_receipt = (
+                    _descriptor_bound_prepared_directory_retry_receipt(
+                        binding,
+                        source=source,
+                        destination=destination,
+                        tree_receipt_builder=descriptor_tree_receipt_builder,
+                    )
+                )
+            except (OSError, StoreSafetyError) as revalidation_exc:
+                terminal_source = _observe_bound_name(parent_fd, source.name)
+                terminal_destination = _observe_bound_name(
+                    parent_fd,
+                    destination.name,
+                )
+                terminal_evidence = _descriptor_bound_directory_recovery_evidence(
+                    binding,
+                    source=source,
+                    destination=destination,
+                    source_observation=terminal_source,
+                    destination_observation=terminal_destination,
+                    tree_receipt=prepared_tree_receipt,
+                )
+                source_terminal_state, source_terminal_stat = terminal_source
+                target_terminal_state, _ = terminal_destination
+                source_terminal_matches = (
+                    source_terminal_state == "present"
+                    and source_terminal_stat is not None
+                    and _identity(source_terminal_stat) == source_identity
+                )
+                publication_state = (
+                    "uncommitted"
+                    if source_terminal_matches
+                    and target_terminal_state in {"absent", "present"}
+                    else "uncertain"
+                )
+                details = _publication_details(
+                    publication_state,
+                    prepared=None,
+                    destination=destination,
+                    retry_safe=False,
+                    descriptor_bound_prepared_root=terminal_evidence,
+                )
+                details["retry_revalidation"] = {
+                    "status": "failed",
+                    "error_code": (
+                        revalidation_exc.code
+                        if isinstance(revalidation_exc, StoreSafetyError)
+                        else "prepared-directory-revalidation-inconclusive"
+                    ),
+                    "error": str(revalidation_exc),
+                }
+                details["publication_error"] = {
+                    "errno": exc.errno,
+                    "error": str(exc),
+                }
+                if source_terminal_matches and target_terminal_state == "present":
+                    raise StoreSafetyError(
+                        "destination-exists",
+                        "The destination appeared while the failed directory "
+                        f"rename was being revalidated: {destination}",
+                        details=details,
+                    ) from revalidation_exc
+                if source_terminal_matches and target_terminal_state == "absent":
+                    raise StoreSafetyError(
+                        "destination-install-failed",
+                        "The directory rename is proved uncommitted, but the "
+                        "prepared tree no longer passes complete descriptor-bound "
+                        f"revalidation: {source}: {revalidation_exc}",
+                        details=details,
+                    ) from revalidation_exc
+                raise StoreSafetyError(
+                    "destination-install-uncertain",
+                    "The directory rename failed and its terminal namespace or "
+                    "prepared-tree evidence is inconclusive: "
+                    f"source={source}, destination={destination}: "
+                    f"{revalidation_exc}",
+                    details=details,
+                ) from revalidation_exc
+            terminal_target_state = prepared_retry_receipt["target"]["state"]
+            if terminal_target_state == "present":
+                raise StoreSafetyError(
+                    "destination-exists",
+                    "The destination appeared while the failed directory rename's "
+                    f"prepared tree was being revalidated: {destination}",
+                    details=_publication_details(
+                        "uncommitted",
+                        prepared=None,
+                        destination=destination,
+                        retry_safe=False,
+                        descriptor_bound_prepared_root=prepared_retry_receipt,
+                    ),
+                ) from exc
+            if terminal_target_state != "absent":
+                raise StoreSafetyError(
+                    "destination-install-uncertain",
+                    "The failed directory rename left the prepared tree intact, "
+                    "but the destination could not be terminally observed "
+                    f"through the held parent descriptor: {destination}",
+                    details=_publication_details(
+                        "uncertain",
+                        prepared=None,
+                        destination=destination,
+                        retry_safe=False,
+                        descriptor_bound_prepared_root=prepared_retry_receipt,
+                    ),
+                ) from exc
+            raise StoreSafetyError(
+                "destination-install-failed",
+                f"Cannot atomically install directory at {destination}: {exc}",
+                details=_publication_details(
+                    "uncommitted",
+                    prepared=None,
+                    destination=destination,
+                    retry_safe=True,
+                    descriptor_bound_prepared_root=prepared_retry_receipt,
+                ),
+            ) from exc
+        raise StoreSafetyError(
+            "destination-install-uncertain",
+            "Cannot prove whether directory publication committed; preserve both "
+            f"paths for inspection: source={source}, destination={destination}: {exc}",
+            details=_publication_details(
+                "uncertain",
+                prepared=None,
+                destination=destination,
+                retry_safe=False,
+                descriptor_bound_prepared_root=descriptor_bound_prepared_root,
+            ),
+        ) from exc
+
+    _latch_publication_commit(publication_guard)
+    descriptor_bound_destination: dict[str, Any] | None = None
+    try:
+        source_state, _ = _observe_bound_name(parent_fd, source.name)
+        destination_state, destination_after = _observe_bound_name(
+            parent_fd,
+            destination.name,
+        )
+        if (
+            source_state != "absent"
+            or destination_state != "present"
+            or destination_after is None
+            or _identity(destination_after) != source_identity
+            or _access_policy(destination_after) != source_access_policy
+        ):
+            raise StoreSafetyError(
+                "prepared-directory-identity-mismatch",
+                "The no-replace syscall returned success, but the bound namespace "
+                f"does not identify the installed directory: {destination}",
+            )
+        _verify_bound_directory_at(
+            binding,
+            parent_fd=parent_fd,
+            basename=destination.name,
+            display_path=destination,
+        )
+        _fsync_bound_parent_descriptor(
+            parent_fd,
+            binding.parent_opened,
+            display_path=destination.parent,
+            identity_code="prepared-directory-identity-mismatch",
+            access_policy_code="prepared-directory-access-policy-mismatch",
+            inconclusive_code="prepared-directory-revalidation-inconclusive",
+        )
+        _verify_bound_directory_at(
+            binding,
+            parent_fd=parent_fd,
+            basename=destination.name,
+            display_path=destination,
+        )
+        terminal_source, _ = _observe_bound_name(parent_fd, source.name)
+        if terminal_source != "absent":
+            raise StoreSafetyError(
+                "prepared-directory-identity-mismatch",
+                f"The private source name reappeared after publication: {source}",
+            )
+        descriptor_bound_destination = _descriptor_bound_directory_destination_receipt(
+            binding,
+            destination,
+            tree_receipt=prepared_tree_receipt,
+            tree_verification="creation-receipt-last-verified-before-rename",
+        )
+        if binding.trusted_alias is not None:
+            descriptor_bound_destination["trusted_alias_before_terminal"] = (
+                _verify_trusted_directory_alias(
+                    binding.trusted_alias,
+                    destination=destination,
+                )
+            )
+        if descriptor_tree_receipt_builder is not None:
+            descriptor_bound_destination["tree_receipt"] = (
+                descriptor_tree_receipt_builder(destination.name)
+            )
+            descriptor_bound_destination["tree_verification"] = (
+                "descriptor-revalidated-after-rename"
+            )
+        terminal_alias_receipt = _verify_installed_directory_path(
+            binding,
+            destination,
+        )
+        if terminal_alias_receipt is not None:
+            descriptor_bound_destination["trusted_alias"] = terminal_alias_receipt
+        if publication_guard is not None:
+            publication_guard["descriptor_bound_destination"] = (
+                descriptor_bound_destination
+            )
+        binding.path = destination
+        binding.namespace_basename = destination.name
+    except Exception as exc:
+        terminal_source_observation = _observe_bound_name(
+            parent_fd,
+            source.name,
+        )
+        terminal_destination_observation = _observe_bound_name(
+            parent_fd,
+            destination.name,
+        )
+        descriptor_bound_prepared_root = _descriptor_bound_directory_recovery_evidence(
+            binding,
+            source=source,
+            destination=destination,
+            source_observation=terminal_source_observation,
+            destination_observation=terminal_destination_observation,
+            tree_receipt=prepared_tree_receipt,
+        )
+        if descriptor_bound_destination is None:
+            try:
+                descriptor_bound_destination = (
+                    _descriptor_bound_directory_destination_receipt(
+                        binding,
+                        destination,
+                        tree_receipt=prepared_tree_receipt,
+                        tree_verification=(
+                            "creation-receipt-last-verified-before-rename"
+                        ),
+                        terminal_error=str(exc),
+                    )
+                )
+            except Exception:
+                descriptor_bound_destination = None
+        elif (
+            descriptor_bound_destination.get("tree_verification")
+            != "descriptor-revalidated-after-rename"
+        ):
+            descriptor_bound_destination["tree_revalidation_error"] = str(exc)
+        if publication_guard is not None:
+            publication_guard["descriptor_bound_destination"] = (
+                descriptor_bound_destination
+            )
+        raise StoreSafetyError(
+            "destination-install-uncertain",
+            "The directory was renamed into place, but descriptor-relative "
+            f"durability or terminal validation is unconfirmed: {destination}: "
+            f"{exc}",
+            details=_publication_details(
+                "uncertain",
+                prepared=None,
+                destination=destination,
+                retry_safe=False,
+                descriptor_bound_destination=descriptor_bound_destination,
+                descriptor_bound_prepared_root=(descriptor_bound_prepared_root),
+            ),
+        ) from exc
+    return descriptor_bound_destination
+
+
+def _require_notes_quit_during_capture(*, phase: str) -> None:
+    """Fail closed when a writeback-grade capture cannot prove Notes is quit."""
+
+    try:
+        running = notes_is_running()
+    except StoreSafetyError as exc:
+        exc.details = _merge_recovery_details(
+            exc.details,
+            {
+                "capture_phase": phase,
+                "mutation_performed": False,
+            },
+        )
+        raise
+    if running:
+        raise StoreSafetyError(
+            "notes-started-during-capture",
+            "Notes.app started before the writeback-grade snapshot completed "
+            f"its {phase} boundary",
+            details={
+                "capture_phase": phase,
+                "notes_state": "running",
+                "mutation_performed": False,
+            },
+        )
+
+
+def _published_snapshot_quarantine_evidence(
+    binding: _BoundDirectory,
+    *,
+    destination: Path,
+    quarantine: Path,
+    publication_receipt: dict[str, Any],
+    quarantine_committed: bool,
+    failure_phase: str,
+    error: BaseException,
+) -> dict[str, Any]:
+    parent_fd = binding.parent_fd
+    destination_observation: tuple[str, os.stat_result | None] = (
+        "unavailable",
+        None,
+    )
+    quarantine_observation: tuple[str, os.stat_result | None] = (
+        "unavailable",
+        None,
+    )
+    if parent_fd is not None:
+        destination_observation = _observe_bound_name(
+            parent_fd,
+            destination.name,
+        )
+        quarantine_observation = _observe_bound_name(
+            parent_fd,
+            quarantine.name,
+        )
+    destination_state, destination_stat = destination_observation
+    quarantine_state, quarantine_stat = quarantine_observation
+    destination_matches = (
+        destination_state == "present"
+        and destination_stat is not None
+        and _same_identity(binding.opened, destination_stat)
+    )
+    quarantine_matches = (
+        quarantine_state == "present"
+        and quarantine_stat is not None
+        and _same_identity(binding.opened, quarantine_stat)
+    )
+    if quarantine_matches:
+        binding.path = quarantine
+        binding.namespace_basename = quarantine.name
+        if binding.canonical_path is not None:
+            binding.canonical_path = binding.canonical_path.parent / quarantine.name
+    elif destination_matches:
+        binding.path = destination
+        binding.namespace_basename = destination.name
+    if quarantine_matches and destination_state == "absent":
+        artifact_state = "namespace-moved-unverified"
+        namespace_state = "moved-unverified"
+    elif destination_matches:
+        artifact_state = "committed"
+        namespace_state = "not-moved"
+    else:
+        artifact_state = "uncertain"
+        namespace_state = "uncertain"
+    locator: dict[str, Any] = {
+        "schema": "apple-notes-snapshot-quarantine/v1",
+        "original_destination": str(destination),
+        "quarantine_path": str(quarantine),
+        "quarantine_rename_returned": quarantine_committed,
+        "artifact_publication_state": artifact_state,
+        "quarantine_namespace_state": namespace_state,
+        "quarantine_verification": "inconclusive",
+        "quarantine_failure_phase": failure_phase,
+        "bound_snapshot_identity": _identity(binding.opened),
+        "bound_snapshot_access_policy": _access_policy(binding.opened),
+        "original_destination_observation": {
+            "state": destination_state,
+            "identity": (
+                _identity(destination_stat) if destination_stat is not None else None
+            ),
+        },
+        "quarantine_observation": {
+            "state": quarantine_state,
+            "identity": (
+                _identity(quarantine_stat) if quarantine_stat is not None else None
+            ),
+        },
+        "publication_receipt": publication_receipt,
+        "error_type": type(error).__name__,
+        "errno": getattr(error, "errno", None),
+    }
+    if isinstance(error, StoreSafetyError):
+        locator["error_code"] = error.code
+    return {
+        "mutation_performed": True,
+        "publication_state": "committed",
+        "artifact_publication_state": artifact_state,
+        "cleanup_state": "inconclusive",
+        "retry_safe": False,
+        "writeback_grade": False,
+        "recovery_locators": {
+            "snapshot_quarantine": locator,
+        },
+    }
+
+
+def _quarantine_published_snapshot(
+    binding: _BoundDirectory,
+    destination: Path,
+    *,
+    publication_receipt: dict[str, Any],
+    descriptor_tree_receipt_builder: Callable[[str], dict[str, Any]],
+) -> dict[str, Any]:
+    """Move the exact published snapshot away from its successful artifact name."""
+
+    if binding.parent_fd is None:
+        raise StoreSafetyError(
+            "snapshot-quarantine-inconclusive",
+            "Published snapshot has no held parent descriptor for quarantine",
+            details={
+                "mutation_performed": True,
+                "publication_state": "committed",
+                "artifact_publication_state": "uncertain",
+                "cleanup_state": "inconclusive",
+                "retry_safe": False,
+                "writeback_grade": False,
+            },
+        )
+    parent_fd = binding.parent_fd
+    quarantine = destination.with_name(
+        f".{destination.name}.notes-started-quarantine-{uuid.uuid4().hex}"
+    )
+    quarantine_committed = False
+    failure_phase = "pre-rename-parent-revalidation"
+    try:
+        _verify_bound_parent_descriptor(
+            parent_fd,
+            binding.parent_opened,
+            display_path=destination.parent,
+            identity_code="prepared-directory-identity-mismatch",
+            access_policy_code="prepared-directory-access-policy-mismatch",
+            inconclusive_code="prepared-directory-revalidation-inconclusive",
+        )
+        failure_phase = "pre-rename-destination-revalidation"
+        _verify_bound_directory_at(
+            binding,
+            parent_fd=parent_fd,
+            basename=destination.name,
+            display_path=destination,
+        )
+        failure_phase = "pre-rename-quarantine-absence"
+        quarantine_state, _ = _observe_bound_name(parent_fd, quarantine.name)
+        if quarantine_state != "absent":
+            raise StoreSafetyError(
+                "snapshot-quarantine-inconclusive",
+                "The randomized snapshot quarantine name is not proved absent: "
+                f"{quarantine}",
+            )
+        failure_phase = "quarantine-rename"
+        _rename_directory_no_replace_at(
+            parent_fd,
+            destination.name,
+            quarantine.name,
+        )
+        quarantine_committed = True
+        binding.path = quarantine
+        binding.namespace_basename = quarantine.name
+        if binding.canonical_path is not None:
+            binding.canonical_path = binding.canonical_path.parent / quarantine.name
+        failure_phase = "post-rename-original-absence"
+        original_state, _ = _observe_bound_name(parent_fd, destination.name)
+        if original_state != "absent":
+            raise StoreSafetyError(
+                "snapshot-quarantine-inconclusive",
+                "The successful snapshot name is not absent after quarantine: "
+                f"{destination}",
+            )
+        failure_phase = "post-rename-directory-revalidation"
+        _verify_bound_directory_at(
+            binding,
+            parent_fd=parent_fd,
+            basename=quarantine.name,
+            display_path=quarantine,
+        )
+        failure_phase = "post-rename-parent-durability"
+        _fsync_bound_parent_descriptor(
+            parent_fd,
+            binding.parent_opened,
+            display_path=destination.parent,
+            identity_code="prepared-directory-identity-mismatch",
+            access_policy_code="prepared-directory-access-policy-mismatch",
+            inconclusive_code="prepared-directory-revalidation-inconclusive",
+        )
+        failure_phase = "post-rename-tree-receipt"
+        tree_receipt = descriptor_tree_receipt_builder(quarantine.name)
+        failure_phase = "post-rename-public-alias"
+        terminal_alias = _verify_installed_directory_path(
+            binding,
+            quarantine,
+        )
+        failure_phase = "verified"
+        return {
+            "schema": "apple-notes-snapshot-quarantine/v1",
+            "original_destination": str(destination),
+            "quarantine_path": str(quarantine),
+            "quarantine_rename_returned": True,
+            "artifact_publication_state": "quarantined",
+            "quarantine_namespace_state": "moved-verified",
+            "quarantine_verification": "verified",
+            "writeback_grade": False,
+            "bound_snapshot_identity": _identity(binding.opened),
+            "bound_snapshot_access_policy": _access_policy(binding.opened),
+            "tree_receipt": tree_receipt,
+            "publication_receipt": publication_receipt,
+            "terminal_alias_receipt": terminal_alias,
+        }
+    except Exception as exc:
+        details = _published_snapshot_quarantine_evidence(
+            binding,
+            destination=destination,
+            quarantine=quarantine,
+            publication_receipt=publication_receipt,
+            quarantine_committed=quarantine_committed,
+            failure_phase=failure_phase,
+            error=exc,
+        )
+        raise StoreSafetyError(
+            "snapshot-quarantine-inconclusive",
+            "Notes state became unsafe after snapshot publication and the "
+            f"identity-bound quarantine could not be fully proved: {exc}",
+            details=details,
+        ) from exc
+
+
+def _post_publication_notes_quit_check(
+    binding: _BoundDirectory,
+    destination: Path,
+    *,
+    publication_receipt: dict[str, Any],
+    descriptor_tree_receipt_builder: Callable[[str], dict[str, Any]],
+    publication_guard: dict[str, Any],
+) -> None:
+    """Recheck Notes and quarantine any artifact that cannot stay writeback-grade."""
+
+    probe_error: StoreSafetyError | None = None
+    try:
+        running = notes_is_running()
+    except StoreSafetyError as exc:
+        running = False
+        probe_error = exc
+    if not running and probe_error is None:
+        return
+
+    primary_code = (
+        probe_error.code if probe_error is not None else "notes-started-during-capture"
+    )
+    primary_message = (
+        "Notes state became unknown immediately after snapshot publication"
+        if probe_error is not None
+        else "Notes.app started before the published snapshot could be accepted"
+    )
+    terminal_artifact_state = "uncertain"
+    terminal_cleanup_state = "inconclusive"
+    try:
+        quarantine = _quarantine_published_snapshot(
+            binding,
+            destination,
+            publication_receipt=publication_receipt,
+            descriptor_tree_receipt_builder=descriptor_tree_receipt_builder,
+        )
+        terminal_artifact_state = "quarantined"
+        terminal_cleanup_state = "retained"
+        details: dict[str, Any] = {
+            "mutation_performed": True,
+            "publication_state": "committed",
+            "artifact_publication_state": "quarantined",
+            "cleanup_state": "retained",
+            "retry_safe": False,
+            "writeback_grade": False,
+            "successful_creation_receipt_emitted": False,
+            "capture_phase": "post-publication-notes-check",
+            "notes_state": "unknown" if probe_error is not None else "running",
+            "recovery_locators": {
+                "snapshot_quarantine": quarantine,
+            },
+        }
+    except StoreSafetyError as quarantine_error:
+        details = _merge_recovery_details(
+            quarantine_error.details,
+            {
+                "mutation_performed": True,
+                "publication_state": "committed",
+                "retry_safe": False,
+                "writeback_grade": False,
+                "successful_creation_receipt_emitted": False,
+                "capture_phase": "post-publication-notes-check",
+                "notes_state": ("unknown" if probe_error is not None else "running"),
+                "quarantine_error_code": quarantine_error.code,
+                "quarantine_error": str(quarantine_error),
+            },
+        )
+        reported_artifact_state = details.get("artifact_publication_state")
+        terminal_artifact_state = (
+            reported_artifact_state
+            if isinstance(reported_artifact_state, str)
+            else "uncertain"
+        )
+    if probe_error is not None:
+        details = _merge_recovery_details(details, probe_error.details)
+        details["notes_probe_error_code"] = probe_error.code
+    # These are terminal properties of the quarantine attempt. Nested Notes
+    # probe details must neither upgrade an incomplete namespace move nor
+    # weaken a verified quarantine receipt.
+    details["mutation_performed"] = True
+    details["publication_state"] = "committed"
+    details["artifact_publication_state"] = terminal_artifact_state
+    details["cleanup_state"] = terminal_cleanup_state
+    details["retry_safe"] = False
+    details["writeback_grade"] = False
+    details["successful_creation_receipt_emitted"] = False
+    error = StoreSafetyError(
+        primary_code,
+        primary_message,
+        details=details,
+    )
+    publication_guard["additional_details"] = details
+    publication_guard["handled_terminal_failure"] = error
+    raise error
+
+
+def _source_revalidation_os_error(
+    path: Path,
+    operation: str,
+    error: OSError,
+) -> StoreSafetyError:
+    if isinstance(error, FileNotFoundError):
+        code = "source-missing-after-read"
+        classification = "missing"
+    elif isinstance(error, PermissionError):
+        code = "source-revalidation-unreadable"
+        classification = "unreadable"
+    else:
+        code = "source-revalidation-inconclusive"
+        classification = "inconclusive"
+    return StoreSafetyError(
+        code,
+        f"Source revalidation is {classification} while attempting to "
+        f"{operation}: {path}: {error}",
+    )
+
+
+def _causal_os_error(error: BaseException) -> OSError | None:
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, OSError):
+            return current
+        current = current.__cause__
+    return None
+
+
+def _bound_file_revalidation_os_error(
+    path: Path,
+    operation: str,
+    error: OSError,
+    codes: _FileProtectionCodes,
+) -> StoreSafetyError:
+    if codes is SOURCE_FILE_CODES:
+        return _source_revalidation_os_error(path, operation, error)
+    return StoreSafetyError(
+        codes.inconclusive,
+        f"Cannot {operation} during bound regular-file revalidation: {path}: {error}",
+    )
+
+
+def _untrusted_regular_read_open_flags() -> int:
+    """Open an untrusted leaf without following links or blocking on a type swap."""
+
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+
+
+def _open_regular_readonly(path: Path) -> tuple[int, os.stat_result]:
+    try:
+        path_before = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            "source-missing", f"Source file is missing: {path}"
+        ) from exc
+    except PermissionError as exc:
+        raise StoreSafetyError(
+            "source-unreadable", f"Source file is unreadable: {path}"
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            "source-revalidation-inconclusive",
+            f"Cannot inspect source file before opening it: {path}: {exc}",
+        ) from exc
+    if not stat.S_ISREG(path_before.st_mode):
+        raise StoreSafetyError(
+            "source-not-regular", f"Source path is not a regular file: {path}"
+        )
+
+    flags = _untrusted_regular_read_open_flags()
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            "source-missing", f"Source disappeared before open: {path}"
+        ) from exc
+    except PermissionError as exc:
+        raise StoreSafetyError(
+            "source-unreadable", f"Source cannot be opened: {path}"
+        ) from exc
+    except OSError as exc:
+        raise _source_revalidation_os_error(
+            path,
+            "safely open the source before descriptor binding",
+            exc,
+        ) from exc
+
+    try:
+        try:
+            opened = os.fstat(fd)
+        except OSError as exc:
+            raise _source_revalidation_os_error(
+                path,
+                "inspect the opened descriptor",
+                exc,
+            ) from exc
+        if not stat.S_ISREG(opened.st_mode):
+            raise StoreSafetyError(
+                "source-not-regular", f"Opened source is not a regular file: {path}"
+            )
+        if not _same_identity(path_before, opened):
+            raise StoreSafetyError(
+                "source-identity-mismatch",
+                f"Source object was replaced while opening: {path}",
+            )
+        return fd, opened
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _open_regular_readonly_at(
+    parent: _BoundDirectory,
+    basename: str,
+    *,
+    display_path: Path,
+) -> tuple[int, os.stat_result]:
+    """Open one source only through the already-held complete parent chain."""
+
+    if basename in {"", ".", ".."} or os.sep in basename:
+        raise StoreSafetyError(
+            "source-revalidation-inconclusive",
+            f"Source basename is not canonical: {display_path}",
+        )
+    _verify_bound_source_directory(parent)
+    try:
+        path_before = os.stat(
+            basename,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            "source-missing", f"Source file is missing: {display_path}"
+        ) from exc
+    except PermissionError as exc:
+        raise StoreSafetyError(
+            "source-unreadable", f"Source file is unreadable: {display_path}"
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            "source-revalidation-inconclusive",
+            "Cannot inspect descriptor-relative source before opening it: "
+            f"{display_path}: {exc}",
+        ) from exc
+    if not stat.S_ISREG(path_before.st_mode):
+        raise StoreSafetyError(
+            "source-not-regular",
+            f"Descriptor-relative source is not a regular file: {display_path}",
+        )
+    flags = _untrusted_regular_read_open_flags()
+    try:
+        fd = os.open(basename, flags, dir_fd=parent.fd)
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            "source-missing", f"Source disappeared before open: {display_path}"
+        ) from exc
+    except PermissionError as exc:
+        raise StoreSafetyError(
+            "source-unreadable", f"Source cannot be opened: {display_path}"
+        ) from exc
+    except OSError as exc:
+        raise _source_revalidation_os_error(
+            display_path,
+            "safely open the descriptor-relative source before binding",
+            exc,
+        ) from exc
+    try:
+        try:
+            opened = os.fstat(fd)
+        except OSError as exc:
+            raise _source_revalidation_os_error(
+                display_path,
+                "inspect the descriptor-relative source after opening it",
+                exc,
+            ) from exc
+        try:
+            path_after = os.stat(
+                basename,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise _source_revalidation_os_error(
+                display_path,
+                "inspect the descriptor-relative source name after opening it",
+                exc,
+            ) from exc
+        _verify_bound_source_directory(parent)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(path_after.st_mode)
+            or not _same_identity(path_before, opened)
+            or not _same_identity(opened, path_after)
+        ):
+            raise StoreSafetyError(
+                "source-identity-mismatch",
+                f"Source object was replaced while opening: {display_path}",
+            )
+        if _access_policy(path_before) != _access_policy(opened) or _access_policy(
+            opened
+        ) != _access_policy(path_after):
+            raise StoreSafetyError(
+                "source-access-policy-mismatch",
+                f"Source access policy changed while opening: {display_path}",
+            )
+        return fd, opened
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def _verify_held_directory_components(
+    components: Iterable[_HeldDirectoryComponent],
+) -> dict[str, Any]:
+    """Revalidate every held component through its already-bound parent."""
+
+    receipts: list[dict[str, Any]] = []
+    for component in components:
+        try:
+            descriptor_before = os.fstat(component.fd)
+            if component.parent_fd is None:
+                path_before = os.stat(component.path, follow_symlinks=False)
+                parent_before = None
+            else:
+                parent_before = os.fstat(component.parent_fd)
+                path_before = os.stat(
+                    component.basename,
+                    dir_fd=component.parent_fd,
+                    follow_symlinks=False,
+                )
+            descriptor_after = os.fstat(component.fd)
+            if component.parent_fd is None:
+                path_after = os.stat(component.path, follow_symlinks=False)
+                parent_after = None
+            else:
+                path_after = os.stat(
+                    component.basename,
+                    dir_fd=component.parent_fd,
+                    follow_symlinks=False,
+                )
+                parent_after = os.fstat(component.parent_fd)
+        except FileNotFoundError as exc:
+            raise StoreSafetyError(
+                "prepared-directory-identity-mismatch",
+                "A descriptor-bound path component disappeared during "
+                f"revalidation: {component.path}",
+            ) from exc
+        except OSError as exc:
+            raise StoreSafetyError(
+                "prepared-directory-revalidation-inconclusive",
+                "Cannot revalidate a descriptor-bound path component: "
+                f"{component.path}: {exc}",
+            ) from exc
+        if (
+            not stat.S_ISDIR(descriptor_before.st_mode)
+            or not stat.S_ISDIR(descriptor_after.st_mode)
+            or not stat.S_ISDIR(path_before.st_mode)
+            or stat.S_ISLNK(path_before.st_mode)
+            or stat.S_ISLNK(path_after.st_mode)
+            or _is_reparse_point(path_before)
+            or _is_reparse_point(path_after)
+            or not _same_identity(component.opened, descriptor_before)
+            or not _same_identity(descriptor_before, path_before)
+            or not _same_identity(path_before, path_after)
+            or not _same_identity(path_after, descriptor_after)
+        ):
+            raise StoreSafetyError(
+                "prepared-directory-identity-mismatch",
+                "A descriptor-bound path component changed identity or became "
+                f"a symlink/reparse point: {component.path}",
+            )
+        if (
+            _access_policy(component.opened) != _access_policy(descriptor_before)
+            or _access_policy(descriptor_before) != _access_policy(path_before)
+            or _access_policy(path_before) != _access_policy(path_after)
+            or _access_policy(path_after) != _access_policy(descriptor_after)
+        ):
+            raise StoreSafetyError(
+                "prepared-directory-access-policy-mismatch",
+                "A descriptor-bound path component changed access policy: "
+                f"{component.path}",
+            )
+        if component.parent_opened is not None:
+            assert parent_before is not None
+            assert parent_after is not None
+            if (
+                not stat.S_ISDIR(parent_before.st_mode)
+                or not stat.S_ISDIR(parent_after.st_mode)
+                or not _same_identity(component.parent_opened, parent_before)
+                or not _same_identity(parent_before, parent_after)
+            ):
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "A held parent changed identity while revalidating its child: "
+                    f"{component.path}",
+                )
+            if _access_policy(component.parent_opened) != _access_policy(
+                parent_before
+            ) or _access_policy(parent_before) != _access_policy(parent_after):
+                raise StoreSafetyError(
+                    "prepared-directory-access-policy-mismatch",
+                    "A held parent changed access policy while revalidating its "
+                    f"child: {component.path}",
+                )
+        receipt = {
+            "path": str(component.path),
+            "identity": _identity(descriptor_after),
+            "access_policy": _access_policy(descriptor_after),
+        }
+        if component.creation_install_receipt is not None:
+            receipt["creation_install_receipt"] = component.creation_install_receipt
+        receipts.append(receipt)
+    return {
+        "schema": "apple-notes-component-path-binding/v1",
+        "components": receipts,
+        "protected_properties": {
+            "object_identity": ["device", "inode", "file_type"],
+            "access_policy": ["mode", "uid", "gid", "flags"],
+            "link_policy": "no-symlink-or-reparse-component",
+        },
+    }
+
+
+@contextmanager
+def _bind_directory_component_chain(
+    path: Path,
+    *,
+    allow_missing: bool,
+    start_binding: _BoundDirectory | None = None,
+    start_path: Path | None = None,
+) -> Iterator[tuple[_BoundDirectory, tuple[str, ...]]]:
+    """Bind an absolute directory path one no-follow component at a time."""
+
+    target = _absolute_path(path)
+    flags = _directory_open_flags()
+    held: list[_HeldDirectoryComponent] = []
+    owned_fds: list[int] = []
+    if start_binding is not None:
+        if start_path is None:
+            raise ValueError("start_path is required with start_binding")
+        bound_start = _absolute_path(start_path)
+        try:
+            relative_parts = target.relative_to(bound_start).parts
+        except ValueError as exc:
+            raise StoreSafetyError(
+                "prepared-directory-identity-mismatch",
+                "A component binding escaped its held root: "
+                f"target={target}, root={bound_start}",
+            ) from exc
+        _verify_bound_directory_namespace(start_binding)
+        current_fd = start_binding.fd
+        current_opened = os.fstat(current_fd)
+        current_path = bound_start
+    else:
+        bound_start = Path("/")
+        relative_parts = target.parts[1:]
+        root_fd: int | None = None
+        try:
+            root_before = os.stat(bound_start, follow_symlinks=False)
+            root_fd = os.open(bound_start, flags)
+            root_opened = os.fstat(root_fd)
+            root_after = os.stat(bound_start, follow_symlinks=False)
+        except OSError as exc:
+            if root_fd is not None:
+                os.close(root_fd)
+            raise StoreSafetyError(
+                "prepared-directory-revalidation-inconclusive",
+                f"Cannot bind filesystem root for {target}: {exc}",
+            ) from exc
+        if (
+            not stat.S_ISDIR(root_before.st_mode)
+            or not stat.S_ISDIR(root_opened.st_mode)
+            or not stat.S_ISDIR(root_after.st_mode)
+            or _is_reparse_point(root_before)
+            or _is_reparse_point(root_after)
+            or not _same_identity(root_before, root_opened)
+            or not _same_identity(root_opened, root_after)
+        ):
+            os.close(root_fd)
+            raise StoreSafetyError(
+                "prepared-directory-identity-mismatch",
+                f"Filesystem root changed identity while binding {target}",
+            )
+        if _access_policy(root_before) != _access_policy(root_opened) or _access_policy(
+            root_opened
+        ) != _access_policy(root_after):
+            os.close(root_fd)
+            raise StoreSafetyError(
+                "prepared-directory-access-policy-mismatch",
+                f"Filesystem root changed access policy while binding {target}",
+            )
+        owned_fds.append(root_fd)
+        held.append(
+            _HeldDirectoryComponent(
+                path=bound_start,
+                basename=None,
+                fd=root_fd,
+                opened=root_opened,
+                parent_fd=None,
+                parent_opened=None,
+            )
+        )
+        current_fd = root_fd
+        current_opened = root_opened
+        current_path = bound_start
+
+    missing_components: tuple[str, ...] = ()
+    try:
+        for index, component in enumerate(relative_parts):
+            if component in {"", ".", ".."}:
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    f"Directory path contains a non-canonical component: {target}",
+                )
+            try:
+                parent_before = os.fstat(current_fd)
+                child_before = os.stat(
+                    component,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError as exc:
+                if not allow_missing:
+                    raise StoreSafetyError(
+                        "prepared-directory-missing",
+                        f"Prepared output directory is missing: {target}",
+                    ) from exc
+                missing_components = tuple(relative_parts[index:])
+                break
+            except OSError as exc:
+                raise StoreSafetyError(
+                    "prepared-directory-revalidation-inconclusive",
+                    "Cannot inspect a descriptor-relative directory component: "
+                    f"{current_path / component}: {exc}",
+                ) from exc
+            child_path = current_path / component
+            if (
+                not stat.S_ISDIR(child_before.st_mode)
+                or stat.S_ISLNK(child_before.st_mode)
+                or _is_reparse_point(child_before)
+            ):
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "Directory ancestry contains an untrusted symlink, reparse "
+                    f"point, or non-directory component: {child_path}",
+                )
+            child_fd: int | None = None
+            try:
+                child_fd = os.open(component, flags, dir_fd=current_fd)
+                child_opened = os.fstat(child_fd)
+                child_after = os.stat(
+                    component,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+                parent_after = os.fstat(current_fd)
+            except FileNotFoundError as exc:
+                if child_fd is not None:
+                    os.close(child_fd)
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    f"Directory component disappeared while binding: {child_path}",
+                ) from exc
+            except OSError as exc:
+                if child_fd is not None:
+                    os.close(child_fd)
+                raise StoreSafetyError(
+                    "prepared-directory-revalidation-inconclusive",
+                    f"Cannot bind directory component {child_path}: {exc}",
+                ) from exc
+            if (
+                not stat.S_ISDIR(child_opened.st_mode)
+                or not stat.S_ISDIR(child_after.st_mode)
+                or stat.S_ISLNK(child_after.st_mode)
+                or _is_reparse_point(child_after)
+                or not _same_identity(child_before, child_opened)
+                or not _same_identity(child_opened, child_after)
+                or not _same_identity(current_opened, parent_before)
+                or not _same_identity(parent_before, parent_after)
+            ):
+                os.close(child_fd)
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "A directory component or its parent changed identity while "
+                    f"binding: {child_path}",
+                )
+            if (
+                _access_policy(child_before) != _access_policy(child_opened)
+                or _access_policy(child_opened) != _access_policy(child_after)
+                or _access_policy(current_opened) != _access_policy(parent_before)
+                or _access_policy(parent_before) != _access_policy(parent_after)
+            ):
+                os.close(child_fd)
+                raise StoreSafetyError(
+                    "prepared-directory-access-policy-mismatch",
+                    "A directory component or its parent changed access policy "
+                    f"while binding: {child_path}",
+                )
+            owned_fds.append(child_fd)
+            held.append(
+                _HeldDirectoryComponent(
+                    path=child_path,
+                    basename=component,
+                    fd=child_fd,
+                    opened=child_opened,
+                    parent_fd=current_fd,
+                    parent_opened=current_opened,
+                )
+            )
+            current_fd = child_fd
+            current_opened = child_opened
+            current_path = child_path
+
+        def revalidate_chain() -> dict[str, Any]:
+            start_receipt = None
+            if start_binding is not None:
+                start_receipt = _verify_bound_directory_namespace(start_binding)
+            receipt = _verify_held_directory_components(held)
+            if start_receipt is not None:
+                receipt["held_root"] = start_receipt
+            return receipt
+
+        revalidate_chain()
+        if held:
+            last = held[-1]
+            parent_opened = (
+                last.parent_opened if last.parent_opened is not None else last.opened
+            )
+            parent_fd = last.parent_fd
+            namespace_basename = last.basename
+        else:
+            assert start_binding is not None
+            parent_opened = start_binding.parent_opened
+            parent_fd = start_binding.parent_fd
+            namespace_basename = start_binding.namespace_basename
+        binding = _BoundDirectory(
+            path=current_path,
+            fd=current_fd,
+            opened=current_opened,
+            parent_opened=parent_opened,
+            parent_fd=parent_fd,
+            before_write=revalidate_chain,
+            path_revalidate=revalidate_chain,
+            namespace_basename=namespace_basename,
+            trusted_alias=None,
+            canonical_path=current_path,
+        )
+        yield binding, missing_components
+        if not _writeback_close_only():
+            revalidate_chain()
+    finally:
+        for fd in reversed(owned_fds):
+            os.close(fd)
+
+
+def _hash_fd(fd: int) -> str:
+    os.lseek(fd, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    while True:
+        chunk = os.read(fd, CHUNK_SIZE)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_bound_regular_file_with_stat(
+    bound: _BoundRegularFile,
+    codes: _FileProtectionCodes,
+    *,
+    target: Path,
+    stat_target: Callable[[], os.stat_result],
+    verify_content: bool = True,
+) -> dict[str, Any]:
+    if bound.trusted_alias is not None:
+        _assert_trusted_alias_matches_path(bound.trusted_alias, target)
+        _verify_trusted_directory_alias(
+            bound.trusted_alias,
+            destination=target,
+        )
+
+    def stat_descriptor() -> os.stat_result:
+        try:
+            return os.fstat(bound.fd)
+        except OSError as exc:
+            raise _bound_file_revalidation_os_error(
+                target,
+                "revalidate the opened file descriptor",
+                exc,
+                codes,
+            ) from exc
+
+    def stat_path() -> os.stat_result:
+        try:
+            return stat_target()
+        except FileNotFoundError as exc:
+            raise StoreSafetyError(
+                codes.missing,
+                f"Bound regular-file path is missing during revalidation: {target}",
+            ) from exc
+        except OSError as exc:
+            raise _bound_file_revalidation_os_error(
+                target,
+                "revalidate the bound regular-file path",
+                exc,
+                codes,
+            ) from exc
+
+    def verify_properties(
+        descriptor: os.stat_result,
+        path_stat: os.stat_result,
+    ) -> None:
+        if (
+            not stat.S_ISREG(descriptor.st_mode)
+            or not stat.S_ISREG(path_stat.st_mode)
+            or not _same_identity(bound.opened, descriptor)
+            or not _same_identity(descriptor, path_stat)
+        ):
+            raise StoreSafetyError(
+                codes.identity,
+                f"Regular-file object identity changed during validation: {target}",
+            )
+        baseline_access = _access_policy(bound.opened)
+        if (
+            _access_policy(descriptor) != baseline_access
+            or _access_policy(path_stat) != baseline_access
+        ):
+            raise StoreSafetyError(
+                codes.access_policy,
+                f"Regular-file access policy changed during validation: {target}",
+            )
+
+    descriptor_before = stat_descriptor()
+    path_before = stat_path()
+    verify_properties(descriptor_before, path_before)
+    first_sha256 = bound.sha256
+    second_sha256 = bound.sha256
+    descriptor_between = descriptor_before
+    path_between = path_before
+    if verify_content:
+        try:
+            first_sha256 = _hash_fd(bound.fd)
+        except OSError as exc:
+            raise _bound_file_revalidation_os_error(
+                target,
+                "hash the bound regular file",
+                exc,
+                codes,
+            ) from exc
+        descriptor_between = stat_descriptor()
+        path_between = stat_path()
+        verify_properties(descriptor_between, path_between)
+        try:
+            second_sha256 = _hash_fd(bound.fd)
+        except OSError as exc:
+            raise _bound_file_revalidation_os_error(
+                target,
+                "repeat the bound regular-file hash",
+                exc,
+                codes,
+            ) from exc
+    descriptor_after = stat_descriptor()
+    path_after = stat_path()
+    verify_properties(descriptor_after, path_after)
+    if (
+        first_sha256 != bound.sha256
+        or second_sha256 != bound.sha256
+        or descriptor_before.st_size != bound.opened.st_size
+        or path_before.st_size != bound.opened.st_size
+        or descriptor_between.st_size != bound.opened.st_size
+        or path_between.st_size != bound.opened.st_size
+        or descriptor_after.st_size != bound.opened.st_size
+        or path_after.st_size != bound.opened.st_size
+    ):
+        raise StoreSafetyError(
+            codes.content,
+            f"Regular-file content changed during validation: {target}",
+        )
+    before_metadata = _metadata(bound.opened)
+    after_metadata = _metadata(descriptor_after)
+    result: dict[str, Any] = {"path": target}
+    if verify_content:
+        result["sha256"] = bound.sha256
+    result.update(
+        {
+            "size": descriptor_after.st_size,
+            "identity": _identity(descriptor_after),
+            "access_policy": _access_policy(descriptor_after),
+            "metadata": after_metadata,
+            "metadata_transitions": {
+                key: {"before": before_metadata[key], "after": after_metadata[key]}
+                for key in before_metadata
+                if before_metadata[key] != after_metadata[key]
+            },
+        }
+    )
+    if not verify_content:
+        result["content_verification"] = "not-performed-identity-access-size-only"
+    if bound.trusted_alias is not None:
+        result["trusted_alias"] = _verify_trusted_directory_alias(
+            bound.trusted_alias,
+            destination=target,
+        )
+    return result
+
+
+def _verify_bound_regular_file(
+    bound: _BoundRegularFile,
+    codes: _FileProtectionCodes,
+    *,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    target = path or bound.path
+    if bound.parent_fd is not None:
+        return _verify_bound_regular_file_at(
+            bound,
+            codes,
+            dir_fd=bound.parent_fd,
+            basename=target.name,
+        )
+    return _verify_bound_regular_file_with_stat(
+        bound,
+        codes,
+        target=target,
+        stat_target=lambda: os.stat(target, follow_symlinks=False),
+    )
+
+
+def _verify_bound_regular_file_at(
+    bound: _BoundRegularFile,
+    codes: _FileProtectionCodes,
+    *,
+    dir_fd: int,
+    basename: str,
+) -> dict[str, Any]:
+    return _verify_bound_regular_file_with_stat(
+        bound,
+        codes,
+        target=bound.path,
+        stat_target=lambda: os.stat(
+            basename,
+            dir_fd=dir_fd,
+            follow_symlinks=False,
+        ),
+    )
+
+
+def _verify_bound_regular_file_properties_at(
+    bound: _BoundRegularFile,
+    codes: _FileProtectionCodes,
+    *,
+    dir_fd: int,
+    basename: str,
+) -> dict[str, Any]:
+    return _verify_bound_regular_file_with_stat(
+        bound,
+        codes,
+        target=bound.path,
+        stat_target=lambda: os.stat(
+            basename,
+            dir_fd=dir_fd,
+            follow_symlinks=False,
+        ),
+        verify_content=False,
+    )
+
+
+@contextmanager
+def _bind_regular_file(
+    path: Path,
+    codes: _FileProtectionCodes,
+) -> Iterator[_BoundRegularFile]:
+    requested = Path(os.path.abspath(os.fspath(path)))
+    with (
+        _bind_existing_directory_with_trusted_alias(requested.parent) as parent,
+        _bind_regular_file_at(requested, parent, codes) as bound,
+    ):
+        yield bound
+
+
+def _scan_bound_directory_entry_types(
+    binding: _BoundDirectory,
+    expected_names: Collection[str],
+) -> dict[str, int]:
+    if isinstance(expected_names, (str, bytes, bytearray)) or not isinstance(
+        expected_names,
+        Collection,
+    ):
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "The expected recovery-directory namespace is not a bounded "
+            "collection of names",
+        )
+    if len(expected_names) > BOUND_DIRECTORY_SCAN_MAX_ENTRIES:
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "The expected recovery-directory entry set exceeds the bounded "
+            f"entry limit ({BOUND_DIRECTORY_SCAN_MAX_ENTRIES})",
+            details={
+                "entry_limit": BOUND_DIRECTORY_SCAN_MAX_ENTRIES,
+                "expected_entries": len(expected_names),
+            },
+        )
+    expected_by_raw_name: dict[bytes, str] = {}
+    expected_entry_count = 0
+    expected_raw_name_bytes = 0
+    for expected_name in expected_names:
+        expected_entry_count += 1
+        if expected_entry_count > BOUND_DIRECTORY_SCAN_MAX_ENTRIES:
+            raise StoreSafetyError(
+                "prepared-file-set-mismatch",
+                "The expected recovery-directory entry set exceeds the bounded "
+                f"entry limit ({BOUND_DIRECTORY_SCAN_MAX_ENTRIES})",
+                details={
+                    "entry_limit": BOUND_DIRECTORY_SCAN_MAX_ENTRIES,
+                    "expected_entries": expected_entry_count,
+                },
+            )
+        if type(expected_name) is not str:
+            raise StoreSafetyError(
+                "prepared-file-set-mismatch",
+                "The expected recovery-directory entry set contains a non-string name",
+            )
+        try:
+            raw_name = os.fsencode(expected_name)
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise StoreSafetyError(
+                "prepared-file-set-mismatch",
+                "The expected recovery-directory entry set contains an "
+                "unencodable raw name",
+            ) from exc
+        if (
+            not raw_name
+            or b"\x00" in raw_name
+            or b"/" in raw_name
+            or raw_name in {b".", b".."}
+        ):
+            raise StoreSafetyError(
+                "prepared-file-set-mismatch",
+                "The expected recovery-directory entry set contains an invalid "
+                "raw name",
+            )
+        previous = expected_by_raw_name.get(raw_name)
+        if previous is not None and previous != expected_name:
+            raise StoreSafetyError(
+                "prepared-file-set-mismatch",
+                "The expected recovery-directory entry set contains a raw-name "
+                "encoding collision",
+            )
+        expected_by_raw_name[raw_name] = expected_name
+        expected_raw_name_bytes += len(raw_name)
+        if expected_raw_name_bytes > BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES:
+            raise StoreSafetyError(
+                "prepared-file-set-mismatch",
+                "The expected recovery-directory entry set exceeds the bounded "
+                "raw name-byte limit "
+                f"({BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES})",
+                details={
+                    "raw_name_bytes_limit": BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES,
+                    "expected_raw_name_bytes": expected_raw_name_bytes,
+                },
+            )
+
+    scans: list[dict[str, int]] = []
+    raw_scans: list[dict[bytes, int]] = []
+    for _ in range(2):
+        child_fd: int | None = None
+        try:
+            child_fd = os.open(
+                ".",
+                _directory_open_flags(),
+                dir_fd=binding.fd,
+            )
+            opened = os.fstat(child_fd)
+            if not stat.S_ISDIR(opened.st_mode) or not _same_identity(
+                binding.opened, opened
+            ):
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "The descriptor-relative recovery directory no longer "
+                    f"identifies its bound object: {binding.path}",
+                )
+            if _access_policy(opened) != _access_policy(binding.opened):
+                raise StoreSafetyError(
+                    "prepared-directory-access-policy-mismatch",
+                    "The descriptor-relative recovery directory access policy "
+                    f"changed: {binding.path}",
+                )
+            with os.scandir(child_fd) as entries:
+                scan: dict[str, int] = {}
+                raw_scan: dict[bytes, int] = {}
+                decoded_to_raw_name: dict[str, bytes] = {}
+                entry_count = 0
+                raw_name_bytes = 0
+                for entry in entries:
+                    entry_count += 1
+                    if entry_count > BOUND_DIRECTORY_SCAN_MAX_ENTRIES:
+                        raise StoreSafetyError(
+                            "prepared-file-set-mismatch",
+                            "Recovery-directory membership exceeds the bounded "
+                            f"entry limit ({BOUND_DIRECTORY_SCAN_MAX_ENTRIES})",
+                            details={
+                                "entry_limit": BOUND_DIRECTORY_SCAN_MAX_ENTRIES,
+                                "observed_entries": entry_count,
+                            },
+                        )
+                    try:
+                        raw_name = os.fsencode(entry.name)
+                        name = os.fsdecode(raw_name)
+                    except (TypeError, ValueError, UnicodeError) as exc:
+                        raise StoreSafetyError(
+                            "prepared-file-set-mismatch",
+                            "A recovery-directory entry has an invalid raw name",
+                        ) from exc
+                    raw_name_bytes += len(raw_name)
+                    if raw_name_bytes > BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES:
+                        raise StoreSafetyError(
+                            "prepared-file-set-mismatch",
+                            "Recovery-directory membership exceeds the bounded "
+                            "raw name-byte limit "
+                            f"({BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES})",
+                            details={
+                                "raw_name_bytes_limit": (
+                                    BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES
+                                ),
+                                "observed_raw_name_bytes": raw_name_bytes,
+                            },
+                        )
+                    expected_name = expected_by_raw_name.get(raw_name)
+                    if expected_name is None:
+                        raise StoreSafetyError(
+                            "prepared-file-set-mismatch",
+                            "Recovery-directory membership contains an entry "
+                            "outside the exact bounded expected namespace",
+                            details={
+                                "expected_entries": len(expected_by_raw_name),
+                                "observed_entries_before_rejection": entry_count,
+                            },
+                        )
+                    if name != expected_name:
+                        raise StoreSafetyError(
+                            "prepared-file-set-mismatch",
+                            "A recovery-directory entry does not round-trip to "
+                            "its expected raw name",
+                        )
+                    previous_raw_name = decoded_to_raw_name.get(name)
+                    if raw_name in raw_scan or (
+                        previous_raw_name is not None and previous_raw_name != raw_name
+                    ):
+                        raise StoreSafetyError(
+                            "prepared-file-set-mismatch",
+                            "Recovery-directory membership contains a duplicate "
+                            "or decoded-name collision",
+                        )
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError as exc:
+                        raise StoreSafetyError(
+                            "prepared-file-set-mismatch",
+                            "Recovery-directory membership changed during "
+                            f"descriptor-relative scan: {binding.path}",
+                        ) from exc
+                    except OSError as exc:
+                        raise StoreSafetyError(
+                            "prepared-directory-revalidation-inconclusive",
+                            "Cannot inspect a recovery-directory entry without "
+                            f"following links: {binding.path / name}: {exc}",
+                        ) from exc
+                    entry_type = stat.S_IFMT(entry_stat.st_mode)
+                    decoded_to_raw_name[name] = raw_name
+                    raw_scan[raw_name] = entry_type
+                    scan[name] = entry_type
+            after = os.fstat(child_fd)
+            if not _same_identity(binding.opened, after):
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "Recovery-directory identity changed during descriptor-relative "
+                    f"scan: {binding.path}",
+                )
+            if _access_policy(after) != _access_policy(binding.opened):
+                raise StoreSafetyError(
+                    "prepared-directory-access-policy-mismatch",
+                    "Recovery-directory access policy changed during "
+                    f"descriptor-relative scan: {binding.path}",
+                )
+            scans.append(scan)
+            raw_scans.append(raw_scan)
+        except StoreSafetyError:
+            raise
+        except OSError as exc:
+            raise StoreSafetyError(
+                "prepared-directory-revalidation-inconclusive",
+                "Cannot scan the bound recovery directory through its descriptor: "
+                f"{binding.path}: {exc}",
+            ) from exc
+        finally:
+            if child_fd is not None:
+                os.close(child_fd)
+    if scans[0] != scans[1] or raw_scans[0] != raw_scans[1]:
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "Recovery-directory raw-name/type membership changed between "
+            f"descriptor-relative scans: {binding.path}",
+        )
+    return scans[1]
+
+
+def _translated_bound_directory_error(
+    error: StoreSafetyError,
+    *,
+    path: Path,
+    missing_code: str,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+    mismatch_code: str,
+) -> StoreSafetyError:
+    if error.code == "prepared-directory-missing":
+        code = missing_code
+    elif error.code in {
+        "prepared-directory-identity-mismatch",
+        "directory-identity-mismatch",
+    }:
+        code = identity_code
+    elif error.code in {
+        "prepared-directory-access-policy-mismatch",
+        "directory-access-policy-mismatch",
+    }:
+        code = access_policy_code
+    elif error.code == "prepared-file-set-mismatch":
+        code = mismatch_code
+    else:
+        code = inconclusive_code
+    return StoreSafetyError(
+        code,
+        f"Cannot validate the descriptor-bound artifact directory {path}: {error}",
+    )
+
+
+def _verify_bound_artifact_directory(
+    binding: _BoundDirectory,
+    *,
+    missing_code: str,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+    mismatch_code: str,
+) -> dict[str, Any]:
+    try:
+        return _verify_bound_directory_namespace(binding)
+    except StoreSafetyError as exc:
+        raise _translated_bound_directory_error(
+            exc,
+            path=binding.path,
+            missing_code=missing_code,
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+            mismatch_code=mismatch_code,
+        ) from exc
+
+
+def _scan_exact_bound_directory_entries(
+    binding: _BoundDirectory,
+    expected_types: dict[str, int],
+    *,
+    missing_code: str,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+    mismatch_code: str,
+) -> dict[str, Any]:
+    before = _verify_bound_artifact_directory(
+        binding,
+        missing_code=missing_code,
+        identity_code=identity_code,
+        access_policy_code=access_policy_code,
+        inconclusive_code=inconclusive_code,
+        mismatch_code=mismatch_code,
+    )
+    try:
+        entries = _scan_bound_directory_entry_types(binding, expected_types)
+    except StoreSafetyError as exc:
+        raise _translated_bound_directory_error(
+            exc,
+            path=binding.path,
+            missing_code=missing_code,
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+            mismatch_code=mismatch_code,
+        ) from exc
+    after = _verify_bound_artifact_directory(
+        binding,
+        missing_code=missing_code,
+        identity_code=identity_code,
+        access_policy_code=access_policy_code,
+        inconclusive_code=inconclusive_code,
+        mismatch_code=mismatch_code,
+    )
+    if before["identity"] != after["identity"]:
+        raise StoreSafetyError(
+            identity_code,
+            f"Artifact directory identity changed during validation: {binding.path}",
+        )
+    if before["access_policy"] != after["access_policy"]:
+        raise StoreSafetyError(
+            access_policy_code,
+            "Artifact directory access policy changed during validation: "
+            f"{binding.path}",
+        )
+    if entries != expected_types:
+        raise StoreSafetyError(
+            mismatch_code,
+            "Descriptor-bound artifact directory name/type set differs from the "
+            f"exact expected set: {binding.path}",
+        )
+    return {
+        "identity": after["identity"],
+        "access_policy": after["access_policy"],
+        "entry_types": entries,
+    }
+
+
+def _scan_exact_prepared_directory_entries(
+    binding: _BoundDirectory,
+    expected_types: dict[str, int],
+    *,
+    missing_code: str,
+) -> dict[str, Any]:
+    return _scan_exact_bound_directory_entries(
+        binding,
+        expected_types,
+        missing_code=missing_code,
+        identity_code="prepared-directory-identity-mismatch",
+        access_policy_code="prepared-directory-access-policy-mismatch",
+        inconclusive_code="prepared-directory-revalidation-inconclusive",
+        mismatch_code="prepared-file-set-mismatch",
+    )
+
+
+@contextmanager
+def _bind_directory_at(
+    path: Path,
+    parent: _BoundDirectory,
+    *,
+    missing_code: str,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+) -> Iterator[_BoundDirectory]:
+    """Bind one child directory only through an already held parent."""
+
+    if path.parent != parent.path:
+        raise StoreSafetyError(
+            identity_code,
+            "Descriptor-relative child binding requires the declared artifact "
+            f"parent: child={path}, parent={parent.path}",
+        )
+    child_fd: int | None = None
+
+    def verify_parent() -> os.stat_result:
+        try:
+            current = os.fstat(parent.fd)
+        except OSError as exc:
+            raise StoreSafetyError(
+                inconclusive_code,
+                f"Cannot revalidate held artifact parent {parent.path}: {exc}",
+            ) from exc
+        if not stat.S_ISDIR(current.st_mode) or not _same_identity(
+            parent.opened, current
+        ):
+            raise StoreSafetyError(
+                identity_code,
+                f"Held artifact parent identity changed: {parent.path}",
+            )
+        if _access_policy(current) != _access_policy(parent.opened):
+            raise StoreSafetyError(
+                access_policy_code,
+                f"Held artifact parent access policy changed: {parent.path}",
+            )
+        return current
+
+    try:
+        parent_before = verify_parent()
+        child_before = os.stat(
+            path.name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+        child_fd = os.open(
+            path.name,
+            _directory_open_flags(),
+            dir_fd=parent.fd,
+        )
+        child_opened = os.fstat(child_fd)
+        child_after = os.stat(
+            path.name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+        parent_after = verify_parent()
+    except FileNotFoundError as exc:
+        if child_fd is not None:
+            os.close(child_fd)
+        raise StoreSafetyError(
+            missing_code,
+            f"Descriptor-bound artifact child directory is missing: {path}",
+        ) from exc
+    except StoreSafetyError:
+        if child_fd is not None:
+            os.close(child_fd)
+        raise
+    except OSError as exc:
+        if child_fd is not None:
+            os.close(child_fd)
+        raise StoreSafetyError(
+            inconclusive_code,
+            f"Cannot bind artifact child directory {path}: {exc}",
+        ) from exc
+    if (
+        not stat.S_ISDIR(child_before.st_mode)
+        or not stat.S_ISDIR(child_opened.st_mode)
+        or not stat.S_ISDIR(child_after.st_mode)
+        or not _same_identity(child_before, child_opened)
+        or not _same_identity(child_opened, child_after)
+        or not _same_identity(parent_before, parent_after)
+    ):
+        os.close(child_fd)
+        raise StoreSafetyError(
+            identity_code,
+            f"Artifact child directory changed identity while binding: {path}",
+        )
+    if (
+        _access_policy(child_before) != _access_policy(child_opened)
+        or _access_policy(child_opened) != _access_policy(child_after)
+        or _access_policy(parent_before) != _access_policy(parent_after)
+    ):
+        os.close(child_fd)
+        raise StoreSafetyError(
+            access_policy_code,
+            f"Artifact child directory changed access policy while binding: {path}",
+        )
+    binding = _BoundDirectory(
+        path=path,
+        fd=child_fd,
+        opened=child_opened,
+        parent_opened=parent.opened,
+        parent_fd=parent.fd,
+        before_write=parent.before_write,
+        path_revalidate=parent.path_revalidate,
+        trusted_alias=parent.trusted_alias,
+        canonical_path=_bound_directory_canonical_path(parent) / path.name,
+    )
+    try:
+        yield binding
+        if not _writeback_close_only():
+            verify_parent()
+            _verify_bound_artifact_directory(
+                binding,
+                missing_code=missing_code,
+                identity_code=identity_code,
+                access_policy_code=access_policy_code,
+                inconclusive_code=inconclusive_code,
+                mismatch_code=identity_code,
+            )
+    finally:
+        os.close(child_fd)
+
+
+@contextmanager
+def _bind_regular_file_at(
+    path: Path,
+    parent: _BoundDirectory,
+    codes: _FileProtectionCodes,
+) -> Iterator[_BoundRegularFile]:
+    try:
+        path_before = os.stat(
+            path.name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            codes.missing,
+            f"Descriptor-relative regular-file path is missing: {path}",
+        ) from exc
+    except OSError as exc:
+        raise _bound_file_revalidation_os_error(
+            path,
+            "inspect the descriptor-relative regular file before opening it",
+            exc,
+            codes,
+        ) from exc
+    if not stat.S_ISREG(path_before.st_mode):
+        raise StoreSafetyError(
+            codes.identity,
+            f"Descriptor-relative source is not a regular file: {path}",
+        )
+    flags = _untrusted_regular_read_open_flags()
+    try:
+        fd = os.open(path.name, flags, dir_fd=parent.fd)
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            codes.missing,
+            f"Descriptor-relative regular file disappeared before open: {path}",
+        ) from exc
+    except OSError as exc:
+        raise _bound_file_revalidation_os_error(
+            path,
+            "safely open the descriptor-relative regular file",
+            exc,
+            codes,
+        ) from exc
+    try:
+        try:
+            opened = os.fstat(fd)
+        except OSError as exc:
+            raise _bound_file_revalidation_os_error(
+                path,
+                "inspect the descriptor-relative regular file after opening it",
+                exc,
+                codes,
+            ) from exc
+        if not stat.S_ISREG(opened.st_mode) or not _same_identity(path_before, opened):
+            raise StoreSafetyError(
+                codes.identity,
+                f"Descriptor-relative regular file was replaced while opening: {path}",
+            )
+        try:
+            path_after_open = os.stat(
+                path.name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as exc:
+            raise StoreSafetyError(
+                codes.missing,
+                "Descriptor-relative regular file disappeared immediately "
+                f"after open: {path}",
+            ) from exc
+        except OSError as exc:
+            raise _bound_file_revalidation_os_error(
+                path,
+                "inspect the descriptor-relative regular-file path immediately "
+                "after opening it",
+                exc,
+                codes,
+            ) from exc
+        if (
+            not stat.S_ISREG(path_after_open.st_mode)
+            or not _same_identity(path_before, path_after_open)
+            or not _same_identity(opened, path_after_open)
+        ):
+            raise StoreSafetyError(
+                codes.identity,
+                "Descriptor-relative regular file changed identity across its "
+                f"open boundary: {path}",
+            )
+        pre_open_access_policy = _access_policy(path_before)
+        if (
+            _access_policy(opened) != pre_open_access_policy
+            or _access_policy(path_after_open) != pre_open_access_policy
+        ):
+            raise StoreSafetyError(
+                codes.access_policy,
+                "Descriptor-relative regular-file access policy changed across "
+                f"its open boundary: {path}",
+            )
+        try:
+            sha256 = _hash_fd(fd)
+        except OSError as exc:
+            raise _bound_file_revalidation_os_error(
+                path,
+                "hash the descriptor-relative regular file after opening it",
+                exc,
+                codes,
+            ) from exc
+        bound = _BoundRegularFile(
+            path=path,
+            fd=fd,
+            opened=opened,
+            sha256=sha256,
+            parent_opened=parent.opened,
+            parent_fd=parent.fd,
+            before_write=parent.before_write,
+            trusted_alias=parent.trusted_alias,
+        )
+        _verify_bound_regular_file_at(
+            bound,
+            codes,
+            dir_fd=parent.fd,
+            basename=path.name,
+        )
+        yield bound
+    finally:
+        os.close(fd)
+
+
+def _verify_bound_recovery_store(
+    store: _BoundRecoveryStore,
+) -> dict[str, Any]:
+    codes = store.file_codes or PREPARED_FILE_CODES
+    try:
+        if store.directory.parent_fd is not None:
+            directory = _verify_bound_directory_at(
+                store.directory,
+                parent_fd=store.directory.parent_fd,
+                basename=store.directory.path.name,
+                display_path=store.directory.path,
+            )
+        else:
+            directory = _verify_bound_directory(store.directory)
+    except StoreSafetyError as exc:
+        if codes is not SNAPSHOT_FILE_CODES:
+            raise
+        code = {
+            "prepared-directory-missing": "snapshot-missing",
+            "prepared-directory-identity-mismatch": (
+                "snapshot-directory-identity-mismatch"
+            ),
+            "prepared-directory-access-policy-mismatch": (
+                "snapshot-directory-access-policy-mismatch"
+            ),
+        }.get(exc.code, SNAPSHOT_FILE_CODES.inconclusive)
+        raise StoreSafetyError(
+            code,
+            "The descriptor-bound snapshot store directory failed "
+            f"revalidation: {store.directory.path}: {exc}",
+            details=exc.details,
+        ) from exc
+    files = {
+        basename: _verify_bound_regular_file_at(
+            bound,
+            codes,
+            dir_fd=store.directory.fd,
+            basename=basename,
+        )
+        for basename, bound in store.files.items()
+    }
+    try:
+        entries = _scan_bound_directory_entry_types(
+            store.directory,
+            store.entry_types,
+        )
+    except StoreSafetyError as exc:
+        if codes is not SNAPSHOT_FILE_CODES:
+            raise
+        raise StoreSafetyError(
+            (
+                store.file_set_mismatch_code
+                if exc.code == "prepared-file-set-mismatch"
+                else SNAPSHOT_FILE_CODES.inconclusive
+            ),
+            "Cannot scan the descriptor-bound snapshot store during terminal "
+            f"revalidation: {store.directory.path}: {exc}",
+            details=exc.details,
+        ) from exc
+    if entries != store.entry_types:
+        raise StoreSafetyError(
+            store.file_set_mismatch_code,
+            "Recovery-directory name/type membership changed while SQLite "
+            f"consumed the bound store: {store.directory.path}",
+        )
+    return {
+        "directory": directory,
+        "files": files,
+        "entry_types": entries,
+    }
+
+
+def _verify_bound_source_store(
+    store: _BoundSourceStore,
+    *,
+    verify_content: bool = True,
+) -> dict[str, Any]:
+    """Revalidate only the reserved NoteStore namespace through the held FD."""
+
+    _verify_bound_source_directory(store.directory)
+    current_paths = _discover_database_files_at(
+        store.directory.path / store.main_name,
+        store.directory,
+    )
+    current_membership = tuple(path.name for path in current_paths)
+    if current_membership != store.membership:
+        raise StoreSafetyError(
+            "store-file-set-mismatch",
+            "SQLite main/WAL/SHM/rollback-journal membership changed while "
+            "the descriptor-bound live store was in use",
+        )
+    verify_file = (
+        _verify_bound_regular_file_at
+        if verify_content
+        else _verify_bound_regular_file_properties_at
+    )
+    files = {
+        basename: verify_file(
+            bound,
+            SOURCE_FILE_CODES,
+            dir_fd=store.directory.fd,
+            basename=basename,
+        )
+        for basename, bound in store.files.items()
+    }
+    terminal_paths = _discover_database_files_at(
+        store.directory.path / store.main_name,
+        store.directory,
+    )
+    terminal_membership = tuple(path.name for path in terminal_paths)
+    _reject_new_rollback_journal_membership(
+        store.directory.path / store.main_name,
+        baseline_names=list(store.membership),
+        observed_names=list(terminal_membership),
+        phase="terminal-store-revalidation",
+    )
+    if terminal_membership != store.membership:
+        raise StoreSafetyError(
+            "store-file-set-mismatch",
+            "SQLite main/WAL/SHM/rollback-journal membership changed during "
+            "terminal descriptor-bound store revalidation",
+        )
+    directory = _verify_bound_source_directory(store.directory)
+    return {
+        "directory": directory,
+        "files": files,
+        "membership": list(terminal_membership),
+    }
+
+
+def _verify_bound_source_directory(
+    directory: _BoundDirectory,
+) -> dict[str, Any]:
+    """Translate complete-chain failures into the live-source taxonomy."""
+
+    try:
+        return _verify_bound_directory_namespace(directory)
+    except (OSError, StoreSafetyError) as exc:
+        raise _source_directory_revalidation_error(directory, exc) from exc
+
+
+def _source_directory_revalidation_error(
+    directory: _BoundDirectory,
+    error: OSError | StoreSafetyError,
+) -> StoreSafetyError:
+    """Translate one failed held-source-directory check without re-probing."""
+
+    if isinstance(error, OSError):
+        return _source_revalidation_os_error(
+            directory.path,
+            "revalidate the held live-source directory chain",
+            error,
+        )
+    os_error = _causal_os_error(error)
+    if os_error is not None:
+        code = _source_revalidation_os_error(
+            directory.path,
+            "revalidate the held live-source directory chain",
+            os_error,
+        ).code
+    else:
+        code = {
+            "prepared-directory-missing": "source-missing-after-read",
+            "prepared-directory-identity-mismatch": "source-identity-mismatch",
+            "directory-identity-mismatch": "source-identity-mismatch",
+            "prepared-directory-access-policy-mismatch": (
+                "source-access-policy-mismatch"
+            ),
+            "directory-access-policy-mismatch": "source-access-policy-mismatch",
+        }.get(error.code, "source-revalidation-inconclusive")
+    return StoreSafetyError(
+        code,
+        "The held live-source directory chain failed terminal "
+        f"revalidation: {directory.path}: {error}",
+        details=error.details,
+    )
+
+
+def _verify_bound_recovery_input(
+    store: Union[_BoundRecoveryStore, _BoundSourceStore],
+) -> dict[str, Any]:
+    if isinstance(store, _BoundSourceStore):
+        return _verify_bound_source_store(store)
+    return _verify_bound_recovery_store(store)
+
+
+def _recovery_input_codes(
+    store: Union[_BoundRecoveryStore, _BoundSourceStore],
+) -> _FileProtectionCodes:
+    if isinstance(store, _BoundSourceStore):
+        return SOURCE_FILE_CODES
+    return store.file_codes or PREPARED_FILE_CODES
+
+
+def _assert_recovery_store_matches_receipt(
+    store: _BoundRecoveryStore,
+    receipt: _RecoveryStoreReceipt,
+) -> dict[str, Any]:
+    current = _verify_bound_recovery_store(store)
+    directory = current["directory"]
+    if directory["identity"] != receipt.directory_identity:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            "Recovery-directory identity differs from its creation receipt: "
+            f"{store.directory.path}",
+        )
+    if directory["access_policy"] != receipt.directory_access_policy:
+        raise StoreSafetyError(
+            "prepared-directory-access-policy-mismatch",
+            "Recovery-directory access policy differs from its creation receipt: "
+            f"{store.directory.path}",
+        )
+    if current["entry_types"] != receipt.entry_types:
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "Recovery-directory membership differs from its creation receipt: "
+            f"{store.directory.path}",
+        )
+    if set(store.files) != set(receipt.files):
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "Bound recovery files differ from the creation receipt: "
+            f"{store.directory.path}",
+        )
+    for basename, file_receipt in receipt.files.items():
+        _assert_bound_matches_receipt(
+            store.files[basename],
+            file_receipt,
+            dir_fd=store.directory.fd,
+            basename=basename,
+        )
+    return current
+
+
+@contextmanager
+def _bind_recovery_store_from_directory(
+    directory: _BoundDirectory,
+    main_name: str,
+    *,
+    creation_receipt: _RecoveryStoreReceipt,
+) -> Iterator[_BoundRecoveryStore]:
+    """Bind a recovery store relative to an already held directory."""
+
+    if directory.parent_fd is not None:
+        _verify_bound_directory_at(
+            directory,
+            parent_fd=directory.parent_fd,
+            basename=directory.path.name,
+            display_path=directory.path,
+        )
+    else:
+        _verify_bound_directory(directory)
+    initial_entries = _scan_bound_directory_entry_types(
+        directory,
+        creation_receipt.entry_types,
+    )
+    if initial_entries != creation_receipt.entry_types:
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "Recovery-directory membership differs from its creation receipt: "
+            f"{directory.path}",
+        )
+    with ExitStack() as stack:
+        files: dict[str, _BoundRegularFile] = {}
+        for basename in creation_receipt.files:
+            if initial_entries.get(basename) != stat.S_IFREG:
+                raise StoreSafetyError(
+                    "prepared-file-identity-mismatch",
+                    "Recovery receipt names a missing or non-regular file: "
+                    f"{directory.path / basename}",
+                )
+            files[basename] = stack.enter_context(
+                _bind_regular_file_at(
+                    directory.path / basename,
+                    directory,
+                    PREPARED_FILE_CODES,
+                )
+            )
+        store = _BoundRecoveryStore(
+            directory=directory,
+            main_name=main_name,
+            files=files,
+            entry_types=initial_entries,
+        )
+        _assert_recovery_store_matches_receipt(store, creation_receipt)
+        try:
+            yield store
+        except Exception:
+            raise
+        else:
+            _assert_recovery_store_matches_receipt(store, creation_receipt)
+
+
+def _recovery_store_creation_receipt(
+    directory: _BoundDirectory,
+    main_name: str,
+    file_receipts: dict[str, dict[str, Any]],
+) -> _RecoveryStoreReceipt:
+    expected_entries = {basename: stat.S_IFREG for basename in file_receipts}
+    directory_receipt = _verify_bound_directory(directory)
+    entries = _scan_bound_directory_entry_types(directory, expected_entries)
+    if entries != expected_entries:
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "Recovery clone membership differs from the exact copied file set: "
+            f"{directory.path}",
+        )
+    receipt = _RecoveryStoreReceipt(
+        directory_identity=dict(directory_receipt["identity"]),
+        directory_access_policy=dict(directory_receipt["access_policy"]),
+        entry_types=dict(expected_entries),
+        files={
+            basename: dict(file_receipt)
+            for basename, file_receipt in file_receipts.items()
+        },
+    )
+    if main_name not in file_receipts:
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "Recovery clone creation receipt does not contain its main database: "
+            f"{directory.path / main_name}",
+        )
+    with _bind_recovery_store_from_directory(
+        directory,
+        main_name,
+        creation_receipt=receipt,
+    ) as store:
+        _assert_recovery_store_matches_receipt(store, receipt)
+    return receipt
+
+
+def _require_authoritative_wal(
+    store: Union[_BoundRecoveryStore, _BoundSourceStore],
+    recovery_evidence: dict[str, Any],
+) -> None:
+    authoritative = (
+        recovery_evidence.get("sidecars", {})
+        .get("recovery", {})
+        .get("authoritative_files", [])
+    )
+    wal_name = f"{store.main_name}-wal"
+    if wal_name in authoritative and wal_name not in store.files:
+        raise StoreSafetyError(
+            "prepared-file-missing",
+            "The validated recovery evidence requires a committed WAL, but the "
+            f"bound recovery store no longer contains it: "
+            f"{store.directory.path / wal_name}",
+        )
+
+
+@contextmanager
+def _bind_recovery_store(
+    main_path: Path,
+    *,
+    creation_receipt: _RecoveryStoreReceipt | None = None,
+) -> Iterator[_BoundRecoveryStore]:
+    directory_path = main_path.parent
+    parent_fd: int | None = None
+    directory_fd: int | None = None
+    try:
+        parent_fd = os.open(directory_path.parent, _directory_open_flags())
+        parent_opened = os.fstat(parent_fd)
+        directory_before = os.stat(
+            directory_path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        directory_fd = os.open(
+            directory_path.name,
+            _directory_open_flags(),
+            dir_fd=parent_fd,
+        )
+        directory_opened = os.fstat(directory_fd)
+        directory_after = os.stat(
+            directory_path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(directory_before.st_mode)
+            or not stat.S_ISDIR(directory_opened.st_mode)
+            or not _same_identity(directory_before, directory_opened)
+            or not _same_identity(directory_opened, directory_after)
+        ):
+            raise StoreSafetyError(
+                "prepared-directory-identity-mismatch",
+                f"Recovery directory was replaced while binding: {directory_path}",
+            )
+        if _access_policy(directory_before) != _access_policy(
+            directory_opened
+        ) or _access_policy(directory_opened) != _access_policy(directory_after):
+            raise StoreSafetyError(
+                "prepared-directory-access-policy-mismatch",
+                "Recovery-directory access policy changed while binding: "
+                f"{directory_path}",
+            )
+    except StoreSafetyError:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise
+    except FileNotFoundError as exc:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise StoreSafetyError(
+            "prepared-directory-missing",
+            f"Recovery directory is missing: {directory_path}",
+        ) from exc
+    except OSError as exc:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Cannot bind recovery directory {directory_path}: {exc}",
+        ) from exc
+    assert directory_fd is not None
+    assert parent_fd is not None
+    directory = _BoundDirectory(
+        path=directory_path,
+        fd=directory_fd,
+        opened=directory_opened,
+        parent_opened=parent_opened,
+    )
+    os.close(parent_fd)
+    parent_fd = None
+    try:
+        main_name = main_path.name
+        wal_name = f"{main_name}-wal"
+        shm_name = f"{main_name}-shm"
+        expected_names: Collection[str] = (
+            creation_receipt.entry_types
+            if creation_receipt is not None
+            else (main_name, wal_name, shm_name)
+        )
+        initial_entries = _scan_bound_directory_entry_types(
+            directory,
+            expected_names,
+        )
+        if creation_receipt is not None:
+            current_directory = _verify_bound_directory(directory)
+            if current_directory["identity"] != creation_receipt.directory_identity:
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "Recovery directory differs from its creation receipt: "
+                    f"{directory_path}",
+                )
+            if (
+                current_directory["access_policy"]
+                != creation_receipt.directory_access_policy
+            ):
+                raise StoreSafetyError(
+                    "prepared-directory-access-policy-mismatch",
+                    "Recovery-directory access policy differs from its creation "
+                    f"receipt: {directory_path}",
+                )
+            if initial_entries != creation_receipt.entry_types:
+                raise StoreSafetyError(
+                    "prepared-file-set-mismatch",
+                    "Recovery-directory membership differs from its creation "
+                    f"receipt: {directory_path}",
+                )
+        if initial_entries.get(main_name) != stat.S_IFREG:
+            code = (
+                "prepared-file-missing"
+                if main_name not in initial_entries
+                else "prepared-file-identity-mismatch"
+            )
+            raise StoreSafetyError(
+                code,
+                f"Recovery main database is missing or not regular: {main_path}",
+            )
+        if wal_name in initial_entries and initial_entries[wal_name] != stat.S_IFREG:
+            raise StoreSafetyError(
+                "prepared-file-identity-mismatch",
+                "Recovery WAL is present but not a regular file: "
+                f"{directory_path / wal_name}",
+            )
+        with ExitStack() as stack:
+            basenames = (
+                list(creation_receipt.files)
+                if creation_receipt is not None
+                else [
+                    basename
+                    for basename in (main_name, wal_name)
+                    if basename in initial_entries
+                ]
+            )
+            files: dict[str, _BoundRegularFile] = {}
+            for basename in basenames:
+                if initial_entries.get(basename) != stat.S_IFREG:
+                    raise StoreSafetyError(
+                        "prepared-file-identity-mismatch",
+                        "Recovery receipt names a missing or non-regular file: "
+                        f"{directory_path / basename}",
+                    )
+                files[basename] = stack.enter_context(
+                    _bind_regular_file_at(
+                        directory_path / basename,
+                        directory,
+                        PREPARED_FILE_CODES,
+                    )
+                )
+            store = _BoundRecoveryStore(
+                directory=directory,
+                main_name=main_name,
+                files=files,
+                entry_types=initial_entries,
+            )
+            _verify_bound_recovery_store(store)
+            if creation_receipt is not None:
+                _assert_recovery_store_matches_receipt(
+                    store,
+                    creation_receipt,
+                )
+            yield store
+    finally:
+        os.close(directory_fd)
+
+
+def _read_bound_file_bytes(
+    bound: _BoundRegularFile,
+    codes: _FileProtectionCodes,
+    *,
+    max_bytes: int,
+    too_large_code: str,
+    path: Path | None = None,
+    dir_fd: int | None = None,
+    basename: str | None = None,
+) -> bytes:
+    if bound.opened.st_size > max_bytes:
+        raise StoreSafetyError(
+            too_large_code,
+            f"File exceeds {max_bytes} bytes: {bound.path}",
+        )
+    os.lseek(bound.fd, 0, os.SEEK_SET)
+    payload = bytearray()
+    while True:
+        chunk = os.read(
+            bound.fd,
+            min(CHUNK_SIZE, max_bytes + 1 - len(payload)),
+        )
+        if not chunk:
+            break
+        payload.extend(chunk)
+        if len(payload) > max_bytes:
+            raise StoreSafetyError(
+                too_large_code,
+                f"File exceeds {max_bytes} bytes: {bound.path}",
+            )
+    if hashlib.sha256(payload).hexdigest() != bound.sha256:
+        raise StoreSafetyError(
+            codes.content,
+            f"Bound file bytes changed while reading: {bound.path}",
+        )
+    if dir_fd is not None and basename is not None:
+        _verify_bound_regular_file_at(
+            bound,
+            codes,
+            dir_fd=dir_fd,
+            basename=basename,
+        )
+    else:
+        _verify_bound_regular_file(bound, codes, path=path)
+    return bytes(payload)
+
+
+def _verify_directory_creation_parent(
+    parent_fd: int,
+    parent_opened: os.stat_result,
+    *,
+    display_path: Path,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+) -> os.stat_result:
+    try:
+        current = os.fstat(parent_fd)
+    except OSError as exc:
+        raise StoreSafetyError(
+            inconclusive_code,
+            f"Cannot revalidate the held directory-creation parent {display_path}: "
+            f"{exc}",
+        ) from exc
+    if not stat.S_ISDIR(current.st_mode) or not _same_identity(parent_opened, current):
+        raise StoreSafetyError(
+            identity_code,
+            f"Directory-creation parent changed identity: {display_path}",
+        )
+    if _access_policy(parent_opened) != _access_policy(current):
+        raise StoreSafetyError(
+            access_policy_code,
+            f"Directory-creation parent changed access policy: {display_path}",
+        )
+    return current
+
+
+def _identity_bound_directory_creation_failure_details(
+    failure: _IdentityBoundDirectoryCreationFailure,
+    *,
+    parent_fd: int,
+    parent_opened: os.stat_result,
+    display_path: Path,
+) -> dict[str, Any]:
+    """Retain create-then-fail evidence without trusting the failed handoff."""
+
+    reported_basename = failure.staging_basename
+    staging_basename = (
+        reported_basename
+        if isinstance(reported_basename, str)
+        and reported_basename not in {"", ".", ".."}
+        and os.sep not in reported_basename
+        and reported_basename.startswith(".apple-notes-create-")
+        else None
+    )
+    directory_fd = (
+        failure.fd
+        if isinstance(failure.fd, int)
+        and not isinstance(failure.fd, bool)
+        and failure.fd >= 0
+        else None
+    )
+    opened = failure.opened if isinstance(failure.opened, os.stat_result) else None
+    provider_proof = failure.proof if isinstance(failure.proof, dict) else None
+    reported_install_state = failure.details.get("provider_install_state")
+    provider_install_state = (
+        reported_install_state
+        if isinstance(reported_install_state, str) and reported_install_state
+        else "trusted-creator-create-then-fail"
+    )
+    creation_state = (
+        "malformed-result"
+        if provider_install_state == "trusted-creator-malformed-result"
+        else "supervisor-transaction-failed"
+        if provider_install_state == "supervisor-request-started"
+        else "create-then-fail"
+    )
+    recovery = _created_directory_install_recovery_details(
+        parent_fd=parent_fd,
+        parent_opened=parent_opened,
+        directory_fd=directory_fd,
+        created=opened,
+        staging_name=staging_basename,
+        target_name=display_path.name,
+        display_path=display_path,
+        install_state=provider_install_state,
+        mutation_performed=True,
+        # A failed provider handoff has not passed the helper's proof checks.
+        creation_proof=None,
+        creation_install_receipt=None,
+    )
+    generic_locator = recovery["recovery_locators"].pop("created_directory_install")
+    generic_locator.update(
+        {
+            "schema": ("apple-notes-identity-bound-directory-creation-failure/v1"),
+            "creation_state": creation_state,
+            "provider_reported_staging_basename": reported_basename,
+            "provider_proof": provider_proof,
+            "provider_error_type": type(failure).__name__,
+            "provider_error": str(failure),
+            "descriptor_ownership_transferred": directory_fd is not None,
+        }
+    )
+    recovery["recovery_locators"]["identity_bound_directory_creation_failure"] = (
+        generic_locator
+    )
+    provider_authority = (
+        provider_proof.get("creation_authority") if provider_proof is not None else None
+    )
+    reported_authority = failure.details.get("creation_authority")
+    recovery.update(
+        {
+            "creation_authority": (
+                provider_authority
+                if isinstance(provider_authority, str) and provider_authority
+                else reported_authority
+                if isinstance(reported_authority, str) and reported_authority
+                else "provider-failure-unverified"
+            ),
+            "provider_install_state": provider_install_state,
+            "provider_proof": provider_proof,
+            "provider_staging_basename": staging_basename,
+        }
+    )
+    return _merge_recovery_details(failure.details, recovery)
+
+
+def _unstructured_directory_creation_failure_details(
+    failure: Exception,
+    *,
+    display_path: Path,
+) -> dict[str, Any]:
+    """Treat an unstructured provider exception as possibly post-mutation."""
+
+    return {
+        "mutation_performed": True,
+        "cleanup_state": "inconclusive",
+        "retry_safe": False,
+        "creation_authority": "provider-failure-unstructured",
+        "provider_install_state": "trusted-creator-state-unknown",
+        "provider_staging_basename": None,
+        "recovery_locators": {
+            "identity_bound_directory_creation_failure": {
+                "schema": ("apple-notes-identity-bound-directory-creation-failure/v1"),
+                "protected_property": "creation-identity-inconclusive",
+                "creation_state": "unknown-after-creator-entry",
+                "display_path": str(display_path),
+                "provider_error_type": type(failure).__name__,
+                "provider_errno": getattr(failure, "errno", None),
+                "provider_error": str(failure),
+                "automatic_cleanup_attempted": False,
+                "evidence_status": "inconclusive",
+            },
+        },
+    }
+
+
+def _creator_result_field(
+    result: object,
+    name: str,
+) -> tuple[object | None, str | None]:
+    try:
+        if isinstance(result, Mapping):
+            if name not in result:
+                return None, "missing"
+            return result[name], None
+        return getattr(result, name), None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"[:512]
+
+
+def _normalize_identity_bound_directory_creation_result(
+    result: object,
+    *,
+    parent_fd: int,
+) -> _IdentityBoundDirectoryCreation:
+    """Conservatively take ownership from a malformed creator result."""
+
+    fields: dict[str, object | None] = {}
+    field_errors: dict[str, str] = {}
+    for field in ("basename", "fd", "opened", "proof"):
+        value, error = _creator_result_field(result, field)
+        fields[field] = value
+        if error is not None:
+            field_errors[field] = error
+
+    issues: list[str] = []
+    if not isinstance(result, _IdentityBoundDirectoryCreation):
+        issues.append("result-type")
+    basename = fields["basename"]
+    if not isinstance(basename, str):
+        issues.append("basename-type")
+    descriptor = fields["fd"]
+    recoverable_fd = (
+        descriptor
+        if isinstance(descriptor, int)
+        and not isinstance(descriptor, bool)
+        and descriptor >= 0
+        and descriptor != parent_fd
+        else None
+    )
+    fd_aliases_parent = (
+        isinstance(descriptor, int)
+        and not isinstance(descriptor, bool)
+        and descriptor == parent_fd
+    )
+    if (
+        not isinstance(descriptor, int)
+        or isinstance(descriptor, bool)
+        or descriptor < 0
+    ):
+        issues.append("fd-type")
+    elif fd_aliases_parent:
+        issues.append("fd-aliases-parent")
+    opened = fields["opened"]
+    if not isinstance(opened, os.stat_result):
+        issues.append("opened-type")
+    proof = fields["proof"]
+    if not isinstance(proof, dict):
+        issues.append("proof-type")
+
+    if issues or field_errors:
+        reported_basename = basename if isinstance(basename, str) else None
+        recoverable_basename = (
+            reported_basename
+            if reported_basename is not None and len(reported_basename) <= 255
+            else None
+        )
+        locator: dict[str, Any] = {
+            "schema": "apple-notes-directory-creator-malformed-result/v1",
+            "protected_property": "creation-identity-inconclusive",
+            "result_type": type(result).__name__,
+            "issues": sorted(set(issues)),
+            "field_errors": field_errors,
+            "field_types": {
+                field: type(value).__name__ if value is not None else None
+                for field, value in fields.items()
+            },
+            "provider_reported_staging_basename": (
+                reported_basename[:256] if reported_basename is not None else None
+            ),
+            "recoverable_descriptor_transferred": recoverable_fd is not None,
+            "fd_aliases_parent": fd_aliases_parent,
+            "automatic_cleanup_attempted": False,
+        }
+        raise _IdentityBoundDirectoryCreationFailure(
+            "The trusted directory creator returned a malformed result.",
+            staging_basename=recoverable_basename,
+            fd=recoverable_fd,
+            opened=(opened if isinstance(opened, os.stat_result) else None),
+            proof=(proof if isinstance(proof, dict) else None),
+            details={
+                "mutation_performed": True,
+                "cleanup_state": "inconclusive",
+                "retry_safe": False,
+                "creation_authority": "provider-malformed-result",
+                "provider_install_state": "trusted-creator-malformed-result",
+                "provider_staging_basename": recoverable_basename,
+                "recovery_locators": {
+                    "identity_bound_directory_creation_malformed_result": locator,
+                },
+            },
+        )
+
+    assert isinstance(result, _IdentityBoundDirectoryCreation)
+    return result
+
+
+def _rejected_identity_bound_creation_details(
+    creation: _IdentityBoundDirectoryCreation,
+    *,
+    authority: str,
+    proof: Any,
+) -> dict[str, Any]:
+    details: dict[str, Any] = {
+        "mutation_performed": True,
+        "cleanup_state": "inconclusive",
+        "creation_authority": authority,
+        "provider_proof": proof,
+        "provider_staging_basename": creation.basename,
+        "retry_safe": False,
+    }
+    try:
+        descriptor = os.fstat(creation.fd)
+    except OSError as exc:
+        details["provider_descriptor_receipt"] = {
+            "status": "inconclusive",
+            "error_type": type(exc).__name__,
+            "errno": getattr(exc, "errno", None),
+        }
+    else:
+        details["provider_descriptor_receipt"] = {
+            "status": "point-in-time-only",
+            "identity": _identity(descriptor),
+            "access_policy": _access_policy(descriptor),
+        }
+    return details
+
+
+def _validate_identity_bound_directory_creation_result(
+    creation: _IdentityBoundDirectoryCreation,
+    *,
+    parent_fd: int,
+    parent_opened: os.stat_result,
+    display_path: Path,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+) -> _IdentityBoundDirectoryCreation:
+    basename = creation.basename
+    if (
+        basename in {"", ".", ".."}
+        or os.sep in basename
+        or not basename.startswith(".apple-notes-create-")
+    ):
+        raise StoreSafetyError(
+            inconclusive_code,
+            "The identity-bound directory creator returned a non-canonical "
+            f"staging basename: {basename!r}",
+        )
+
+    proof = creation.proof
+    required_proof = {
+        "schema": DIRECTORY_CREATOR_PROOF_SCHEMA,
+        "actual_created_object_descriptor_returned": True,
+        "namespace_race_excluded_by_model": True,
+    }
+    if (
+        any(proof.get(key) != value for key, value in required_proof.items())
+        or not isinstance(proof.get("creation_authority"), str)
+        or not proof["creation_authority"]
+        or not isinstance(proof.get("creation_method"), str)
+        or not proof["creation_method"]
+        or not isinstance(proof.get("threat_model"), str)
+        or not proof["threat_model"]
+    ):
+        raise StoreSafetyError(
+            "directory-creation-identity-inconclusive",
+            "The directory creator did not attest an actual-created-object FD "
+            "and an explicit namespace threat model: "
+            f"{display_path}",
+        )
+
+    try:
+        descriptor_before = os.fstat(creation.fd)
+        named = os.stat(
+            basename,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        descriptor_after = os.fstat(creation.fd)
+    except OSError as exc:
+        raise StoreSafetyError(
+            "directory-creation-identity-inconclusive",
+            "Cannot validate the provider-returned created-directory FD and "
+            f"name: {display_path}: {exc}",
+        ) from exc
+    if (
+        not stat.S_ISDIR(creation.opened.st_mode)
+        or not stat.S_ISDIR(descriptor_before.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or not stat.S_ISDIR(descriptor_after.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or _is_reparse_point(named)
+        or not _same_identity(creation.opened, descriptor_before)
+        or not _same_identity(descriptor_before, named)
+        or not _same_identity(named, descriptor_after)
+        or proof.get("directory_identity") != _identity(descriptor_after)
+        or proof.get("parent_identity") != _identity(parent_opened)
+    ):
+        raise StoreSafetyError(
+            identity_code,
+            "The provider-returned name no longer identifies the exact object "
+            f"created and opened by the trusted creator: {display_path}",
+        )
+    expected_uid = os.geteuid() if hasattr(os, "geteuid") else descriptor_after.st_uid
+    expected_access = _access_policy(descriptor_after)
+    if (
+        stat.S_IMODE(descriptor_after.st_mode) != 0o700
+        or descriptor_after.st_uid != expected_uid
+        or _access_policy(creation.opened) != expected_access
+        or _access_policy(descriptor_before) != expected_access
+        or _access_policy(named) != expected_access
+        or proof.get("directory_access_policy") != expected_access
+        or proof.get("parent_access_policy") != _access_policy(parent_opened)
+    ):
+        raise StoreSafetyError(
+            access_policy_code,
+            "The provider-returned created directory is not owner-private or "
+            f"its access policy changed during handoff: {display_path}",
+        )
+    _verify_directory_creation_parent(
+        parent_fd,
+        parent_opened,
+        display_path=display_path.parent,
+        identity_code=identity_code,
+        access_policy_code=access_policy_code,
+        inconclusive_code=inconclusive_code,
+    )
+    return _IdentityBoundDirectoryCreation(
+        basename=basename,
+        fd=creation.fd,
+        opened=descriptor_after,
+        proof=dict(proof),
+    )
+
+
+def _create_identity_bound_directory_at(
+    parent_fd: int,
+    parent_opened: os.stat_result,
+    *,
+    display_path: Path,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+) -> _IdentityBoundDirectoryCreation:
+    """Obtain a creator-returned directory FD or fail before any mutation."""
+
+    creator = _IDENTITY_BOUND_DIRECTORY_CREATOR
+    if creator is None:
+        raise StoreSafetyError(
+            "directory-creation-identity-inconclusive",
+            "This runtime has no trusted directory creator that returns the "
+            "actual newly created object descriptor; refusing mkdir-then-open: "
+            f"{display_path}",
+            details={
+                "mutation_performed": False,
+                "creation_authority": "unavailable",
+                "unsupported_fallbacks": [
+                    "mkdir-then-open",
+                    "mkdirat-then-openat",
+                    "mkdtemp-then-open",
+                    "mkdtempat_np-then-openat",
+                ],
+                "retry_safe": False,
+            },
+        )
+
+    _verify_directory_creation_parent(
+        parent_fd,
+        parent_opened,
+        display_path=display_path.parent,
+        identity_code=identity_code,
+        access_policy_code=access_policy_code,
+        inconclusive_code=inconclusive_code,
+    )
+    try:
+        creation = _normalize_identity_bound_directory_creation_result(
+            creator(parent_fd, ".apple-notes-create-"),
+            parent_fd=parent_fd,
+        )
+    except _IdentityBoundDirectoryCreatorUnavailable as exc:
+        reported_authority = exc.details.get("creation_authority")
+        creation_authority = (
+            reported_authority
+            if isinstance(reported_authority, str) and reported_authority
+            else "supervisor-channel-unavailable"
+        )
+        raise StoreSafetyError(
+            "directory-creation-identity-inconclusive",
+            "This runtime has no usable trusted directory-creation capability; "
+            "refusing mkdir-then-open: "
+            f"{display_path}: {exc}",
+            details=_merge_recovery_details(
+                exc.details,
+                {
+                    "mutation_performed": False,
+                    "cleanup_state": "not-needed",
+                    "retry_safe": False,
+                    "creation_authority": creation_authority,
+                    "unsupported_fallbacks": list(
+                        PACKAGED_DIRECTORY_CREATOR_UNSUPPORTED_PRIMITIVES
+                    ),
+                },
+            ),
+        ) from exc
+    except _IdentityBoundDirectoryCreationFailure as exc:
+        try:
+            try:
+                details = _identity_bound_directory_creation_failure_details(
+                    exc,
+                    parent_fd=parent_fd,
+                    parent_opened=parent_opened,
+                    display_path=display_path,
+                )
+            except Exception as evidence_exc:
+                fallback = _unstructured_directory_creation_failure_details(
+                    evidence_exc,
+                    display_path=display_path,
+                )
+                fallback.update(
+                    {
+                        "creation_authority": (
+                            "provider-structured-failure-evidence-inconclusive"
+                        ),
+                        "provider_install_state": ("trusted-creator-create-then-fail"),
+                        "provider_staging_basename": (
+                            exc.staging_basename
+                            if isinstance(exc.staging_basename, str)
+                            else None
+                        ),
+                        "provider_failure_type": type(exc).__name__,
+                        "provider_failure": str(exc),
+                        "provider_evidence_error_type": (type(evidence_exc).__name__),
+                        "provider_evidence_errno": getattr(
+                            evidence_exc,
+                            "errno",
+                            None,
+                        ),
+                    }
+                )
+                details = _merge_recovery_details(exc.details, fallback)
+        finally:
+            if isinstance(exc.fd, int) and not isinstance(exc.fd, bool) and exc.fd >= 0:
+                try:
+                    os.close(exc.fd)
+                except OSError:
+                    pass
+        raise StoreSafetyError(
+            "directory-creation-identity-inconclusive",
+            "The trusted directory creator reported a failure after entering "
+            f"its creation boundary; preserve the returned evidence: "
+            f"{display_path}: {exc}",
+            details=details,
+        ) from exc
+    except Exception as exc:
+        raise StoreSafetyError(
+            "directory-creation-identity-inconclusive",
+            "The trusted directory creator raised without structured "
+            "create-then-fail evidence; mutation cannot be excluded: "
+            f"{display_path}: {exc}",
+            details=_unstructured_directory_creation_failure_details(
+                exc,
+                display_path=display_path,
+            ),
+        ) from exc
+
+    try:
+        return _validate_identity_bound_directory_creation_result(
+            creation,
+            parent_fd=parent_fd,
+            parent_opened=parent_opened,
+            display_path=display_path,
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+        )
+    except Exception as exc:
+        proof = creation.proof
+        authority = (
+            str(proof.get("creation_authority"))
+            if isinstance(proof, dict) and proof.get("creation_authority")
+            else "provider-result-validation-failed"
+        )
+        details = _rejected_identity_bound_creation_details(
+            creation,
+            authority=authority,
+            proof=proof,
+        )
+        try:
+            os.close(creation.fd)
+        except OSError:
+            pass
+        if isinstance(exc, StoreSafetyError):
+            exc.details = _merge_recovery_details(exc.details, details)
+            raise
+        raise StoreSafetyError(
+            "directory-creation-identity-inconclusive",
+            "The trusted directory creator result failed validation after "
+            f"possible creation: {display_path}: {exc}",
+            details=details,
+        ) from exc
+
+
+def _verify_created_directory_name_at(
+    parent_fd: int,
+    parent_opened: os.stat_result,
+    directory_fd: int,
+    created: os.stat_result,
+    *,
+    basename: str,
+    display_path: Path,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+) -> dict[str, Any]:
+    _verify_directory_creation_parent(
+        parent_fd,
+        parent_opened,
+        display_path=display_path.parent,
+        identity_code=identity_code,
+        access_policy_code=access_policy_code,
+        inconclusive_code=inconclusive_code,
+    )
+    try:
+        descriptor_before = os.fstat(directory_fd)
+        named = os.stat(
+            basename,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        descriptor_after = os.fstat(directory_fd)
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            identity_code,
+            f"Created directory name disappeared: {display_path}",
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            inconclusive_code,
+            f"Cannot revalidate created directory {display_path}: {exc}",
+        ) from exc
+    if (
+        not stat.S_ISDIR(descriptor_before.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or not stat.S_ISDIR(descriptor_after.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or _is_reparse_point(named)
+        or not _same_identity(created, descriptor_before)
+        or not _same_identity(descriptor_before, named)
+        or not _same_identity(named, descriptor_after)
+    ):
+        raise StoreSafetyError(
+            identity_code,
+            "Created directory name no longer resolves to the transaction's "
+            f"retained object: {display_path}",
+        )
+    baseline_access = _access_policy(created)
+    if (
+        _access_policy(descriptor_before) != baseline_access
+        or _access_policy(named) != baseline_access
+        or _access_policy(descriptor_after) != baseline_access
+    ):
+        raise StoreSafetyError(
+            access_policy_code,
+            f"Created directory access policy changed: {display_path}",
+        )
+    _verify_directory_creation_parent(
+        parent_fd,
+        parent_opened,
+        display_path=display_path.parent,
+        identity_code=identity_code,
+        access_policy_code=access_policy_code,
+        inconclusive_code=inconclusive_code,
+    )
+    return {
+        "identity": _identity(descriptor_after),
+        "access_policy": _access_policy(descriptor_after),
+        "metadata": _metadata(descriptor_after),
+    }
+
+
+def _created_directory_install_recovery_details(
+    *,
+    parent_fd: int,
+    parent_opened: os.stat_result,
+    directory_fd: int | None,
+    created: os.stat_result | None,
+    staging_name: str | None,
+    target_name: str,
+    display_path: Path,
+    install_state: str,
+    mutation_performed: bool,
+    creation_proof: dict[str, Any] | None,
+    creation_install_receipt: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Describe a failed create/install without deleting through a mutable name."""
+
+    receipt: dict[str, Any] = {
+        "schema": "apple-notes-created-directory-install-recovery/v1",
+        "protected_property": (
+            "transaction-created-object-identity"
+            if creation_proof is not None
+            else "creation-identity-inconclusive"
+        ),
+        "creation_proof": creation_proof,
+        "display_path": str(display_path),
+        "target_basename": target_name,
+        "staging_basename": staging_name,
+        "install_state": install_state,
+        "mutation_performed": mutation_performed,
+        "cleanup_policy": (
+            "delete-only-through-an-atomic-identity-bound-directory-primitive"
+        ),
+        "automatic_cleanup_attempted": False,
+        "cleanup_reason": (
+            "No portable descriptor-bound directory unlink can atomically "
+            "reconfirm identity at removal; retain point-in-time evidence."
+        ),
+    }
+    if creation_install_receipt is not None:
+        receipt["creation_install_receipt"] = creation_install_receipt
+    try:
+        parent_current = os.fstat(parent_fd)
+    except OSError as exc:
+        receipt["evidence_status"] = "inconclusive"
+        receipt["parent_descriptor_error"] = str(exc)
+    else:
+        receipt["parent_descriptor"] = {
+            "identity": _identity(parent_current),
+            "access_policy": _access_policy(parent_current),
+            "matches_creation_receipt": (
+                _same_identity(parent_opened, parent_current)
+                and _access_policy(parent_opened) == _access_policy(parent_current)
+            ),
+        }
+        if not receipt["parent_descriptor"]["matches_creation_receipt"]:
+            receipt["evidence_status"] = "inconclusive"
+    if directory_fd is not None:
+        try:
+            descriptor = os.fstat(directory_fd)
+        except OSError as exc:
+            receipt["evidence_status"] = "inconclusive"
+            receipt["created_descriptor_error"] = str(exc)
+        else:
+            receipt["created_descriptor"] = {
+                "identity": _identity(descriptor),
+                "access_policy": _access_policy(descriptor),
+                "matches_creation_receipt": (
+                    created is not None and _same_identity(created, descriptor)
+                ),
+                "matches_creation_access_policy": (
+                    created is not None
+                    and _access_policy(created) == _access_policy(descriptor)
+                ),
+            }
+            if not receipt["created_descriptor"]["matches_creation_receipt"]:
+                receipt["evidence_status"] = "inconclusive"
+    observations: dict[str, Any] = {}
+    for label, basename in (
+        ("staging_name", staging_name),
+        ("target_name", target_name),
+    ):
+        if basename is None:
+            observations[label] = {"status": "not-created"}
+            continue
+        state, observed = _observe_bound_name(parent_fd, basename)
+        row: dict[str, Any] = {
+            "status": state,
+            "authority": "point-in-time-only",
+        }
+        if state == "present" and observed is not None:
+            row["identity"] = _identity(observed)
+            row["access_policy"] = _access_policy(observed)
+            row["matches_created_identity"] = created is not None and _same_identity(
+                created, observed
+            )
+        elif state == "unavailable":
+            row["evidence_status"] = "inconclusive"
+            receipt["evidence_status"] = "inconclusive"
+        observations[label] = row
+    receipt["namespace_observations"] = observations
+    receipt.setdefault("evidence_status", "checked")
+    recovery_locators = {
+        "created_directory_install": receipt,
+    }
+    if creation_install_receipt is not None:
+        recovery_locators["creation_install_receipt"] = creation_install_receipt
+    return {
+        "mutation_performed": mutation_performed,
+        "cleanup_state": (
+            "preserved-no-identity-safe-directory-unlink"
+            if mutation_performed
+            else "not-needed"
+        ),
+        "retry_safe": False,
+        "recovery_locators": recovery_locators,
+    }
+
+
+def _created_directory_install_receipt(
+    *,
+    parent_opened: os.stat_result,
+    created: os.stat_result,
+    display_path: Path,
+    target_name: str,
+    staging_name: str,
+    creation_proof: dict[str, Any],
+) -> dict[str, Any]:
+    """Latch the exact creator-held object immediately after installation."""
+
+    return {
+        "schema": "apple-notes-created-directory-install/v1",
+        "protected_property": "transaction-created-object-identity",
+        "creation_protocol": "trusted-creator-returned-fd-before-no-replace-install",
+        "creation_proof": creation_proof,
+        "display_path": str(display_path),
+        "target_basename": target_name,
+        "staging_basename": staging_name,
+        "parent_identity": _identity(parent_opened),
+        "parent_access_policy": _access_policy(parent_opened),
+        "directory_identity": _identity(created),
+        "directory_access_policy": _access_policy(created),
+        "directory_entry_durability": {
+            "schema": "apple-notes-directory-entry-durability/v1",
+            "protected_property": "directory-entry-durability",
+            "operation": "fsync-held-parent-after-no-replace-install",
+            "name_installation_state": "not-installed",
+            "status": "not-attempted",
+            "display_path": str(display_path),
+            "parent_identity": _identity(parent_opened),
+            "parent_access_policy": _access_policy(parent_opened),
+            "directory_identity": _identity(created),
+            "directory_access_policy": _access_policy(created),
+            "target_basename": target_name,
+        },
+        "cleanup_policy": (
+            "delete-only-through-an-atomic-identity-bound-directory-primitive"
+        ),
+    }
+
+
+def _create_and_install_directory_at(
+    parent_fd: int,
+    parent_opened: os.stat_result,
+    target_name: str,
+    *,
+    display_path: Path,
+    revalidate_scope: Callable[[], dict[str, Any] | None] | None,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+    collision_code: str,
+    pre_create: Callable[[], Any] | None = None,
+) -> _CreatedDirectoryInstallation:
+    """Create privately, bind first, then atomically install without replacement."""
+
+    if target_name in {"", ".", ".."} or os.sep in target_name:
+        raise StoreSafetyError(
+            inconclusive_code,
+            f"Directory target basename is not canonical: {display_path}",
+        )
+
+    staging_name: str | None = None
+    directory_fd: int | None = None
+    created: os.stat_result | None = None
+    creation_proof: dict[str, Any] | None = None
+    creation_install_receipt: dict[str, Any] | None = None
+    mutation_performed = False
+    install_state = "not-created"
+    try:
+        _verify_directory_creation_parent(
+            parent_fd,
+            parent_opened,
+            display_path=display_path.parent,
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+        )
+        if revalidate_scope is not None:
+            revalidate_scope()
+        _verify_directory_creation_parent(
+            parent_fd,
+            parent_opened,
+            display_path=display_path.parent,
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+        )
+
+        if pre_create is not None:
+            pre_create()
+        creation = _create_identity_bound_directory_at(
+            parent_fd,
+            parent_opened,
+            display_path=display_path,
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+        )
+        staging_name = creation.basename
+        directory_fd = creation.fd
+        created = creation.opened
+        creation_proof = creation.proof
+        mutation_performed = True
+        install_state = "staging-bound-owner-private"
+
+        _verify_created_directory_name_at(
+            parent_fd,
+            parent_opened,
+            directory_fd,
+            created,
+            basename=staging_name,
+            display_path=display_path.with_name(staging_name),
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+        )
+        if revalidate_scope is not None:
+            revalidate_scope()
+        _verify_created_directory_name_at(
+            parent_fd,
+            parent_opened,
+            directory_fd,
+            created,
+            basename=staging_name,
+            display_path=display_path.with_name(staging_name),
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+        )
+
+        pending_install_receipt = _created_directory_install_receipt(
+            parent_opened=parent_opened,
+            created=created,
+            display_path=display_path,
+            target_name=target_name,
+            staging_name=staging_name,
+            creation_proof=creation_proof,
+        )
+        install_state = "no-replace-install-started"
+        _install_created_directory_no_replace_at(
+            parent_fd,
+            staging_name,
+            target_name,
+        )
+        creation_install_receipt, install_state = (
+            pending_install_receipt,
+            "no-replace-install-returned",
+        )
+        directory_entry_durability = creation_install_receipt[
+            "directory_entry_durability"
+        ]
+        directory_entry_durability["name_installation_state"] = "installed"
+        _verify_created_directory_name_at(
+            parent_fd,
+            parent_opened,
+            directory_fd,
+            created,
+            basename=target_name,
+            display_path=display_path,
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+        )
+        staging_state, _ = _observe_bound_name(parent_fd, staging_name)
+        if staging_state != "absent":
+            raise StoreSafetyError(
+                (identity_code if staging_state == "present" else inconclusive_code),
+                "The randomized private staging name did not disappear after "
+                f"no-replace installation: {display_path.with_name(staging_name)}",
+            )
+        if revalidate_scope is not None:
+            revalidate_scope()
+        _verify_created_directory_name_at(
+            parent_fd,
+            parent_opened,
+            directory_fd,
+            created,
+            basename=target_name,
+            display_path=display_path,
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+        )
+        install_state = "installed-revalidated-parent-fsync-started"
+        directory_entry_durability["status"] = "attempted-unverified"
+        try:
+            _fsync_bound_parent_descriptor(
+                parent_fd,
+                parent_opened,
+                display_path=display_path.parent,
+                identity_code=identity_code,
+                access_policy_code=access_policy_code,
+                inconclusive_code=inconclusive_code,
+            )
+        except Exception as exc:
+            underlying = (
+                exc.__cause__
+                if isinstance(exc, StoreSafetyError) and exc.__cause__ is not None
+                else exc
+            )
+            directory_entry_durability.update(
+                {
+                    "status": "unverified",
+                    "failure_type": type(underlying).__name__,
+                    "failure_errno": getattr(underlying, "errno", None),
+                }
+            )
+            directory_component_commit = {
+                "schema": "apple-notes-directory-component-commit/v1",
+                "scope": "internal-created-directory-component",
+                "name_commit_state": "committed",
+                "display_path": str(display_path),
+                "target_basename": target_name,
+                "parent_identity": _identity(parent_opened),
+                "parent_access_policy": _access_policy(parent_opened),
+                "directory_identity": _identity(created),
+                "directory_access_policy": _access_policy(created),
+                "directory_entry_durability": dict(directory_entry_durability),
+            }
+            durability_details = {
+                "mutation_performed": True,
+                "retry_safe": False,
+                "directory_component_commit": directory_component_commit,
+                "directory_entry_durability": dict(directory_entry_durability),
+                "recovery_locators": {
+                    "directory_component_commit": directory_component_commit,
+                    "directory_entry_durability": dict(directory_entry_durability),
+                },
+            }
+            if isinstance(exc, StoreSafetyError):
+                exc.details = _merge_recovery_details(
+                    exc.details,
+                    durability_details,
+                )
+                raise
+            raise StoreSafetyError(
+                inconclusive_code,
+                "The directory name was installed, but its held parent could "
+                f"not be fsynced for directory-entry durability: {display_path}: "
+                f"{exc}",
+                details=durability_details,
+            ) from exc
+        directory_entry_durability["status"] = "fsync-completed"
+        install_state = "installed-parent-fsync-returned"
+        if revalidate_scope is not None:
+            revalidate_scope()
+        _verify_created_directory_name_at(
+            parent_fd,
+            parent_opened,
+            directory_fd,
+            created,
+            basename=target_name,
+            display_path=display_path,
+            identity_code=identity_code,
+            access_policy_code=access_policy_code,
+            inconclusive_code=inconclusive_code,
+        )
+        directory_entry_durability["status"] = "verified"
+        install_state = "installed-revalidated-parent-durable"
+        return _CreatedDirectoryInstallation(
+            fd=directory_fd,
+            opened=created,
+            receipt=creation_install_receipt,
+        )
+    except Exception as exc:
+        if isinstance(exc, StoreSafetyError):
+            mutation_performed = mutation_performed or bool(
+                exc.details.get("mutation_performed")
+            )
+            provider_staging_basename = exc.details.get("provider_staging_basename")
+            if (
+                staging_name is None
+                and isinstance(provider_staging_basename, str)
+                and provider_staging_basename
+            ):
+                staging_name = provider_staging_basename
+            provider_install_state = exc.details.get("provider_install_state")
+            if (
+                install_state == "not-created"
+                and isinstance(provider_install_state, str)
+                and provider_install_state
+            ):
+                install_state = provider_install_state
+        details = _created_directory_install_recovery_details(
+            parent_fd=parent_fd,
+            parent_opened=parent_opened,
+            directory_fd=directory_fd,
+            created=created,
+            staging_name=staging_name,
+            target_name=target_name,
+            display_path=display_path,
+            install_state=install_state,
+            mutation_performed=mutation_performed,
+            creation_proof=creation_proof,
+            creation_install_receipt=creation_install_receipt,
+        )
+        if isinstance(exc, StoreSafetyError):
+            exc.details = _merge_recovery_details(exc.details, details)
+            raise
+        details["underlying_error_type"] = type(exc).__name__
+        details["underlying_errno"] = getattr(exc, "errno", None)
+        code = collision_code if isinstance(exc, FileExistsError) else inconclusive_code
+        raise StoreSafetyError(
+            code,
+            "Cannot create, bind, and atomically install directory "
+            f"{display_path}: {exc}",
+            details=details,
+        ) from exc
+    finally:
+        if (
+            install_state != "installed-revalidated-parent-durable"
+            and directory_fd is not None
+        ):
+            os.close(directory_fd)
+
+
+@contextmanager
+def _create_bound_directory(
+    path: Path,
+    *,
+    retain_failure_receipt: bool = False,
+    parent_binding: _BoundDirectory | None = None,
+    pre_create: Callable[[], Any] | None = None,
+) -> Iterator[_BoundDirectory]:
+    path = _absolute_path(path)
+    with ExitStack() as resource_stack:
+        if parent_binding is None:
+            effective_parent = resource_stack.enter_context(
+                _bind_existing_directory_with_trusted_alias(path.parent)
+            )
+            _verify_bound_directory_namespace(effective_parent)
+            parent_fd = os.dup(effective_parent.fd)
+        else:
+            effective_parent = parent_binding
+            if path.parent != effective_parent.path:
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "Descriptor-relative child creation requires the declared bound "
+                    f"parent: child={path}, parent={effective_parent.path}",
+                )
+            if effective_parent.parent_fd is None:
+                raise StoreSafetyError(
+                    "prepared-directory-revalidation-inconclusive",
+                    "Bound parent has no namespace descriptor: "
+                    f"{effective_parent.path}",
+                )
+            _verify_bound_directory_namespace(effective_parent)
+            parent_fd = os.dup(effective_parent.fd)
+        resource_stack.callback(os.close, parent_fd)
+        parent_opened = os.fstat(parent_fd)
+
+        def revalidate_creation_scope() -> dict[str, Any]:
+            return _verify_bound_directory_namespace(effective_parent)
+
+        installation = _create_and_install_directory_at(
+            parent_fd,
+            parent_opened,
+            path.name,
+            display_path=path,
+            revalidate_scope=revalidate_creation_scope,
+            identity_code="prepared-directory-identity-mismatch",
+            access_policy_code="prepared-directory-access-policy-mismatch",
+            inconclusive_code="prepared-directory-revalidation-inconclusive",
+            collision_code="prepared-directory-revalidation-inconclusive",
+            pre_create=pre_create,
+        )
+
+        fd = installation.fd
+        binding = _BoundDirectory(
+            path=path,
+            fd=fd,
+            opened=installation.opened,
+            parent_opened=parent_opened,
+            parent_fd=parent_fd,
+            before_write=(effective_parent.before_write or revalidate_creation_scope),
+            path_revalidate=(
+                effective_parent.path_revalidate or revalidate_creation_scope
+            ),
+            trusted_alias=effective_parent.trusted_alias,
+            canonical_path=_bound_directory_canonical_path(effective_parent)
+            / path.name,
+            creation_install_receipt=installation.receipt,
+        )
+        try:
+            try:
+                _verify_bound_directory_at(
+                    binding,
+                    parent_fd=parent_fd,
+                    basename=path.name,
+                    display_path=path,
+                )
+                yield binding
+            except Exception as exc:
+                safety_error = exc if isinstance(exc, StoreSafetyError) else None
+                existing_details = dict(safety_error.details) if safety_error else {}
+                publication_state = existing_details.get("publication_state")
+                if (
+                    retain_failure_receipt
+                    and safety_error is not None
+                    and safety_error.code == "destination-install-uncertain"
+                ):
+                    merged = dict(existing_details)
+                    merged["publication_state"] = "uncertain"
+                    merged["retry_safe"] = False
+                    locators = dict(merged.get("recovery_locators", {}))
+                    locators.setdefault(
+                        "descriptor_bound_prepared_root",
+                        _descriptor_bound_directory_recovery_evidence(
+                            binding,
+                            source=path,
+                            destination=path,
+                            source_observation=None,
+                            destination_observation=None,
+                            tree_receipt=None,
+                        ),
+                    )
+                    merged["recovery_locators"] = locators
+                    existing_details = merged
+                    publication_state = "uncertain"
+                if (
+                    retain_failure_receipt
+                    and (
+                        safety_error is None
+                        or safety_error.code != "destination-install-uncertain"
+                    )
+                    and publication_state not in {"committed", "uncertain"}
+                ):
+                    try:
+                        retained = _retained_bound_directory_receipt(binding, path)
+                    except Exception as receipt_error:
+                        merged = dict(existing_details)
+                        if isinstance(receipt_error, StoreSafetyError):
+                            merged = _merge_recovery_details(
+                                merged,
+                                receipt_error.details,
+                            )
+                            cleanup_error_code = receipt_error.code
+                        else:
+                            merged = _merge_recovery_details(
+                                merged,
+                                {
+                                    "cleanup_state": "preserved-or-incomplete",
+                                    "mutation_performed": True,
+                                    "recovery_locators": {
+                                        "prepared_namespace": str(path),
+                                        "prepared_parent": str(path.parent),
+                                    },
+                                    "cleanup_error_type": type(receipt_error).__name__,
+                                },
+                            )
+                            cleanup_error_code = (
+                                "prepared-directory-revalidation-inconclusive"
+                            )
+                        merged["cleanup_error_code"] = cleanup_error_code
+                        merged["cleanup_error"] = str(receipt_error)
+                        existing_details = merged
+                    else:
+                        if retained is not None:
+                            existing_details = _merge_recovery_details(
+                                existing_details,
+                                retained,
+                            )
+                if safety_error is not None:
+                    safety_error.details = existing_details
+                    raise
+                if not retain_failure_receipt:
+                    raise
+                existing_details.update(
+                    {
+                        "underlying_error_type": type(exc).__name__,
+                        "underlying_errno": getattr(exc, "errno", None),
+                    }
+                )
+                raise StoreSafetyError(
+                    "prepared-operation-failed",
+                    "A prepared-tree operation failed before a safe terminal "
+                    f"publication state: {path}: {exc}",
+                    details=existing_details,
+                ) from exc
+        finally:
+            os.close(fd)
+
+
+@contextmanager
+def _bind_existing_directory_no_alias(path: Path) -> Iterator[_BoundDirectory]:
+    """Bind every existing directory component without following links."""
+
+    requested = _absolute_path(path)
+    with _bind_directory_component_chain(
+        requested,
+        allow_missing=False,
+    ) as (binding, missing_components):
+        if missing_components:
+            raise StoreSafetyError(
+                "prepared-directory-missing",
+                f"Prepared output directory is missing: {requested}",
+            )
+        yield binding
+
+
+@contextmanager
+def _bind_existing_directory(path: Path) -> Iterator[_BoundDirectory]:
+    """Bind an existing directory with the registered root-alias policy."""
+
+    with _bind_existing_directory_with_trusted_alias(path) as binding:
+        yield binding
+
+
+@contextmanager
+def _bind_artifact_root(
+    path: Path,
+    *,
+    missing_code: str,
+) -> Iterator[_BoundDirectory]:
+    """Bind an artifact root while preserving its public error taxonomy."""
+
+    requested_path, _, _ = _trusted_alias_paths(path)
+    entered = False
+    try:
+        with _bind_existing_directory_with_trusted_alias(requested_path) as binding:
+            entered = True
+            yield binding
+    except StoreSafetyError as exc:
+        if entered:
+            raise
+        if exc.code == "prepared-directory-missing":
+            code = missing_code
+        elif exc.code == "prepared-directory-identity-mismatch":
+            code = "directory-identity-mismatch"
+        elif exc.code == "prepared-directory-access-policy-mismatch":
+            code = "directory-access-policy-mismatch"
+        else:
+            code = "directory-scan-inconclusive"
+        raise StoreSafetyError(
+            code, f"Cannot bind artifact root {requested_path}: {exc}"
+        ) from exc
+
+
+def _verify_bound_directory_with_stat(
+    binding: _BoundDirectory,
+    *,
+    target: Path,
+    stat_target: Callable[[], os.stat_result],
+) -> dict[str, Any]:
+    try:
+        descriptor = os.fstat(binding.fd)
+        path_stat = stat_target()
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            f"Bound prepared directory is missing: {target}",
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Cannot revalidate bound prepared directory {target}: {exc}",
+        ) from exc
+    if (
+        not stat.S_ISDIR(descriptor.st_mode)
+        or not stat.S_ISDIR(path_stat.st_mode)
+        or not _same_identity(binding.opened, descriptor)
+        or not _same_identity(descriptor, path_stat)
+    ):
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            f"Prepared directory object identity changed: {target}",
+        )
+    baseline_access = _access_policy(binding.opened)
+    if (
+        _access_policy(descriptor) != baseline_access
+        or _access_policy(path_stat) != baseline_access
+    ):
+        raise StoreSafetyError(
+            "prepared-directory-access-policy-mismatch",
+            f"Prepared directory access policy changed: {target}",
+        )
+    return {
+        "identity": _identity(descriptor),
+        "access_policy": _access_policy(descriptor),
+        "metadata": _metadata(descriptor),
+    }
+
+
+def _verify_bound_directory(
+    binding: _BoundDirectory,
+    *,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    target = path or binding.path
+    if binding.parent_fd is not None:
+        return _verify_bound_directory_at(
+            binding,
+            parent_fd=binding.parent_fd,
+            basename=_bound_directory_basename(binding),
+            display_path=target,
+        )
+    return _verify_bound_directory_with_stat(
+        binding,
+        target=target,
+        stat_target=lambda: os.stat(target, follow_symlinks=False),
+    )
+
+
+def _verify_bound_directory_at(
+    binding: _BoundDirectory,
+    *,
+    parent_fd: int,
+    basename: str,
+    display_path: Path,
+) -> dict[str, Any]:
+    return _verify_bound_directory_with_stat(
+        binding,
+        target=display_path,
+        stat_target=lambda: os.stat(
+            basename,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        ),
+    )
+
+
+def _verify_bound_directory_namespace(
+    binding: _BoundDirectory,
+) -> dict[str, Any]:
+    component_receipt = (
+        binding.path_revalidate() if binding.path_revalidate is not None else None
+    )
+    if binding.trusted_alias is not None:
+        _assert_trusted_alias_matches_path(binding.trusted_alias, binding.path)
+        _verify_trusted_directory_alias(
+            binding.trusted_alias,
+            destination=binding.path,
+        )
+    if binding.parent_fd is None:
+        result = _verify_bound_directory(binding)
+    else:
+        result = _verify_bound_directory_at(
+            binding,
+            parent_fd=binding.parent_fd,
+            basename=_bound_directory_basename(binding),
+            display_path=binding.path,
+        )
+    if binding.trusted_alias is not None:
+        result["trusted_alias"] = _verify_trusted_directory_alias(
+            binding.trusted_alias,
+            destination=binding.path,
+        )
+    if component_receipt is not None:
+        result["component_path_binding"] = component_receipt
+    if binding.creation_install_receipt is not None:
+        result["creation_install_receipt"] = binding.creation_install_receipt
+    return result
+
+
+def _retained_created_regular_file_details(
+    parent: _BoundDirectory,
+    file_fd: int,
+    created: os.stat_result | None,
+    *,
+    display_path: Path,
+    candidate_basenames: Iterable[str],
+    content_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Describe a retained failed output without deleting through its name."""
+
+    receipt: dict[str, Any] = {
+        "evidence_status": "checked",
+        "display_path": str(display_path),
+        "cleanup_policy": "retain-never-stat-then-unlink",
+        "protected_property": "object-identity",
+        "namespace_authority": "point-in-time-observation-only",
+        "namespace_note": (
+            "A namespace leaf can be replaced after observation. Recovery must "
+            "match the descriptor receipt before any later destructive action."
+        ),
+    }
+    if created is None:
+        receipt.update(
+            {
+                "evidence_status": "inconclusive",
+                "creation_receipt_status": "unavailable",
+                "creation_receipt_reason": (
+                    "first-descriptor-stat-failed-after-exclusive-create"
+                ),
+            }
+        )
+    else:
+        receipt.update(
+            {
+                "creation_receipt_status": "recorded",
+                "created_identity": _identity(created),
+                "created_access_policy": _access_policy(created),
+            }
+        )
+    try:
+        parent_current = os.fstat(parent.fd)
+    except OSError as exc:
+        receipt["evidence_status"] = "inconclusive"
+        receipt["parent_descriptor_error"] = str(exc)
+    else:
+        receipt["parent_descriptor"] = {
+            "identity": _identity(parent_current),
+            "access_policy": _access_policy(parent_current),
+            "matches_creation_receipt": (
+                _same_identity(parent.opened, parent_current)
+                and _access_policy(parent.opened) == _access_policy(parent_current)
+            ),
+        }
+        if not receipt["parent_descriptor"]["matches_creation_receipt"]:
+            receipt["evidence_status"] = "inconclusive"
+    try:
+        file_current = os.fstat(file_fd)
+    except OSError as exc:
+        receipt["evidence_status"] = "inconclusive"
+        receipt["file_descriptor_error"] = str(exc)
+    else:
+        receipt["file_descriptor"] = {
+            "identity": _identity(file_current),
+            "access_policy": _access_policy(file_current),
+            "size": file_current.st_size,
+        }
+        if created is not None:
+            receipt["file_descriptor"]["matches_created_identity"] = _same_identity(
+                created, file_current
+            )
+        if (
+            created is not None
+            and not receipt["file_descriptor"]["matches_created_identity"]
+        ):
+            receipt["evidence_status"] = "inconclusive"
+    receipt["content_evidence"] = (
+        {
+            "status": "last-verified-before-failure",
+            "sha256": content_sha256,
+            "terminal": False,
+        }
+        if content_sha256 is not None
+        else {
+            "status": "inconclusive",
+            "reason": "operation-failed-before-complete-content-receipt",
+        }
+    )
+    observations: dict[str, Any] = {}
+    namespace_inconclusive = False
+    for basename in dict.fromkeys(candidate_basenames):
+        state, observed = _observe_bound_name(parent.fd, basename)
+        row: dict[str, Any] = {
+            "status": state,
+            "authority": "point-in-time-only",
+        }
+        if state == "present" and observed is not None:
+            row.update(
+                {
+                    "identity": _identity(observed),
+                    "access_policy": _access_policy(observed),
+                }
+            )
+            if created is not None:
+                row["matches_created_identity"] = _same_identity(
+                    created,
+                    observed,
+                )
+        elif state == "unavailable":
+            row["evidence_status"] = "inconclusive"
+            namespace_inconclusive = True
+        observations[basename] = row
+    receipt["namespace_observations"] = observations
+    receipt["namespace_evidence_status"] = (
+        "inconclusive" if namespace_inconclusive else "point-in-time-only"
+    )
+    return {
+        "cleanup_state": (
+            "retained" if created is not None else "preserved-or-incomplete"
+        ),
+        "cleanup_policy": "retain-never-stat-then-unlink",
+        "mutation_performed": True,
+        "retry_safe": False,
+        "recovery_locators": {
+            "descriptor_bound_prepared_file": receipt,
+        },
+    }
+
+
+def _retained_rebound_regular_file_details(
+    parent: _BoundDirectory,
+    prepared: _BoundRegularFile,
+    creation_receipt: dict[str, Any],
+    *,
+    display_path: Path,
+    candidate_basenames: Iterable[str],
+) -> dict[str, Any]:
+    """Describe a rebound retained file without signing it as the created object."""
+
+    expected_identity = creation_receipt.get("identity")
+    expected_access_policy = creation_receipt.get("access_policy")
+    expected_sha256 = creation_receipt.get("sha256")
+    expected_size = creation_receipt.get("size")
+    receipt: dict[str, Any] = {
+        "schema": "apple-notes-retained-rebound-prepared-file/v1",
+        "evidence_status": "checked",
+        "display_path": str(display_path),
+        "cleanup_policy": "retain-never-stat-then-unlink",
+        "protected_properties": [
+            "object-identity",
+            "content-stability",
+            "access-policy",
+        ],
+        "namespace_authority": "point-in-time-observation-only",
+        "namespace_note": (
+            "A namespace leaf can be replaced after observation. Recovery must "
+            "match the creation receipt and descriptor evidence before any later "
+            "destructive action."
+        ),
+        "creation_receipt": {
+            "identity": expected_identity,
+            "access_policy": expected_access_policy,
+            "sha256": expected_sha256,
+            "size": expected_size,
+        },
+        "initial_bound_descriptor": {
+            "identity": _identity(prepared.opened),
+            "access_policy": _access_policy(prepared.opened),
+            "sha256": prepared.sha256,
+            "size": prepared.opened.st_size,
+            "identity_matches_creation_receipt": (
+                _identity(prepared.opened) == expected_identity
+            ),
+            "access_policy_matches_creation_receipt": (
+                _access_policy(prepared.opened) == expected_access_policy
+            ),
+            "content_matches_creation_receipt": (
+                prepared.sha256 == expected_sha256
+                and prepared.opened.st_size == expected_size
+            ),
+        },
+    }
+    try:
+        parent_current = os.fstat(parent.fd)
+    except OSError as exc:
+        receipt["evidence_status"] = "inconclusive"
+        receipt["parent_descriptor_error"] = str(exc)
+    else:
+        receipt["parent_descriptor"] = {
+            "identity": _identity(parent_current),
+            "access_policy": _access_policy(parent_current),
+            "matches_creation_receipt": (
+                _same_identity(parent.opened, parent_current)
+                and _access_policy(parent.opened) == _access_policy(parent_current)
+            ),
+        }
+        if not receipt["parent_descriptor"]["matches_creation_receipt"]:
+            receipt["evidence_status"] = "inconclusive"
+    try:
+        file_current = os.fstat(prepared.fd)
+    except OSError as exc:
+        receipt["evidence_status"] = "inconclusive"
+        receipt["file_descriptor_error"] = str(exc)
+    else:
+        receipt["file_descriptor"] = {
+            "identity": _identity(file_current),
+            "access_policy": _access_policy(file_current),
+            "size": file_current.st_size,
+            "identity_matches_creation_receipt": (
+                _identity(file_current) == expected_identity
+            ),
+            "access_policy_matches_creation_receipt": (
+                _access_policy(file_current) == expected_access_policy
+            ),
+            "size_matches_creation_receipt": file_current.st_size == expected_size,
+        }
+    receipt["content_evidence"] = {
+        "status": "last-verified-during-descriptor-bind",
+        "sha256": prepared.sha256,
+        "size": prepared.opened.st_size,
+        "matches_creation_receipt": (
+            prepared.sha256 == expected_sha256
+            and prepared.opened.st_size == expected_size
+        ),
+        "terminal": False,
+    }
+    observations: dict[str, Any] = {}
+    namespace_inconclusive = False
+    for basename in dict.fromkeys(candidate_basenames):
+        state, observed = _observe_bound_name(parent.fd, basename)
+        row: dict[str, Any] = {
+            "status": state,
+            "authority": "point-in-time-only",
+        }
+        if state == "present" and observed is not None:
+            row.update(
+                {
+                    "identity": _identity(observed),
+                    "access_policy": _access_policy(observed),
+                    "size": observed.st_size,
+                    "identity_matches_creation_receipt": (
+                        _identity(observed) == expected_identity
+                    ),
+                    "access_policy_matches_creation_receipt": (
+                        _access_policy(observed) == expected_access_policy
+                    ),
+                    "size_matches_creation_receipt": observed.st_size == expected_size,
+                }
+            )
+        elif state == "unavailable":
+            row["evidence_status"] = "inconclusive"
+            namespace_inconclusive = True
+        observations[basename] = row
+    receipt["namespace_observations"] = observations
+    receipt["namespace_evidence_status"] = (
+        "inconclusive" if namespace_inconclusive else "point-in-time-only"
+    )
+    return {
+        "cleanup_state": "retained",
+        "cleanup_policy": "retain-never-stat-then-unlink",
+        "retry_safe": False,
+        "recovery_locators": {
+            "descriptor_bound_prepared_file": receipt,
+        },
+    }
+
+
+def _inconclusive_rebound_regular_file_details(
+    parent: _BoundDirectory,
+    prepared: _BoundRegularFile,
+    creation_receipt: dict[str, Any],
+    *,
+    display_path: Path,
+    evidence_error: BaseException,
+) -> dict[str, Any]:
+    """Return fixed descriptor evidence when richer retention inspection fails."""
+
+    return {
+        "cleanup_state": "inconclusive",
+        "cleanup_policy": "retain-never-stat-then-unlink",
+        "retry_safe": False,
+        "cleanup_error_type": type(evidence_error).__name__,
+        "cleanup_error": str(evidence_error),
+        "recovery_locators": {
+            "descriptor_bound_prepared_file": {
+                "schema": "apple-notes-retained-rebound-prepared-file/v1",
+                "evidence_status": "inconclusive",
+                "display_path": str(display_path),
+                "cleanup_policy": "retain-never-stat-then-unlink",
+                "protected_properties": [
+                    "object-identity",
+                    "content-stability",
+                    "access-policy",
+                ],
+                "creation_receipt": {
+                    "identity": dict.get(creation_receipt, "identity"),
+                    "access_policy": dict.get(creation_receipt, "access_policy"),
+                    "sha256": dict.get(creation_receipt, "sha256"),
+                    "size": dict.get(creation_receipt, "size"),
+                },
+                "initial_bound_descriptor": {
+                    "identity": _identity(prepared.opened),
+                    "access_policy": _access_policy(prepared.opened),
+                    "sha256": prepared.sha256,
+                    "size": prepared.opened.st_size,
+                },
+                "parent_creation_receipt": {
+                    "identity": _identity(parent.opened),
+                    "access_policy": _access_policy(parent.opened),
+                },
+                "retention_evidence_error_type": type(evidence_error).__name__,
+                "retention_evidence_error": str(evidence_error),
+                "namespace_evidence_status": "inconclusive",
+            },
+        },
+    }
+
+
+def _retained_unbound_regular_file_details(
+    parent: _BoundDirectory,
+    creation_receipt: dict[str, Any],
+    *,
+    display_path: Path,
+    candidate_basenames: Iterable[str],
+) -> dict[str, Any]:
+    """Report a created file that could not be rebound after writer return."""
+
+    expected_identity = creation_receipt.get("identity")
+    expected_access_policy = creation_receipt.get("access_policy")
+    expected_size = creation_receipt.get("size")
+    locator: dict[str, Any] = {
+        "schema": "apple-notes-retained-unbound-prepared-file/v1",
+        "evidence_status": "checked",
+        "display_path": str(display_path),
+        "cleanup_policy": "retain-never-stat-then-unlink",
+        "protected_properties": [
+            "object-identity",
+            "content-stability",
+            "access-policy",
+        ],
+        "creation_receipt": {
+            "identity": expected_identity,
+            "access_policy": expected_access_policy,
+            "sha256": creation_receipt.get("sha256"),
+            "size": expected_size,
+        },
+        "binding_status": "inconclusive",
+        "namespace_authority": "point-in-time-observation-only",
+    }
+    try:
+        parent_current = os.fstat(parent.fd)
+    except OSError as exc:
+        locator["evidence_status"] = "inconclusive"
+        locator["parent_descriptor_error"] = str(exc)
+    else:
+        locator["parent_descriptor"] = {
+            "identity": _identity(parent_current),
+            "access_policy": _access_policy(parent_current),
+            "matches_creation_receipt": (
+                _same_identity(parent.opened, parent_current)
+                and _access_policy(parent.opened) == _access_policy(parent_current)
+            ),
+        }
+        if not locator["parent_descriptor"]["matches_creation_receipt"]:
+            locator["evidence_status"] = "inconclusive"
+    observations: dict[str, Any] = {}
+    namespace_inconclusive = False
+    for basename in dict.fromkeys(candidate_basenames):
+        state, observed = _observe_bound_name(parent.fd, basename)
+        row: dict[str, Any] = {
+            "status": state,
+            "authority": "point-in-time-only",
+        }
+        if state == "present" and observed is not None:
+            row.update(
+                {
+                    "identity": _identity(observed),
+                    "access_policy": _access_policy(observed),
+                    "size": observed.st_size,
+                    "identity_matches_creation_receipt": (
+                        _identity(observed) == expected_identity
+                    ),
+                    "access_policy_matches_creation_receipt": (
+                        _access_policy(observed) == expected_access_policy
+                    ),
+                    "size_matches_creation_receipt": observed.st_size == expected_size,
+                }
+            )
+        elif state == "unavailable":
+            row["evidence_status"] = "inconclusive"
+            namespace_inconclusive = True
+        observations[basename] = row
+    locator["namespace_observations"] = observations
+    locator["namespace_evidence_status"] = (
+        "inconclusive" if namespace_inconclusive else "point-in-time-only"
+    )
+    return {
+        "cleanup_state": "preserved-or-incomplete",
+        "cleanup_policy": "retain-never-stat-then-unlink",
+        "retry_safe": False,
+        "recovery_locators": {
+            "creation_receipt_prepared_file": locator,
+        },
+    }
+
+
+def _inconclusive_unbound_regular_file_details(
+    parent: _BoundDirectory,
+    creation_receipt: dict[str, Any],
+    *,
+    display_path: Path,
+    evidence_error: BaseException,
+) -> dict[str, Any]:
+    """Return fixed creation evidence when unbound retention inspection fails."""
+
+    return {
+        "cleanup_state": "inconclusive",
+        "cleanup_policy": "retain-never-stat-then-unlink",
+        "retry_safe": False,
+        "cleanup_error_type": type(evidence_error).__name__,
+        "cleanup_error": str(evidence_error),
+        "recovery_locators": {
+            "creation_receipt_prepared_file": {
+                "schema": "apple-notes-retained-unbound-prepared-file/v1",
+                "evidence_status": "inconclusive",
+                "display_path": str(display_path),
+                "cleanup_policy": "retain-never-stat-then-unlink",
+                "creation_receipt": {
+                    "identity": dict.get(creation_receipt, "identity"),
+                    "access_policy": dict.get(creation_receipt, "access_policy"),
+                    "sha256": dict.get(creation_receipt, "sha256"),
+                    "size": dict.get(creation_receipt, "size"),
+                },
+                "parent_creation_receipt": {
+                    "identity": _identity(parent.opened),
+                    "access_policy": _access_policy(parent.opened),
+                },
+                "binding_status": "inconclusive",
+                "retention_evidence_error_type": type(evidence_error).__name__,
+                "retention_evidence_error": str(evidence_error),
+                "namespace_evidence_status": "inconclusive",
+            },
+        },
+    }
+
+
+@contextmanager
+def _bind_prepared_regular_file_with_failure_receipt(
+    path: Path,
+    parent: _BoundDirectory,
+    creation_receipt: dict[str, Any],
+) -> Iterator[_BoundRegularFile]:
+    """Bind a writer-created file or report its unbound creation receipt."""
+
+    prepared: _BoundRegularFile | None = None
+    try:
+        with _bind_regular_file_at(path, parent, PREPARED_FILE_CODES) as prepared:
+            yield prepared
+    except Exception as exc:
+        if prepared is not None:
+            raise
+        try:
+            retained = _retained_unbound_regular_file_details(
+                parent,
+                creation_receipt,
+                display_path=path,
+                candidate_basenames=(path.name,),
+            )
+        except Exception as evidence_error:
+            retained = _inconclusive_unbound_regular_file_details(
+                parent,
+                creation_receipt,
+                display_path=path,
+                evidence_error=evidence_error,
+            )
+        if isinstance(exc, StoreSafetyError):
+            exc.details = _merge_recovery_details(exc.details, retained)
+            raise
+        details = dict(retained)
+        details.update(
+            {
+                "underlying_error_type": type(exc).__name__,
+                "underlying_errno": getattr(exc, "errno", None),
+            }
+        )
+        raise StoreSafetyError(
+            "prepared-operation-failed",
+            "A writer-created sensitive file could not be rebound before "
+            f"publication and was retained: {path}: {exc}",
+            details=details,
+        ) from exc
+
+
+@contextmanager
+def _pre_publication_regular_file_failure_guard(
+    parent: _BoundDirectory,
+    prepared: _BoundRegularFile,
+    creation_receipt: dict[str, Any],
+    *,
+    display_path: Path,
+    candidate_basenames: Iterable[str],
+) -> Iterator[None]:
+    """Retain and report a descriptor-bound sensitive file before publication."""
+
+    try:
+        yield
+    except Exception as exc:
+        try:
+            retained = _retained_rebound_regular_file_details(
+                parent,
+                prepared,
+                creation_receipt,
+                display_path=display_path,
+                candidate_basenames=candidate_basenames,
+            )
+        except Exception as evidence_error:
+            retained = _inconclusive_rebound_regular_file_details(
+                parent,
+                prepared,
+                creation_receipt,
+                display_path=display_path,
+                evidence_error=evidence_error,
+            )
+        if isinstance(exc, StoreSafetyError):
+            exc.details = _merge_recovery_details(
+                exc.details,
+                retained,
+            )
+            raise
+        details = dict(retained)
+        details.update(
+            {
+                "underlying_error_type": type(exc).__name__,
+                "underlying_errno": getattr(exc, "errno", None),
+            }
+        )
+        raise StoreSafetyError(
+            "prepared-operation-failed",
+            "A descriptor-bound prepared-file operation failed before "
+            f"publication; the sensitive file was retained: {display_path}: {exc}",
+            details=details,
+        ) from exc
+
+
+def _verify_bound_parent_descriptor(
+    parent_fd: int,
+    opened: os.stat_result,
+    *,
+    display_path: Path,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+) -> os.stat_result:
+    try:
+        current = os.fstat(parent_fd)
+    except OSError as exc:
+        raise StoreSafetyError(
+            inconclusive_code,
+            f"Cannot revalidate bound parent descriptor {display_path}: {exc}",
+        ) from exc
+    if not stat.S_ISDIR(current.st_mode) or not _same_identity(opened, current):
+        raise StoreSafetyError(
+            identity_code,
+            f"Bound parent directory identity changed: {display_path}",
+        )
+    if _access_policy(opened) != _access_policy(current):
+        raise StoreSafetyError(
+            access_policy_code,
+            f"Bound parent directory access policy changed: {display_path}",
+        )
+    return current
+
+
+def _fsync_bound_parent_descriptor(
+    parent_fd: int,
+    opened: os.stat_result,
+    *,
+    display_path: Path,
+    identity_code: str,
+    access_policy_code: str,
+    inconclusive_code: str,
+) -> None:
+    _verify_bound_parent_descriptor(
+        parent_fd,
+        opened,
+        display_path=display_path,
+        identity_code=identity_code,
+        access_policy_code=access_policy_code,
+        inconclusive_code=inconclusive_code,
+    )
+    try:
+        os.fsync(parent_fd)
+    except OSError as exc:
+        raise StoreSafetyError(
+            inconclusive_code,
+            f"Cannot fsync bound parent directory {display_path}: {exc}",
+        ) from exc
+    _verify_bound_parent_descriptor(
+        parent_fd,
+        opened,
+        display_path=display_path,
+        identity_code=identity_code,
+        access_policy_code=access_policy_code,
+        inconclusive_code=inconclusive_code,
+    )
+
+
+def _fsync_bound_directory_descriptor(
+    binding: _BoundDirectory,
+    *,
+    display_path: Path | None = None,
+) -> None:
+    """Make one bound directory durable without reopening it by pathname."""
+
+    if binding.parent_fd is None:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Bound directory has no parent descriptor: {binding.path}",
+        )
+    target = display_path or binding.path
+
+    def verify() -> None:
+        _verify_bound_parent_descriptor(
+            binding.parent_fd,
+            binding.parent_opened,
+            display_path=target.parent,
+            identity_code="prepared-directory-identity-mismatch",
+            access_policy_code="prepared-directory-access-policy-mismatch",
+            inconclusive_code="prepared-directory-revalidation-inconclusive",
+        )
+        _verify_bound_directory_at(
+            binding,
+            parent_fd=binding.parent_fd,
+            basename=_bound_directory_basename(binding),
+            display_path=target,
+        )
+
+    verify()
+    try:
+        os.fsync(binding.fd)
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Cannot fsync bound prepared directory {target}: {exc}",
+        ) from exc
+    verify()
+
+
+def _inventory_file_type(mode: int) -> str:
+    if stat.S_ISREG(mode):
+        return "regular"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    return "other"
+
+
+def _scan_sensitive_partial_inventory(
+    binding: _BoundDirectory,
+    *,
+    max_entries: int = BOUND_DIRECTORY_SCAN_MAX_ENTRIES,
+    max_raw_name_bytes: int = BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES,
+    max_depth: int = 4,
+) -> list[dict[str, Any]]:
+    """Inventory a retained partial without following any child links."""
+
+    def scan_directory(
+        directory_fd: int,
+        relative_parent: Path,
+        depth: int,
+        records: list[dict[str, Any]],
+        scan_state: dict[str, int],
+    ) -> None:
+        if depth > max_depth:
+            raise StoreSafetyError(
+                "prepared-directory-revalidation-inconclusive",
+                "Retained partial exceeds the descriptor-safe inventory depth cap",
+            )
+        try:
+            bounded_names: list[tuple[bytes, str]] = []
+            raw_names: set[bytes] = set()
+            decoded_to_raw_name: dict[str, bytes] = {}
+            with os.scandir(directory_fd) as entries:
+                for entry in entries:
+                    scan_state["entry_count"] += 1
+                    if scan_state["entry_count"] > max_entries:
+                        raise StoreSafetyError(
+                            "prepared-directory-revalidation-inconclusive",
+                            "Retained partial exceeds the descriptor-safe inventory "
+                            f"entry cap ({max_entries})",
+                            details={
+                                "entry_limit": max_entries,
+                                "observed_entries": scan_state["entry_count"],
+                            },
+                        )
+                    try:
+                        raw_name = os.fsencode(entry.name)
+                        name = os.fsdecode(raw_name)
+                    except (TypeError, ValueError, UnicodeError) as exc:
+                        raise StoreSafetyError(
+                            "prepared-directory-revalidation-inconclusive",
+                            "Retained partial contains an invalid raw entry name",
+                        ) from exc
+                    if (
+                        not raw_name
+                        or b"\x00" in raw_name
+                        or b"/" in raw_name
+                        or raw_name in {b".", b".."}
+                    ):
+                        raise StoreSafetyError(
+                            "prepared-directory-revalidation-inconclusive",
+                            "Retained partial contains an invalid raw entry name",
+                        )
+                    scan_state["raw_name_bytes"] += len(raw_name)
+                    if scan_state["raw_name_bytes"] > max_raw_name_bytes:
+                        raise StoreSafetyError(
+                            "prepared-directory-revalidation-inconclusive",
+                            "Retained partial exceeds the descriptor-safe inventory "
+                            f"raw name-byte cap ({max_raw_name_bytes})",
+                            details={
+                                "raw_name_bytes_limit": max_raw_name_bytes,
+                                "observed_raw_name_bytes": (
+                                    scan_state["raw_name_bytes"]
+                                ),
+                            },
+                        )
+                    previous_raw_name = decoded_to_raw_name.get(name)
+                    if raw_name in raw_names or (
+                        previous_raw_name is not None and previous_raw_name != raw_name
+                    ):
+                        raise StoreSafetyError(
+                            "prepared-directory-revalidation-inconclusive",
+                            "Retained partial contains a duplicate raw name or "
+                            "decoded-name collision",
+                        )
+                    raw_names.add(raw_name)
+                    decoded_to_raw_name[name] = raw_name
+                    bounded_names.append((raw_name, name))
+        except StoreSafetyError:
+            raise
+        except OSError as exc:
+            raise StoreSafetyError(
+                "prepared-directory-revalidation-inconclusive",
+                "Cannot list retained partial through its bound descriptor: "
+                f"{binding.path}: {exc}",
+            ) from exc
+        for raw_name, name in sorted(bounded_names, key=lambda item: item[0]):
+            relative_path = relative_parent / name
+            try:
+                entry_stat = os.stat(
+                    raw_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise StoreSafetyError(
+                    "prepared-directory-revalidation-inconclusive",
+                    "Cannot inspect retained partial entry without following links: "
+                    f"{binding.path / relative_path}: {exc}",
+                ) from exc
+            record: dict[str, Any] = {
+                "relative_path": str(relative_path),
+                "file_type": _inventory_file_type(entry_stat.st_mode),
+                "identity": _identity(entry_stat),
+                "access_policy": _access_policy(entry_stat),
+            }
+            if stat.S_ISREG(entry_stat.st_mode):
+                record["size"] = entry_stat.st_size
+            records.append(record)
+            if not stat.S_ISDIR(entry_stat.st_mode):
+                continue
+            child_fd: int | None = None
+            try:
+                child_fd = os.open(
+                    raw_name,
+                    _directory_open_flags(),
+                    dir_fd=directory_fd,
+                )
+                child_stat = os.fstat(child_fd)
+                if not _same_identity(entry_stat, child_stat):
+                    raise StoreSafetyError(
+                        "prepared-directory-identity-mismatch",
+                        "Retained partial child directory changed while binding: "
+                        f"{binding.path / relative_path}",
+                    )
+                scan_directory(
+                    child_fd,
+                    relative_path,
+                    depth + 1,
+                    records,
+                    scan_state,
+                )
+                child_after = os.fstat(child_fd)
+                current_child = os.stat(
+                    raw_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if not _same_identity(entry_stat, child_after) or not _same_identity(
+                    child_after, current_child
+                ):
+                    raise StoreSafetyError(
+                        "prepared-directory-identity-mismatch",
+                        "Retained partial child directory changed during inventory: "
+                        f"{binding.path / relative_path}",
+                    )
+                if _access_policy(entry_stat) != _access_policy(
+                    child_after
+                ) or _access_policy(child_after) != _access_policy(current_child):
+                    raise StoreSafetyError(
+                        "prepared-directory-access-policy-mismatch",
+                        "Retained partial child access policy changed during "
+                        f"inventory: {binding.path / relative_path}",
+                    )
+            finally:
+                if child_fd is not None:
+                    os.close(child_fd)
+
+    inventories: list[list[dict[str, Any]]] = []
+    for _ in range(2):
+        inventory_fd: int | None = None
+        try:
+            inventory_fd = os.open(
+                ".",
+                _directory_open_flags(),
+                dir_fd=binding.fd,
+            )
+            opened = os.fstat(inventory_fd)
+            if not _same_identity(binding.opened, opened):
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "Retained partial root descriptor no longer identifies the "
+                    f"creation-time object: {binding.path}",
+                )
+            records: list[dict[str, Any]] = []
+            scan_directory(
+                inventory_fd,
+                Path(),
+                0,
+                records,
+                {"entry_count": 0, "raw_name_bytes": 0},
+            )
+            inventories.append(records)
+        finally:
+            if inventory_fd is not None:
+                os.close(inventory_fd)
+    if inventories[0] != inventories[1]:
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "Retained partial inventory changed between descriptor-relative scans: "
+            f"{binding.path}",
+        )
+    return inventories[1]
+
+
+def _retained_bound_directory_receipt(
+    binding: _BoundDirectory | None,
+    path: Path,
+) -> dict[str, Any] | None:
+    """Preserve and precisely describe a failed sensitive prepared tree."""
+
+    recovery_details = {
+        "cleanup_state": "preserved-or-incomplete",
+        "mutation_performed": True,
+        "recovery_locators": {
+            "prepared_namespace": str(path),
+            "prepared_parent": str(path.parent),
+        },
+    }
+    if binding is None:
+        state, _ = _observe_path(path)
+        if state == "absent":
+            return None
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            "Cannot prove ownership of a prepared directory without its "
+            f"creation receipt; preserving {path}",
+            details=recovery_details,
+        )
+    if binding.parent_fd is None:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            "The creation-time parent descriptor is unavailable while preserving "
+            f"the retained partial: {path}",
+            details=recovery_details,
+        )
+
+    try:
+        _verify_bound_parent_descriptor(
+            binding.parent_fd,
+            binding.parent_opened,
+            display_path=path.parent,
+            identity_code="prepared-directory-identity-mismatch",
+            access_policy_code="prepared-directory-access-policy-mismatch",
+            inconclusive_code="prepared-directory-revalidation-inconclusive",
+        )
+        root = _verify_bound_directory_at(
+            binding,
+            parent_fd=binding.parent_fd,
+            basename=path.name,
+            display_path=path,
+        )
+        inventory = _scan_sensitive_partial_inventory(binding)
+        terminal_root = _verify_bound_directory_at(
+            binding,
+            parent_fd=binding.parent_fd,
+            basename=path.name,
+            display_path=path,
+        )
+        terminal_parent = _verify_bound_parent_descriptor(
+            binding.parent_fd,
+            binding.parent_opened,
+            display_path=path.parent,
+            identity_code="prepared-directory-identity-mismatch",
+            access_policy_code="prepared-directory-access-policy-mismatch",
+            inconclusive_code="prepared-directory-revalidation-inconclusive",
+        )
+        return {
+            "cleanup_state": "retained",
+            "mutation_performed": True,
+            "recovery_locators": {
+                "prepared_namespace": str(path),
+                "prepared_parent": str(path.parent),
+                "namespace_verification": "creation-receipt-matched",
+                "prepared_identity": root["identity"],
+                "prepared_parent_identity": _identity(terminal_parent),
+            },
+            "sensitive_partial_inventory": inventory,
+            "terminal_prepared_identity": terminal_root["identity"],
+        }
+    except StoreSafetyError as exc:
+        details = dict(recovery_details)
+        details.update(exc.details)
+        raise StoreSafetyError(
+            exc.code,
+            str(exc),
+            details=details,
+        ) from exc
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(fd, payload[offset:])
+        if written <= 0:
+            raise OSError("short write while copying database file")
+        offset += written
+
+
+def _bind_created_regular_file_access_policy(
+    fd: int,
+    path: Path,
+    parent: _BoundDirectory,
+    *,
+    created: os.stat_result,
+    expected_mode: int = 0o600,
+) -> tuple[os.stat_result, dict[str, int]]:
+    """Enforce and bind a new file's access policy before writing any bytes."""
+
+    if not stat.S_ISREG(created.st_mode):
+        raise StoreSafetyError(
+            "prepared-file-identity-mismatch",
+            f"Newly created output is not a regular file: {path}",
+        )
+    expected_uid = os.geteuid()
+    expected_gid = os.getegid()
+    try:
+        if created.st_gid != expected_gid:
+            os.fchown(fd, -1, expected_gid)
+        os.fchmod(fd, expected_mode)
+        descriptor = os.fstat(fd)
+        path_stat = os.stat(
+            path.name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            "prepared-file-missing",
+            f"Newly created output disappeared before access binding: {path}",
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Cannot bind the newly created output access policy: {path}: {exc}",
+        ) from exc
+    if (
+        not stat.S_ISREG(descriptor.st_mode)
+        or not stat.S_ISREG(path_stat.st_mode)
+        or not _same_identity(created, descriptor)
+        or not _same_identity(descriptor, path_stat)
+    ):
+        raise StoreSafetyError(
+            "prepared-file-identity-mismatch",
+            f"Newly created output changed identity before writing: {path}",
+        )
+    expected_access_policy = _access_policy(descriptor)
+    if (
+        expected_access_policy["uid"] != expected_uid
+        or expected_access_policy["gid"] != expected_gid
+        or expected_access_policy["mode"] != expected_mode
+        or _access_policy(path_stat) != expected_access_policy
+    ):
+        raise StoreSafetyError(
+            "prepared-file-access-policy-mismatch",
+            "Newly created output did not retain the enforced owner/group/mode "
+            f"before writing: {path}",
+        )
+    return descriptor, expected_access_policy
+
+
+def _verify_created_regular_file_boundary(
+    fd: int,
+    path: Path,
+    parent: _BoundDirectory,
+    *,
+    created: os.stat_result,
+    expected_access_policy: dict[str, int],
+    phase: str,
+) -> os.stat_result:
+    """Revalidate identity and the creation-bound policy at one write boundary."""
+
+    try:
+        descriptor = os.fstat(fd)
+        path_stat = os.stat(
+            path.name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as exc:
+        raise StoreSafetyError(
+            "prepared-file-missing",
+            f"Created output disappeared during {phase}: {path}",
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Cannot revalidate created output during {phase}: {path}: {exc}",
+        ) from exc
+    if (
+        not stat.S_ISREG(descriptor.st_mode)
+        or not stat.S_ISREG(path_stat.st_mode)
+        or not _same_identity(created, descriptor)
+        or not _same_identity(descriptor, path_stat)
+    ):
+        raise StoreSafetyError(
+            "prepared-file-identity-mismatch",
+            f"Created output changed identity during {phase}: {path}",
+        )
+    if (
+        _access_policy(descriptor) != expected_access_policy
+        or _access_policy(path_stat) != expected_access_policy
+    ):
+        raise StoreSafetyError(
+            "prepared-file-access-policy-mismatch",
+            f"Created output access policy changed during {phase}: {path}",
+        )
+    return descriptor
+
+
+def _copy_fd(
+    fd: int,
+    destination: Path,
+    *,
+    destination_binding: _BoundDirectory,
+) -> dict[str, Any]:
+    if destination.parent != destination_binding.path:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            "Descriptor-relative copy target does not use the bound destination: "
+            f"{destination}",
+        )
+    _verify_bound_directory_namespace(destination_binding)
+    if destination_binding.before_write is not None:
+        destination_binding.before_write()
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        out_fd = os.open(
+            destination.name,
+            flags,
+            0o600,
+            dir_fd=destination_binding.fd,
+        )
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Cannot exclusively create descriptor-bound copy {destination}: {exc}",
+        ) from exc
+    created: os.stat_result | None = None
+    verified_sha256: str | None = None
+    digest = hashlib.sha256()
+    copied_size = 0
+    try:
+        try:
+            created = os.fstat(out_fd)
+        except OSError as exc:
+            raise StoreSafetyError(
+                "prepared-file-revalidation-inconclusive",
+                "Cannot inspect the exclusively created descriptor-bound copy "
+                f"before writing: {destination}: {exc}",
+            ) from exc
+        _, expected_access_policy = _bind_created_regular_file_access_policy(
+            out_fd,
+            destination,
+            destination_binding,
+            created=created,
+        )
+        os.lseek(fd, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(fd, CHUNK_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+            copied_size += len(chunk)
+            _write_all(out_fd, chunk)
+        os.fsync(out_fd)
+        written_sha256 = digest.hexdigest()
+        _verify_bound_directory_namespace(destination_binding)
+        opened = _verify_created_regular_file_boundary(
+            out_fd,
+            destination,
+            destination_binding,
+            created=created,
+            expected_access_policy=expected_access_policy,
+            phase="post-copy pre-readback",
+        )
+        if opened.st_size != copied_size:
+            raise StoreSafetyError(
+                "copy-content-mismatch",
+                f"Destination size differs from bytes written: {destination}",
+            )
+        bound = _BoundRegularFile(
+            path=destination,
+            fd=out_fd,
+            opened=opened,
+            sha256=written_sha256,
+            parent_opened=destination_binding.opened,
+            parent_fd=destination_binding.fd,
+            before_write=destination_binding.before_write,
+            trusted_alias=destination_binding.trusted_alias,
+        )
+        result = _verify_bound_regular_file_at(
+            bound,
+            PREPARED_FILE_CODES,
+            dir_fd=destination_binding.fd,
+            basename=destination.name,
+        )
+        if result["size"] != copied_size:
+            raise StoreSafetyError(
+                "copy-content-mismatch",
+                f"Destination readback differs from bytes written: {destination}",
+            )
+        _verify_bound_directory_namespace(destination_binding)
+        verified_sha256 = written_sha256
+        return result
+    except Exception as exc:
+        retained = _retained_created_regular_file_details(
+            destination_binding,
+            out_fd,
+            created,
+            display_path=destination,
+            candidate_basenames=(destination.name,),
+            content_sha256=verified_sha256,
+        )
+        if isinstance(exc, StoreSafetyError):
+            exc.details = _merge_recovery_details(
+                exc.details,
+                retained,
+            )
+            raise
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Copy failed; the descriptor-bound partial file was retained: "
+            f"{destination}: {exc}",
+            details=retained,
+        ) from exc
+    finally:
+        os.close(out_fd)
+
+
+def _discover_database_files_at(
+    main_path: Path,
+    parent: _BoundDirectory,
+) -> list[Path]:
+    """Discover the exact NoteStore set only through one held parent FD."""
+
+    candidates = tuple(
+        main_path.with_name(name)
+        for name in (
+            main_path.name,
+            f"{main_path.name}-wal",
+            f"{main_path.name}-shm",
+            f"{main_path.name}-journal",
+        )
+    )
+    _verify_bound_source_directory(parent)
+    present: list[Path] = []
+    for candidate in candidates:
+        try:
+            os.stat(
+                candidate.name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        except PermissionError as exc:
+            raise StoreSafetyError(
+                "source-unreadable",
+                f"Cannot determine database file-set membership: {candidate}",
+            ) from exc
+        except OSError as exc:
+            raise StoreSafetyError(
+                "source-revalidation-inconclusive",
+                "Cannot safely determine database file-set membership: "
+                f"{candidate}: {exc}",
+            ) from exc
+        present.append(candidate)
+    _verify_bound_source_directory(parent)
+    if main_path not in present:
+        raise StoreSafetyError(
+            "source-missing", f"Main SQLite file is missing: {main_path}"
+        )
+    return present
+
+
+def _discover_database_files(main_path: Path) -> list[Path]:
+    """Compatibility wrapper that still binds the complete parent chain once."""
+
+    main_path = _absolute_path(main_path)
+    with _bind_existing_directory_with_trusted_alias(main_path.parent) as parent:
+        return _discover_database_files_at(main_path, parent)
+
+
+def _reject_bound_rollback_journal(
+    opened_sources: list[_OpenedSource],
+    main_path: Path,
+) -> None:
+    journal_name = f"{main_path.name}-journal"
+    journal = next(
+        (opened for opened in opened_sources if opened.path.name == journal_name),
+        None,
+    )
+    if journal is None:
+        return
+    try:
+        journal.first_sha256 = _hash_fd(journal.fd)
+        second_sha256 = _hash_fd(journal.fd)
+        receipt = _revalidate_open_source(journal, second_sha256)
+    except StoreSafetyError as exc:
+        raise StoreSafetyError(
+            "rollback-journal-present",
+            "A SQLite rollback journal is present, but its stable bytes and "
+            f"identity cannot be proven: {journal.path}: {exc}",
+            details={
+                "journal": str(journal.path),
+                "binding_status": "inconclusive",
+                "reason_code": exc.code,
+                "safe_action": "preserve-main-and-journal-and-retry-after-quiescence",
+            },
+        ) from exc
+    except OSError as exc:
+        raise StoreSafetyError(
+            "rollback-journal-present",
+            "A SQLite rollback journal is present, but its descriptor bytes "
+            f"cannot be read stably: {journal.path}: {exc}",
+            details={
+                "journal": str(journal.path),
+                "binding_status": "inconclusive",
+                "reason_code": "journal-read-inconclusive",
+                "safe_action": "preserve-main-and-journal-and-retry-after-quiescence",
+            },
+        ) from exc
+    raise StoreSafetyError(
+        "rollback-journal-present",
+        "A descriptor-bound SQLite rollback journal is present; refusing to "
+        "capture or recover the main database without SQLite owning rollback: "
+        f"{journal.path}",
+        details={
+            "journal": str(journal.path),
+            "binding_status": "stable",
+            "journal_receipt": receipt,
+            "safe_action": "preserve-main-and-journal-and-retry-after-quiescence",
+        },
+    )
+
+
+def _reject_new_rollback_journal_membership(
+    main_path: Path,
+    *,
+    baseline_names: list[str],
+    observed_names: list[str],
+    phase: str,
+) -> None:
+    journal_name = f"{main_path.name}-journal"
+    if journal_name not in observed_names or journal_name in baseline_names:
+        return
+    journal_path = main_path.with_name(journal_name)
+    raise StoreSafetyError(
+        "rollback-journal-present",
+        "A SQLite rollback journal appeared while binding the database file set; "
+        f"refusing an ambiguous capture: {journal_path}",
+        details={
+            "journal": str(journal_path),
+            "binding_status": "inconclusive",
+            "reason_code": "journal-membership-changed",
+            "phase": phase,
+            "safe_action": "preserve-main-and-journal-and-retry-after-quiescence",
+        },
+    )
+
+
+def _stat_opened_source_name(
+    opened: _OpenedSource,
+    operation: str,
+) -> os.stat_result:
+    try:
+        if opened.parent_revalidate is not None:
+            opened.parent_revalidate()
+        if opened.parent_fd is None:
+            value = os.stat(opened.path, follow_symlinks=False)
+        else:
+            parent = os.fstat(opened.parent_fd)
+            if (
+                opened.parent_opened is None
+                or not stat.S_ISDIR(parent.st_mode)
+                or not _same_identity(opened.parent_opened, parent)
+            ):
+                raise StoreSafetyError(
+                    "source-identity-mismatch",
+                    "The descriptor-bound source parent changed identity: "
+                    f"{opened.path.parent}",
+                )
+            if _access_policy(opened.parent_opened) != _access_policy(parent):
+                raise StoreSafetyError(
+                    "source-access-policy-mismatch",
+                    "The descriptor-bound source parent changed access policy: "
+                    f"{opened.path.parent}",
+                )
+            value = os.stat(
+                opened.path.name,
+                dir_fd=opened.parent_fd,
+                follow_symlinks=False,
+            )
+        if opened.parent_revalidate is not None:
+            opened.parent_revalidate()
+        return value
+    except StoreSafetyError:
+        raise
+    except OSError as exc:
+        raise _source_revalidation_os_error(
+            opened.path,
+            operation,
+            exc,
+        ) from exc
+
+
+def _revalidate_open_source(
+    opened: _OpenedSource, second_sha256: str
+) -> dict[str, Any]:
+    try:
+        after = os.fstat(opened.fd)
+    except OSError as exc:
+        raise _source_revalidation_os_error(
+            opened.path,
+            "inspect the opened descriptor after hashing",
+            exc,
+        ) from exc
+    path_after = _stat_opened_source_name(
+        opened,
+        "inspect the source name through its held parent after hashing",
+    )
+
+    if not _same_identity(opened.before, after) or not _same_identity(
+        after, path_after
+    ):
+        raise StoreSafetyError(
+            "source-identity-mismatch",
+            f"Source object identity changed during read: {opened.path}",
+        )
+    if opened.first_sha256 != second_sha256 or opened.before.st_size != after.st_size:
+        raise StoreSafetyError(
+            "source-content-mismatch",
+            f"Source bytes changed during read: {opened.path}",
+        )
+    if _access_policy(opened.before) != _access_policy(after) or _access_policy(
+        after
+    ) != _access_policy(path_after):
+        raise StoreSafetyError(
+            "source-access-policy-mismatch",
+            f"Source access policy changed during read: {opened.path}",
+        )
+
+    before_metadata = _metadata(opened.before)
+    after_metadata = _metadata(after)
+    transitions = {
+        key: {"before": before_metadata[key], "after": after_metadata[key]}
+        for key in before_metadata
+        if before_metadata[key] != after_metadata[key]
+    }
+    return {
+        "path": opened.path,
+        "sha256": second_sha256,
+        "size": after.st_size,
+        "identity": _identity(after),
+        "access_policy": _access_policy(after),
+        "metadata": after_metadata,
+        "metadata_transitions": transitions,
+    }
+
+
+def _terminal_revalidate_open_source(
+    opened: _OpenedSource,
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    """Rehash one held source and recheck each protected property."""
+
+    try:
+        descriptor_before = os.fstat(opened.fd)
+    except OSError as exc:
+        raise _source_revalidation_os_error(
+            opened.path,
+            "inspect the descriptor before terminal hashing",
+            exc,
+        ) from exc
+    path_before = _stat_opened_source_name(
+        opened,
+        "inspect the source name through its held parent before terminal hashing",
+    )
+    try:
+        terminal_sha256 = _hash_fd(opened.fd)
+    except OSError as exc:
+        raise _source_revalidation_os_error(
+            opened.path,
+            "repeat the descriptor hash during terminal revalidation",
+            exc,
+        ) from exc
+    try:
+        descriptor_after = os.fstat(opened.fd)
+    except OSError as exc:
+        raise _source_revalidation_os_error(
+            opened.path,
+            "inspect the descriptor after terminal hashing",
+            exc,
+        ) from exc
+    path_after = _stat_opened_source_name(
+        opened,
+        "inspect the source name through its held parent after terminal hashing",
+    )
+
+    descriptor_and_path_stats = (
+        descriptor_before,
+        path_before,
+        descriptor_after,
+        path_after,
+    )
+    if any(
+        not stat.S_ISREG(current.st_mode) or not _same_identity(opened.before, current)
+        for current in descriptor_and_path_stats
+    ):
+        raise StoreSafetyError(
+            "source-identity-mismatch",
+            "Source object identity changed during terminal revalidation: "
+            f"{opened.path}",
+        )
+
+    expected_sha256 = str(receipt["sha256"])
+    expected_size = int(receipt["size"])
+    if terminal_sha256 != expected_sha256 or any(
+        current.st_size != expected_size for current in descriptor_and_path_stats
+    ):
+        raise StoreSafetyError(
+            "source-content-mismatch",
+            f"Source bytes changed during terminal revalidation: {opened.path}",
+        )
+
+    expected_access_policy = receipt["access_policy"]
+    if any(
+        _access_policy(current) != expected_access_policy
+        for current in descriptor_and_path_stats
+    ):
+        raise StoreSafetyError(
+            "source-access-policy-mismatch",
+            "Source descriptor or pathname access policy changed during terminal "
+            f"revalidation: {opened.path}",
+        )
+
+    initial_metadata = _metadata(opened.before)
+    terminal_metadata = _metadata(descriptor_after)
+    return {
+        **receipt,
+        "sha256": expected_sha256,
+        "size": expected_size,
+        "identity": _identity(descriptor_after),
+        "access_policy": _access_policy(descriptor_after),
+        "metadata": terminal_metadata,
+        "metadata_transitions": {
+            key: {
+                "before": initial_metadata[key],
+                "after": terminal_metadata[key],
+            }
+            for key in initial_metadata
+            if initial_metadata[key] != terminal_metadata[key]
+        },
+    }
+
+
+def _opened_source_from_bound(
+    bound: _BoundRegularFile,
+    parent: _BoundDirectory,
+) -> _OpenedSource:
+    return _OpenedSource(
+        path=bound.path,
+        fd=bound.fd,
+        before=bound.opened,
+        parent_fd=parent.fd,
+        parent_opened=parent.opened,
+        parent_revalidate=lambda: _verify_bound_source_directory(parent),
+    )
+
+
+@contextmanager
+def _bind_source_directory(path: Path) -> Iterator[_BoundDirectory]:
+    """Keep generic directory teardown inside the live-source taxonomy."""
+
+    directory: _BoundDirectory | None = None
+    body_error: BaseException | None = None
+    try:
+        with _bind_existing_directory_with_trusted_alias(path) as bound:
+            directory = bound
+            try:
+                yield bound
+            except BaseException as exc:
+                body_error = exc
+                raise
+    except (OSError, StoreSafetyError) as exc:
+        if exc is body_error or directory is None:
+            raise
+        raise _source_directory_revalidation_error(directory, exc) from exc
+
+
+@contextmanager
+def _bind_source_store(main_path: Path) -> Iterator[_BoundSourceStore]:
+    """Bind one NoteStore transaction through one complete no-follow chain."""
+
+    main_path = _absolute_path(main_path)
+    with (
+        _bind_source_directory(main_path.parent) as parent,
+        ExitStack() as stack,
+    ):
+        before_paths = _discover_database_files_at(main_path, parent)
+        before_membership = tuple(path.name for path in before_paths)
+        files: dict[str, _BoundRegularFile] = {}
+        for path in before_paths:
+            try:
+                observed = os.stat(
+                    path.name,
+                    dir_fd=parent.fd,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISREG(observed.st_mode):
+                    raise StoreSafetyError(
+                        "source-not-regular",
+                        f"A discovered NoteStore member is not a regular file: {path}",
+                    )
+                files[path.name] = stack.enter_context(
+                    _bind_regular_file_at(
+                        path,
+                        parent,
+                        SOURCE_FILE_CODES,
+                    )
+                )
+            except StoreSafetyError as exc:
+                if path.name != f"{main_path.name}-journal":
+                    raise
+                raise StoreSafetyError(
+                    "rollback-journal-present",
+                    "A SQLite rollback-journal namespace is present but cannot "
+                    f"be bound as one stable regular file: {path}: {exc}",
+                    details={
+                        "journal": str(path),
+                        "binding_status": "inconclusive",
+                        "reason_code": exc.code,
+                        "safe_action": (
+                            "preserve-main-and-journal-and-retry-after-quiescence"
+                        ),
+                    },
+                ) from exc
+            except OSError as exc:
+                source_error = _source_revalidation_os_error(
+                    path,
+                    "revalidate the discovered NoteStore member before "
+                    "descriptor-relative open",
+                    exc,
+                )
+                if path.name != f"{main_path.name}-journal":
+                    raise source_error from exc
+                raise StoreSafetyError(
+                    "rollback-journal-present",
+                    "Cannot revalidate a discovered NoteStore member before "
+                    f"descriptor-relative open: {path}: {exc}",
+                    details={
+                        "journal": str(path),
+                        "binding_status": "inconclusive",
+                        "reason_code": source_error.code,
+                        "safe_action": (
+                            "preserve-main-and-journal-and-retry-after-quiescence"
+                        ),
+                    },
+                ) from exc
+        after_membership = tuple(
+            path.name for path in _discover_database_files_at(main_path, parent)
+        )
+        _reject_new_rollback_journal_membership(
+            main_path,
+            baseline_names=list(before_membership),
+            observed_names=list(after_membership),
+            phase="after-open",
+        )
+        if after_membership != before_membership:
+            raise StoreSafetyError(
+                "store-file-set-mismatch",
+                "SQLite main/WAL/SHM/rollback-journal membership changed while "
+                "opening the descriptor-bound store",
+            )
+        journal_name = f"{main_path.name}-journal"
+        journal = files.get(journal_name)
+        if journal is not None:
+            opened_journal = _opened_source_from_bound(journal, parent)
+            try:
+                opened_journal.first_sha256 = _hash_fd(journal.fd)
+                second_sha256 = _hash_fd(journal.fd)
+                receipt = _revalidate_open_source(
+                    opened_journal,
+                    second_sha256,
+                )
+            except (OSError, StoreSafetyError) as exc:
+                reason_code = (
+                    exc.code
+                    if isinstance(exc, StoreSafetyError)
+                    else "journal-read-inconclusive"
+                )
+                raise StoreSafetyError(
+                    "rollback-journal-present",
+                    "A SQLite rollback journal is present, but its stable bytes "
+                    f"and identity cannot be proven: {journal.path}: {exc}",
+                    details={
+                        "journal": str(journal.path),
+                        "binding_status": "inconclusive",
+                        "reason_code": reason_code,
+                        "safe_action": (
+                            "preserve-main-and-journal-and-retry-after-quiescence"
+                        ),
+                    },
+                ) from exc
+            raise StoreSafetyError(
+                "rollback-journal-present",
+                "A descriptor-bound SQLite rollback journal is present; "
+                "refusing to consume an ambiguous live store: "
+                f"{journal.path}",
+                details={
+                    "journal": str(journal.path),
+                    "binding_status": "stable",
+                    "journal_receipt": receipt,
+                    "safe_action": (
+                        "preserve-main-and-journal-and-retry-after-quiescence"
+                    ),
+                },
+            )
+        store = _BoundSourceStore(
+            directory=parent,
+            main_name=main_path.name,
+            files=files,
+            membership=before_membership,
+        )
+        _verify_bound_source_store(store)
+        try:
+            yield store
+        except Exception:
+            raise
+        else:
+            if not _writeback_close_only():
+                _verify_bound_source_store(store)
+
+
+def _capture_bound_source_store(
+    store: _BoundSourceStore,
+    destination_dir: Path | None = None,
+    *,
+    destination_binding: _BoundDirectory | None = None,
+) -> list[dict[str, Any]]:
+    if destination_dir is not None:
+        if destination_binding is None:
+            raise StoreSafetyError(
+                "prepared-directory-revalidation-inconclusive",
+                "Descriptor-bound source capture requires a held destination "
+                f"directory: {destination_dir}",
+            )
+        if destination_binding.path != destination_dir:
+            raise StoreSafetyError(
+                "prepared-directory-identity-mismatch",
+                "Recovery destination binding does not match the copy target: "
+                f"{destination_dir}",
+            )
+        _verify_bound_directory_namespace(destination_binding)
+
+    _verify_bound_source_store(store)
+    records: list[dict[str, Any]] = []
+    for basename in store.membership:
+        bound = store.files[basename]
+        opened = _opened_source_from_bound(bound, store.directory)
+        if destination_dir is None:
+            opened.first_sha256 = bound.sha256
+        else:
+            assert destination_binding is not None
+            opened.copied = _copy_fd(
+                bound.fd,
+                destination_dir / basename,
+                destination_binding=destination_binding,
+            )
+            opened.first_sha256 = opened.copied["sha256"]
+        try:
+            second_sha256 = _hash_fd(bound.fd)
+        except OSError as exc:
+            raise _source_revalidation_os_error(
+                bound.path,
+                "repeat the descriptor hash",
+                exc,
+            ) from exc
+        source_record = _revalidate_open_source(opened, second_sha256)
+        source_record = _terminal_revalidate_open_source(
+            opened,
+            source_record,
+        )
+        record: dict[str, Any] = {
+            "basename": basename,
+            "source": source_record,
+        }
+        if opened.copied is not None:
+            record["copy"] = opened.copied
+        records.append(record)
+    _verify_bound_source_store(store)
+    if destination_binding is not None:
+        _verify_bound_directory_namespace(destination_binding)
+    return records
+
+
+def _capture_database_files(
+    main_path: Path,
+    destination_dir: Path | None = None,
+    *,
+    destination_binding: _BoundDirectory | None = None,
+    source_binding: _BoundDirectory | None = None,
+) -> list[dict[str, Any]]:
+    main_path = _absolute_path(main_path)
+    if source_binding is None:
+        with _bind_source_store(main_path) as store:
+            if destination_dir is not None and destination_binding is None:
+                with _create_bound_directory(destination_dir) as created_destination:
+                    return _capture_bound_source_store(
+                        store,
+                        destination_dir,
+                        destination_binding=created_destination,
+                    )
+            return _capture_bound_source_store(
+                store,
+                destination_dir,
+                destination_binding=destination_binding,
+            )
+    if source_binding.path != main_path.parent:
+        raise StoreSafetyError(
+            "source-identity-mismatch",
+            "Descriptor-relative NoteStore capture requires the exact held group "
+            f"container: main={main_path}, parent={source_binding.path}",
+        )
+    before_paths = _discover_database_files_at(main_path, source_binding)
+    with ExitStack() as stack:
+        files = {
+            path.name: stack.enter_context(
+                _bind_regular_file_at(path, source_binding, SOURCE_FILE_CODES)
+            )
+            for path in before_paths
+        }
+        journal_name = f"{main_path.name}-journal"
+        if journal_name in files:
+            _reject_bound_rollback_journal(
+                [_opened_source_from_bound(files[journal_name], source_binding)],
+                main_path,
+            )
+        store = _BoundSourceStore(
+            directory=source_binding,
+            main_name=main_path.name,
+            files=files,
+            membership=tuple(path.name for path in before_paths),
+        )
+        return _capture_bound_source_store(
+            store,
+            destination_dir,
+            destination_binding=destination_binding,
+        )
+
+
+def _fingerprint_exact_file(path: Path) -> dict[str, Any]:
+    fd, opened_stat = _open_regular_readonly(path)
+    opened = _OpenedSource(path=path, fd=fd, before=opened_stat)
+    try:
+        try:
+            opened.first_sha256 = _hash_fd(fd)
+            second_sha256 = _hash_fd(fd)
+        except OSError as exc:
+            raise _source_revalidation_os_error(
+                path,
+                "hash the opened descriptor",
+                exc,
+            ) from exc
+        return _revalidate_open_source(opened, second_sha256)
+    finally:
+        os.close(fd)
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_json_atomic(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    parent_binding: _BoundDirectory | None = None,
+    ensure_ascii: bool = False,
+    pre_temp_create: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    if parent_binding is None:
+        with _bind_existing_directory_with_trusted_alias(path.parent) as bound_parent:
+            return _write_json_atomic(
+                path,
+                payload,
+                parent_binding=bound_parent,
+                ensure_ascii=ensure_ascii,
+                pre_temp_create=pre_temp_create,
+            )
+    if path.parent != parent_binding.path:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            f"Manifest target does not use the bound prepared directory: {path}",
+        )
+    _verify_bound_directory_namespace(parent_binding)
+    if parent_binding.before_write is not None:
+        parent_binding.before_write()
+    temp_path = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    if pre_temp_create is not None:
+        pre_temp_create()
+    try:
+        fd = os.open(
+            temp_path.name,
+            flags,
+            0o600,
+            dir_fd=parent_binding.fd,
+        )
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Cannot exclusively create bound manifest temporary file "
+            f"{temp_path}: {exc}",
+        ) from exc
+    created: os.stat_result | None = None
+    verified_sha256: str | None = None
+    try:
+        try:
+            created = os.fstat(fd)
+        except OSError as exc:
+            raise StoreSafetyError(
+                "prepared-file-revalidation-inconclusive",
+                "Cannot inspect the exclusively created manifest temporary "
+                f"file before writing: {temp_path}: {exc}",
+            ) from exc
+        _, expected_access_policy = _bind_created_regular_file_access_policy(
+            fd,
+            temp_path,
+            parent_binding,
+            created=created,
+        )
+        payload_bytes = (
+            json.dumps(
+                payload,
+                indent=2,
+                ensure_ascii=ensure_ascii,
+                default=_json_default,
+            )
+            + "\n"
+        ).encode("utf-8", errors="strict")
+        expected_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        expected_size = len(payload_bytes)
+        _write_all(fd, payload_bytes)
+        os.fsync(fd)
+        _verify_bound_directory_namespace(parent_binding)
+        opened = _verify_created_regular_file_boundary(
+            fd,
+            temp_path,
+            parent_binding,
+            created=created,
+            expected_access_policy=expected_access_policy,
+            phase="post-write pre-readback",
+        )
+        if opened.st_size != expected_size:
+            raise StoreSafetyError(
+                "prepared-file-content-mismatch",
+                f"JSON output size changed while writing: {temp_path}",
+            )
+        bound = _BoundRegularFile(
+            path=path,
+            fd=fd,
+            opened=opened,
+            sha256=expected_sha256,
+            parent_opened=parent_binding.opened,
+            parent_fd=parent_binding.fd,
+            before_write=parent_binding.before_write,
+            trusted_alias=parent_binding.trusted_alias,
+        )
+        _verify_bound_regular_file_at(
+            bound,
+            PREPARED_FILE_CODES,
+            dir_fd=parent_binding.fd,
+            basename=temp_path.name,
+        )
+        verified_sha256 = expected_sha256
+        if parent_binding.before_write is not None:
+            parent_binding.before_write()
+        _verify_bound_regular_file_at(
+            bound,
+            PREPARED_FILE_CODES,
+            dir_fd=parent_binding.fd,
+            basename=temp_path.name,
+        )
+        _rename_file_no_replace_at(
+            parent_binding.fd,
+            temp_path.name,
+            path.name,
+        )
+        _verify_bound_regular_file_at(
+            bound,
+            PREPARED_FILE_CODES,
+            dir_fd=parent_binding.fd,
+            basename=path.name,
+        )
+        _fsync_bound_directory_descriptor(parent_binding)
+        return _verify_bound_regular_file_at(
+            bound,
+            PREPARED_FILE_CODES,
+            dir_fd=parent_binding.fd,
+            basename=path.name,
+        )
+    except Exception as exc:
+        retained = _retained_created_regular_file_details(
+            parent_binding,
+            fd,
+            created,
+            display_path=path,
+            candidate_basenames=(temp_path.name, path.name),
+            content_sha256=verified_sha256,
+        )
+        if isinstance(exc, StoreSafetyError):
+            exc.details = _merge_recovery_details(
+                exc.details,
+                retained,
+            )
+            raise
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Manifest publication failed; the descriptor-bound file was "
+            f"retained: {path}: {exc}",
+            details=retained,
+        ) from exc
+    finally:
+        os.close(fd)
+
+
+def _assert_bounded_json_nesting(payload: str) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in payload:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > MANIFEST_JSON_MAX_DEPTH:
+                raise ValueError("JSON nesting exceeds the manifest limit")
+        elif character in "]}" and depth:
+            depth -= 1
+
+
+def _parse_bounded_json_integer(value: str) -> int:
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > MANIFEST_JSON_MAX_INTEGER_DIGITS:
+        raise ValueError("JSON integer exceeds the manifest digit limit")
+    return int(value)
+
+
+def _bounded_json_loads(payload: str) -> Any:
+    _assert_bounded_json_nesting(payload)
+    return json.loads(payload, parse_int=_parse_bounded_json_integer)
+
+
+def _parse_manifest_bytes(
+    payload_bytes: bytes,
+    *,
+    path: Path,
+    expected_schema: str,
+) -> dict[str, Any]:
+    try:
+        payload_text = payload_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise StoreSafetyError(
+            "manifest-unreadable", f"Cannot read manifest {path}: {exc}"
+        ) from exc
+    try:
+        payload = _bounded_json_loads(payload_text)
+    except json.JSONDecodeError as exc:
+        raise StoreSafetyError(
+            "manifest-unreadable", f"Cannot read manifest {path}: {exc}"
+        ) from exc
+    except (ValueError, RecursionError) as exc:
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Manifest exceeds bounded JSON parsing limits: {path}",
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("schema") != expected_schema:
+        raise StoreSafetyError(
+            "manifest-schema-mismatch",
+            f"Unexpected manifest schema in {path}; expected {expected_schema}",
+        )
+    return payload
+
+
+def _normalized_json_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = json.loads(
+        json.dumps(payload, ensure_ascii=False, default=_json_default)
+    )
+    if not isinstance(normalized, dict):
+        raise TypeError("Expected a JSON object")
+    return normalized
+
+
+def _manifest_creation_receipt_payload(
+    *,
+    artifact_kind: str,
+    artifact_schema: str,
+    manifest_name: str,
+    manifest_receipt: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema": MANIFEST_CREATION_RECEIPT_SCHEMA,
+        "artifact_kind": artifact_kind,
+        "artifact_schema": artifact_schema,
+        "manifest_name": manifest_name,
+        "manifest": {
+            "sha256": manifest_receipt["sha256"],
+            "size": manifest_receipt["size"],
+            "identity": manifest_receipt["identity"],
+            "access_policy": manifest_receipt["access_policy"],
+        },
+    }
+
+
+def _normalized_manifest_creation_receipt(
+    value: Any,
+    *,
+    artifact_kind: str,
+    artifact_schema: str | Collection[str],
+    manifest_name: str,
+) -> dict[str, Any]:
+    allowed_artifact_schemas = (
+        (artifact_schema,)
+        if isinstance(artifact_schema, str)
+        else tuple(artifact_schema)
+    )
+    if not allowed_artifact_schemas or any(
+        type(candidate) is not str for candidate in allowed_artifact_schemas
+    ):
+        raise RuntimeError("Artifact schema policy must contain exact strings")
+    if value is None:
+        raise StoreSafetyError(
+            "manifest-creation-receipt-required",
+            "A caller-preserved artifact-external manifest creation receipt is "
+            f"required before consuming {manifest_name}",
+        )
+    if (
+        isinstance(value, dict)
+        and "manifest_creation_receipt" in value
+        and value.get("schema") != MANIFEST_CREATION_RECEIPT_SCHEMA
+    ):
+        value = value.get("manifest_creation_receipt")
+    if not isinstance(value, dict):
+        raise StoreSafetyError(
+            "manifest-creation-receipt-invalid",
+            "Manifest creation receipt must be a JSON object",
+        )
+    expected_outer_keys = {
+        "schema",
+        "artifact_kind",
+        "artifact_schema",
+        "manifest_name",
+        "manifest",
+    }
+    if (
+        set(value) != expected_outer_keys
+        or value.get("schema") != MANIFEST_CREATION_RECEIPT_SCHEMA
+        or value.get("artifact_kind") != artifact_kind
+        or value.get("artifact_schema") not in allowed_artifact_schemas
+        or value.get("manifest_name") != manifest_name
+    ):
+        raise StoreSafetyError(
+            "manifest-creation-receipt-invalid",
+            "Manifest creation receipt schema or artifact binding is invalid "
+            f"for {manifest_name}",
+        )
+    manifest = value.get("manifest")
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "sha256",
+        "size",
+        "identity",
+        "access_policy",
+    }:
+        raise StoreSafetyError(
+            "manifest-creation-receipt-invalid",
+            f"Manifest creation receipt fields are invalid for {manifest_name}",
+        )
+    sha256 = manifest.get("sha256")
+    size = manifest.get("size")
+    if (
+        not isinstance(sha256, str)
+        or len(sha256) != 64
+        or any(character not in "0123456789abcdef" for character in sha256)
+        or type(size) is not int
+        or size < 0
+    ):
+        raise StoreSafetyError(
+            "manifest-creation-receipt-invalid",
+            f"Manifest content receipt is malformed for {manifest_name}",
+        )
+    try:
+        protection = _manifest_protection_receipt(
+            manifest,
+            label=f"external receipt for {manifest_name}",
+        )
+    except StoreSafetyError as exc:
+        raise StoreSafetyError(
+            "manifest-creation-receipt-invalid",
+            f"Manifest protection receipt is malformed for {manifest_name}: {exc}",
+        ) from exc
+    return {
+        "schema": MANIFEST_CREATION_RECEIPT_SCHEMA,
+        "artifact_kind": artifact_kind,
+        "artifact_schema": value["artifact_schema"],
+        "manifest_name": manifest_name,
+        "manifest": {
+            "sha256": sha256,
+            "size": size,
+            **protection,
+        },
+    }
+
+
+def _assert_bound_manifest_creation_receipt(
+    bound: _BoundRegularFile,
+    creation_receipt: dict[str, Any],
+    codes: _FileProtectionCodes,
+    *,
+    parent: _BoundDirectory,
+) -> dict[str, Any]:
+    current = _verify_bound_regular_file_at(
+        bound,
+        codes,
+        dir_fd=parent.fd,
+        basename=bound.path.name,
+    )
+    expected = creation_receipt["manifest"]
+    if current["identity"] != expected["identity"]:
+        raise StoreSafetyError(
+            "manifest-creation-receipt-identity-mismatch",
+            "Manifest identity differs from the caller-preserved creation "
+            f"receipt: {bound.path}",
+        )
+    if current["sha256"] != expected["sha256"] or current["size"] != expected["size"]:
+        raise StoreSafetyError(
+            "manifest-creation-receipt-content-mismatch",
+            "Manifest bytes differ from the caller-preserved creation receipt: "
+            f"{bound.path}",
+        )
+    if current["access_policy"] != expected["access_policy"]:
+        raise StoreSafetyError(
+            "manifest-creation-receipt-access-policy-mismatch",
+            "Manifest access policy differs from the caller-preserved creation "
+            f"receipt: {bound.path}",
+        )
+    return current
+
+
+def _assert_manifest_external_anchor_declaration(
+    manifest: dict[str, Any],
+    *,
+    artifact_kind: str,
+    manifest_name: str,
+) -> None:
+    expected = {
+        "schema": MANIFEST_CREATION_RECEIPT_SCHEMA,
+        "artifact_kind": artifact_kind,
+        "manifest_name": manifest_name,
+        "required_before_manifest_consumption": True,
+    }
+    if manifest.get("external_creation_receipt") != expected:
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "Manifest does not declare its required artifact-external creation "
+            f"receipt: {manifest_name}",
+        )
+
+
+def _manifest_protection_receipt(
+    value: Any,
+    *,
+    label: str,
+) -> dict[str, dict[str, int]]:
+    if not isinstance(value, dict):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Manifest protection receipt is missing for {label}",
+        )
+    identity = value.get("identity")
+    access_policy = value.get("access_policy")
+    identity_keys = {"device", "inode", "file_type"}
+    access_keys = {"mode", "uid", "gid", "flags"}
+    if (
+        not isinstance(identity, dict)
+        or set(identity) != identity_keys
+        or any(type(identity[key]) is not int for key in identity_keys)
+        or not isinstance(access_policy, dict)
+        or set(access_policy) != access_keys
+        or any(type(access_policy[key]) is not int for key in access_keys)
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Manifest protection receipt is malformed for {label}",
+        )
+    return {
+        "identity": {key: int(identity[key]) for key in sorted(identity_keys)},
+        "access_policy": {
+            key: (
+                int(access_policy[key]) & DARWIN_ACCESS_POLICY_FLAG_MASK
+                if key == "flags"
+                else int(access_policy[key])
+            )
+            for key in sorted(access_keys)
+        },
+    }
+
+
+def _assert_manifest_protection_receipt(
+    current: dict[str, Any],
+    value: Any,
+    *,
+    label: str,
+    identity_code: str,
+    access_policy_code: str,
+) -> None:
+    receipt = _manifest_protection_receipt(value, label=label)
+    if current.get("identity") != receipt["identity"]:
+        raise StoreSafetyError(
+            identity_code,
+            f"Object identity differs from the creation manifest: {label}",
+        )
+    if current.get("access_policy") != receipt["access_policy"]:
+        raise StoreSafetyError(
+            access_policy_code,
+            f"Access policy differs from the creation manifest: {label}",
+        )
+
+
+def _normalized_source_component_path_binding(
+    value: Any,
+    *,
+    label: str,
+    strict_manifest: bool = False,
+    _depth: int = 0,
+) -> dict[str, Any]:
+    """Flatten one held component-chain receipt to protected properties only."""
+
+    if _depth > 8 or not isinstance(value, dict):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source component binding is malformed for {label}",
+        )
+    expected_schema = "apple-notes-component-path-binding/v1"
+    schema = value.get("schema")
+    if schema is not None and schema != expected_schema:
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source component schema is invalid for {label}",
+        )
+    if schema is None:
+        if strict_manifest:
+            raise StoreSafetyError(
+                "manifest-invalid",
+                f"Snapshot source component schema is missing for {label}",
+            )
+        nested = value.get("component_path_binding")
+        if not isinstance(nested, dict):
+            raise StoreSafetyError(
+                "manifest-invalid",
+                f"Snapshot source component binding is missing for {label}",
+            )
+        return _normalized_source_component_path_binding(
+            nested,
+            label=label,
+            strict_manifest=False,
+            _depth=_depth + 1,
+        )
+
+    expected_keys = {"schema", "components", "protected_properties"}
+    if value.get("held_root") is not None and not strict_manifest:
+        expected_keys.add("held_root")
+    if set(value) != expected_keys:
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source component fields are invalid for {label}",
+        )
+
+    protected_properties = value.get("protected_properties")
+    expected_properties = {
+        "object_identity": ["device", "inode", "file_type"],
+        "access_policy": ["mode", "uid", "gid", "flags"],
+        "link_policy": "no-symlink-or-reparse-component",
+    }
+    rows = value.get("components")
+    if protected_properties != expected_properties or not isinstance(rows, list):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source component binding contract is malformed for {label}",
+        )
+
+    prefix_rows: list[dict[str, Any]] = []
+    if value.get("held_root") is not None:
+        prefix = _normalized_source_component_path_binding(
+            value["held_root"],
+            label=f"{label} held root",
+            strict_manifest=False,
+            _depth=_depth + 1,
+        )
+        prefix_rows = list(prefix["components"])
+
+    normalized_rows: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"path", "identity", "access_policy"}
+            or type(row.get("path")) is not str
+        ):
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Snapshot source component receipt is malformed: "
+                f"{label} component {index}",
+            )
+        path = Path(row["path"])
+        if not path.is_absolute() or str(path) != row["path"]:
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Snapshot source component path is not canonical and absolute: "
+                f"{row['path']}",
+            )
+        protection = _manifest_protection_receipt(
+            row,
+            label=f"{label} component {index}",
+        )
+        if protection["identity"]["file_type"] != stat.S_IFDIR:
+            raise StoreSafetyError(
+                "manifest-invalid",
+                f"Snapshot source component is not a directory: {path}",
+            )
+        normalized_rows.append(
+            {
+                "path": str(path),
+                **protection,
+            }
+        )
+
+    combined: list[dict[str, Any]] = []
+    for row in (*prefix_rows, *normalized_rows):
+        if combined and row["path"] == combined[-1]["path"]:
+            if row != combined[-1]:
+                raise StoreSafetyError(
+                    "manifest-invalid",
+                    "Snapshot source component receipt repeats one path with "
+                    f"different protection evidence: {row['path']}",
+                )
+            continue
+        if combined and Path(row["path"]).parent != Path(combined[-1]["path"]):
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Snapshot source component binding is not one complete ordered "
+                f"absolute chain: {combined[-1]['path']} -> {row['path']}",
+            )
+        combined.append(row)
+    if not combined or combined[0]["path"] != "/":
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source component binding is not rooted at / for {label}",
+        )
+    return {
+        "schema": expected_schema,
+        "components": combined,
+        "protected_properties": expected_properties,
+    }
+
+
+def _normalized_source_trusted_alias_binding(
+    value: Any,
+    *,
+    label: str,
+    strict_manifest: bool = False,
+) -> dict[str, Any] | None:
+    """Normalize a registered Darwin alias receipt without directory metadata."""
+
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source trusted-alias binding is malformed for {label}",
+        )
+    runtime_keys = {
+        "alias",
+        "canonical_target",
+        "alias_parent_identity",
+        "alias_parent_access_policy",
+        "alias_entry_identity",
+        "alias_entry_access_policy",
+        "alias_target_text",
+        "canonical_target_receipt",
+    }
+    expected_keys = runtime_keys | ({"schema"} if strict_manifest else set())
+    expected_schema = (
+        REGISTERED_DARWIN_ALIAS_BINDING_SCHEMA if strict_manifest else None
+    )
+    if set(value) != expected_keys or value.get("schema") != expected_schema:
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source trusted-alias schema or fields are invalid for {label}",
+        )
+    string_fields = ("alias", "canonical_target", "alias_target_text")
+    if any(type(value.get(field)) is not str for field in string_fields):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source trusted-alias locator is malformed for {label}",
+        )
+    alias = Path(value["alias"])
+    canonical_target = Path(value["canonical_target"])
+    if (
+        not alias.is_absolute()
+        or not canonical_target.is_absolute()
+        or str(alias) != value["alias"]
+        or str(canonical_target) != value["canonical_target"]
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source trusted-alias paths are not canonical for {label}",
+        )
+    alias_parent = _manifest_protection_receipt(
+        {
+            "identity": value.get("alias_parent_identity"),
+            "access_policy": value.get("alias_parent_access_policy"),
+        },
+        label=f"{label} alias parent",
+    )
+    alias_entry = _manifest_protection_receipt(
+        {
+            "identity": value.get("alias_entry_identity"),
+            "access_policy": value.get("alias_entry_access_policy"),
+        },
+        label=f"{label} alias entry",
+    )
+    canonical_receipt = value.get("canonical_target_receipt")
+    if strict_manifest and (
+        not isinstance(canonical_receipt, dict)
+        or set(canonical_receipt)
+        != {"identity", "access_policy", "component_path_binding"}
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "Snapshot source trusted-alias canonical receipt fields are invalid "
+            f"for {label}",
+        )
+    canonical_protection = _manifest_protection_receipt(
+        canonical_receipt,
+        label=f"{label} canonical target",
+    )
+    if (
+        alias_parent["identity"]["file_type"] != stat.S_IFDIR
+        or alias_entry["identity"]["file_type"] != stat.S_IFLNK
+        or canonical_protection["identity"]["file_type"] != stat.S_IFDIR
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            f"Snapshot source trusted-alias object types are invalid for {label}",
+        )
+    canonical_components = _normalized_source_component_path_binding(
+        (
+            canonical_receipt.get("component_path_binding")
+            if isinstance(canonical_receipt, dict)
+            else None
+        ),
+        label=f"{label} canonical target",
+        strict_manifest=strict_manifest,
+    )
+    canonical_terminal = canonical_components["components"][-1]
+    if (
+        canonical_terminal["path"] != str(canonical_target)
+        or canonical_terminal["identity"] != canonical_protection["identity"]
+        or canonical_terminal["access_policy"] != canonical_protection["access_policy"]
+        or _alias_target_path(alias, value["alias_target_text"]) != canonical_target
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "Snapshot source trusted-alias target receipt is internally "
+            f"inconsistent for {label}",
+        )
+    return {
+        "schema": REGISTERED_DARWIN_ALIAS_BINDING_SCHEMA,
+        "alias": str(alias),
+        "canonical_target": str(canonical_target),
+        "alias_parent_identity": alias_parent["identity"],
+        "alias_parent_access_policy": alias_parent["access_policy"],
+        "alias_entry_identity": alias_entry["identity"],
+        "alias_entry_access_policy": alias_entry["access_policy"],
+        "alias_target_text": value["alias_target_text"],
+        "canonical_target_receipt": {
+            **canonical_protection,
+            "component_path_binding": canonical_components,
+        },
+    }
+
+
+def _live_source_binding_receipt(
+    source_root: Path,
+    directory_receipt: dict[str, Any],
+    *,
+    strict_manifest: bool = False,
+) -> dict[str, Any]:
+    """Project a held live directory receipt onto writeback-protected fields."""
+
+    source_root = _absolute_path(source_root)
+    requested_root, canonical_root, alias_spec = _trusted_alias_paths(source_root)
+    protection = _manifest_protection_receipt(
+        directory_receipt,
+        label="live source directory",
+    )
+    component_binding = _normalized_source_component_path_binding(
+        directory_receipt.get("component_path_binding"),
+        label="live source directory",
+        strict_manifest=strict_manifest,
+    )
+    terminal_component = component_binding["components"][-1]
+    if (
+        terminal_component["path"] != str(canonical_root)
+        or terminal_component["identity"] != protection["identity"]
+        or terminal_component["access_policy"] != protection["access_policy"]
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "Snapshot source component chain terminal receipt does not match "
+            f"the canonical live source directory: {canonical_root}",
+        )
+    trusted_alias = _normalized_source_trusted_alias_binding(
+        directory_receipt.get("trusted_alias"),
+        label="live source directory",
+        strict_manifest=strict_manifest,
+    )
+    if alias_spec is None:
+        if trusted_alias is not None:
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Snapshot source binding records an unregistered root alias",
+            )
+    elif (
+        trusted_alias is None
+        or trusted_alias["alias"] != str(alias_spec[0])
+        or trusted_alias["canonical_target"] != str(alias_spec[1])
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "Snapshot source binding does not record the registered root alias",
+        )
+    return {
+        "schema": LIVE_SOURCE_BINDING_SCHEMA,
+        "source_root": str(requested_root),
+        "directory_identity": protection["identity"],
+        "directory_access_policy": protection["access_policy"],
+        "component_path_binding": component_binding,
+        "trusted_alias_binding": trusted_alias,
+    }
+
+
+def _snapshot_manifest_source_binding(
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    value = manifest.get("source_binding")
+    required_keys = {
+        "schema",
+        "source_root",
+        "directory_identity",
+        "directory_access_policy",
+        "component_path_binding",
+        "trusted_alias_binding",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != required_keys
+        or value.get("schema") != LIVE_SOURCE_BINDING_SCHEMA
+        or type(value.get("source_root")) is not str
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "Snapshot manifest has no valid live source binding",
+        )
+    source_root = Path(value["source_root"])
+    if not source_root.is_absolute() or str(source_root) != value["source_root"]:
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "Snapshot manifest live source root is not canonical and absolute",
+        )
+    return _live_source_binding_receipt(
+        source_root,
+        {
+            "identity": value["directory_identity"],
+            "access_policy": value["directory_access_policy"],
+            "component_path_binding": value["component_path_binding"],
+            "trusted_alias": value["trusted_alias_binding"],
+        },
+        strict_manifest=True,
+    )
+
+
+def _snapshot_manifest_writeback_grade(
+    manifest: dict[str, Any],
+    source_binding: dict[str, Any] | None,
+) -> bool:
+    """Report grade from validated properties, never the manifest classification."""
+
+    return (
+        manifest.get("schema") == SNAPSHOT_SCHEMA
+        and source_binding is not None
+        and type(manifest.get("source_root")) is str
+        and manifest["source_root"] == source_binding["source_root"]
+        and manifest.get("notes_running") is False
+        and manifest.get("notes_quit_required") is True
+    )
+
+
+def _source_binding_identity_projection(value: dict[str, Any]) -> dict[str, Any]:
+    alias = value["trusted_alias_binding"]
+    return {
+        "source_root": value["source_root"],
+        "directory_identity": value["directory_identity"],
+        "components": [
+            {
+                "path": row["path"],
+                "identity": row["identity"],
+            }
+            for row in value["component_path_binding"]["components"]
+        ],
+        "trusted_alias": (
+            None
+            if alias is None
+            else {
+                "alias": alias["alias"],
+                "canonical_target": alias["canonical_target"],
+                "alias_target_text": alias["alias_target_text"],
+                "alias_parent_identity": alias["alias_parent_identity"],
+                "alias_entry_identity": alias["alias_entry_identity"],
+                "canonical_target_identity": alias["canonical_target_receipt"][
+                    "identity"
+                ],
+                "canonical_target_components": [
+                    {
+                        "path": row["path"],
+                        "identity": row["identity"],
+                    }
+                    for row in alias["canonical_target_receipt"][
+                        "component_path_binding"
+                    ]["components"]
+                ],
+            }
+        ),
+    }
+
+
+def _source_binding_access_policy_projection(
+    value: dict[str, Any],
+) -> dict[str, Any]:
+    alias = value["trusted_alias_binding"]
+    return {
+        "directory_access_policy": value["directory_access_policy"],
+        "components": [
+            {
+                "path": row["path"],
+                "access_policy": row["access_policy"],
+            }
+            for row in value["component_path_binding"]["components"]
+        ],
+        "trusted_alias": (
+            None
+            if alias is None
+            else {
+                "alias_parent_access_policy": alias["alias_parent_access_policy"],
+                "alias_entry_access_policy": alias["alias_entry_access_policy"],
+                "canonical_target_access_policy": alias["canonical_target_receipt"][
+                    "access_policy"
+                ],
+                "canonical_target_components": [
+                    {
+                        "path": row["path"],
+                        "access_policy": row["access_policy"],
+                    }
+                    for row in alias["canonical_target_receipt"][
+                        "component_path_binding"
+                    ]["components"]
+                ],
+            }
+        ),
+    }
+
+
+def _compare_live_source_binding(
+    store: _BoundSourceStore,
+    baseline_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    baseline = _snapshot_manifest_source_binding(baseline_manifest)
+    current_directory = _verify_bound_source_store(store)["directory"]
+    current = _live_source_binding_receipt(
+        store.directory.path,
+        current_directory,
+    )
+    if _source_binding_identity_projection(
+        current
+    ) != _source_binding_identity_projection(baseline):
+        raise StoreSafetyError(
+            "baseline-identity-mismatch",
+            "Live source directory or component-chain identity differs from "
+            "the backup baseline",
+        )
+    if _source_binding_access_policy_projection(
+        current
+    ) != _source_binding_access_policy_projection(baseline):
+        raise StoreSafetyError(
+            "baseline-access-policy-mismatch",
+            "Live source directory or component-chain access policy differs "
+            "from the backup baseline",
+        )
+    return current
+
+
+def _load_bound_manifest(
+    bound: _BoundRegularFile,
+    codes: _FileProtectionCodes,
+    expected_schema: str,
+    *,
+    parent: _BoundDirectory | None = None,
+) -> dict[str, Any]:
+    payload_bytes = _read_bound_file_bytes(
+        bound,
+        codes,
+        max_bytes=MANIFEST_MAX_BYTES,
+        too_large_code="manifest-too-large",
+        dir_fd=parent.fd if parent is not None else None,
+        basename=bound.path.name if parent is not None else None,
+    )
+    return _parse_manifest_bytes(
+        payload_bytes,
+        path=bound.path,
+        expected_schema=expected_schema,
+    )
+
+
+def _load_manifest(path: Path, expected_schema: str) -> dict[str, Any]:
+    try:
+        fd, opened_stat = _open_regular_readonly(path)
+    except StoreSafetyError as exc:
+        if exc.code == "source-missing":
+            raise StoreSafetyError(
+                "manifest-missing", f"Manifest is missing: {path}"
+            ) from exc
+        if exc.code == "source-unreadable":
+            raise StoreSafetyError(
+                "manifest-unreadable", f"Manifest is unreadable: {path}"
+            ) from exc
+        raise
+    opened = _OpenedSource(path=path, fd=fd, before=opened_stat)
+    try:
+        if opened_stat.st_size > MANIFEST_MAX_BYTES:
+            raise StoreSafetyError(
+                "manifest-too-large",
+                f"Manifest exceeds {MANIFEST_MAX_BYTES} bytes: {path}",
+            )
+        os.lseek(fd, 0, os.SEEK_SET)
+        payload_bytes = bytearray()
+        while True:
+            chunk = os.read(
+                fd, min(CHUNK_SIZE, MANIFEST_MAX_BYTES + 1 - len(payload_bytes))
+            )
+            if not chunk:
+                break
+            payload_bytes.extend(chunk)
+            if len(payload_bytes) > MANIFEST_MAX_BYTES:
+                raise StoreSafetyError(
+                    "manifest-too-large",
+                    f"Manifest exceeds {MANIFEST_MAX_BYTES} bytes: {path}",
+                )
+        opened.first_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+        second_sha256 = _hash_fd(fd)
+        _revalidate_open_source(opened, second_sha256)
+    finally:
+        os.close(fd)
+    return _parse_manifest_bytes(
+        bytes(payload_bytes),
+        path=path,
+        expected_schema=expected_schema,
+    )
+
+
+def _assert_bound_matches_receipt(
+    bound: _BoundRegularFile,
+    receipt: dict[str, Any],
+    *,
+    path: Path | None = None,
+    dir_fd: int | None = None,
+    basename: str | None = None,
+) -> dict[str, Any]:
+    if (dir_fd is None) != (basename is None):
+        raise ValueError("dir_fd and basename must be supplied together")
+    if dir_fd is not None and basename is not None:
+        current = _verify_bound_regular_file_at(
+            bound,
+            PREPARED_FILE_CODES,
+            dir_fd=dir_fd,
+            basename=basename,
+        )
+        target = bound.path
+    else:
+        current = _verify_bound_regular_file(
+            bound,
+            PREPARED_FILE_CODES,
+            path=path,
+        )
+        target = path or bound.path
+    if current["identity"] != receipt.get("identity"):
+        raise StoreSafetyError(
+            "prepared-file-identity-mismatch",
+            f"Prepared file identity differs from its creation receipt: {target}",
+        )
+    if current["access_policy"] != receipt.get("access_policy"):
+        raise StoreSafetyError(
+            "prepared-file-access-policy-mismatch",
+            f"Prepared file access policy differs from its creation receipt: {target}",
+        )
+    if current["sha256"] != receipt.get("sha256") or current["size"] != receipt.get(
+        "size"
+    ):
+        raise StoreSafetyError(
+            "prepared-file-content-mismatch",
+            f"Prepared file bytes differ from its creation receipt: {target}",
+        )
+    return current
+
+
+@contextmanager
+def _bind_prepared_regular_files(
+    root: Path,
+    *,
+    root_binding: _BoundDirectory,
+    directory_bindings: dict[Path, _BoundDirectory],
+    manifest_name: str,
+    manifest_payload: dict[str, Any],
+    manifest_receipt: dict[str, Any],
+    file_receipts: dict[Path, dict[str, Any]],
+) -> Iterator[dict[Path, _BoundRegularFile]]:
+    with ExitStack() as stack:
+
+        def parent_for(relative_path: Path) -> _BoundDirectory:
+            parent_relative = relative_path.parent
+            if parent_relative == Path("."):
+                return root_binding
+            try:
+                return directory_bindings[parent_relative]
+            except KeyError as exc:
+                raise StoreSafetyError(
+                    "prepared-directory-revalidation-inconclusive",
+                    "No descriptor-bound prepared parent was supplied for "
+                    f"{root / relative_path}",
+                ) from exc
+
+        manifest_relative = Path(manifest_name)
+        bindings = {
+            manifest_relative: stack.enter_context(
+                _bind_regular_file_at(
+                    root / manifest_relative,
+                    parent_for(manifest_relative),
+                    PREPARED_FILE_CODES,
+                )
+            )
+        }
+        for relative_path in file_receipts:
+            bindings[relative_path] = stack.enter_context(
+                _bind_regular_file_at(
+                    root / relative_path,
+                    parent_for(relative_path),
+                    PREPARED_FILE_CODES,
+                )
+            )
+        loaded_manifest = _load_bound_manifest(
+            bindings[manifest_relative],
+            PREPARED_FILE_CODES,
+            str(manifest_payload["schema"]),
+        )
+        if loaded_manifest != _normalized_json_payload(manifest_payload):
+            raise StoreSafetyError(
+                "prepared-manifest-mismatch",
+                f"Prepared manifest differs from the in-memory payload: "
+                f"{root / manifest_relative}",
+            )
+        _assert_bound_matches_receipt(
+            bindings[manifest_relative],
+            manifest_receipt,
+        )
+        for relative_path, receipt in file_receipts.items():
+            _assert_bound_matches_receipt(
+                bindings[relative_path],
+                receipt,
+            )
+        yield bindings
+
+
+def _revalidate_published_regular_files(
+    destination: Path,
+    bindings: dict[Path, _BoundRegularFile],
+    *,
+    manifest_name: str,
+    manifest_payload: dict[str, Any],
+    manifest_receipt: dict[str, Any],
+    file_receipts: dict[Path, dict[str, Any]],
+) -> None:
+    manifest_relative = Path(manifest_name)
+    manifest_binding = bindings[manifest_relative]
+    if manifest_binding.parent_fd is None:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Published manifest has no held parent descriptor: "
+            f"{destination / manifest_relative}",
+        )
+    _assert_bound_matches_receipt(
+        manifest_binding,
+        manifest_receipt,
+        dir_fd=manifest_binding.parent_fd,
+        basename=manifest_relative.name,
+    )
+    for relative_path, receipt in file_receipts.items():
+        binding = bindings[relative_path]
+        if binding.parent_fd is None:
+            raise StoreSafetyError(
+                "prepared-file-revalidation-inconclusive",
+                f"Published file has no held parent descriptor: "
+                f"{destination / relative_path}",
+            )
+        _assert_bound_matches_receipt(
+            binding,
+            receipt,
+            dir_fd=binding.parent_fd,
+            basename=relative_path.name,
+        )
+    manifest_bytes = _read_bound_file_bytes(
+        manifest_binding,
+        PREPARED_FILE_CODES,
+        max_bytes=MANIFEST_MAX_BYTES,
+        too_large_code="manifest-too-large",
+        dir_fd=manifest_binding.parent_fd,
+        basename=manifest_relative.name,
+    )
+    installed_manifest = _parse_manifest_bytes(
+        manifest_bytes,
+        path=destination / manifest_relative,
+        expected_schema=str(manifest_payload["schema"]),
+    )
+    if installed_manifest != _normalized_json_payload(manifest_payload):
+        raise StoreSafetyError(
+            "prepared-manifest-mismatch",
+            f"Published manifest differs from the in-memory payload: "
+            f"{destination / manifest_relative}",
+        )
+
+
+def _descriptor_bound_prepared_tree_receipt(
+    root_binding: _BoundDirectory,
+    *,
+    published_basename: str,
+    root_receipt: dict[str, Any],
+    nested_directories: dict[
+        Path,
+        tuple[_BoundDirectory, dict[str, Any]],
+    ],
+    bindings: dict[Path, _BoundRegularFile],
+    manifest_name: str,
+    manifest_payload: dict[str, Any],
+    manifest_receipt: dict[str, Any],
+    file_receipts: dict[Path, dict[str, Any]],
+) -> dict[str, Any]:
+    """Revalidate an installed prepared tree entirely through held descriptors."""
+
+    if root_binding.parent_fd is None:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Prepared root has no parent descriptor: {root_binding.path}",
+        )
+    root_current = _verify_bound_directory_at(
+        root_binding,
+        parent_fd=root_binding.parent_fd,
+        basename=published_basename,
+        display_path=root_binding.path.parent / published_basename,
+    )
+    root_entries = _scan_bound_directory_entry_types(
+        root_binding,
+        root_receipt["entry_types"],
+    )
+    if root_current["identity"] != root_receipt.get("identity") or root_current[
+        "access_policy"
+    ] != root_receipt.get("access_policy"):
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            "Installed prepared root differs from its creation receipt",
+        )
+    if root_entries != root_receipt.get("entry_types"):
+        raise StoreSafetyError(
+            "prepared-file-set-mismatch",
+            "Installed prepared root membership differs from its creation receipt",
+        )
+
+    directory_bindings: dict[Path, _BoundDirectory] = {
+        Path("."): root_binding,
+    }
+    directory_receipts: dict[str, Any] = {}
+    for relative_path, (directory, receipt) in nested_directories.items():
+        parent = directory_bindings.get(relative_path.parent)
+        if parent is None:
+            raise StoreSafetyError(
+                "prepared-directory-revalidation-inconclusive",
+                f"No bound parent for prepared directory {relative_path}",
+            )
+        current = _verify_bound_directory_at(
+            directory,
+            parent_fd=parent.fd,
+            basename=relative_path.name,
+            display_path=root_binding.path / relative_path,
+        )
+        entries = _scan_bound_directory_entry_types(
+            directory,
+            receipt["entry_types"],
+        )
+        if current["identity"] != receipt.get("identity") or current[
+            "access_policy"
+        ] != receipt.get("access_policy"):
+            raise StoreSafetyError(
+                "prepared-directory-identity-mismatch",
+                f"Installed prepared directory differs from its creation receipt: "
+                f"{relative_path}",
+            )
+        if entries != receipt.get("entry_types"):
+            raise StoreSafetyError(
+                "prepared-file-set-mismatch",
+                f"Installed prepared directory membership differs from its "
+                f"creation receipt: {relative_path}",
+            )
+        directory_bindings[relative_path] = directory
+        directory_receipts[str(relative_path)] = {
+            **current,
+            "entry_types": entries,
+        }
+
+    manifest_relative = Path(manifest_name)
+    all_file_receipts = {
+        manifest_relative: manifest_receipt,
+        **file_receipts,
+    }
+    current_files: dict[str, Any] = {}
+    for relative_path, receipt in all_file_receipts.items():
+        parent = directory_bindings.get(relative_path.parent)
+        if parent is None:
+            raise StoreSafetyError(
+                "prepared-directory-revalidation-inconclusive",
+                f"No bound parent for prepared file {relative_path}",
+            )
+        current_files[str(relative_path)] = _assert_bound_matches_receipt(
+            bindings[relative_path],
+            receipt,
+            dir_fd=parent.fd,
+            basename=relative_path.name,
+        )
+
+    manifest_parent = directory_bindings[manifest_relative.parent]
+    manifest_bytes = _read_bound_file_bytes(
+        bindings[manifest_relative],
+        PREPARED_FILE_CODES,
+        max_bytes=MANIFEST_MAX_BYTES,
+        too_large_code="manifest-too-large",
+        dir_fd=manifest_parent.fd,
+        basename=manifest_relative.name,
+    )
+    installed_manifest = _parse_manifest_bytes(
+        manifest_bytes,
+        path=root_binding.path / manifest_relative,
+        expected_schema=str(manifest_payload["schema"]),
+    )
+    if installed_manifest != _normalized_json_payload(manifest_payload):
+        raise StoreSafetyError(
+            "prepared-manifest-mismatch",
+            "Descriptor-bound installed manifest differs from the in-memory payload",
+        )
+    return {
+        "schema": "apple-notes-prepared-tree-receipt/v1",
+        "root": {
+            **root_current,
+            "entry_types": root_entries,
+        },
+        "directories": directory_receipts,
+        "files": current_files,
+    }
+
+
+def _terminate_notes_state_probe(
+    process: subprocess.Popen[bytes],
+) -> dict[str, Any]:
+    """Terminate one probe session and prove its process group was reaped."""
+
+    actions: list[str] = []
+    errors: list[str] = []
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        actions.append("sigterm-process-group")
+    except ProcessLookupError:
+        actions.append("process-group-already-exited")
+    except OSError as exc:
+        errors.append(f"SIGTERM: {type(exc).__name__}: {exc}")
+    try:
+        process.wait(timeout=NOTES_STATE_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            actions.append("sigkill-process-group")
+        except ProcessLookupError:
+            actions.append("process-group-exited-before-sigkill")
+        except OSError as exc:
+            errors.append(f"SIGKILL: {type(exc).__name__}: {exc}")
+        try:
+            process.wait(timeout=NOTES_STATE_TERMINATION_GRACE_SECONDS)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"wait-after-sigkill: {type(exc).__name__}: {exc}")
+    except OSError as exc:
+        errors.append(f"wait-after-sigterm: {type(exc).__name__}: {exc}")
+    reaped = process.poll() is not None
+    return {
+        "actions": actions,
+        "errors": errors,
+        "process_group_reaped": reaped,
+    }
+
+
+def _close_notes_state_probe_pipes(process: subprocess.Popen[bytes]) -> None:
+    """Close probe pipes without replacing a pending process-control exception."""
+
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(process, stream_name, None)
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except BaseException:
+            pass
+
+
+def notes_is_running() -> bool:
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        process = subprocess.Popen(
+            [NOTES_PGREP_PATH, "-x", "Notes"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd="/",
+            env={
+                "PATH": "/usr/bin:/bin",
+                "LC_ALL": "C",
+                "LANG": "C",
+            },
+            close_fds=True,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise StoreSafetyError(
+            "notes-state-unknown",
+            f"Cannot launch the fixed Notes.app state probe: {exc}",
+            details={
+                "probe": NOTES_PGREP_PATH,
+                "phase": "exec",
+                "notes_state": "unknown",
+            },
+        ) from exc
+    try:
+        stdout, stderr = process.communicate(timeout=NOTES_STATE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        cleanup = _terminate_notes_state_probe(process)
+        _close_notes_state_probe_pipes(process)
+        raise StoreSafetyError(
+            "notes-state-unknown",
+            "The Notes.app state probe exceeded its hard deadline",
+            details={
+                "probe": NOTES_PGREP_PATH,
+                "phase": "timeout",
+                "timeout_seconds": NOTES_STATE_TIMEOUT_SECONDS,
+                "notes_state": "unknown",
+                "cleanup": cleanup,
+            },
+        ) from exc
+    except OSError as exc:
+        cleanup = _terminate_notes_state_probe(process)
+        _close_notes_state_probe_pipes(process)
+        raise StoreSafetyError(
+            "notes-state-unknown",
+            f"Cannot collect the Notes.app state probe result: {exc}",
+            details={
+                "probe": NOTES_PGREP_PATH,
+                "phase": "communicate",
+                "notes_state": "unknown",
+                "cleanup": cleanup,
+            },
+        ) from exc
+    except BaseException:
+        try:
+            _terminate_notes_state_probe(process)
+        except BaseException:
+            pass
+        finally:
+            _close_notes_state_probe_pipes(process)
+        raise
+    returncode = process.returncode
+    if not isinstance(stdout, bytes) or not isinstance(stderr, bytes):
+        raise StoreSafetyError(
+            "notes-state-unknown",
+            "The Notes.app state probe returned an unexpected output type",
+            details={
+                "probe": NOTES_PGREP_PATH,
+                "phase": "parse",
+                "notes_state": "unknown",
+            },
+        )
+    if stderr:
+        raise StoreSafetyError(
+            "notes-state-unknown",
+            "The Notes.app state probe emitted ambiguous diagnostic output",
+            details={
+                "probe": NOTES_PGREP_PATH,
+                "phase": "parse",
+                "returncode": returncode,
+                "stderr_bytes": len(stderr),
+                "notes_state": "unknown",
+            },
+        )
+    if returncode == 0:
+        pid_lines = stdout.splitlines()
+        if (
+            not pid_lines
+            or any(not line.isascii() or not line.isdigit() for line in pid_lines)
+            or any(int(line) <= 0 for line in pid_lines)
+        ):
+            raise StoreSafetyError(
+                "notes-state-unknown",
+                "The Notes.app state probe returned malformed PID evidence",
+                details={
+                    "probe": NOTES_PGREP_PATH,
+                    "phase": "parse",
+                    "returncode": returncode,
+                    "stdout_bytes": len(stdout),
+                    "notes_state": "unknown",
+                },
+            )
+        return True
+    if returncode == 1 and not stdout:
+        return False
+    raise StoreSafetyError(
+        "notes-state-unknown",
+        "The Notes.app state probe returned an ambiguous exit/output matrix",
+        details={
+            "probe": NOTES_PGREP_PATH,
+            "phase": "classify",
+            "returncode": returncode,
+            "stdout_bytes": len(stdout),
+            "notes_state": "unknown",
+        },
+    )
+
+
+def _normalized_scope_parts(path: Path) -> tuple[str, ...]:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    return tuple(
+        unicodedata.normalize("NFD", component).casefold()
+        for component in absolute.parts
+    )
+
+
+def _trusted_directory_alias_registry() -> tuple[tuple[Path, Path], ...]:
+    """Return exact platform-owned root aliases accepted for destinations."""
+
+    if sys.platform != "darwin":
+        return ()
+    return (
+        (Path("/etc"), Path("/private/etc")),
+        (Path("/tmp"), Path("/private/tmp")),
+        (Path("/var"), Path("/private/var")),
+    )
+
+
+def _trusted_alias_destination(
+    destination: Path,
+) -> tuple[Path, tuple[Path, Path] | None]:
+    destination_parts = destination.parts
+    for alias, target in _trusted_directory_alias_registry():
+        alias_parts = alias.parts
+        if destination_parts[: len(alias_parts)] != alias_parts:
+            continue
+        return destination, (alias, target)
+    return destination, None
+
+
+def _trusted_alias_paths(
+    path: Path,
+) -> tuple[Path, Path, tuple[Path, Path] | None]:
+    """Return display and canonical paths for one exact registered root alias."""
+
+    requested = Path(os.path.abspath(os.fspath(path)))
+    _, alias_spec = _trusted_alias_destination(requested)
+    if alias_spec is None:
+        return requested, requested, None
+    alias_parts = alias_spec[0].parts
+    canonical = alias_spec[1].joinpath(*requested.parts[len(alias_parts) :])
+    return requested, canonical, alias_spec
+
+
+def _trusted_alias_scope_forms(path: Path) -> tuple[tuple[str, Path], ...]:
+    """Return distinct requested and registry-canonical lexical scope forms."""
+
+    requested, canonical, alias_spec = _trusted_alias_paths(path)
+    forms = (("requested", requested),)
+    if alias_spec is not None and canonical != requested:
+        forms += (("canonical", canonical),)
+    return forms
+
+
+def _alias_target_path(alias: Path, target_text: str) -> Path:
+    return Path(
+        os.path.abspath(
+            os.path.join(
+                os.fspath(alias.parent),
+                target_text,
+            )
+        )
+    )
+
+
+def _raise_destination_scope_inconclusive(
+    message: str,
+    *,
+    destination: Path,
+    cause: BaseException | None = None,
+    mutation_performed: bool = False,
+) -> StoreSafetyError:
+    details: dict[str, Any] = {
+        "destination": str(destination),
+        "scope_evidence": "inconclusive",
+        "mutation_performed": mutation_performed,
+    }
+    if cause is not None:
+        details["underlying_error_type"] = type(cause).__name__
+        details["underlying_errno"] = getattr(cause, "errno", None)
+    return StoreSafetyError(
+        "snapshot-destination-scope-inconclusive",
+        message,
+        details=details,
+    )
+
+
+@contextmanager
+def _bind_trusted_directory_alias(
+    alias: Path,
+    target: Path,
+    *,
+    destination: Path,
+) -> Iterator[_TrustedDirectoryAlias]:
+    """Bind one exact platform alias entry and its canonical target."""
+
+    try:
+        with ExitStack() as stack:
+            alias_parent_before = os.stat(alias.parent, follow_symlinks=False)
+            alias_parent_fd = os.open(alias.parent, _directory_open_flags())
+            stack.callback(os.close, alias_parent_fd)
+            alias_parent_opened = os.fstat(alias_parent_fd)
+            alias_entry_before = os.stat(
+                alias.name,
+                dir_fd=alias_parent_fd,
+                follow_symlinks=False,
+            )
+            alias_target_before = os.readlink(alias.name, dir_fd=alias_parent_fd)
+            alias_target_path = _alias_target_path(alias, alias_target_before)
+            if alias_target_path != target:
+                raise _raise_destination_scope_inconclusive(
+                    "A platform-trusted destination alias no longer names its "
+                    f"registered canonical target: alias={alias}, target={target}",
+                    destination=destination,
+                )
+            target_binding = stack.enter_context(
+                _bind_existing_directory_no_alias(target)
+            )
+            alias_followed_before = os.stat(alias)
+            alias_entry_after = os.stat(
+                alias.name,
+                dir_fd=alias_parent_fd,
+                follow_symlinks=False,
+            )
+            alias_target_after = os.readlink(alias.name, dir_fd=alias_parent_fd)
+            alias_parent_after = os.stat(alias.parent, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(alias_parent_before.st_mode)
+                or not stat.S_ISDIR(alias_parent_opened.st_mode)
+                or not stat.S_ISDIR(alias_parent_after.st_mode)
+                or not stat.S_ISLNK(alias_entry_before.st_mode)
+                or not stat.S_ISLNK(alias_entry_after.st_mode)
+                or not _same_identity(alias_parent_before, alias_parent_opened)
+                or not _same_identity(alias_parent_opened, alias_parent_after)
+                or not _same_identity(alias_entry_before, alias_entry_after)
+                or alias_target_before != alias_target_after
+                or not _same_identity(alias_followed_before, target_binding.opened)
+            ):
+                raise _raise_destination_scope_inconclusive(
+                    "A platform-trusted destination alias, its parent, or its "
+                    f"canonical target changed identity while binding: {alias}",
+                    destination=destination,
+                )
+            if (
+                _access_policy(alias_parent_before)
+                != _access_policy(alias_parent_opened)
+                or _access_policy(alias_parent_opened)
+                != _access_policy(alias_parent_after)
+                or _access_policy(alias_entry_before)
+                != _access_policy(alias_entry_after)
+                or _access_policy(alias_followed_before)
+                != _access_policy(target_binding.opened)
+            ):
+                raise _raise_destination_scope_inconclusive(
+                    "A platform-trusted destination alias, its parent, or its "
+                    f"canonical target changed access policy while binding: {alias}",
+                    destination=destination,
+                )
+            yield _TrustedDirectoryAlias(
+                alias=alias,
+                target=target,
+                alias_parent_fd=alias_parent_fd,
+                alias_parent_opened=alias_parent_opened,
+                alias_entry_opened=alias_entry_before,
+                alias_target_text=alias_target_before,
+                target_binding=target_binding,
+            )
+    except StoreSafetyError:
+        raise
+    except Exception as exc:
+        raise _raise_destination_scope_inconclusive(
+            "Cannot bind a platform-trusted destination alias and canonical "
+            f"target: alias={alias}, target={target}: {exc}",
+            destination=destination,
+            cause=exc,
+        ) from exc
+
+
+def _verify_trusted_directory_alias(
+    binding: _TrustedDirectoryAlias,
+    *,
+    destination: Path,
+) -> dict[str, Any]:
+    try:
+        parent_descriptor_before = os.fstat(binding.alias_parent_fd)
+        parent_path_before = os.stat(binding.alias.parent, follow_symlinks=False)
+        entry_before = os.stat(
+            binding.alias.name,
+            dir_fd=binding.alias_parent_fd,
+            follow_symlinks=False,
+        )
+        target_text_before = os.readlink(
+            binding.alias.name,
+            dir_fd=binding.alias_parent_fd,
+        )
+        followed_before = os.stat(binding.alias)
+        target_receipt = _verify_bound_directory_namespace(binding.target_binding)
+        followed_after = os.stat(binding.alias)
+        target_text_after = os.readlink(
+            binding.alias.name,
+            dir_fd=binding.alias_parent_fd,
+        )
+        entry_after = os.stat(
+            binding.alias.name,
+            dir_fd=binding.alias_parent_fd,
+            follow_symlinks=False,
+        )
+        parent_path_after = os.stat(binding.alias.parent, follow_symlinks=False)
+        parent_descriptor_after = os.fstat(binding.alias_parent_fd)
+    except Exception as exc:
+        raise _raise_destination_scope_inconclusive(
+            "Cannot revalidate a platform-trusted destination alias and its "
+            f"canonical target: {binding.alias}: {exc}",
+            destination=destination,
+            cause=exc,
+        ) from exc
+    if (
+        not stat.S_ISLNK(entry_before.st_mode)
+        or not stat.S_ISLNK(entry_after.st_mode)
+        or not _same_identity(
+            binding.alias_parent_opened,
+            parent_descriptor_before,
+        )
+        or not _same_identity(parent_descriptor_before, parent_path_before)
+        or not _same_identity(parent_path_before, parent_path_after)
+        or not _same_identity(parent_path_after, parent_descriptor_after)
+        or not _same_identity(binding.alias_entry_opened, entry_before)
+        or not _same_identity(entry_before, entry_after)
+        or target_text_before != binding.alias_target_text
+        or target_text_after != binding.alias_target_text
+        or _alias_target_path(binding.alias, target_text_before) != binding.target
+        or not _same_identity(followed_before, binding.target_binding.opened)
+        or not _same_identity(followed_before, followed_after)
+        or target_receipt["identity"] != _identity(binding.target_binding.opened)
+    ):
+        raise _raise_destination_scope_inconclusive(
+            "A platform-trusted destination alias, its parent, or canonical "
+            f"target changed identity or retargeted: {binding.alias}",
+            destination=destination,
+        )
+    if (
+        _access_policy(binding.alias_parent_opened)
+        != _access_policy(parent_descriptor_before)
+        or _access_policy(parent_descriptor_before)
+        != _access_policy(parent_path_before)
+        or _access_policy(parent_path_before) != _access_policy(parent_path_after)
+        or _access_policy(parent_path_after) != _access_policy(parent_descriptor_after)
+        or _access_policy(binding.alias_entry_opened) != _access_policy(entry_before)
+        or _access_policy(entry_before) != _access_policy(entry_after)
+        or _access_policy(followed_before)
+        != _access_policy(binding.target_binding.opened)
+        or _access_policy(followed_before) != _access_policy(followed_after)
+        or target_receipt["access_policy"]
+        != _access_policy(binding.target_binding.opened)
+    ):
+        raise _raise_destination_scope_inconclusive(
+            "A platform-trusted destination alias, its parent, or canonical "
+            f"target changed access policy: {binding.alias}",
+            destination=destination,
+        )
+    return {
+        "alias": str(binding.alias),
+        "canonical_target": str(binding.target),
+        "alias_parent_identity": _identity(parent_descriptor_after),
+        "alias_parent_access_policy": _access_policy(parent_descriptor_after),
+        "alias_entry_identity": _identity(entry_after),
+        "alias_entry_access_policy": _access_policy(entry_after),
+        "alias_target_text": target_text_after,
+        "canonical_target_receipt": target_receipt,
+    }
+
+
+def _assert_trusted_alias_matches_path(
+    binding: _TrustedDirectoryAlias,
+    path: Path,
+) -> tuple[Path, Path]:
+    """Require one path to remain under the exact held alias registration."""
+
+    requested, canonical, alias_spec = _trusted_alias_paths(path)
+    if (
+        alias_spec is None
+        or alias_spec[0] != binding.alias
+        or alias_spec[1] != binding.target
+    ):
+        raise _raise_destination_scope_inconclusive(
+            "A later path boundary does not use the exact platform-trusted "
+            "alias object that authorized the operation: "
+            f"path={requested}, held_alias={binding.alias}, "
+            f"held_target={binding.target}",
+            destination=requested,
+        )
+    alias_parts = binding.alias.parts
+    expected_canonical = binding.target.joinpath(*requested.parts[len(alias_parts) :])
+    if canonical != expected_canonical:
+        raise _raise_destination_scope_inconclusive(
+            "A later path boundary no longer has the canonical mapping bound "
+            "by the held platform alias: "
+            f"path={requested}, canonical={canonical}, "
+            f"expected={expected_canonical}",
+            destination=requested,
+        )
+    return requested, canonical
+
+
+@contextmanager
+def _bind_nearest_existing_directory_with_trusted_alias(
+    path: Path,
+    *,
+    trusted_alias: _TrustedDirectoryAlias | None = None,
+    allow_missing: bool = True,
+) -> Iterator[tuple[_BoundDirectory, tuple[str, ...]]]:
+    """Bind one path component chain, optionally ending at its nearest ancestor."""
+
+    requested, canonical, alias_spec = _trusted_alias_paths(path)
+    with ExitStack() as stack:
+        alias_binding = trusted_alias
+        if alias_spec is not None:
+            if alias_binding is None:
+                alias_binding = stack.enter_context(
+                    _bind_trusted_directory_alias(
+                        alias_spec[0],
+                        alias_spec[1],
+                        destination=requested,
+                    )
+                )
+            requested, canonical = _assert_trusted_alias_matches_path(
+                alias_binding,
+                requested,
+            )
+            _verify_trusted_directory_alias(
+                alias_binding,
+                destination=requested,
+            )
+        elif alias_binding is not None:
+            raise _raise_destination_scope_inconclusive(
+                "A later path boundary escaped the platform-trusted alias "
+                "object that authorized the operation: "
+                f"path={requested}, held_alias={alias_binding.alias}",
+                destination=requested,
+            )
+
+        if alias_binding is None:
+            canonical_binding, missing_components = stack.enter_context(
+                _bind_directory_component_chain(
+                    canonical,
+                    allow_missing=allow_missing,
+                )
+            )
+        else:
+            canonical_binding, missing_components = stack.enter_context(
+                _bind_directory_component_chain(
+                    canonical,
+                    allow_missing=allow_missing,
+                    start_binding=alias_binding.target_binding,
+                    start_path=alias_binding.target,
+                )
+            )
+
+        requested_existing = requested
+        for _ in missing_components:
+            requested_existing = requested_existing.parent
+
+        def revalidate_scope() -> dict[str, Any]:
+            component_receipt = _verify_bound_directory_namespace(canonical_binding)
+            alias_receipt = None
+            if alias_binding is not None:
+                _assert_trusted_alias_matches_path(alias_binding, requested)
+                alias_receipt = _verify_trusted_directory_alias(
+                    alias_binding,
+                    destination=requested,
+                )
+            return {
+                "component_path_binding": component_receipt,
+                "trusted_alias": alias_receipt,
+            }
+
+        binding = _BoundDirectory(
+            path=requested_existing,
+            fd=canonical_binding.fd,
+            opened=canonical_binding.opened,
+            parent_opened=canonical_binding.parent_opened,
+            parent_fd=canonical_binding.parent_fd,
+            before_write=revalidate_scope,
+            path_revalidate=revalidate_scope,
+            namespace_basename=canonical_binding.path.name,
+            trusted_alias=alias_binding,
+            canonical_path=canonical_binding.path,
+        )
+        revalidate_scope()
+        yield binding, missing_components
+        if not _writeback_close_only():
+            _verify_bound_directory_namespace(binding)
+
+
+@contextmanager
+def _bind_existing_directory_with_trusted_alias(
+    path: Path,
+    *,
+    trusted_alias: _TrustedDirectoryAlias | None = None,
+) -> Iterator[_BoundDirectory]:
+    """Bind an existing path through one exact trusted root alias, if needed."""
+
+    requested = _absolute_path(path)
+    with _bind_nearest_existing_directory_with_trusted_alias(
+        requested,
+        trusted_alias=trusted_alias,
+        allow_missing=True,
+    ) as (binding, missing_components):
+        if missing_components:
+            raise StoreSafetyError(
+                "prepared-directory-missing",
+                f"Prepared output directory is missing: {requested}",
+            )
+        yield binding
+
+
+def _assert_snapshot_destination_lexically_outside_live_containers(
+    destination: Path,
+    live_containers: tuple[Path, ...],
+) -> None:
+    destination_forms = _trusted_alias_scope_forms(destination)
+    requested_destination = destination_forms[0][1]
+    reserved = {
+        unicodedata.normalize("NFD", basename).casefold()
+        for basename in NOTE_STORE_DISCOVERY_BASENAMES
+    }
+    for destination_form, destination_path in destination_forms:
+        destination_parts = _normalized_scope_parts(destination_path)
+        reserved_component = next(
+            (component for component in destination_parts if component in reserved),
+            None,
+        )
+        if reserved_component is not None:
+            raise StoreSafetyError(
+                "snapshot-destination-reserved-store-path",
+                "Destination would use a live or reserved SQLite store name, "
+                "including through a case-insensitive, Unicode-normalized, or "
+                f"trusted-alias canonical form: {requested_destination}",
+                details={
+                    "destination": str(requested_destination),
+                    "destination_scope_form": destination_form,
+                    "destination_scope_path": str(destination_path),
+                    "reserved_component_normalized": reserved_component,
+                    "overlap_detection": "normalized-lexical-scope",
+                    "mutation_performed": False,
+                },
+            )
+    for live_container in live_containers:
+        live_forms = _trusted_alias_scope_forms(live_container)
+        requested_live_container = live_forms[0][1]
+        for destination_form, destination_path in destination_forms:
+            destination_parts = _normalized_scope_parts(destination_path)
+            for live_form, live_path in live_forms:
+                live_parts = _normalized_scope_parts(live_path)
+                destination_inside_live = (
+                    destination_parts[: len(live_parts)] == live_parts
+                )
+                destination_contains_live = (
+                    live_parts[: len(destination_parts)] == destination_parts
+                )
+                if not destination_inside_live and not destination_contains_live:
+                    continue
+                raise StoreSafetyError(
+                    "snapshot-destination-inside-live-container",
+                    "Destination overlaps an Apple Notes live container as an "
+                    "ancestor or descendant, including through a "
+                    "case-insensitive, Unicode-normalized, or trusted-alias "
+                    f"canonical form: {requested_destination}",
+                    details={
+                        "destination": str(requested_destination),
+                        "destination_scope_form": destination_form,
+                        "destination_scope_path": str(destination_path),
+                        "live_container": str(requested_live_container),
+                        "live_container_scope_form": live_form,
+                        "live_container_scope_path": str(live_path),
+                        "overlap_detection": (
+                            "normalized-lexical-descendant"
+                            if destination_inside_live
+                            else "normalized-lexical-ancestor"
+                        ),
+                        "mutation_performed": False,
+                    },
+                )
+
+
+def _raise_snapshot_destination_scope_inconclusive(
+    message: str,
+    *,
+    destination: Path,
+    cause: BaseException | None = None,
+    mutation_performed: bool = False,
+) -> StoreSafetyError:
+    return _raise_destination_scope_inconclusive(
+        message,
+        destination=destination,
+        cause=cause,
+        mutation_performed=mutation_performed,
+    )
+
+
+def _bind_snapshot_live_containers(
+    stack: ExitStack,
+    live_containers: tuple[Path, ...],
+    *,
+    destination: Path,
+) -> list[dict[str, Any]]:
+    bindings: list[dict[str, Any]] = []
+    for live_container in live_containers:
+        try:
+            directory, missing_components = stack.enter_context(
+                _bind_nearest_existing_directory_with_trusted_alias(
+                    live_container,
+                    allow_missing=True,
+                )
+            )
+        except StoreSafetyError as exc:
+            raise _raise_snapshot_destination_scope_inconclusive(
+                "Cannot bind the component path for an Apple Notes live "
+                f"container: {live_container}: {exc}",
+                destination=destination,
+                cause=exc,
+            ) from exc
+        if missing_components:
+            bindings.append(
+                {
+                    "path": live_container,
+                    "status": "absent",
+                    "ancestor": directory,
+                    "missing_components": missing_components,
+                }
+            )
+            continue
+        bindings.append(
+            {
+                "path": live_container,
+                "status": "bound",
+                "directory": directory,
+            }
+        )
+    return bindings
+
+
+def _verify_snapshot_live_container_bindings(
+    bindings: list[dict[str, Any]],
+    *,
+    destination: Path,
+) -> list[dict[str, Any]]:
+    receipts: list[dict[str, Any]] = []
+    for binding in bindings:
+        live_container = Path(binding["path"])
+        if binding["status"] == "absent":
+            ancestor = binding["ancestor"]
+            missing_components = tuple(binding["missing_components"])
+            if not missing_components:
+                raise _raise_snapshot_destination_scope_inconclusive(
+                    "An absent live-container binding has no missing component: "
+                    f"{live_container}",
+                    destination=destination,
+                )
+            try:
+                ancestor_receipt = _verify_bound_directory_namespace(ancestor)
+                os.stat(
+                    missing_components[0],
+                    dir_fd=ancestor.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                receipts.append(
+                    {
+                        "path": str(live_container),
+                        "status": "absent",
+                        "nearest_existing_ancestor": str(ancestor.path),
+                        "missing_components": list(missing_components),
+                        "ancestor": ancestor_receipt,
+                    }
+                )
+                continue
+            except StoreSafetyError as exc:
+                raise _raise_snapshot_destination_scope_inconclusive(
+                    "Cannot revalidate the held component path for an initially "
+                    f"absent Apple Notes live container: {live_container}: {exc}",
+                    destination=destination,
+                    cause=exc,
+                ) from exc
+            except OSError as exc:
+                raise _raise_snapshot_destination_scope_inconclusive(
+                    "Cannot revalidate an initially absent Apple Notes live "
+                    f"container: {live_container}: {exc}",
+                    destination=destination,
+                    cause=exc,
+                ) from exc
+            raise _raise_snapshot_destination_scope_inconclusive(
+                "An Apple Notes live container appeared during snapshot "
+                f"destination validation: {live_container}",
+                destination=destination,
+            )
+        directory = binding["directory"]
+        try:
+            directory_receipt = _verify_bound_directory_namespace(directory)
+            descriptor = os.fstat(directory.fd)
+        except (OSError, StoreSafetyError) as exc:
+            raise _raise_snapshot_destination_scope_inconclusive(
+                "Cannot revalidate a bound Apple Notes live container: "
+                f"{live_container}: {exc}",
+                destination=destination,
+                cause=exc,
+            ) from exc
+        receipts.append(
+            {
+                "path": str(live_container),
+                "status": "bound",
+                "identity": _identity(descriptor),
+                "access_policy": _access_policy(descriptor),
+                "component_path_binding": directory_receipt,
+            }
+        )
+    return receipts
+
+
+def _assert_snapshot_destination_ancestors_exclude_live_containers(
+    start_fd: int,
+    live_bindings: list[dict[str, Any]],
+    *,
+    destination: Path,
+    display_path: Path,
+) -> list[dict[str, int]]:
+    try:
+        chain = _descriptor_directory_ancestor_chain(
+            start_fd,
+            display_path=display_path,
+        )
+    except StoreSafetyError as exc:
+        raise _raise_snapshot_destination_scope_inconclusive(
+            "Cannot establish the descriptor-bound ancestor chain for the "
+            f"snapshot destination: {display_path}: {exc}",
+            destination=destination,
+            cause=exc,
+        ) from exc
+    chain_keys = {(row["device"], row["inode"]) for row in chain}
+    for binding in live_bindings:
+        if binding["status"] != "bound":
+            continue
+        opened = binding["directory"].opened
+        if _directory_identity_key(opened) not in chain_keys:
+            continue
+        raise StoreSafetyError(
+            "snapshot-destination-inside-live-container",
+            "Snapshot destination resolves inside an Apple Notes live "
+            "container through a descriptor-bound path or symlink alias: "
+            f"{display_path}",
+            details={
+                "destination": str(destination),
+                "live_container": str(binding["path"]),
+                "overlap_detection": "descriptor-ancestor-identity",
+            },
+        )
+    return chain
+
+
+@contextmanager
+def _create_bound_snapshot_destination_parent_components(
+    ancestor: _BoundDirectory,
+    components: tuple[str, ...],
+    *,
+    live_bindings: list[dict[str, Any]],
+    trusted_alias: _TrustedDirectoryAlias | None,
+    destination: Path,
+    display_path: Path,
+) -> Iterator[_BoundDirectory]:
+    owned_fds: list[int] = []
+    held_components: list[_HeldDirectoryComponent] = []
+    current_fd: int | None = None
+    current_opened = ancestor.opened
+    flags = _directory_open_flags()
+    mutation_performed = False
+    body_error: BaseException | None = None
+
+    def created_component_details() -> dict[str, Any]:
+        if not held_components:
+            return {}
+        return {
+            "mutation_performed": True,
+            "cleanup_state": "preserved-no-identity-safe-directory-unlink",
+            "retry_safe": False,
+            "recovery_locators": {
+                "created_destination_parent_components": {
+                    "schema": ("apple-notes-created-destination-parent-components/v1"),
+                    "destination": str(destination),
+                    "display_path": str(display_path),
+                    "protected_properties": {
+                        "object_identity": ["device", "inode", "file_type"],
+                        "access_policy": ["mode", "uid", "gid", "flags"],
+                    },
+                    "components": [
+                        {
+                            "path": str(component.path),
+                            "target_basename": component.basename,
+                            "directory_identity": _identity(component.opened),
+                            "directory_access_policy": _access_policy(component.opened),
+                            "creation_install_receipt": (
+                                component.creation_install_receipt
+                            ),
+                        }
+                        for component in held_components
+                    ],
+                }
+            },
+        }
+
+    def fail(
+        message: str,
+        *,
+        cause: BaseException | None = None,
+    ) -> StoreSafetyError:
+        cause_mutation = (
+            bool(cause.details.get("mutation_performed"))
+            if isinstance(cause, StoreSafetyError)
+            else False
+        )
+        error = _raise_snapshot_destination_scope_inconclusive(
+            message,
+            destination=destination,
+            cause=cause,
+            mutation_performed=mutation_performed or cause_mutation,
+        )
+        component_details = created_component_details()
+        if component_details:
+            error.details = _merge_recovery_details(
+                error.details,
+                component_details,
+            )
+        if isinstance(cause, StoreSafetyError):
+            error.details = _merge_recovery_details(
+                error.details,
+                cause.details,
+            )
+            error.details["mutation_performed"] = mutation_performed or cause_mutation
+        if mutation_performed or cause_mutation:
+            error.details["mutation_performed"] = True
+            error.details["retry_safe"] = False
+        return error
+
+    def revalidate_chain() -> dict[str, Any]:
+        ancestor_receipt = _verify_bound_directory_namespace(ancestor)
+        component_receipt = _verify_held_directory_components(held_components)
+        live_receipts = _verify_snapshot_live_container_bindings(
+            live_bindings,
+            destination=destination,
+        )
+        alias_receipt = (
+            _verify_trusted_directory_alias(
+                trusted_alias,
+                destination=destination,
+            )
+            if trusted_alias is not None
+            else None
+        )
+        current = current_fd if current_fd is not None else ancestor.fd
+        ancestor_chain = _assert_snapshot_destination_ancestors_exclude_live_containers(
+            current,
+            live_bindings,
+            destination=destination,
+            display_path=display_path,
+        )
+        return {
+            "ancestor": ancestor_receipt,
+            "created_components": component_receipt,
+            "live_containers": live_receipts,
+            "trusted_alias": alias_receipt,
+            "ancestor_chain": ancestor_chain,
+        }
+
+    def revalidate_after_creation(phase: str) -> dict[str, Any]:
+        try:
+            return revalidate_chain()
+        except Exception as exc:
+            if not mutation_performed:
+                raise
+            raise fail(
+                "Cannot revalidate the snapshot-destination parent after "
+                f"directory creation during {phase}: {display_path}: {exc}",
+                cause=exc,
+            ) from exc
+
+    try:
+        current_fd = os.open(".", flags, dir_fd=ancestor.fd)
+        owned_fds.append(current_fd)
+        if not _same_identity(current_opened, os.fstat(current_fd)) or _access_policy(
+            current_opened
+        ) != _access_policy(os.fstat(current_fd)):
+            raise fail(
+                "Bound snapshot-destination ancestor changed before parent "
+                f"creation: {display_path}"
+            )
+        for component_index, component in enumerate(components):
+            if component in {"", ".", ".."}:
+                raise fail(
+                    "Snapshot destination contains a non-canonical parent "
+                    f"component: {display_path}"
+                )
+            revalidate_after_creation("before-next-component")
+            try:
+                parent_before = os.fstat(current_fd)
+            except Exception as exc:
+                if not mutation_performed:
+                    raise
+                raise fail(
+                    "Cannot inspect the held destination parent after prior "
+                    f"component creation: {display_path}: {exc}",
+                    cause=exc,
+                ) from exc
+            if not _same_identity(
+                current_opened,
+                parent_before,
+            ) or _access_policy(current_opened) != _access_policy(parent_before):
+                raise fail(
+                    "Bound snapshot-destination ancestor changed before "
+                    f"descriptor-relative parent creation: {display_path}"
+                )
+            child_path = _bound_directory_canonical_path(ancestor).joinpath(
+                *components[: component_index + 1]
+            )
+            child_display_path = ancestor.path.joinpath(
+                *components[: component_index + 1]
+            )
+            try:
+                installation = _create_and_install_directory_at(
+                    current_fd,
+                    current_opened,
+                    component,
+                    display_path=child_display_path,
+                    revalidate_scope=revalidate_chain,
+                    identity_code="prepared-directory-identity-mismatch",
+                    access_policy_code="prepared-directory-access-policy-mismatch",
+                    inconclusive_code=("prepared-directory-revalidation-inconclusive"),
+                    collision_code="prepared-directory-identity-mismatch",
+                )
+                mutation_performed = True
+            except Exception as exc:
+                raise fail(
+                    "Cannot create, bind, and no-replace install the snapshot "
+                    "destination parent through its held ancestor: "
+                    f"{child_display_path}: {exc}",
+                    cause=exc,
+                ) from exc
+            child_fd = installation.fd
+            child_opened = installation.opened
+            held_components.append(
+                _HeldDirectoryComponent(
+                    path=child_path,
+                    basename=component,
+                    fd=child_fd,
+                    opened=child_opened,
+                    parent_fd=current_fd,
+                    parent_opened=current_opened,
+                    creation_install_receipt=installation.receipt,
+                )
+            )
+            owned_fds.append(child_fd)
+            current_fd = child_fd
+            current_opened = child_opened
+            revalidate_after_creation("after-component-install")
+        revalidate_after_creation("before-parent-yield")
+        if held_components:
+            final = held_components[-1]
+            binding = _BoundDirectory(
+                path=display_path,
+                fd=final.fd,
+                opened=final.opened,
+                parent_opened=final.parent_opened or ancestor.opened,
+                parent_fd=final.parent_fd,
+                before_write=revalidate_chain,
+                path_revalidate=revalidate_chain,
+                namespace_basename=final.basename,
+                trusted_alias=trusted_alias,
+                canonical_path=final.path,
+                creation_install_receipt=final.creation_install_receipt,
+            )
+        else:
+            binding = _BoundDirectory(
+                path=display_path,
+                fd=ancestor.fd,
+                opened=ancestor.opened,
+                parent_opened=ancestor.parent_opened,
+                parent_fd=ancestor.parent_fd,
+                before_write=revalidate_chain,
+                path_revalidate=revalidate_chain,
+                namespace_basename=ancestor.namespace_basename,
+                trusted_alias=trusted_alias,
+                canonical_path=_bound_directory_canonical_path(ancestor),
+            )
+        try:
+            yield binding
+        except StoreSafetyError as exc:
+            component_details = created_component_details()
+            if component_details:
+                exc.details = _merge_recovery_details(
+                    exc.details,
+                    component_details,
+                )
+                exc.details["mutation_performed"] = True
+                exc.details["retry_safe"] = False
+            raise
+        except Exception as exc:
+            if not mutation_performed:
+                raise
+            raise fail(
+                "A destination-parent operation failed after directory "
+                f"creation: {display_path}: {exc}",
+                cause=exc,
+            ) from exc
+        revalidate_after_creation("parent-context-teardown")
+    except BaseException as exc:
+        body_error = exc
+        raise
+    finally:
+        close_failures: list[dict[str, Any]] = []
+        for fd in reversed(owned_fds):
+            try:
+                os.close(fd)
+            except OSError as exc:
+                close_failures.append(
+                    {
+                        "fd": fd,
+                        "error_type": type(exc).__name__,
+                        "errno": exc.errno,
+                        "error": str(exc),
+                    }
+                )
+        if close_failures:
+            cleanup_details = {
+                **created_component_details(),
+                "cleanup_state": "inconclusive",
+                "directory_descriptor_cleanup": {
+                    "status": "inconclusive",
+                    "failures": close_failures,
+                },
+            }
+            if isinstance(body_error, StoreSafetyError):
+                body_error.details = _merge_recovery_details(
+                    body_error.details,
+                    cleanup_details,
+                )
+                if mutation_performed:
+                    body_error.details["mutation_performed"] = True
+                    body_error.details["retry_safe"] = False
+            elif body_error is None:
+                cleanup_error = OSError(
+                    close_failures[0]["errno"],
+                    "Cannot close every held destination-parent descriptor",
+                )
+                if mutation_performed:
+                    error = fail(
+                        "Cannot close every held destination-parent descriptor "
+                        f"after directory creation: {display_path}",
+                        cause=cleanup_error,
+                    )
+                    error.details = _merge_recovery_details(
+                        error.details,
+                        cleanup_details,
+                    )
+                    raise error from cleanup_error
+                raise cleanup_error
+
+
+@contextmanager
+def _preflight_live_safe_destination_parent_raw(
+    paths: NoteStorePaths,
+    destination: Path,
+    *,
+    trusted_alias: _TrustedDirectoryAlias | None = None,
+) -> Iterator[_LiveDestinationPreflight]:
+    """Hold a zero-write destination-scope proof without creating parents."""
+
+    requested_destination, canonical_destination, alias_spec = _trusted_alias_paths(
+        destination
+    )
+    live_containers = (paths.group_container, paths.app_container)
+    _assert_snapshot_destination_lexically_outside_live_containers(
+        requested_destination,
+        live_containers,
+    )
+    with ExitStack() as stack:
+        if alias_spec is not None:
+            if trusted_alias is None:
+                trusted_alias = stack.enter_context(
+                    _bind_trusted_directory_alias(
+                        alias_spec[0],
+                        alias_spec[1],
+                        destination=requested_destination,
+                    )
+                )
+            _assert_trusted_alias_matches_path(
+                trusted_alias,
+                requested_destination,
+            )
+            _verify_trusted_directory_alias(
+                trusted_alias,
+                destination=requested_destination,
+            )
+        elif trusted_alias is not None:
+            raise _raise_snapshot_destination_scope_inconclusive(
+                "A zero-write destination preflight escaped its carried "
+                "platform-trusted alias object: "
+                f"path={requested_destination}, held_alias={trusted_alias.alias}",
+                destination=requested_destination,
+            )
+        live_bindings = _bind_snapshot_live_containers(
+            stack,
+            live_containers,
+            destination=requested_destination,
+        )
+        try:
+            ancestor_binding, missing_components = stack.enter_context(
+                _bind_nearest_existing_directory_with_trusted_alias(
+                    requested_destination.parent,
+                    trusted_alias=trusted_alias,
+                    allow_missing=True,
+                )
+            )
+        except StoreSafetyError as exc:
+            try:
+                alias_nearest, _ = _nearest_existing_output_ancestor_following_aliases(
+                    requested_destination.parent
+                )
+                with _bind_existing_directory_following_aliases(alias_nearest) as (
+                    alias_ancestor_fd,
+                    _,
+                ):
+                    _assert_snapshot_destination_ancestors_exclude_live_containers(
+                        alias_ancestor_fd,
+                        live_bindings,
+                        destination=requested_destination,
+                        display_path=alias_nearest,
+                    )
+            except StoreSafetyError as alias_probe_exc:
+                if alias_probe_exc.code == "snapshot-destination-inside-live-container":
+                    raise
+            raise _raise_snapshot_destination_scope_inconclusive(
+                "Cannot bind a stable no-follow component path for the "
+                f"destination parent: {requested_destination.parent}: {exc}",
+                destination=requested_destination,
+                cause=exc,
+            ) from exc
+        try:
+            if trusted_alias is not None:
+                _verify_trusted_directory_alias(
+                    trusted_alias,
+                    destination=requested_destination,
+                )
+            _verify_snapshot_live_container_bindings(
+                live_bindings,
+                destination=requested_destination,
+            )
+            _assert_snapshot_destination_ancestors_exclude_live_containers(
+                ancestor_binding.fd,
+                live_bindings,
+                destination=requested_destination,
+                display_path=ancestor_binding.path,
+            )
+        except StoreSafetyError as exc:
+            if exc.code in {
+                "snapshot-destination-inside-live-container",
+                "snapshot-destination-reserved-store-path",
+                "snapshot-destination-scope-inconclusive",
+            }:
+                raise
+            raise _raise_snapshot_destination_scope_inconclusive(
+                "Cannot preflight a safe destination parent: "
+                f"{canonical_destination.parent}: {exc}",
+                destination=requested_destination,
+                cause=exc,
+            ) from exc
+
+        def revalidate() -> dict[str, Any]:
+            _assert_snapshot_destination_lexically_outside_live_containers(
+                requested_destination,
+                live_containers,
+            )
+            alias_receipt = (
+                _verify_trusted_directory_alias(
+                    trusted_alias,
+                    destination=requested_destination,
+                )
+                if trusted_alias is not None
+                else None
+            )
+            live_receipts = _verify_snapshot_live_container_bindings(
+                live_bindings,
+                destination=requested_destination,
+            )
+            try:
+                ancestor_receipt = _verify_bound_directory_namespace(ancestor_binding)
+            except StoreSafetyError as exc:
+                raise _raise_snapshot_destination_scope_inconclusive(
+                    "Cannot revalidate the descriptor-bound destination "
+                    f"ancestor: {ancestor_binding.path}: {exc}",
+                    destination=requested_destination,
+                    cause=exc,
+                ) from exc
+            missing_component_receipt: dict[str, Any] | None = None
+            if missing_components:
+                state, _ = _observe_bound_name(
+                    ancestor_binding.fd,
+                    missing_components[0],
+                )
+                if state != "absent":
+                    raise _raise_snapshot_destination_scope_inconclusive(
+                        "The first missing destination-parent component no "
+                        "longer has a stable absent namespace state: "
+                        f"{requested_destination.parent}",
+                        destination=requested_destination,
+                    )
+                missing_component_receipt = {
+                    "nearest_existing_ancestor": str(ancestor_binding.path),
+                    "missing_components": list(missing_components),
+                    "first_missing_component_state": state,
+                }
+            ancestor_chain = (
+                _assert_snapshot_destination_ancestors_exclude_live_containers(
+                    ancestor_binding.fd,
+                    live_bindings,
+                    destination=requested_destination,
+                    display_path=ancestor_binding.path,
+                )
+            )
+            return {
+                "schema": "apple-notes-live-destination-preflight/v1",
+                "requested_destination": str(requested_destination),
+                "canonical_destination": str(canonical_destination),
+                "ancestor": ancestor_receipt,
+                "missing_parent": missing_component_receipt,
+                "live_containers": live_receipts,
+                "trusted_alias": alias_receipt,
+                "ancestor_chain": ancestor_chain,
+                "protected_properties": {
+                    "object_identity": ["device", "inode", "file_type"],
+                    "location_scope": (
+                        "normalized-requested-and-canonical-alias-forms-"
+                        "bidirectional-and-descriptor-ancestor-exclusion"
+                    ),
+                    "access_policy": ["mode", "uid", "gid", "flags"],
+                    "trusted_alias": (
+                        "exact-registry-entry-parent-target-and-retarget-binding"
+                    ),
+                },
+            }
+
+        revalidate()
+        yield _LiveDestinationPreflight(
+            requested_destination=requested_destination,
+            canonical_destination=canonical_destination,
+            ancestor=ancestor_binding,
+            missing_parent_components=missing_components,
+            live_bindings=live_bindings,
+            live_containers=live_containers,
+            trusted_alias=trusted_alias,
+            revalidate=revalidate,
+        )
+
+
+@contextmanager
+def _preflight_live_safe_destination_parent(
+    paths: NoteStorePaths,
+    destination: Path,
+    *,
+    trusted_alias: _TrustedDirectoryAlias | None = None,
+) -> Iterator[_LiveDestinationPreflight]:
+    """Mark only failures before the first held proof as non-mutating."""
+
+    initial_proof_complete = False
+    body_error: BaseException | None = None
+    try:
+        with _preflight_live_safe_destination_parent_raw(
+            paths,
+            destination,
+            trusted_alias=trusted_alias,
+        ) as preflight:
+            initial_proof_complete = True
+            try:
+                yield preflight
+            except BaseException as exc:
+                body_error = exc
+                raise
+    except StoreSafetyError as exc:
+        if not initial_proof_complete:
+            exc.details = _merge_recovery_details(
+                exc.details,
+                {"mutation_performed": False},
+            )
+        elif exc is not body_error and exc.details.get("mutation_performed") is False:
+            exc.details = dict(exc.details)
+            del exc.details["mutation_performed"]
+        raise
+
+
+def _assert_destination_preflight_name_absent(
+    preflight: _LiveDestinationPreflight,
+    *,
+    exists_code: str,
+    inconclusive_code: str,
+    label: str,
+) -> None:
+    preflight.revalidate()
+    if preflight.missing_parent_components:
+        return
+    state, _ = _observe_bound_name(
+        preflight.ancestor.fd,
+        preflight.requested_destination.name,
+    )
+    if state == "present":
+        raise StoreSafetyError(
+            exists_code,
+            f"{label} already exists: {preflight.requested_destination}",
+            details={
+                "destination": str(preflight.requested_destination),
+                "mutation_performed": False,
+            },
+        )
+    if state != "absent":
+        raise StoreSafetyError(
+            inconclusive_code,
+            f"Cannot prove that the descriptor-bound {label.lower()} name is "
+            f"absent: {preflight.requested_destination}",
+            details={
+                "destination": str(preflight.requested_destination),
+                "mutation_performed": False,
+            },
+        )
+
+
+def _revalidate_live_destination_name_absent(
+    scope: _LiveDestinationScope,
+    *,
+    exists_code: str,
+    inconclusive_code: str,
+    label: str,
+) -> None:
+    """Linearize a zero-write boundary against the held formal leaf name."""
+
+    scope.revalidate()
+    state, _ = _observe_bound_name(
+        scope.parent.fd,
+        scope.destination.name,
+    )
+    if state == "present":
+        raise StoreSafetyError(
+            exists_code,
+            f"{label} already exists: {scope.destination}",
+            details={
+                "destination": str(scope.destination),
+                "mutation_performed": False,
+            },
+        )
+    if state != "absent":
+        raise StoreSafetyError(
+            inconclusive_code,
+            f"Cannot prove that the descriptor-bound {label.lower()} name is "
+            f"absent: {scope.destination}",
+            details={
+                "destination": str(scope.destination),
+                "mutation_performed": False,
+            },
+        )
+
+
+@contextmanager
+def _create_bound_artifact_partial_after_destination_revalidation(
+    scope: _LiveDestinationScope,
+) -> Iterator[_BoundDirectory]:
+    """Revalidate the public leaf immediately before any partial creator runs."""
+
+    def revalidate_formal_leaf() -> None:
+        _revalidate_live_destination_name_absent(
+            scope,
+            exists_code="destination-exists",
+            inconclusive_code="snapshot-destination-scope-inconclusive",
+            label="Destination",
+        )
+
+    revalidate_formal_leaf()
+    partial = scope.destination.parent / (
+        f".{scope.destination.name}.partial-{uuid.uuid4().hex}"
+    )
+    with _create_bound_directory(
+        partial,
+        retain_failure_receipt=True,
+        parent_binding=scope.parent,
+        pre_create=revalidate_formal_leaf,
+    ) as bound_partial:
+        yield bound_partial
+
+
+@contextmanager
+def _commit_live_safe_destination_parent(
+    preflight: _LiveDestinationPreflight,
+) -> Iterator[_LiveDestinationScope]:
+    """Create a preflighted parent and expose its held write scope."""
+
+    requested_destination = preflight.requested_destination
+    canonical_destination = preflight.canonical_destination
+    live_containers = preflight.live_containers
+    live_bindings = preflight.live_bindings
+    trusted_alias = preflight.trusted_alias
+    missing_components = preflight.missing_parent_components
+    ancestor_binding = preflight.ancestor
+    parent_creation_mutation_performed = False
+    entered_scope = False
+    preflight.revalidate()
+    try:
+        with _create_bound_snapshot_destination_parent_components(
+            ancestor_binding,
+            missing_components,
+            live_bindings=live_bindings,
+            trusted_alias=trusted_alias,
+            destination=requested_destination,
+            display_path=requested_destination.parent,
+        ) as output_parent:
+            parent_creation_mutation_performed = bool(missing_components)
+
+            def revalidate() -> dict[str, Any]:
+                _assert_snapshot_destination_lexically_outside_live_containers(
+                    requested_destination,
+                    live_containers,
+                )
+                alias_receipt = (
+                    _verify_trusted_directory_alias(
+                        trusted_alias,
+                        destination=requested_destination,
+                    )
+                    if trusted_alias is not None
+                    else None
+                )
+                live_receipts = _verify_snapshot_live_container_bindings(
+                    live_bindings,
+                    destination=requested_destination,
+                )
+                try:
+                    parent_receipt = _verify_bound_directory_namespace(output_parent)
+                except StoreSafetyError as exc:
+                    if exc.code in {
+                        "prepared-directory-identity-mismatch",
+                        "prepared-directory-access-policy-mismatch",
+                    }:
+                        raise
+                    raise _raise_snapshot_destination_scope_inconclusive(
+                        "Cannot revalidate the descriptor-bound destination "
+                        f"parent: {requested_destination.parent}: {exc}",
+                        destination=requested_destination,
+                        cause=exc,
+                        mutation_performed=(
+                            parent_creation_mutation_performed
+                            or bool(exc.details.get("mutation_performed"))
+                        ),
+                    ) from exc
+                ancestor_chain = (
+                    _assert_snapshot_destination_ancestors_exclude_live_containers(
+                        output_parent.fd,
+                        live_bindings,
+                        destination=requested_destination,
+                        display_path=requested_destination.parent,
+                    )
+                )
+                return {
+                    "schema": "apple-notes-live-destination-scope/v2",
+                    "requested_destination": str(requested_destination),
+                    "canonical_destination": str(canonical_destination),
+                    "parent": parent_receipt,
+                    "live_containers": live_receipts,
+                    "trusted_alias": alias_receipt,
+                    "ancestor_chain": ancestor_chain,
+                    "protected_properties": {
+                        "object_identity": ["device", "inode", "file_type"],
+                        "location_scope": (
+                            "normalized-requested-and-canonical-alias-forms-"
+                            "bidirectional-and-descriptor-ancestor-exclusion"
+                        ),
+                        "access_policy": ["mode", "uid", "gid", "flags"],
+                        "trusted_alias": (
+                            "exact-registry-entry-parent-target-and-retarget-binding"
+                        ),
+                    },
+                }
+
+            revalidate()
+            output_parent.before_write = revalidate
+            entered_scope = True
+            yield _LiveDestinationScope(
+                requested_destination=requested_destination,
+                destination=requested_destination,
+                parent=output_parent,
+                revalidate=revalidate,
+                trusted_alias=trusted_alias,
+                parent_creation_mutation_performed=(parent_creation_mutation_performed),
+            )
+    except StoreSafetyError as exc:
+        mutation_performed = parent_creation_mutation_performed or bool(
+            exc.details.get("mutation_performed")
+        )
+        if mutation_performed:
+            exc.details = _merge_recovery_details(
+                exc.details,
+                {"mutation_performed": True},
+            )
+        if entered_scope or exc.code in {
+            "snapshot-destination-inside-live-container",
+            "snapshot-destination-reserved-store-path",
+            "snapshot-destination-scope-inconclusive",
+        }:
+            raise
+        error = _raise_snapshot_destination_scope_inconclusive(
+            "Cannot bind or create a safe destination parent: "
+            f"{canonical_destination.parent}: {exc}",
+            destination=requested_destination,
+            cause=exc,
+            mutation_performed=mutation_performed,
+        )
+        error.details = _merge_recovery_details(error.details, exc.details)
+        raise error from exc
+
+
+@contextmanager
+def _bind_live_safe_destination_parent(
+    paths: NoteStorePaths,
+    destination: Path,
+) -> Iterator[_LiveDestinationScope]:
+    """Preflight and then bind one live-safe destination parent."""
+
+    with _preflight_live_safe_destination_parent(
+        paths,
+        destination,
+    ) as preflight:
+        _assert_destination_preflight_name_absent(
+            preflight,
+            exists_code="destination-exists",
+            inconclusive_code="snapshot-destination-scope-inconclusive",
+            label="Destination",
+        )
+        with _commit_live_safe_destination_parent(preflight) as destination_scope:
+            yield destination_scope
+
+
+def _bounded_probe_directory_sample(directory_fd: int) -> list[str]:
+    """Return a small sorted sample while enforcing complete-scan input caps."""
+
+    names: list[str] = []
+    entry_count = 0
+    raw_name_bytes = 0
+    with os.scandir(directory_fd) as children:
+        for entry in children:
+            entry_count += 1
+            if entry_count > BOUND_DIRECTORY_SCAN_MAX_ENTRIES:
+                raise StoreSafetyError(
+                    "container-revalidation-inconclusive",
+                    "Container membership exceeds the bounded probe entry limit "
+                    f"({BOUND_DIRECTORY_SCAN_MAX_ENTRIES})",
+                    details={
+                        "entry_limit": BOUND_DIRECTORY_SCAN_MAX_ENTRIES,
+                        "observed_entries": entry_count,
+                    },
+                )
+            try:
+                raw_name = os.fsencode(entry.name)
+                name = os.fsdecode(raw_name)
+            except (TypeError, ValueError, UnicodeError) as exc:
+                raise StoreSafetyError(
+                    "container-revalidation-inconclusive",
+                    "Container membership contains an invalid raw entry name",
+                ) from exc
+            if (
+                not raw_name
+                or b"\x00" in raw_name
+                or b"/" in raw_name
+                or raw_name in {b".", b".."}
+                or os.fsencode(name) != raw_name
+            ):
+                raise StoreSafetyError(
+                    "container-revalidation-inconclusive",
+                    "Container membership contains an invalid raw entry name",
+                )
+            raw_name_bytes += len(raw_name)
+            if raw_name_bytes > BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES:
+                raise StoreSafetyError(
+                    "container-revalidation-inconclusive",
+                    "Container membership exceeds the bounded probe raw name-byte "
+                    f"limit ({BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES})",
+                    details={
+                        "raw_name_bytes_limit": (
+                            BOUND_DIRECTORY_SCAN_MAX_RAW_NAME_BYTES
+                        ),
+                        "observed_raw_name_bytes": raw_name_bytes,
+                    },
+                )
+            names.append(name)
+    return sorted(names)[:5]
+
+
+def _record_probe_container_failure(
+    record: dict[str, Any],
+    error: OSError | StoreSafetyError,
+    *,
+    binding: _BoundDirectory | None,
+    terminal: bool,
+) -> StoreSafetyError | None:
+    """Keep one container failure inside its probe-result boundary."""
+
+    if terminal and binding is not None:
+        translated = _source_directory_revalidation_error(binding, error)
+        _record_probe_terminal_source_failure(record, translated)
+        return translated
+
+    record["sample_children"] = []
+    if isinstance(error, StoreSafetyError):
+        if error.code == "prepared-directory-missing":
+            return None
+        record["exists"] = error.code != "prepared-directory-missing"
+        error_code = (
+            "container-unreadable"
+            if _exception_chain_contains_permission_error(error)
+            else "container-revalidation-inconclusive"
+        )
+        record["error_code"] = error_code
+        record["error"] = str(error)
+        return StoreSafetyError(error_code, str(error))
+    if isinstance(error, FileNotFoundError):
+        return None
+    record["exists"] = not isinstance(error, FileNotFoundError)
+    error_code = (
+        "container-unreadable"
+        if isinstance(error, PermissionError)
+        else "container-revalidation-inconclusive"
+    )
+    record["error_code"] = error_code
+    record["error"] = str(error)
+    return StoreSafetyError(error_code, str(error))
+
+
+def _record_probe_terminal_source_failure(
+    record: dict[str, Any],
+    error: StoreSafetyError,
+) -> None:
+    """Replace one earlier readable result with terminal source evidence."""
+
+    record.update(
+        {
+            "exists": True,
+            "readable": False,
+            "error_code": error.code,
+            "error": str(error),
+        }
+    )
+
+
+def _invalidate_probe_file_records_for_terminal_source_failure(
+    file_records: list[dict[str, Any]],
+    error: StoreSafetyError,
+) -> None:
+    """Withdraw file authority derived from a terminally invalid directory."""
+
+    for file_record in file_records:
+        file_record["readable"] = False
+        file_record["error_code"] = error.code
+        file_record["error"] = str(error)
+        for field in ("size", "identity", "access_policy"):
+            file_record.pop(field, None)
+
+
+def probe_db_access(paths: NoteStorePaths) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
+    group_binding: _BoundDirectory | None = None
+    group_stack: ExitStack | None = None
+    group_record: dict[str, Any] | None = None
+    group_dependency_error: StoreSafetyError | None = None
+    for is_group, path in (
+        (True, paths.group_container),
+        (False, paths.app_container),
+    ):
+        record: dict[str, Any] = {"path": path, "exists": False, "readable": False}
+        binding: _BoundDirectory | None = None
+        body_complete = False
+        try:
+            with ExitStack() as container_stack:
+                binding = container_stack.enter_context(
+                    _bind_existing_directory_with_trusted_alias(path)
+                )
+                scan_fd = os.dup(binding.fd)
+                try:
+                    record["sample_children"] = _bounded_probe_directory_sample(scan_fd)
+                finally:
+                    os.close(scan_fd)
+                body_complete = True
+                _verify_bound_directory_namespace(binding)
+                if is_group:
+                    group_stack = container_stack.pop_all()
+            record["exists"] = True
+            record["readable"] = True
+            if is_group:
+                group_binding = binding
+                group_record = record
+        except (FileNotFoundError, StoreSafetyError) as exc:
+            dependency_error = _record_probe_container_failure(
+                record,
+                exc,
+                binding=binding,
+                terminal=body_complete,
+            )
+            if is_group and dependency_error is not None:
+                group_dependency_error = dependency_error
+        except OSError as exc:
+            dependency_error = _record_probe_container_failure(
+                record,
+                exc,
+                binding=binding,
+                terminal=body_complete,
+            )
+            if is_group and dependency_error is not None:
+                group_dependency_error = dependency_error
+        entries.append(record)
+
+    file_records: list[dict[str, Any]] = []
+    try:
+        for db_file in paths.note_store_files():
+            file_record: dict[str, Any] = {
+                "path": db_file,
+                "exists": False,
+                "readable": False,
+            }
+            if group_binding is None:
+                if group_dependency_error is not None:
+                    file_record["error_code"] = group_dependency_error.code
+                    file_record["error"] = str(group_dependency_error)
+                file_records.append(file_record)
+                continue
+            try:
+                fd, opened = _open_regular_readonly_at(
+                    group_binding,
+                    db_file.name,
+                    display_path=db_file,
+                )
+            except StoreSafetyError as exc:
+                if exc.code != "source-missing":
+                    file_record["exists"] = True
+                    file_record["error_code"] = exc.code
+                    file_record["error"] = str(exc)
+            else:
+                os.close(fd)
+                try:
+                    _verify_bound_source_directory(group_binding)
+                except StoreSafetyError as exc:
+                    file_record.update(
+                        {
+                            "exists": True,
+                            "error_code": exc.code,
+                            "error": str(exc),
+                        }
+                    )
+                else:
+                    file_record.update(
+                        {
+                            "exists": True,
+                            "readable": True,
+                            "size": opened.st_size,
+                            "identity": _identity(opened),
+                            "access_policy": _access_policy(opened),
+                        }
+                    )
+            file_records.append(file_record)
+    finally:
+        if group_stack is not None:
+            try:
+                group_stack.close()
+            except (OSError, StoreSafetyError) as exc:
+                if group_record is None or group_binding is None:
+                    raise
+                translated = _source_directory_revalidation_error(
+                    group_binding,
+                    exc,
+                )
+                _record_probe_terminal_source_failure(
+                    group_record,
+                    translated,
+                )
+                _invalidate_probe_file_records_for_terminal_source_failure(
+                    file_records,
+                    translated,
+                )
+    return {"paths": entries, "note_store_files": file_records}
+
+
+def _wal_checksum(
+    payload: bytes,
+    byte_order: str,
+    seed: tuple[int, int] = (0, 0),
+) -> tuple[int, int]:
+    if len(payload) % 8:
+        raise StoreSafetyError(
+            "wal-invalid", "WAL checksum input is not 8-byte aligned"
+        )
+    values = struct.unpack(f"{byte_order}{len(payload) // 4}I", payload)
+    checksum0, checksum1 = seed
+    for index in range(0, len(values), 2):
+        checksum0 = (checksum0 + values[index] + checksum1) & 0xFFFFFFFF
+        checksum1 = (checksum1 + values[index + 1] + checksum0) & 0xFFFFFFFF
+    return checksum0, checksum1
+
+
+def _inspect_wal_payload(payload: bytes, wal_path: Path) -> dict[str, Any]:
+    size = len(payload)
+    if size == 0:
+        return {
+            "present": True,
+            "status": "empty",
+            "size": 0,
+            "frame_count": 0,
+            "commit_frame_count": 0,
+        }
+    header = payload[:32]
+    if len(header) != 32:
+        raise StoreSafetyError("wal-invalid", f"WAL header is truncated: {wal_path}")
+    magic, version, raw_page_size, _, salt1, salt2, stored0, stored1 = struct.unpack(
+        ">8I", header
+    )
+    if magic not in WAL_MAGIC_NUMBERS:
+        raise StoreSafetyError("wal-invalid", f"WAL magic is invalid: {wal_path}")
+    if version != WAL_VERSION:
+        raise StoreSafetyError(
+            "wal-version-unsupported",
+            f"Unsupported WAL version {version}: {wal_path}",
+        )
+    page_size = raw_page_size
+    if page_size < 512 or page_size > 65536 or page_size & (page_size - 1):
+        raise StoreSafetyError("wal-invalid", f"WAL page size is invalid: {wal_path}")
+    checksum_byte_order = ">" if magic == 0x377F0683 else "<"
+    checksum = _wal_checksum(header[:24], checksum_byte_order)
+    if checksum != (stored0, stored1):
+        raise StoreSafetyError(
+            "wal-invalid", f"WAL header checksum is invalid: {wal_path}"
+        )
+    frame_size = 24 + page_size
+    frame_bytes = size - 32
+    physical_frame_count, trailing_bytes = divmod(frame_bytes, frame_size)
+    valid_frame_count = 0
+    commit_frame_count = 0
+    last_valid_commit_frame = 0
+    last_valid_commit_evidence: dict[str, Any] | None = None
+    first_invalid_frame: int | None = None
+    for index in range(physical_frame_count):
+        offset = 32 + index * frame_size
+        frame_header = payload[offset : offset + 24]
+        page = payload[offset + 24 : offset + frame_size]
+        page_number, database_pages, frame_salt1, frame_salt2, _, _ = struct.unpack(
+            ">6I", frame_header
+        )
+        if page_number == 0 or (frame_salt1, frame_salt2) != (salt1, salt2):
+            first_invalid_frame = index + 1
+            break
+        expected_checksum = struct.unpack(">2I", frame_header[16:24])
+        checksum = _wal_checksum(
+            frame_header[:8] + page,
+            checksum_byte_order,
+            checksum,
+        )
+        if checksum != expected_checksum:
+            first_invalid_frame = index + 1
+            break
+        valid_frame_count = index + 1
+        if database_pages:
+            commit_frame_count += 1
+            last_valid_commit_frame = index + 1
+            last_valid_commit_evidence = {
+                "frame": index + 1,
+                "database_page_count": database_pages,
+                "frame_checksum": list(expected_checksum),
+            }
+    return {
+        "present": True,
+        "status": (
+            "valid"
+            if first_invalid_frame is None and trailing_bytes == 0
+            else "valid-prefix-with-ignored-tail"
+        ),
+        "size": size,
+        "page_size": page_size,
+        "physical_frame_count": physical_frame_count,
+        "valid_frame_count": valid_frame_count,
+        "commit_frame_count": commit_frame_count,
+        "last_valid_commit_frame": last_valid_commit_frame,
+        "last_valid_commit_evidence": last_valid_commit_evidence,
+        "first_invalid_frame": first_invalid_frame,
+        "trailing_bytes": trailing_bytes,
+        "salt": [salt1, salt2],
+        "checksum_byte_order": ("little" if checksum_byte_order == "<" else "big"),
+        "big_end_checksum": checksum_byte_order == ">",
+    }
+
+
+def _wal_physical_frame_header_evidence(
+    payload: bytes,
+    wal: dict[str, Any],
+    frame_number: int,
+) -> dict[str, Any] | None:
+    """Return bounded header evidence for one complete physical WAL frame."""
+
+    physical_frame_count = int(wal.get("physical_frame_count", 0))
+    if frame_number <= 0 or frame_number > physical_frame_count:
+        return None
+    page_size = int(wal["page_size"])
+    frame_size = 24 + page_size
+    offset = 32 + (frame_number - 1) * frame_size
+    if offset + frame_size > len(payload):
+        return None
+    frame_header = payload[offset : offset + 24]
+    page_number, database_pages, salt1, salt2, checksum0, checksum1 = struct.unpack(
+        ">6I",
+        frame_header,
+    )
+    return {
+        "frame": frame_number,
+        "page_number": page_number,
+        "database_page_count": database_pages,
+        "salt": [salt1, salt2],
+        "frame_checksum": [checksum0, checksum1],
+    }
+
+
+def _inspect_wal(wal_path: Path) -> dict[str, Any]:
+    try:
+        payload = wal_path.read_bytes()
+    except OSError as exc:
+        raise StoreSafetyError(
+            "wal-invalid",
+            f"Cannot read WAL for validation: {wal_path}: {exc}",
+        ) from exc
+    return _inspect_wal_payload(payload, wal_path)
+
+
+def _parse_shm_header_copy(payload: bytes, offset: int) -> dict[str, Any] | None:
+    if len(payload) < offset + 48:
+        return None
+    byte_order = "<" if sys.byteorder == "little" else ">"
+    version = struct.unpack_from(f"{byte_order}I", payload, offset)[0]
+    if version != WAL_VERSION:
+        return None
+    initialized = payload[offset + 12]
+    if initialized not in {0, 1}:
+        return None
+    big_end_checksum = payload[offset + 13]
+    if big_end_checksum not in {0, 1}:
+        return None
+    calculated_checksum = _wal_checksum(
+        payload[offset : offset + 40],
+        byte_order,
+    )
+    stored_checksum = struct.unpack_from(
+        f"{byte_order}2I",
+        payload,
+        offset + 40,
+    )
+    if calculated_checksum != stored_checksum:
+        return None
+    raw_page_size = struct.unpack_from(f"{byte_order}H", payload, offset + 14)[0]
+    page_size = 65536 if raw_page_size == 1 else raw_page_size
+    max_frame = struct.unpack_from(f"{byte_order}I", payload, offset + 16)[0]
+    # WAL-index integers use native byte order, but aSalt is copied byte-for-byte
+    # from the big-endian WAL header.
+    salt = list(struct.unpack_from(">2I", payload, offset + 32))
+    return {
+        "byte_order": sys.byteorder,
+        "initialized": bool(initialized),
+        "change_counter": struct.unpack_from(
+            f"{byte_order}I",
+            payload,
+            offset + 8,
+        )[0],
+        "big_end_checksum": bool(big_end_checksum),
+        "raw_page_size": raw_page_size,
+        "page_size": page_size,
+        "max_frame": max_frame,
+        "database_page_count": struct.unpack_from(
+            f"{byte_order}I",
+            payload,
+            offset + 20,
+        )[0],
+        "frame_checksum": list(
+            struct.unpack_from(
+                f"{byte_order}2I",
+                payload,
+                offset + 24,
+            )
+        ),
+        "salt": salt,
+        "header_checksum": list(stored_checksum),
+    }
+
+
+def _classify_sidecar_payloads(
+    main_path: Path,
+    *,
+    wal_payload: bytes | None,
+    shm_payload: bytes | None,
+) -> dict[str, Any]:
+    wal_path = main_path.with_name(f"{main_path.name}-wal")
+    shm_path = main_path.with_name(f"{main_path.name}-shm")
+    wal: dict[str, Any]
+    if wal_payload is not None:
+        wal = _inspect_wal_payload(wal_payload, wal_path)
+    else:
+        wal = {"present": False, "status": "absent"}
+
+    shm: dict[str, Any] = {"present": False, "status": "absent"}
+    if shm_payload is not None:
+        header = shm_payload[:96]
+        parsed_copies = (
+            _parse_shm_header_copy(header, 0),
+            _parse_shm_header_copy(header, 48),
+        )
+        copies = [parsed for parsed in parsed_copies if parsed is not None]
+        duplicate_headers_consistent = (
+            len(copies) == 2
+            and parsed_copies[0] == parsed_copies[1]
+            and header[:48] == header[48:96]
+        )
+        trusted_header = parsed_copies[0] if duplicate_headers_consistent else None
+        same_generation_header = (
+            trusted_header
+            if trusted_header is not None
+            and wal.get("status") not in {"absent", "empty"}
+            and trusted_header["initialized"]
+            and trusted_header["salt"] == wal["salt"]
+            and trusted_header["page_size"] == wal["page_size"]
+            and trusted_header["big_end_checksum"] == wal["big_end_checksum"]
+            else None
+        )
+        committed_frame_binding: dict[str, Any] | None = None
+        matching_wal_commit = False
+        if same_generation_header is not None:
+            committed_frame_binding = _wal_physical_frame_header_evidence(
+                wal_payload,
+                wal,
+                int(same_generation_header["max_frame"]),
+            )
+            exact_physical_commit_binding = (
+                committed_frame_binding is not None
+                and committed_frame_binding["page_number"] > 0
+                and committed_frame_binding["database_page_count"] > 0
+                and committed_frame_binding["salt"] == wal["salt"]
+                and committed_frame_binding["frame_checksum"]
+                == same_generation_header["frame_checksum"]
+                and committed_frame_binding["database_page_count"]
+                == same_generation_header["database_page_count"]
+            )
+            last_valid_commit = wal.get("last_valid_commit_evidence")
+            matching_wal_commit = bool(
+                exact_physical_commit_binding
+                and last_valid_commit is not None
+                and committed_frame_binding["frame"] == wal["last_valid_commit_frame"]
+                and committed_frame_binding["frame"] == last_valid_commit["frame"]
+                and committed_frame_binding["frame_checksum"]
+                == last_valid_commit["frame_checksum"]
+                and committed_frame_binding["database_page_count"]
+                == last_valid_commit["database_page_count"]
+            )
+            if (
+                exact_physical_commit_binding
+                and committed_frame_binding["frame"] > wal["last_valid_commit_frame"]
+            ):
+                raise StoreSafetyError(
+                    "wal-shm-commit-mismatch",
+                    "The duplicate native-order SHM header binds mxFrame, "
+                    "aFrameCksum, and nPage to a later physical WAL commit frame "
+                    "whose checksum-valid prefix is incomplete",
+                )
+        shm = {
+            "present": True,
+            "status": "derived-match"
+            if matching_wal_commit
+            else "derived-rebuild-required",
+            "size": len(shm_payload),
+            "valid_header_copies": len(copies),
+            "duplicate_headers_consistent": duplicate_headers_consistent,
+            "native_byte_order": sys.byteorder,
+            "same_generation_header_copies": (
+                2 if same_generation_header is not None else 0
+            ),
+            "matching_wal_header_copies": (
+                2 if matching_wal_commit and duplicate_headers_consistent else 0
+            ),
+            "committed_frame_binding": committed_frame_binding,
+        }
+
+    ignored = [shm_path.name] if shm_payload is not None else []
+    authoritative = [main_path.name]
+    if wal_payload is not None and wal.get("last_valid_commit_frame", 0) > 0:
+        authoritative.append(wal_path.name)
+    return {
+        "wal": wal,
+        "shm": shm,
+        "recovery": {
+            "authoritative_files": authoritative,
+            "ignored_derived_files": ignored,
+            "strategy": (
+                "bind copied main/WAL/SHM, ignore derived SHM bytes, and apply the "
+                "checksum-valid committed WAL prefix to an anonymous image"
+            ),
+        },
+    }
+
+
+def _inspect_sidecars(main_path: Path) -> dict[str, Any]:
+    wal_path = main_path.with_name(f"{main_path.name}-wal")
+    shm_path = main_path.with_name(f"{main_path.name}-shm")
+    try:
+        wal_payload = wal_path.read_bytes() if wal_path.exists() else None
+        shm_payload = shm_path.read_bytes() if shm_path.exists() else None
+    except OSError as exc:
+        raise StoreSafetyError(
+            "wal-invalid",
+            f"Cannot read copied recovery sidecars beside {main_path}: {exc}",
+        ) from exc
+    return _classify_sidecar_payloads(
+        main_path,
+        wal_payload=wal_payload,
+        shm_payload=shm_payload,
+    )
+
+
+def _inspect_bound_sidecars(
+    store: Union[_BoundRecoveryStore, _BoundSourceStore],
+) -> dict[str, Any]:
+    wal_name = f"{store.main_name}-wal"
+    shm_name = f"{store.main_name}-shm"
+    codes = _recovery_input_codes(store)
+
+    def read_if_present(basename: str) -> bytes | None:
+        bound = store.files.get(basename)
+        if bound is None:
+            return None
+        return _read_bound_file_bytes(
+            bound,
+            codes,
+            max_bytes=bound.opened.st_size,
+            too_large_code=codes.content,
+            dir_fd=store.directory.fd,
+            basename=basename,
+        )
+
+    _verify_bound_recovery_input(store)
+    result = _classify_sidecar_payloads(
+        store.directory.path / store.main_name,
+        wal_payload=read_if_present(wal_name),
+        shm_payload=read_if_present(shm_name),
+    )
+    _verify_bound_recovery_input(store)
+    return result
+
+
+def _sqlite_integrity(
+    database: Path | _BoundRegularFile,
+    *,
+    parent: _BoundDirectory | None = None,
+    file_codes: _FileProtectionCodes = PREPARED_FILE_CODES,
+) -> dict[str, Any]:
+    db_path = database.path if isinstance(database, _BoundRegularFile) else database
+    if isinstance(database, _BoundRegularFile):
+
+        def verify_bound() -> dict[str, Any]:
+            if parent is None:
+                return _verify_bound_regular_file(
+                    database,
+                    file_codes,
+                )
+            return _verify_bound_regular_file_at(
+                database,
+                file_codes,
+                dir_fd=parent.fd,
+                basename=database.path.name,
+            )
+
+        with _deserialized_sqlite_image(
+            database,
+            db_path,
+            verify_bound=verify_bound,
+            error_code="sqlite-integrity-failed",
+            require_backup=False,
+            file_codes=file_codes,
+        ) as image:
+            return _sqlite_integrity_from_image(image, db_path)
+    try:
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("PRAGMA busy_timeout = 5000")
+            rows = [
+                str(row[0]) for row in conn.execute("PRAGMA integrity_check").fetchall()
+            ]
+            journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0])
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+    except sqlite3.Error as exc:
+        raise StoreSafetyError(
+            "sqlite-integrity-failed",
+            f"SQLite could not validate {db_path}: {exc}",
+        ) from exc
+    if rows != ["ok"]:
+        raise StoreSafetyError(
+            "sqlite-integrity-failed",
+            f"SQLite integrity_check failed for {db_path}: {rows[:5]}",
+        )
+    return {
+        "result": "ok",
+        "check": "PRAGMA integrity_check",
+        "journal_mode": journal_mode,
+        "page_count": page_count,
+    }
+
+
+def _make_recovery_clone(src_main: Path, destination: Path) -> _RecoveryClone:
+    with _create_bound_directory(destination) as destination_binding:
+        records = _capture_database_files(
+            src_main,
+            destination,
+            destination_binding=destination_binding,
+        )
+        copied_main = destination / src_main.name
+        file_receipts = {str(record["basename"]): record["copy"] for record in records}
+        receipt = _recovery_store_creation_receipt(
+            destination_binding,
+            src_main.name,
+            file_receipts,
+        )
+        with _bind_recovery_store(
+            copied_main,
+            creation_receipt=receipt,
+        ) as copied_store:
+            sidecars = _inspect_bound_sidecars(copied_store)
+            _assert_recovery_store_matches_receipt(copied_store, receipt)
+        _verify_bound_directory(destination_binding)
+    return _RecoveryClone(
+        main_path=copied_main,
+        evidence={"capture": records, "sidecars": sidecars},
+        receipt=receipt,
+    )
+
+
+def _make_recovery_clone_from_bound(
+    files: dict[str, _BoundRegularFile],
+    destination: Path,
+    codes: _FileProtectionCodes,
+    *,
+    source_parent: _BoundDirectory,
+) -> _RecoveryClone:
+    """Copy an already-bound store without reopening mutable source paths."""
+
+    if NOTE_STORE_MAIN not in files:
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "The bound recovery file set has no main SQLite database",
+        )
+    with _create_bound_directory(destination) as destination_binding:
+        records: list[dict[str, Any]] = []
+        for basename in NOTE_STORE_BASENAMES:
+            bound = files.get(basename)
+            if bound is None:
+                continue
+            source = _verify_bound_regular_file_at(
+                bound,
+                codes,
+                dir_fd=source_parent.fd,
+                basename=basename,
+            )
+            copied = _copy_fd(
+                bound.fd,
+                destination / basename,
+                destination_binding=destination_binding,
+            )
+            if (
+                copied["sha256"] != bound.sha256
+                or copied["size"] != bound.opened.st_size
+            ):
+                raise StoreSafetyError(
+                    codes.content,
+                    f"Bound source changed while creating recovery clone: {bound.path}",
+                )
+            _verify_bound_regular_file_at(
+                bound,
+                codes,
+                dir_fd=source_parent.fd,
+                basename=basename,
+            )
+            records.append(
+                {
+                    "basename": basename,
+                    "source": source,
+                    "copy": copied,
+                }
+            )
+        copied_main = destination / NOTE_STORE_MAIN
+        file_receipts = {str(record["basename"]): record["copy"] for record in records}
+        receipt = _recovery_store_creation_receipt(
+            destination_binding,
+            NOTE_STORE_MAIN,
+            file_receipts,
+        )
+        with _bind_recovery_store(
+            copied_main,
+            creation_receipt=receipt,
+        ) as copied_store:
+            sidecars = _inspect_bound_sidecars(copied_store)
+            _assert_recovery_store_matches_receipt(copied_store, receipt)
+        _verify_bound_directory(destination_binding)
+    return _RecoveryClone(
+        main_path=copied_main,
+        evidence={"capture": records, "sidecars": sidecars},
+        receipt=receipt,
+    )
+
+
+def _validate_bound_database_recovery(
+    source_store: _BoundSourceStore,
+) -> dict[str, Any]:
+    evidence = {
+        "capture": _capture_bound_source_store(source_store),
+        "sidecars": _inspect_bound_sidecars(source_store),
+    }
+    _require_authoritative_wal(source_store, evidence)
+    evidence["sqlite_integrity"] = _bound_recovery_integrity(source_store)
+    _verify_bound_source_store(source_store)
+    return evidence
+
+
+def validate_database_recovery(src_main: Path) -> dict[str, Any]:
+    with _bind_source_store(src_main) as source_store:
+        return _validate_bound_database_recovery(source_store)
+
+
+def _fingerprint_file(path: Path) -> dict[str, Any]:
+    records = _capture_database_files(path)
+    if len(records) != 1:
+        raise StoreSafetyError(
+            "unexpected-sidecars",
+            f"Expected a standalone SQLite file but found sidecars beside {path}",
+        )
+    return records[0]["source"]
+
+
+def _publication_details(
+    state: str,
+    *,
+    prepared: _BoundRegularFile | None,
+    destination: Path,
+    retry_safe: bool,
+    descriptor_bound_destination: dict[str, Any] | None = None,
+    descriptor_bound_prepared_file: dict[str, Any] | None = None,
+    descriptor_bound_prepared_root: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    locators: dict[str, Any] = {"destination": str(destination)}
+    if descriptor_bound_destination is not None:
+        locators["descriptor_bound_destination"] = descriptor_bound_destination
+    if descriptor_bound_prepared_file is not None:
+        locators["descriptor_bound_prepared_file"] = descriptor_bound_prepared_file
+    if descriptor_bound_prepared_root is not None:
+        locators["descriptor_bound_prepared_root"] = descriptor_bound_prepared_root
+    if prepared is not None:
+        receipt: dict[str, Any] = {
+            "path": str(prepared.path),
+            "identity": _identity(prepared.opened),
+        }
+        if prepared.parent_opened is not None:
+            receipt["parent_identity"] = _identity(prepared.parent_opened)
+        try:
+            parent = os.stat(prepared.path.parent, follow_symlinks=False)
+            leaf = os.stat(prepared.path, follow_symlinks=False)
+        except FileNotFoundError:
+            receipt["verification"] = "absent-or-parent-missing"
+            locators["prepared_unverified"] = receipt
+        except Exception as exc:
+            receipt["verification"] = f"inconclusive: {exc}"
+            receipt["verification_error_type"] = type(exc).__name__
+            receipt["verification_errno"] = getattr(exc, "errno", None)
+            locators["prepared_unverified"] = receipt
+        else:
+            parent_matches = (
+                prepared.parent_opened is not None
+                and stat.S_ISDIR(parent.st_mode)
+                and _same_identity(prepared.parent_opened, parent)
+                and _access_policy(prepared.parent_opened) == _access_policy(parent)
+            )
+            leaf_matches = (
+                stat.S_ISREG(leaf.st_mode)
+                and _same_identity(prepared.opened, leaf)
+                and _access_policy(prepared.opened) == _access_policy(leaf)
+            )
+            if parent_matches and leaf_matches:
+                locators["prepared"] = str(prepared.path)
+            else:
+                receipt["verification"] = "creation-receipt-mismatch"
+                receipt["observed_identity"] = _identity(leaf)
+                receipt["observed_parent_identity"] = _identity(parent)
+                locators["prepared_unverified"] = receipt
+    return {
+        "publication_state": state,
+        "retry_safe": retry_safe,
+        "recovery_locators": locators,
+    }
+
+
+def _post_publication_uncertain_error(
+    exc: BaseException,
+    *,
+    destination: Path,
+    descriptor_bound_destination: dict[str, Any] | None,
+    phase: str,
+    message: str,
+    additional_details: dict[str, Any] | None = None,
+) -> StoreSafetyError:
+    """Classify every failure after publication as mutated and non-retryable."""
+
+    failure_receipt: dict[str, Any] = {
+        "schema": "apple-notes-post-publication-failure/v1",
+        "destination": str(destination),
+        "phase": phase,
+        "mutation_performed": True,
+        "publication_state": "uncertain",
+        "retry_safe": False,
+        "error_type": type(exc).__name__,
+        "errno": getattr(exc, "errno", None),
+    }
+    if isinstance(exc, StoreSafetyError):
+        failure_receipt["error_code"] = exc.code
+
+    details = _publication_details(
+        "uncertain",
+        prepared=None,
+        destination=destination,
+        retry_safe=False,
+        descriptor_bound_destination=descriptor_bound_destination,
+    )
+    details.update(
+        {
+            "mutation_performed": True,
+            "cleanup_state": "retained",
+            "post_publication_phase": phase,
+            "post_publication_error_type": type(exc).__name__,
+            "post_publication_errno": getattr(exc, "errno", None),
+        }
+    )
+    details["recovery_locators"]["post_publication_failure"] = failure_receipt
+    if isinstance(exc, StoreSafetyError):
+        details = _merge_recovery_details(details, exc.details)
+        details["post_publication_error_code"] = exc.code
+    if additional_details:
+        details = _merge_recovery_details(details, additional_details)
+
+    # These fields are terminal properties of this wrapper.  Reassert them
+    # after evidence merging so nested pre-publication receipts cannot weaken
+    # the post-publication conclusion.
+    details["mutation_performed"] = True
+    details["publication_state"] = "uncertain"
+    details["retry_safe"] = False
+    return StoreSafetyError(
+        "destination-install-uncertain",
+        f"{message}: {destination}: {exc}",
+        details=details,
+    )
+
+
+def _latch_publication_commit(state: dict[str, Any] | None) -> None:
+    """Record a monotonic commit fact before any post-rename evidence work."""
+
+    if state is None:
+        return
+    state["committed"] = True
+    state["commit_boundary"] = "no-replace-rename-returned-or-proved-committed"
+
+
+@contextmanager
+def _post_publication_failure_guard(
+    state: dict[str, Any],
+    *,
+    destination: Path,
+    phase: str,
+    message: str,
+) -> Iterator[None]:
+    """Catch body and nested-context teardown failures after publication."""
+
+    try:
+        yield
+    except Exception as exc:
+        if not state.get("committed"):
+            raise
+        if state.get("handled_terminal_failure") is exc:
+            raise
+        descriptor = state.get("descriptor_bound_destination")
+        additional = state.get("additional_details")
+        error = _post_publication_uncertain_error(
+            exc,
+            destination=destination,
+            descriptor_bound_destination=(
+                descriptor if isinstance(descriptor, dict) else None
+            ),
+            phase=phase,
+            message=message,
+            additional_details=(additional if isinstance(additional, dict) else None),
+        )
+        if (
+            isinstance(exc, StoreSafetyError)
+            and exc.code == "destination-install-uncertain"
+        ):
+            exc.details = error.details
+            raise
+        raise error from exc
+
+
+def _descriptor_bound_prepared_retry_receipt(
+    parent_fd: int,
+    prepared: _BoundRegularFile,
+    destination: Path,
+) -> dict[str, Any]:
+    """Prove that a failed rename left the complete prepared object retryable."""
+
+    if prepared.parent_opened is None:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Prepared file has no parent receipt: {prepared.path}",
+        )
+    parent = _verify_bound_parent_descriptor(
+        parent_fd,
+        prepared.parent_opened,
+        display_path=prepared.path.parent,
+        identity_code="prepared-file-identity-mismatch",
+        access_policy_code="prepared-file-access-policy-mismatch",
+        inconclusive_code="prepared-file-revalidation-inconclusive",
+    )
+    fingerprint = _verify_bound_regular_file_at(
+        prepared,
+        PREPARED_FILE_CODES,
+        dir_fd=parent_fd,
+        basename=prepared.path.name,
+    )
+    parent = _verify_bound_parent_descriptor(
+        parent_fd,
+        prepared.parent_opened,
+        display_path=prepared.path.parent,
+        identity_code="prepared-file-identity-mismatch",
+        access_policy_code="prepared-file-access-policy-mismatch",
+        inconclusive_code="prepared-file-revalidation-inconclusive",
+    )
+    target_state, target_observed = _observe_bound_sibling(
+        parent_fd,
+        prepared,
+        destination,
+    )
+    parent = _verify_bound_parent_descriptor(
+        parent_fd,
+        prepared.parent_opened,
+        display_path=prepared.path.parent,
+        identity_code="prepared-file-identity-mismatch",
+        access_policy_code="prepared-file-access-policy-mismatch",
+        inconclusive_code="prepared-file-revalidation-inconclusive",
+    )
+    target_receipt: dict[str, Any] = {
+        "display_path": str(destination),
+        "basename": destination.name,
+        "state": target_state,
+        "verification": "terminal-descriptor-relative-no-follow-observation",
+        "parent_identity": _identity(parent),
+        "evidence_status": (
+            "inconclusive" if target_state == "unavailable" else "checked"
+        ),
+    }
+    if target_state == "present" and target_observed is not None:
+        target_receipt["identity"] = _identity(target_observed)
+        target_receipt["access_policy"] = _access_policy(target_observed)
+    return {
+        "display_path": str(prepared.path),
+        "verification": (
+            "bound-parent-leaf-identity-content-size-and-access-match-creation-receipts"
+        ),
+        "parent_identity": _identity(parent),
+        "parent_access_policy": _access_policy(parent),
+        "leaf_identity": fingerprint["identity"],
+        "leaf_access_policy": fingerprint["access_policy"],
+        "sha256": fingerprint["sha256"],
+        "size": fingerprint["size"],
+        "target": target_receipt,
+    }
+
+
+def _descriptor_bound_destination_receipt(
+    parent_fd: int,
+    prepared: _BoundRegularFile,
+    destination: Path,
+) -> dict[str, Any]:
+    """Bind the installed leaf to the still-open publication parent."""
+
+    if prepared.parent_opened is None:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Prepared file has no parent receipt: {prepared.path}",
+        )
+    parent = _verify_bound_parent_descriptor(
+        parent_fd,
+        prepared.parent_opened,
+        display_path=destination.parent,
+        identity_code="prepared-file-identity-mismatch",
+        access_policy_code="prepared-file-access-policy-mismatch",
+        inconclusive_code="prepared-file-revalidation-inconclusive",
+    )
+    leaf = os.stat(
+        destination.name,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+    )
+    if not stat.S_ISREG(leaf.st_mode) or not _same_identity(prepared.opened, leaf):
+        raise StoreSafetyError(
+            "prepared-file-identity-mismatch",
+            "The descriptor-bound destination no longer identifies the prepared "
+            f"regular file: {destination}",
+        )
+    if _access_policy(prepared.opened) != _access_policy(leaf):
+        raise StoreSafetyError(
+            "prepared-file-access-policy-mismatch",
+            f"The descriptor-bound destination changed access policy: {destination}",
+        )
+    fingerprint = _verify_bound_regular_file_at(
+        prepared,
+        PREPARED_FILE_CODES,
+        dir_fd=parent_fd,
+        basename=destination.name,
+    )
+    return {
+        "display_path": str(destination),
+        "verification": "bound-parent-and-leaf-match-creation-receipts",
+        "content_verification": "descriptor-rehashed-against-creation-receipt",
+        "namespace_note": (
+            "The display path may no longer resolve if its ancestor namespace "
+            "was replaced after descriptor-bound publication"
+        ),
+        "parent_identity": _identity(parent),
+        "parent_access_policy": _access_policy(parent),
+        "leaf_identity": _identity(leaf),
+        "leaf_access_policy": _access_policy(leaf),
+        "sha256": fingerprint["sha256"],
+        "size": fingerprint["size"],
+    }
+
+
+def _descriptor_bound_file_recovery_evidence(
+    parent_fd: int,
+    prepared: _BoundRegularFile,
+    destination: Path,
+    *,
+    terminal_error: BaseException,
+) -> dict[str, Any]:
+    """Retain best-effort descriptor evidence without claiming terminal content."""
+
+    evidence: dict[str, Any] = {
+        "evidence_status": "checked",
+        "prepared_display_path": str(prepared.path),
+        "destination_display_path": str(destination),
+        "terminal_error_type": type(terminal_error).__name__,
+        "terminal_errno": getattr(terminal_error, "errno", None),
+        "terminal_error": str(terminal_error),
+        "namespace_note": (
+            "Display paths are advisory; the held parent and file descriptors "
+            "remain the recovery authority"
+        ),
+        "content": {
+            "sha256": prepared.sha256,
+            "size": prepared.opened.st_size,
+            "verification": "creation-receipt-last-verified-before-terminal-error",
+        },
+    }
+    observations: dict[str, Any] = {}
+    for label, path in (
+        ("prepared_name", prepared.path),
+        ("destination_name", destination),
+    ):
+        state, observed = _observe_bound_sibling(parent_fd, prepared, path)
+        row: dict[str, Any] = {"status": state}
+        if state == "present" and observed is not None:
+            row["identity"] = _identity(observed)
+            row["access_policy"] = _access_policy(observed)
+        elif state == "unavailable":
+            evidence["evidence_status"] = "inconclusive"
+            row["evidence_status"] = "inconclusive"
+        observations[label] = row
+    evidence["namespace_observations"] = observations
+
+    try:
+        parent = os.fstat(parent_fd)
+    except Exception as exc:
+        evidence["evidence_status"] = "inconclusive"
+        evidence["parent_descriptor_error"] = str(exc)
+        evidence["parent_descriptor_error_type"] = type(exc).__name__
+        evidence["parent_descriptor_errno"] = getattr(exc, "errno", None)
+    else:
+        parent_matches = (
+            prepared.parent_opened is not None
+            and _same_identity(prepared.parent_opened, parent)
+            and _access_policy(prepared.parent_opened) == _access_policy(parent)
+        )
+        evidence["parent"] = {
+            "identity": _identity(parent),
+            "access_policy": _access_policy(parent),
+            "matches_creation_receipt": parent_matches,
+        }
+        if not parent_matches:
+            evidence["evidence_status"] = "inconclusive"
+
+    try:
+        leaf = os.fstat(prepared.fd)
+    except Exception as exc:
+        evidence["evidence_status"] = "inconclusive"
+        evidence["file_descriptor_error"] = str(exc)
+        evidence["file_descriptor_error_type"] = type(exc).__name__
+        evidence["file_descriptor_errno"] = getattr(exc, "errno", None)
+    else:
+        leaf_matches = _same_identity(prepared.opened, leaf) and _access_policy(
+            prepared.opened
+        ) == _access_policy(leaf)
+        evidence["file"] = {
+            "identity": _identity(leaf),
+            "access_policy": _access_policy(leaf),
+            "matches_creation_receipt": leaf_matches,
+        }
+        if not leaf_matches:
+            evidence["evidence_status"] = "inconclusive"
+    return evidence
+
+
+def _verify_installed_file_path(
+    prepared: _BoundRegularFile,
+    destination: Path,
+) -> dict[str, Any] | None:
+    """Terminally prove that the public path names the descriptor-bound leaf."""
+
+    if prepared.parent_opened is None:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Prepared file has no parent receipt: {prepared.path}",
+        )
+    parent_before, parent_descriptor, parent_after, leaf, alias_receipt = (
+        _terminal_installed_path_stats(
+            destination,
+            trusted_alias=prepared.trusted_alias,
+            missing_code="prepared-file-identity-mismatch",
+            inconclusive_code="prepared-file-revalidation-inconclusive",
+        )
+    )
+    if (
+        not stat.S_ISDIR(parent_before.st_mode)
+        or not stat.S_ISDIR(parent_descriptor.st_mode)
+        or not stat.S_ISDIR(parent_after.st_mode)
+        or not _same_identity(prepared.parent_opened, parent_before)
+        or not _same_identity(parent_before, parent_descriptor)
+        or not _same_identity(parent_descriptor, parent_after)
+        or not stat.S_ISREG(leaf.st_mode)
+        or not _same_identity(prepared.opened, leaf)
+    ):
+        raise StoreSafetyError(
+            "prepared-file-identity-mismatch",
+            "The installed path parent or leaf does not match the "
+            f"descriptor-bound publication receipts: {destination}",
+        )
+    if (
+        _access_policy(prepared.parent_opened) != _access_policy(parent_before)
+        or _access_policy(parent_before) != _access_policy(parent_descriptor)
+        or _access_policy(parent_descriptor) != _access_policy(parent_after)
+        or _access_policy(prepared.opened) != _access_policy(leaf)
+    ):
+        raise StoreSafetyError(
+            "prepared-file-access-policy-mismatch",
+            f"The installed path parent or leaf changed access policy: {destination}",
+        )
+    return alias_receipt
+
+
+@contextmanager
+def _bind_publication_parent(
+    prepared: _BoundRegularFile,
+) -> Iterator[int]:
+    parent_fd: int | None = None
+    try:
+        parent_before = os.stat(prepared.path.parent, follow_symlinks=False)
+        parent_fd = os.open(prepared.path.parent, _directory_open_flags())
+        parent_descriptor = os.fstat(parent_fd)
+        parent_after = os.stat(prepared.path.parent, follow_symlinks=False)
+        prepared_leaf = os.stat(
+            prepared.path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as exc:
+        if parent_fd is not None:
+            os.close(parent_fd)
+            parent_fd = None
+        raise StoreSafetyError(
+            "prepared-file-missing",
+            f"The private publication parent or leaf is missing: {prepared.path}",
+        ) from exc
+    except PermissionError as exc:
+        if parent_fd is not None:
+            os.close(parent_fd)
+            parent_fd = None
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"The private publication parent or leaf is unreadable: {prepared.path}",
+        ) from exc
+    except OSError as exc:
+        if parent_fd is not None:
+            os.close(parent_fd)
+            parent_fd = None
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Cannot bind the private publication parent and leaf: "
+            f"{prepared.path}: {exc}",
+        ) from exc
+    try:
+        if (
+            not stat.S_ISDIR(parent_before.st_mode)
+            or not stat.S_ISDIR(parent_descriptor.st_mode)
+            or not stat.S_ISDIR(parent_after.st_mode)
+            or not _same_identity(parent_before, parent_descriptor)
+            or not _same_identity(parent_descriptor, parent_after)
+            or prepared.parent_opened is None
+            or not _same_identity(prepared.parent_opened, parent_descriptor)
+            or not stat.S_ISREG(prepared_leaf.st_mode)
+            or not _same_identity(prepared.opened, prepared_leaf)
+        ):
+            raise StoreSafetyError(
+                "prepared-file-identity-mismatch",
+                f"The private publication parent or leaf changed identity: "
+                f"{prepared.path}",
+            )
+        if (
+            _access_policy(parent_before) != _access_policy(parent_descriptor)
+            or _access_policy(parent_descriptor) != _access_policy(parent_after)
+            or _access_policy(prepared.parent_opened)
+            != _access_policy(parent_descriptor)
+            or _access_policy(prepared.opened) != _access_policy(prepared_leaf)
+        ):
+            raise StoreSafetyError(
+                "prepared-file-access-policy-mismatch",
+                f"The private publication parent or leaf changed access policy: "
+                f"{prepared.path}",
+            )
+        yield parent_fd
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+def _observe_bound_sibling(
+    parent_fd: int,
+    prepared: _BoundRegularFile,
+    path: Path,
+) -> tuple[str, os.stat_result | None]:
+    if path.parent != prepared.path.parent:
+        return "unavailable", None
+    try:
+        value = os.stat(
+            path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return "absent", None
+    except Exception:
+        return "unavailable", None
+    return "present", value
+
+
+def _publish_file_no_replace(
+    prepared: _BoundRegularFile,
+    destination: Path,
+    *,
+    publication_guard: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Install one bound file and classify every publication failure."""
+
+    _verify_bound_regular_file(prepared, PREPARED_FILE_CODES)
+    if destination.parent != prepared.path.parent:
+        raise StoreSafetyError(
+            "destination-install-failed",
+            "Bound single-file publication requires the private and destination "
+            f"leaves to share one parent: prepared={prepared.path}, "
+            f"destination={destination}",
+            details=_publication_details(
+                "uncommitted",
+                prepared=prepared,
+                destination=destination,
+                retry_safe=True,
+            ),
+        )
+    try:
+        with _bind_publication_parent(prepared) as parent_fd:
+            return _publish_file_no_replace_from_parent(
+                prepared,
+                destination,
+                parent_fd,
+                publication_guard=publication_guard,
+            )
+    except StoreSafetyError as exc:
+        if exc.details:
+            raise
+        raise StoreSafetyError(
+            exc.code,
+            str(exc),
+            details=_publication_details(
+                "uncommitted",
+                prepared=prepared,
+                destination=destination,
+                retry_safe=False,
+            ),
+        ) from exc
+
+
+def _publish_file_no_replace_from_parent(
+    prepared: _BoundRegularFile,
+    destination: Path,
+    parent_fd: int,
+    *,
+    publication_guard: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if prepared.parent_opened is None:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Prepared file has no creation-time parent receipt: {prepared.path}",
+        )
+    before_rename = os.fstat(prepared.fd)
+    descriptor_bound_destination: dict[str, Any] | None = None
+    try:
+        if prepared.before_write is not None:
+            prepared.before_write()
+        _rename_file_no_replace_at(
+            parent_fd,
+            prepared.path.name,
+            destination.name,
+        )
+    except OSError as exc:
+        source_state, source_after = _observe_bound_sibling(
+            parent_fd,
+            prepared,
+            prepared.path,
+        )
+        destination_state, destination_after = _observe_bound_sibling(
+            parent_fd,
+            prepared,
+            destination,
+        )
+        committed = (
+            source_state == "absent"
+            and destination_state == "present"
+            and destination_after is not None
+            and _same_identity(prepared.opened, destination_after)
+        )
+        source_is_prepared = (
+            source_state == "present"
+            and source_after is not None
+            and _same_identity(prepared.opened, source_after)
+        )
+        if committed:
+            _latch_publication_commit(publication_guard)
+            descriptor_bound_prepared_file = _descriptor_bound_file_recovery_evidence(
+                parent_fd,
+                prepared,
+                destination,
+                terminal_error=exc,
+            )
+            try:
+                descriptor_bound_destination = _descriptor_bound_destination_receipt(
+                    parent_fd,
+                    prepared,
+                    destination,
+                )
+            except Exception:
+                descriptor_bound_destination = None
+            if publication_guard is not None:
+                publication_guard["descriptor_bound_destination"] = (
+                    descriptor_bound_destination
+                )
+            raise StoreSafetyError(
+                "destination-install-uncertain",
+                "The destination contains the prepared database, but the "
+                f"publication syscall reported an error: {destination}: {exc}",
+                details=_publication_details(
+                    "uncertain",
+                    prepared=prepared,
+                    destination=destination,
+                    retry_safe=False,
+                    descriptor_bound_destination=descriptor_bound_destination,
+                    descriptor_bound_prepared_file=(descriptor_bound_prepared_file),
+                ),
+            ) from exc
+        if (
+            exc.errno == errno.EEXIST
+            and source_is_prepared
+            and destination_state == "present"
+        ):
+            raise StoreSafetyError(
+                "destination-exists",
+                f"Recovery destination appeared before installation: {destination}",
+                details=_publication_details(
+                    "uncommitted",
+                    prepared=prepared,
+                    destination=destination,
+                    retry_safe=False,
+                ),
+            ) from exc
+        if source_is_prepared and destination_state == "absent":
+            try:
+                prepared_retry_receipt = _descriptor_bound_prepared_retry_receipt(
+                    parent_fd,
+                    prepared,
+                    destination,
+                )
+            except (OSError, StoreSafetyError) as revalidation_exc:
+                details = _publication_details(
+                    "uncertain",
+                    prepared=prepared,
+                    destination=destination,
+                    retry_safe=False,
+                )
+                prepared_locator = details["recovery_locators"].pop(
+                    "prepared",
+                    None,
+                )
+                if prepared_locator is not None:
+                    details["recovery_locators"]["prepared_unverified"] = {
+                        "path": prepared_locator,
+                        "identity": _identity(prepared.opened),
+                        "parent_identity": _identity(prepared.parent_opened),
+                        "verification": "descriptor-revalidation-failed",
+                    }
+                details["retry_revalidation"] = {
+                    "status": "failed",
+                    "error_code": (
+                        revalidation_exc.code
+                        if isinstance(revalidation_exc, StoreSafetyError)
+                        else "prepared-file-revalidation-inconclusive"
+                    ),
+                    "error": str(revalidation_exc),
+                }
+                details["publication_error"] = {
+                    "errno": exc.errno,
+                    "error": str(exc),
+                }
+                raise StoreSafetyError(
+                    "destination-install-uncertain",
+                    "The rename reported an uncommitted failure, but the held "
+                    "prepared database no longer passes complete descriptor-bound "
+                    f"revalidation: {prepared.path}: {revalidation_exc}",
+                    details=details,
+                ) from revalidation_exc
+            terminal_target_state = prepared_retry_receipt["target"]["state"]
+            if terminal_target_state == "present":
+                raise StoreSafetyError(
+                    "destination-exists",
+                    "Recovery destination appeared while the failed rename's "
+                    f"prepared file was being revalidated: {destination}",
+                    details=_publication_details(
+                        "uncommitted",
+                        prepared=prepared,
+                        destination=destination,
+                        retry_safe=False,
+                        descriptor_bound_prepared_file=prepared_retry_receipt,
+                    ),
+                ) from exc
+            if terminal_target_state != "absent":
+                raise StoreSafetyError(
+                    "destination-install-uncertain",
+                    "The failed rename left the prepared file intact, but the "
+                    "destination could not be terminally observed through the "
+                    f"held parent descriptor: {destination}",
+                    details=_publication_details(
+                        "uncertain",
+                        prepared=prepared,
+                        destination=destination,
+                        retry_safe=False,
+                        descriptor_bound_prepared_file=prepared_retry_receipt,
+                    ),
+                ) from exc
+            raise StoreSafetyError(
+                "destination-install-failed",
+                f"Cannot install recovered database at {destination}: {exc}",
+                details=_publication_details(
+                    "uncommitted",
+                    prepared=prepared,
+                    destination=destination,
+                    retry_safe=True,
+                    descriptor_bound_prepared_file=prepared_retry_receipt,
+                ),
+            ) from exc
+        raise StoreSafetyError(
+            "destination-install-uncertain",
+            "Cannot prove whether recovered-file publication committed; preserve "
+            f"the reported locators: prepared={prepared.path}, "
+            f"destination={destination}: {exc}",
+            details=_publication_details(
+                "uncertain",
+                prepared=prepared,
+                destination=destination,
+                retry_safe=False,
+            ),
+        ) from exc
+
+    _latch_publication_commit(publication_guard)
+    try:
+        source_state, _ = _observe_bound_sibling(
+            parent_fd,
+            prepared,
+            prepared.path,
+        )
+        destination_state, destination_after = _observe_bound_sibling(
+            parent_fd,
+            prepared,
+            destination,
+        )
+        if (
+            source_state != "absent"
+            or destination_state != "present"
+            or destination_after is None
+            or not _same_identity(before_rename, destination_after)
+            or _access_policy(destination_after) != _access_policy(prepared.opened)
+        ):
+            raise StoreSafetyError(
+                "prepared-file-identity-mismatch",
+                "The no-replace rename succeeded, but the source/destination "
+                f"namespace does not identify the prepared object: {destination}",
+            )
+        fingerprint = _verify_bound_regular_file_at(
+            prepared,
+            PREPARED_FILE_CODES,
+            dir_fd=parent_fd,
+            basename=destination.name,
+        )
+        _fsync_bound_parent_descriptor(
+            parent_fd,
+            prepared.parent_opened,
+            display_path=destination.parent,
+            identity_code="prepared-file-identity-mismatch",
+            access_policy_code="prepared-file-access-policy-mismatch",
+            inconclusive_code="prepared-file-revalidation-inconclusive",
+        )
+        fingerprint = _verify_bound_regular_file_at(
+            prepared,
+            PREPARED_FILE_CODES,
+            dir_fd=parent_fd,
+            basename=destination.name,
+        )
+        terminal_source, _ = _observe_bound_sibling(
+            parent_fd,
+            prepared,
+            prepared.path,
+        )
+        if terminal_source != "absent":
+            raise StoreSafetyError(
+                "prepared-file-identity-mismatch",
+                "The private source name reappeared after publication: "
+                f"{prepared.path}",
+            )
+        descriptor_bound_destination = _descriptor_bound_destination_receipt(
+            parent_fd,
+            prepared,
+            destination,
+        )
+        if prepared.trusted_alias is not None:
+            descriptor_bound_destination["trusted_alias_before_terminal"] = (
+                _verify_trusted_directory_alias(
+                    prepared.trusted_alias,
+                    destination=destination,
+                )
+            )
+        terminal_alias_receipt = _verify_installed_file_path(
+            prepared,
+            destination,
+        )
+        if terminal_alias_receipt is not None:
+            descriptor_bound_destination["trusted_alias"] = terminal_alias_receipt
+        if publication_guard is not None:
+            publication_guard["descriptor_bound_destination"] = (
+                descriptor_bound_destination
+            )
+    except Exception as exc:
+        descriptor_bound_prepared_file = _descriptor_bound_file_recovery_evidence(
+            parent_fd,
+            prepared,
+            destination,
+            terminal_error=exc,
+        )
+        if descriptor_bound_destination is None:
+            try:
+                descriptor_bound_destination = _descriptor_bound_destination_receipt(
+                    parent_fd,
+                    prepared,
+                    destination,
+                )
+            except Exception:
+                descriptor_bound_destination = None
+        if publication_guard is not None:
+            publication_guard["descriptor_bound_destination"] = (
+                descriptor_bound_destination
+            )
+        raise StoreSafetyError(
+            "destination-install-uncertain",
+            "The recovered database was renamed into place, but final durability "
+            f"or fingerprint validation is unconfirmed: {destination}: {exc}",
+            details=_publication_details(
+                "uncertain",
+                prepared=prepared,
+                destination=destination,
+                retry_safe=False,
+                descriptor_bound_destination=descriptor_bound_destination,
+                descriptor_bound_prepared_file=descriptor_bound_prepared_file,
+            ),
+        ) from exc
+    return fingerprint
+
+
+def _load_native_sqlite_api(
+    source_path: Path,
+    *,
+    error_code: str,
+    require_backup: bool,
+) -> _NativeSQLiteApi:
+    library_path = ctypes.util.find_library("sqlite3")
+    if library_path is None:
+        raise StoreSafetyError(
+            error_code,
+            "Cannot locate the native SQLite library required for "
+            f"descriptor-bound consumption of {source_path}",
+        )
+    try:
+        library = ctypes.CDLL(library_path)
+        open_v2 = library.sqlite3_open_v2
+        close = library.sqlite3_close
+        error_message = library.sqlite3_errmsg
+        malloc64 = library.sqlite3_malloc64
+        sqlite_free = library.sqlite3_free
+        deserialize = library.sqlite3_deserialize
+        exec_sql = library.sqlite3_exec
+        backup_init = library.sqlite3_backup_init if require_backup else None
+        backup_step = library.sqlite3_backup_step if require_backup else None
+        backup_finish = library.sqlite3_backup_finish if require_backup else None
+        serialize = library.sqlite3_serialize if require_backup else None
+    except (AttributeError, OSError) as exc:
+        raise StoreSafetyError(
+            error_code,
+            "The native SQLite library lacks the required read-only "
+            f"deserialize interface for {source_path}: {exc}",
+        ) from exc
+
+    open_v2.argtypes = [
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_int,
+        ctypes.c_char_p,
+    ]
+    open_v2.restype = ctypes.c_int
+    close.argtypes = [ctypes.c_void_p]
+    close.restype = ctypes.c_int
+    error_message.argtypes = [ctypes.c_void_p]
+    error_message.restype = ctypes.c_char_p
+    malloc64.argtypes = [ctypes.c_ulonglong]
+    malloc64.restype = ctypes.c_void_p
+    sqlite_free.argtypes = [ctypes.c_void_p]
+    sqlite_free.restype = None
+    deserialize.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_longlong,
+        ctypes.c_longlong,
+        ctypes.c_uint,
+    ]
+    deserialize.restype = ctypes.c_int
+    exec_sql.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        _SQLITE_EXEC_CALLBACK,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_char_p),
+    ]
+    exec_sql.restype = ctypes.c_int
+    if require_backup:
+        assert backup_init is not None
+        assert backup_step is not None
+        assert backup_finish is not None
+        assert serialize is not None
+        backup_init.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+        ]
+        backup_init.restype = ctypes.c_void_p
+        backup_step.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        backup_step.restype = ctypes.c_int
+        backup_finish.argtypes = [ctypes.c_void_p]
+        backup_finish.restype = ctypes.c_int
+        serialize.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_longlong),
+            ctypes.c_uint,
+        ]
+        serialize.restype = ctypes.c_void_p
+    return _NativeSQLiteApi(
+        library=library,
+        open_v2=open_v2,
+        close=close,
+        error_message=error_message,
+        malloc64=malloc64,
+        sqlite_free=sqlite_free,
+        deserialize=deserialize,
+        exec_sql=exec_sql,
+        backup_init=backup_init,
+        backup_step=backup_step,
+        backup_finish=backup_finish,
+        serialize=serialize,
+    )
+
+
+def _native_sqlite_message(
+    api: _NativeSQLiteApi,
+    database: ctypes.c_void_p,
+) -> str:
+    if not database:
+        return "unknown SQLite error"
+    raw = api.error_message(database)
+    return raw.decode("utf-8", errors="replace") if raw else "unknown SQLite error"
+
+
+def _native_sqlite_deserialize(
+    api: _NativeSQLiteApi,
+    database: ctypes.c_void_p,
+    buffer: int,
+    byte_count: int,
+) -> int:
+    return int(
+        api.deserialize(
+            database,
+            b"main",
+            buffer,
+            byte_count,
+            byte_count,
+            SQLITE_DESERIALIZE_READONLY,
+        )
+    )
+
+
+def _native_sqlite_close(
+    api: _NativeSQLiteApi,
+    database: ctypes.c_void_p,
+) -> int:
+    return int(api.close(database))
+
+
+def _native_sqlite_free(
+    api: _NativeSQLiteApi,
+    pointer: int,
+) -> None:
+    api.sqlite_free(pointer)
+
+
+def _native_sqlite_exec(
+    api: _NativeSQLiteApi,
+    database: ctypes.c_void_p,
+    sql: bytes,
+    callback: Any,
+    error_text: ctypes.c_char_p,
+) -> int:
+    return int(
+        api.exec_sql(
+            database,
+            sql,
+            callback,
+            None,
+            ctypes.byref(error_text),
+        )
+    )
+
+
+def _native_sqlite_backup_init(
+    api: _NativeSQLiteApi,
+    destination: ctypes.c_void_p,
+    source: ctypes.c_void_p,
+) -> int | None:
+    assert api.backup_init is not None
+    backup = api.backup_init(
+        destination,
+        b"main",
+        source,
+        b"main",
+    )
+    return int(backup) if backup else None
+
+
+def _native_sqlite_backup_step(
+    api: _NativeSQLiteApi,
+    backup: int,
+) -> int:
+    assert api.backup_step is not None
+    return int(api.backup_step(backup, -1))
+
+
+def _native_sqlite_backup_finish(
+    api: _NativeSQLiteApi,
+    backup: int,
+) -> int:
+    assert api.backup_finish is not None
+    return int(api.backup_finish(backup))
+
+
+def _native_sqlite_serialize(
+    api: _NativeSQLiteApi,
+    database: ctypes.c_void_p,
+    byte_count: ctypes.c_longlong,
+) -> int | None:
+    assert api.serialize is not None
+    serialized = api.serialize(
+        database,
+        b"main",
+        ctypes.byref(byte_count),
+        0,
+    )
+    return int(serialized) if serialized else None
+
+
+def _sqlite_exception_evidence(exc: Exception) -> dict[str, Any]:
+    evidence: dict[str, Any] = {"error_type": type(exc).__name__}
+    if isinstance(exc, StoreSafetyError):
+        evidence["error_code"] = exc.code
+    try:
+        error_number = getattr(exc, "errno", None)
+    except Exception:
+        error_number = None
+    if isinstance(error_number, int):
+        evidence["errno"] = error_number
+    return evidence
+
+
+def _sqlite_secondary_failure_evidence(
+    exc: Exception,
+    *,
+    phase: str,
+) -> dict[str, Any]:
+    evidence = {
+        "schema": "apple-notes-sqlite-secondary-failure/v1",
+        "phase": phase,
+        **_sqlite_exception_evidence(exc),
+    }
+    if isinstance(exc, StoreSafetyError):
+        for key in (
+            "sqlite_callback_failure",
+            "sqlite_input_secondary_failure",
+        ):
+            nested = exc.details.get(key)
+            if isinstance(nested, dict):
+                evidence[key] = dict(nested)
+    return evidence
+
+
+def _sqlite_exception_text(exc: Exception) -> str:
+    try:
+        return str(exc)
+    except Exception:
+        return f"<unprintable {type(exc).__name__}>"
+
+
+def _classified_sqlite_failure(
+    primary_error: Exception,
+    *,
+    error_code: str,
+    message: str,
+    cleanup_key: str,
+    cleanup: dict[str, Any],
+) -> StoreSafetyError:
+    if isinstance(primary_error, StoreSafetyError):
+        code = primary_error.code
+        failure_message = _sqlite_exception_text(primary_error)
+        details = dict(primary_error.details)
+    else:
+        code = error_code
+        failure_message = f"{message}: {_sqlite_exception_text(primary_error)}"
+        details = {
+            "sqlite_runtime_failure": _sqlite_exception_evidence(primary_error),
+        }
+    details[cleanup_key] = cleanup
+    return StoreSafetyError(
+        code,
+        failure_message,
+        details=details,
+    )
+
+
+def _cleanup_deserialized_sqlite_input(
+    api: _NativeSQLiteApi | None,
+    database: ctypes.c_void_p,
+    buffer: int | None,
+    *,
+    byte_count: int | None,
+    sha256: str | None,
+) -> dict[str, Any]:
+    close_step: dict[str, Any] = {"status": "not-needed"}
+    free_step: dict[str, Any] = {"status": "not-needed"}
+    close_proved = not bool(database)
+    if api is not None and database:
+        try:
+            close_result = _native_sqlite_close(api, database)
+        except Exception as exc:
+            close_step = {
+                "status": "failed",
+                **_sqlite_exception_evidence(exc),
+            }
+        else:
+            close_proved = close_result == SQLITE_OK
+            close_step = {
+                "status": "complete" if close_proved else "failed",
+                "result": close_result,
+            }
+
+    buffer_release_status = "not-allocated"
+    if api is not None and buffer is not None:
+        if not close_proved:
+            buffer_release_status = "retained"
+            free_step = {
+                "status": "skipped-unsafe",
+                "reason": "database-close-unproved",
+            }
+        else:
+            try:
+                _native_sqlite_free(api, buffer)
+            except Exception as exc:
+                buffer_release_status = "inconclusive"
+                free_step = {
+                    "status": "failed",
+                    **_sqlite_exception_evidence(exc),
+                }
+            else:
+                buffer_release_status = "released"
+                free_step = {"status": "complete"}
+
+    cleanup_complete = all(
+        step["status"] in {"complete", "not-needed"} for step in (close_step, free_step)
+    )
+    return {
+        "schema": "apple-notes-sqlite-input-cleanup/v1",
+        "status": "complete" if cleanup_complete else "incomplete",
+        "steps": {
+            "connection_close": close_step,
+            "buffer_free": free_step,
+        },
+        "buffer": {
+            "release_status": buffer_release_status,
+            "size": byte_count,
+            "sha256": sha256,
+        },
+    }
+
+
+def _verify_deserialized_sqlite_buffer(
+    image: _DeserializedSQLiteImage,
+    source_path: Path,
+) -> None:
+    try:
+        current = ctypes.string_at(image.buffer, image.byte_count)
+    except (OSError, ValueError) as exc:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            "Cannot revalidate the SQLite-owned read-only input buffer for "
+            f"{source_path}: {exc}",
+        ) from exc
+    if (
+        len(current) != image.byte_count
+        or hashlib.sha256(current).hexdigest() != image.sha256
+    ):
+        raise StoreSafetyError(
+            "prepared-file-content-mismatch",
+            "The SQLite-owned read-only input buffer changed while consuming "
+            f"{source_path}",
+        )
+
+
+def _apply_committed_wal(
+    main_payload: bytes,
+    wal_payload: bytes,
+    wal: dict[str, Any],
+    source_path: Path,
+) -> bytes:
+    last_commit = int(wal.get("last_valid_commit_frame", 0))
+    if last_commit == 0:
+        return main_payload
+    if len(main_payload) < 100 or main_payload[:16] != b"SQLite format 3\0":
+        raise StoreSafetyError(
+            "sqlite-recovery-failed",
+            f"Recovery main database has an invalid SQLite header: {source_path}",
+        )
+    raw_main_page_size = struct.unpack(">H", main_payload[16:18])[0]
+    main_page_size = 65536 if raw_main_page_size == 1 else raw_main_page_size
+    page_size = int(wal["page_size"])
+    if (
+        main_page_size != page_size
+        or len(main_payload) % page_size != 0
+        or len(main_payload) < page_size
+    ):
+        raise StoreSafetyError(
+            "wal-invalid",
+            "The bound WAL page size does not match the complete main database: "
+            f"{source_path}",
+        )
+    frame_size = 24 + page_size
+    final_header_offset = 32 + (last_commit - 1) * frame_size
+    final_database_pages = struct.unpack(
+        ">I",
+        wal_payload[final_header_offset + 4 : final_header_offset + 8],
+    )[0]
+    if final_database_pages == 0:
+        raise StoreSafetyError(
+            "wal-invalid",
+            f"The selected final WAL frame is not a commit frame: {source_path}",
+        )
+    main_pages = len(main_payload) // page_size
+    if final_database_pages > main_pages + last_commit:
+        raise StoreSafetyError(
+            "wal-invalid",
+            "The committed WAL database size exceeds the bounded growth implied "
+            f"by the main database and committed frame count: {source_path}",
+        )
+    recovered = bytearray(main_payload[: final_database_pages * page_size])
+    if len(recovered) < final_database_pages * page_size:
+        recovered.extend(b"\0" * (final_database_pages * page_size - len(recovered)))
+    for index in range(last_commit):
+        offset = 32 + index * frame_size
+        page_number = struct.unpack(">I", wal_payload[offset : offset + 4])[0]
+        if page_number <= final_database_pages:
+            page_start = (page_number - 1) * page_size
+            recovered[page_start : page_start + page_size] = wal_payload[
+                offset + 24 : offset + frame_size
+            ]
+    return bytes(recovered)
+
+
+def _bound_recovery_payload(
+    store: Union[_BoundRecoveryStore, _BoundSourceStore],
+) -> bytes:
+    codes = _recovery_input_codes(store)
+    _verify_bound_recovery_input(store)
+    main = store.files[store.main_name]
+    main_payload = _read_bound_file_bytes(
+        main,
+        codes,
+        max_bytes=main.opened.st_size,
+        too_large_code=codes.content,
+        dir_fd=store.directory.fd,
+        basename=store.main_name,
+    )
+    wal_name = f"{store.main_name}-wal"
+    wal_bound = store.files.get(wal_name)
+    if wal_bound is None:
+        recovered = main_payload
+    else:
+        wal_payload = _read_bound_file_bytes(
+            wal_bound,
+            codes,
+            max_bytes=wal_bound.opened.st_size,
+            too_large_code=codes.content,
+            dir_fd=store.directory.fd,
+            basename=wal_name,
+        )
+        wal = _inspect_wal_payload(
+            wal_payload,
+            store.directory.path / wal_name,
+        )
+        recovered = _apply_committed_wal(
+            main_payload,
+            wal_payload,
+            wal,
+            store.directory.path / store.main_name,
+        )
+    _verify_bound_recovery_input(store)
+    return recovered
+
+
+def _normalize_deserialized_sqlite_header(
+    payload: bytes,
+    source_path: Path,
+    *,
+    error_code: str,
+) -> bytes:
+    if len(payload) < 20 or payload[:16] != b"SQLite format 3\0":
+        return payload
+    version_pair = (payload[18], payload[19])
+    if version_pair == (1, 1):
+        return payload
+    if version_pair == (2, 2):
+        normalized = bytearray(payload)
+        normalized[18] = 1
+        normalized[19] = 1
+        return bytes(normalized)
+    raise StoreSafetyError(
+        error_code,
+        "SQLite database-header read/write versions are not an accepted pair "
+        f"for descriptor-bound deserialization of {source_path}: "
+        f"{version_pair[0]}/{version_pair[1]}",
+        details={
+            "sqlite_header_versions": {
+                "write": version_pair[0],
+                "read": version_pair[1],
+                "accepted_pairs": [[1, 1], [2, 2]],
+            }
+        },
+    )
+
+
+def _bind_written_anonymous_recovery_file(
+    fd: int,
+    source_path: Path,
+    *,
+    created: os.stat_result,
+    expected_sha256: str,
+    expected_size: int,
+    expected_access_policy: dict[str, int],
+) -> os.stat_result:
+    terminal: os.stat_result | None = None
+    for attempt in range(2):
+        try:
+            descriptor_before = os.fstat(fd)
+            readback_sha256 = _hash_fd(fd)
+            descriptor_after = os.fstat(fd)
+        except OSError as exc:
+            raise StoreSafetyError(
+                "prepared-file-revalidation-inconclusive",
+                "Cannot bind the anonymous descriptor-backed recovery image "
+                f"during readback {attempt + 1} for {source_path}: {exc}",
+            ) from exc
+        if (
+            not stat.S_ISREG(descriptor_before.st_mode)
+            or not stat.S_ISREG(descriptor_after.st_mode)
+            or not _same_identity(created, descriptor_before)
+            or not _same_identity(descriptor_before, descriptor_after)
+        ):
+            raise StoreSafetyError(
+                "prepared-file-identity-mismatch",
+                "Anonymous descriptor-backed recovery image identity changed "
+                f"before binding for {source_path}",
+            )
+        if (
+            _access_policy(descriptor_before) != expected_access_policy
+            or _access_policy(descriptor_after) != expected_access_policy
+        ):
+            raise StoreSafetyError(
+                "prepared-file-access-policy-mismatch",
+                "Anonymous descriptor-backed recovery image access policy "
+                f"changed before binding for {source_path}",
+            )
+        if (
+            readback_sha256 != expected_sha256
+            or descriptor_before.st_size != expected_size
+            or descriptor_after.st_size != expected_size
+        ):
+            raise StoreSafetyError(
+                "prepared-file-content-mismatch",
+                "Anonymous descriptor-backed recovery image bytes changed "
+                f"before binding for {source_path}",
+            )
+        terminal = descriptor_after
+    assert terminal is not None
+    return terminal
+
+
+def _verify_anonymous_recovery_file(
+    bound: _BoundRegularFile,
+) -> None:
+    try:
+        descriptor_before = os.fstat(bound.fd)
+        first_sha256 = _hash_fd(bound.fd)
+        descriptor_between = os.fstat(bound.fd)
+        second_sha256 = _hash_fd(bound.fd)
+        descriptor_after = os.fstat(bound.fd)
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            "Cannot revalidate the anonymous descriptor-backed recovery image "
+            f"for {bound.path}: {exc}",
+        ) from exc
+    if (
+        not stat.S_ISREG(descriptor_before.st_mode)
+        or not _same_identity(bound.opened, descriptor_before)
+        or not _same_identity(descriptor_before, descriptor_between)
+        or not _same_identity(descriptor_between, descriptor_after)
+    ):
+        raise StoreSafetyError(
+            "prepared-file-identity-mismatch",
+            "Anonymous descriptor-backed recovery image identity changed for "
+            f"{bound.path}",
+        )
+    baseline_access = _access_policy(bound.opened)
+    if any(
+        _access_policy(current) != baseline_access
+        for current in (descriptor_before, descriptor_between, descriptor_after)
+    ):
+        raise StoreSafetyError(
+            "prepared-file-access-policy-mismatch",
+            "Anonymous descriptor-backed recovery image access policy changed for "
+            f"{bound.path}",
+        )
+    if (
+        first_sha256 != bound.sha256
+        or second_sha256 != bound.sha256
+        or descriptor_before.st_size != bound.opened.st_size
+        or descriptor_between.st_size != bound.opened.st_size
+        or descriptor_after.st_size != bound.opened.st_size
+    ):
+        raise StoreSafetyError(
+            "prepared-file-content-mismatch",
+            "Anonymous descriptor-backed recovery image bytes changed for "
+            f"{bound.path}",
+        )
+
+
+def _read_descriptor_bound_sqlite_bytes(
+    bound: _BoundRegularFile,
+    verify_bound: Callable[[], Any],
+    *,
+    file_codes: _FileProtectionCodes = PREPARED_FILE_CODES,
+) -> bytes:
+    verify_bound()
+    try:
+        descriptor_before = os.fstat(bound.fd)
+        os.lseek(bound.fd, 0, os.SEEK_SET)
+        payload = bytearray()
+        expected_size = int(bound.opened.st_size)
+        while True:
+            chunk = os.read(
+                bound.fd,
+                min(CHUNK_SIZE, expected_size + 1 - len(payload)),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+            if len(payload) > expected_size:
+                break
+        descriptor_after = os.fstat(bound.fd)
+    except OSError as exc:
+        raise StoreSafetyError(
+            file_codes.inconclusive,
+            f"Cannot read the descriptor-bound SQLite input for {bound.path}: {exc}",
+        ) from exc
+    if (
+        not stat.S_ISREG(descriptor_before.st_mode)
+        or not stat.S_ISREG(descriptor_after.st_mode)
+        or not _same_identity(bound.opened, descriptor_before)
+        or not _same_identity(descriptor_before, descriptor_after)
+    ):
+        raise StoreSafetyError(
+            file_codes.identity,
+            f"Descriptor-bound SQLite input identity changed for {bound.path}",
+        )
+    baseline_access = _access_policy(bound.opened)
+    if (
+        _access_policy(descriptor_before) != baseline_access
+        or _access_policy(descriptor_after) != baseline_access
+    ):
+        raise StoreSafetyError(
+            file_codes.access_policy,
+            f"Descriptor-bound SQLite input access policy changed for {bound.path}",
+        )
+    if (
+        len(payload) != expected_size
+        or descriptor_before.st_size != expected_size
+        or descriptor_after.st_size != expected_size
+        or hashlib.sha256(payload).hexdigest() != bound.sha256
+    ):
+        raise StoreSafetyError(
+            file_codes.content,
+            f"Descriptor-bound SQLite input bytes changed for {bound.path}",
+        )
+    verify_bound()
+    return bytes(payload)
+
+
+@contextmanager
+def _deserialized_sqlite_image(
+    bound: _BoundRegularFile,
+    source_path: Path,
+    *,
+    verify_bound: Callable[[], Any],
+    error_code: str,
+    require_backup: bool,
+    file_codes: _FileProtectionCodes = PREPARED_FILE_CODES,
+) -> Iterator[_DeserializedSQLiteImage]:
+    api: _NativeSQLiteApi | None = None
+    database = ctypes.c_void_p()
+    buffer: int | None = None
+    byte_count: int | None = None
+    expected_sha256: str | None = None
+    primary_error: Exception | None = None
+    consumer_error: Exception | None = None
+    process_control_error: BaseException | None = None
+    try:
+        payload = _read_descriptor_bound_sqlite_bytes(
+            bound,
+            verify_bound,
+            file_codes=file_codes,
+        )
+        byte_count = len(payload)
+        expected_sha256 = hashlib.sha256(payload).hexdigest()
+        api = _load_native_sqlite_api(
+            source_path,
+            error_code=error_code,
+            require_backup=require_backup,
+        )
+        raw_buffer = api.malloc64(byte_count)
+        if not raw_buffer:
+            raise StoreSafetyError(
+                error_code,
+                "SQLite cannot allocate a read-only deserialization buffer for "
+                f"{source_path}",
+            )
+        buffer = int(raw_buffer)
+        ctypes.memmove(buffer, payload, len(payload))
+        result = api.open_v2(
+            b":memory:",
+            ctypes.byref(database),
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+            None,
+        )
+        if result != SQLITE_OK:
+            raise StoreSafetyError(
+                error_code,
+                "SQLite cannot create the in-memory descriptor-bound input for "
+                f"{source_path}: {_native_sqlite_message(api, database)}",
+            )
+        result = _native_sqlite_deserialize(
+            api,
+            database,
+            buffer,
+            len(payload),
+        )
+        if result != SQLITE_OK:
+            raise StoreSafetyError(
+                error_code,
+                "SQLite cannot deserialize the descriptor-bound input for "
+                f"{source_path}: {_native_sqlite_message(api, database)}",
+            )
+        image = _DeserializedSQLiteImage(
+            api=api,
+            database=database,
+            buffer=buffer,
+            byte_count=byte_count,
+            sha256=expected_sha256,
+            bound=bound,
+            verify_bound=verify_bound,
+        )
+        _verify_deserialized_sqlite_buffer(image, source_path)
+        verify_bound()
+        try:
+            yield image
+        except Exception as exc:
+            consumer_error = exc
+            primary_error = exc
+            try:
+                _verify_deserialized_sqlite_buffer(image, source_path)
+                verify_bound()
+            except Exception as revalidation_error:
+                primary_error = revalidation_error
+        else:
+            _verify_deserialized_sqlite_buffer(image, source_path)
+            verify_bound()
+    except Exception as exc:
+        if primary_error is None:
+            primary_error = exc
+    except BaseException as exc:
+        process_control_error = exc
+
+    cleanup = _cleanup_deserialized_sqlite_input(
+        api,
+        database,
+        buffer,
+        byte_count=byte_count,
+        sha256=expected_sha256,
+    )
+    if process_control_error is not None:
+        raise process_control_error
+    if primary_error is not None:
+        failure = _classified_sqlite_failure(
+            primary_error,
+            error_code=error_code,
+            message=(f"SQLite descriptor-bound input failed for {source_path}"),
+            cleanup_key="sqlite_input_cleanup",
+            cleanup=cleanup,
+        )
+        if consumer_error is not None and consumer_error is not primary_error:
+            failure.details["sqlite_input_secondary_failure"] = (
+                _sqlite_secondary_failure_evidence(
+                    consumer_error,
+                    phase="consumer",
+                )
+            )
+        raise failure from primary_error
+    if cleanup["status"] != "complete":
+        raise StoreSafetyError(
+            error_code,
+            f"SQLite descriptor-bound input cleanup did not complete for {source_path}",
+            details={"sqlite_input_cleanup": cleanup},
+        )
+
+
+@contextmanager
+def _anonymous_recovery_file(
+    payload: bytes,
+    source_path: Path,
+    *,
+    error_code: str,
+) -> Iterator[_BoundRegularFile]:
+    sqlite_payload = _normalize_deserialized_sqlite_header(
+        payload,
+        source_path,
+        error_code=error_code,
+    )
+    expected_size = len(sqlite_payload)
+    expected_sha256 = hashlib.sha256(sqlite_payload).hexdigest()
+    try:
+        with tempfile.TemporaryFile(prefix="apple-notes-recovered-image-") as handle:
+            fd = handle.fileno()
+            created = os.fstat(fd)
+            if not stat.S_ISREG(created.st_mode):
+                raise StoreSafetyError(
+                    "prepared-file-identity-mismatch",
+                    "Anonymous recovery input was not created as a regular file "
+                    f"for {source_path}",
+                )
+            expected_access_policy = _access_policy(created)
+            expected_access_policy["mode"] = 0o600
+            os.fchmod(fd, 0o600)
+            access_bound = os.fstat(fd)
+            if not _same_identity(created, access_bound):
+                raise StoreSafetyError(
+                    "prepared-file-identity-mismatch",
+                    "Anonymous recovery input identity changed before writing "
+                    f"for {source_path}",
+                )
+            if _access_policy(access_bound) != expected_access_policy:
+                raise StoreSafetyError(
+                    "prepared-file-access-policy-mismatch",
+                    "Anonymous recovery input did not retain the pre-bound 0600 "
+                    f"access policy for {source_path}",
+                )
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            _write_all(fd, sqlite_payload)
+            os.fsync(fd)
+            opened = _bind_written_anonymous_recovery_file(
+                fd,
+                source_path,
+                created=created,
+                expected_sha256=expected_sha256,
+                expected_size=expected_size,
+                expected_access_policy=expected_access_policy,
+            )
+            bound = _BoundRegularFile(
+                path=source_path,
+                fd=fd,
+                opened=opened,
+                sha256=expected_sha256,
+            )
+            _verify_anonymous_recovery_file(bound)
+            try:
+                yield bound
+            except Exception:
+                raise
+            else:
+                _verify_anonymous_recovery_file(bound)
+    except StoreSafetyError:
+        raise
+    except OSError as exc:
+        raise StoreSafetyError(
+            error_code,
+            "Cannot prepare the anonymous descriptor-backed recovery image for "
+            f"{source_path}: {exc}",
+        ) from exc
+
+
+def _sqlite_backup_bytes_from_payload(
+    payload: bytes,
+    source_path: Path,
+) -> bytes:
+    """Back up bytes read from one anonymous, descriptor-bound recovery image."""
+
+    with _anonymous_recovery_file(
+        payload,
+        source_path,
+        error_code="sqlite-recovery-failed",
+    ) as bound:
+        with _deserialized_sqlite_image(
+            bound,
+            source_path,
+            verify_bound=lambda: _verify_anonymous_recovery_file(bound),
+            error_code="sqlite-recovery-failed",
+            require_backup=True,
+        ) as image:
+            return _sqlite_backup_bytes(image, source_path)
+
+
+def _decode_sqlite_callback_value(value: bytes | None) -> str | None:
+    if value is None:
+        return None
+    return value.decode("utf-8", errors="replace")
+
+
+def _native_sqlite_query_rows(
+    image: _DeserializedSQLiteImage,
+    sql: str,
+    source_path: Path,
+    *,
+    error_code: str,
+) -> list[list[str | None]]:
+    image.verify_bound()
+    _verify_deserialized_sqlite_buffer(image, source_path)
+    rows: list[list[str | None]] = []
+    callback_error: BaseException | None = None
+
+    @_SQLITE_EXEC_CALLBACK
+    def collect_row(
+        _context: ctypes.c_void_p,
+        column_count: int,
+        values: ctypes.POINTER(ctypes.c_char_p),
+        _names: ctypes.POINTER(ctypes.c_char_p),
+    ) -> int:
+        nonlocal callback_error
+        if callback_error is not None:
+            return SQLITE_ABORT
+        try:
+            rows.append(
+                [
+                    _decode_sqlite_callback_value(values[index])
+                    for index in range(column_count)
+                ]
+            )
+        except BaseException as exc:
+            callback_error = exc
+            return SQLITE_ABORT
+        else:
+            return SQLITE_OK
+
+    error_text = ctypes.c_char_p()
+    result: int
+    try:
+        result = _native_sqlite_exec(
+            image.api,
+            image.database,
+            sql.encode("utf-8"),
+            collect_row,
+            error_text,
+        )
+        detail = (
+            error_text.value.decode("utf-8", errors="replace")
+            if error_text.value
+            else _native_sqlite_message(image.api, image.database)
+        )
+    finally:
+        error_pointer = ctypes.cast(error_text, ctypes.c_void_p).value
+        if error_pointer is not None:
+            _native_sqlite_free(image.api, int(error_pointer))
+    if callback_error is not None and not isinstance(callback_error, Exception):
+        raise callback_error
+    callback_failure: StoreSafetyError | None = None
+    if callback_error is not None:
+        callback_failure = StoreSafetyError(
+            error_code,
+            "SQLite row callback failed while decoding descriptor-bound input "
+            f"for {source_path}: {_sqlite_exception_text(callback_error)}",
+            details={
+                "sqlite_callback_failure": _sqlite_exception_evidence(callback_error),
+            },
+        )
+    try:
+        _verify_deserialized_sqlite_buffer(image, source_path)
+        image.verify_bound()
+    except Exception as revalidation_error:
+        if callback_failure is None:
+            raise
+        secondary = _sqlite_secondary_failure_evidence(
+            callback_failure,
+            phase="sqlite-row-callback",
+        )
+        if isinstance(revalidation_error, StoreSafetyError):
+            revalidation_error.details["sqlite_input_secondary_failure"] = secondary
+            raise
+        raise StoreSafetyError(
+            error_code,
+            "SQLite terminal input revalidation failed after a row callback "
+            f"failure for {source_path}: "
+            f"{_sqlite_exception_text(revalidation_error)}",
+            details={
+                "sqlite_runtime_failure": _sqlite_exception_evidence(
+                    revalidation_error
+                ),
+                "sqlite_input_secondary_failure": secondary,
+            },
+        ) from revalidation_error
+    if callback_failure is not None:
+        raise callback_failure from callback_error
+    if result != SQLITE_OK:
+        raise StoreSafetyError(
+            error_code,
+            f"SQLite query failed for {source_path}: {detail}",
+        )
+    return rows
+
+
+def _sqlite_integrity_from_image(
+    image: _DeserializedSQLiteImage,
+    source_path: Path,
+) -> dict[str, Any]:
+    integrity_rows = _native_sqlite_query_rows(
+        image,
+        "PRAGMA integrity_check",
+        source_path,
+        error_code="sqlite-integrity-failed",
+    )
+    rows = [str(row[0]) for row in integrity_rows if row]
+    if rows != ["ok"]:
+        raise StoreSafetyError(
+            "sqlite-integrity-failed",
+            f"SQLite integrity_check failed for {source_path}: {rows[:5]}",
+        )
+    journal_rows = _native_sqlite_query_rows(
+        image,
+        "PRAGMA journal_mode",
+        source_path,
+        error_code="sqlite-integrity-failed",
+    )
+    page_rows = _native_sqlite_query_rows(
+        image,
+        "PRAGMA page_count",
+        source_path,
+        error_code="sqlite-integrity-failed",
+    )
+    if (
+        len(journal_rows) != 1
+        or len(journal_rows[0]) != 1
+        or journal_rows[0][0] is None
+        or len(page_rows) != 1
+        or len(page_rows[0]) != 1
+        or page_rows[0][0] is None
+    ):
+        raise StoreSafetyError(
+            "sqlite-integrity-failed",
+            f"SQLite returned incomplete validation metadata for {source_path}",
+        )
+    try:
+        page_count = int(page_rows[0][0])
+    except ValueError as exc:
+        raise StoreSafetyError(
+            "sqlite-integrity-failed",
+            f"SQLite returned an invalid page count for {source_path}",
+        ) from exc
+    return {
+        "result": "ok",
+        "check": "PRAGMA integrity_check",
+        "journal_mode": str(journal_rows[0][0]),
+        "page_count": page_count,
+    }
+
+
+def _sqlite_integrity_from_payload(
+    payload: bytes,
+    source_path: Path,
+) -> dict[str, Any]:
+    with _anonymous_recovery_file(
+        payload,
+        source_path,
+        error_code="sqlite-integrity-failed",
+    ) as bound:
+        with _deserialized_sqlite_image(
+            bound,
+            source_path,
+            verify_bound=lambda: _verify_anonymous_recovery_file(bound),
+            error_code="sqlite-integrity-failed",
+            require_backup=False,
+        ) as image:
+            return _sqlite_integrity_from_image(image, source_path)
+
+
+def _bound_recovery_integrity(
+    store: Union[_BoundRecoveryStore, _BoundSourceStore],
+) -> dict[str, Any]:
+    recovered_payload = _bound_recovery_payload(store)
+    result = _sqlite_integrity_from_payload(
+        recovered_payload,
+        store.directory.path / store.main_name,
+    )
+    _verify_bound_recovery_input(store)
+    return result
+
+
+def _cleanup_sqlite_backup(
+    api: _NativeSQLiteApi,
+    destination_db: ctypes.c_void_p,
+    backup: int | None,
+    serialized: int | None,
+    *,
+    finish_step: dict[str, Any],
+) -> dict[str, Any]:
+    if backup is not None:
+        try:
+            finish_result = _native_sqlite_backup_finish(api, backup)
+        except Exception as exc:
+            finish_step = {
+                "status": "failed",
+                "resource_state": "inconclusive",
+                **_sqlite_exception_evidence(exc),
+            }
+        else:
+            finish_step = {
+                "status": "complete",
+                "result": finish_result,
+                "resource_state": "released",
+            }
+
+    serialized_free_step: dict[str, Any] = {"status": "not-needed"}
+    serialized_release_status = "not-allocated"
+    if serialized is not None:
+        try:
+            _native_sqlite_free(api, serialized)
+        except Exception as exc:
+            serialized_release_status = "inconclusive"
+            serialized_free_step = {
+                "status": "failed",
+                **_sqlite_exception_evidence(exc),
+            }
+        else:
+            serialized_release_status = "released"
+            serialized_free_step = {"status": "complete"}
+
+    destination_close_step: dict[str, Any] = {"status": "not-needed"}
+    destination_release_status = "not-opened"
+    if destination_db:
+        try:
+            close_result = _native_sqlite_close(api, destination_db)
+        except Exception as exc:
+            destination_release_status = "inconclusive"
+            destination_close_step = {
+                "status": "failed",
+                **_sqlite_exception_evidence(exc),
+            }
+        else:
+            close_proved = close_result == SQLITE_OK
+            destination_release_status = "released" if close_proved else "retained"
+            destination_close_step = {
+                "status": "complete" if close_proved else "failed",
+                "result": close_result,
+            }
+
+    steps = {
+        "backup_finish": finish_step,
+        "serialized_free": serialized_free_step,
+        "destination_close": destination_close_step,
+    }
+    cleanup_complete = all(
+        step["status"] in {"complete", "not-needed"} for step in steps.values()
+    )
+    return {
+        "schema": "apple-notes-sqlite-backup-cleanup/v1",
+        "status": "complete" if cleanup_complete else "incomplete",
+        "steps": steps,
+        "resources": {
+            "serialized": serialized_release_status,
+            "destination": destination_release_status,
+        },
+    }
+
+
+def _sqlite_backup_bytes(
+    source: _DeserializedSQLiteImage,
+    source_path: Path,
+) -> bytes:
+    """Run the native SQLite backup API into memory and serialize its bytes."""
+
+    api = source.api
+    destination_db = ctypes.c_void_p()
+    backup: int | None = None
+    serialized: int | None = None
+    primary_error: BaseException | None = None
+    result_payload: bytes | None = None
+    finish_step: dict[str, Any] = {"status": "not-needed"}
+
+    try:
+        source.verify_bound()
+        _verify_deserialized_sqlite_buffer(source, source_path)
+        assert api.backup_init is not None
+        assert api.backup_step is not None
+        assert api.backup_finish is not None
+        assert api.serialize is not None
+        result = api.open_v2(
+            b":memory:",
+            ctypes.byref(destination_db),
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+            None,
+        )
+        if result != SQLITE_OK:
+            raise StoreSafetyError(
+                "sqlite-recovery-failed",
+                "SQLite cannot create the in-memory backup destination for "
+                f"{source_path}: {_native_sqlite_message(api, destination_db)}",
+            )
+        backup = _native_sqlite_backup_init(
+            api,
+            destination_db,
+            source.database,
+        )
+        if not backup:
+            raise StoreSafetyError(
+                "sqlite-recovery-failed",
+                f"SQLite cannot initialize backup of {source_path}: "
+                f"{_native_sqlite_message(api, destination_db)}",
+            )
+        step_result = _native_sqlite_backup_step(api, backup)
+        finishing_backup = backup
+        backup = None
+        try:
+            finish_result = _native_sqlite_backup_finish(
+                api,
+                finishing_backup,
+            )
+        except Exception as exc:
+            finish_step = {
+                "status": "failed",
+                "resource_state": "inconclusive",
+                **_sqlite_exception_evidence(exc),
+            }
+            raise
+        else:
+            finish_step = {
+                "status": "complete",
+                "result": finish_result,
+                "resource_state": "released",
+            }
+        if step_result != SQLITE_DONE or finish_result != SQLITE_OK:
+            raise StoreSafetyError(
+                "sqlite-recovery-failed",
+                "SQLite backup failed for "
+                f"{source_path}: {_native_sqlite_message(api, destination_db)}",
+            )
+        byte_count = ctypes.c_longlong()
+        serialized = _native_sqlite_serialize(
+            api,
+            destination_db,
+            byte_count,
+        )
+        if not serialized or byte_count.value <= 0:
+            raise StoreSafetyError(
+                "sqlite-recovery-failed",
+                f"SQLite could not serialize the standalone backup of {source_path}",
+            )
+        result_payload = ctypes.string_at(serialized, byte_count.value)
+        _verify_deserialized_sqlite_buffer(source, source_path)
+        source.verify_bound()
+    except BaseException as exc:
+        primary_error = exc
+
+    cleanup = _cleanup_sqlite_backup(
+        api,
+        destination_db,
+        backup,
+        serialized,
+        finish_step=finish_step,
+    )
+    if primary_error is not None:
+        if not isinstance(primary_error, Exception):
+            raise primary_error
+        failure = _classified_sqlite_failure(
+            primary_error,
+            error_code="sqlite-recovery-failed",
+            message=f"SQLite backup failed for {source_path}",
+            cleanup_key="sqlite_backup_cleanup",
+            cleanup=cleanup,
+        )
+        raise failure from primary_error
+    if cleanup["status"] != "complete":
+        raise StoreSafetyError(
+            "sqlite-recovery-failed",
+            f"SQLite backup cleanup did not complete for {source_path}",
+            details={"sqlite_backup_cleanup": cleanup},
+        )
+    if result_payload is None:
+        raise StoreSafetyError(
+            "sqlite-recovery-failed",
+            f"SQLite backup produced no serialized payload for {source_path}",
+            details={"sqlite_backup_cleanup": cleanup},
+        )
+    return result_payload
+
+
+def _terminal_standalone_output_receipt(
+    output_fd: int,
+    output: Path,
+    destination_binding: _BoundDirectory,
+    *,
+    created: os.stat_result,
+    expected_sha256: str,
+    expected_size: int,
+    expected_access_policy: dict[str, int],
+) -> dict[str, Any]:
+    """Verify two consecutive readbacks against the pre-bound payload receipt."""
+
+    last_descriptor: os.stat_result | None = None
+    for attempt in range(2):
+        try:
+            descriptor_before = os.fstat(output_fd)
+            path_before = os.stat(
+                output.name,
+                dir_fd=destination_binding.fd,
+                follow_symlinks=False,
+            )
+            readback_sha256 = _hash_fd(output_fd)
+            descriptor_after = os.fstat(output_fd)
+            path_after = os.stat(
+                output.name,
+                dir_fd=destination_binding.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as exc:
+            raise StoreSafetyError(
+                "prepared-file-missing",
+                "Standalone recovery output disappeared during terminal "
+                f"readback {attempt + 1}: {output}",
+            ) from exc
+        except OSError as exc:
+            raise StoreSafetyError(
+                "prepared-file-revalidation-inconclusive",
+                "Cannot terminally revalidate the standalone recovery output "
+                f"during readback {attempt + 1}: {output}: {exc}",
+            ) from exc
+
+        observations = (
+            descriptor_before,
+            path_before,
+            descriptor_after,
+            path_after,
+        )
+        if any(
+            not stat.S_ISREG(current.st_mode) or not _same_identity(created, current)
+            for current in observations
+        ):
+            raise StoreSafetyError(
+                "prepared-file-identity-mismatch",
+                "Standalone recovery output identity changed during terminal "
+                f"readback {attempt + 1}: {output}",
+            )
+        if readback_sha256 != expected_sha256 or any(
+            current.st_size != expected_size for current in observations
+        ):
+            raise StoreSafetyError(
+                "prepared-file-content-mismatch",
+                "Standalone recovery output differs from the pre-bound payload "
+                f"during terminal readback {attempt + 1}: {output}",
+            )
+        if any(
+            _access_policy(current) != expected_access_policy
+            for current in observations
+        ):
+            raise StoreSafetyError(
+                "prepared-file-access-policy-mismatch",
+                "Standalone recovery output access policy changed during "
+                f"terminal readback {attempt + 1}: {output}",
+            )
+        last_descriptor = descriptor_after
+
+    assert last_descriptor is not None
+    return {
+        "path": output,
+        "sha256": expected_sha256,
+        "size": expected_size,
+        "identity": _identity(last_descriptor),
+        "access_policy": dict(expected_access_policy),
+    }
+
+
+def _terminal_standalone_sidecar_absence_receipt(
+    destination_binding: _BoundDirectory,
+    output: Path,
+) -> dict[str, Any]:
+    """Observe every standalone sidecar twice through the held parent fd."""
+
+    receipt: dict[str, Any] = {
+        "schema": "apple-notes-standalone-sidecar-absence-receipt/v1",
+        "main": output.name,
+        "verification": "two-pass-descriptor-relative-no-follow",
+        "namespace_authority": "point-in-time-observation-only",
+        "evidence_status": "checked",
+        "sidecars": {
+            f"{output.name}{suffix}": {"passes": []}
+            for suffix in ("-wal", "-shm", "-journal")
+        },
+    }
+
+    def verify_parent(phase: str) -> None:
+        try:
+            _verify_bound_parent_descriptor(
+                destination_binding.fd,
+                destination_binding.opened,
+                display_path=output.parent,
+                identity_code="prepared-directory-identity-mismatch",
+                access_policy_code="prepared-directory-access-policy-mismatch",
+                inconclusive_code="prepared-directory-revalidation-inconclusive",
+            )
+        except StoreSafetyError as exc:
+            receipt["evidence_status"] = "inconclusive"
+            receipt["parent_revalidation"] = {
+                "phase": phase,
+                "error_code": exc.code,
+                "error": str(exc),
+            }
+            receipt["reason_code"] = (
+                "standalone-output-sidecar-revalidation-inconclusive"
+            )
+            raise StoreSafetyError(
+                "standalone-output-sidecar-revalidation-inconclusive",
+                "Cannot terminally revalidate the standalone output parent "
+                f"during {phase}: {output.parent}: {exc}",
+                details={"terminal_sidecar_revalidation": receipt},
+            ) from exc
+
+    observed_statuses: set[str] = set()
+    for pass_index in range(2):
+        pass_number = pass_index + 1
+        verify_parent(f"before-sidecar-pass-{pass_number}")
+        for basename, sidecar in receipt["sidecars"].items():
+            row: dict[str, Any] = {
+                "pass": pass_number,
+                "follow_symlinks": False,
+            }
+            try:
+                observed = os.stat(
+                    basename,
+                    dir_fd=destination_binding.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                row["status"] = "absent"
+            except PermissionError as exc:
+                row.update(
+                    {
+                        "status": "unreadable",
+                        "errno": exc.errno,
+                        "evidence_status": "inconclusive",
+                    }
+                )
+            except OSError as exc:
+                row.update(
+                    {
+                        "status": "unverifiable",
+                        "errno": exc.errno,
+                        "evidence_status": "inconclusive",
+                    }
+                )
+            else:
+                row.update(
+                    {
+                        "status": "present",
+                        "identity": _identity(observed),
+                        "access_policy": _access_policy(observed),
+                        "size": observed.st_size,
+                    }
+                )
+            sidecar["passes"].append(row)
+            observed_statuses.add(str(row["status"]))
+        verify_parent(f"after-sidecar-pass-{pass_number}")
+
+    non_absent = observed_statuses - {"absent"}
+    if non_absent:
+        if "present" in non_absent:
+            code = "standalone-output-sidecar-present"
+            receipt["evidence_status"] = "present"
+        elif "unreadable" in non_absent:
+            code = "standalone-output-sidecar-unreadable"
+            receipt["evidence_status"] = "inconclusive"
+        else:
+            code = "standalone-output-sidecar-revalidation-inconclusive"
+            receipt["evidence_status"] = "inconclusive"
+        receipt["reason_code"] = code
+        receipt["safe_action"] = (
+            "preserve-main-and-observed-sidecars-do-not-retry-or-delete-"
+            "quiesce-writer-and-rebind"
+        )
+        raise StoreSafetyError(
+            code,
+            "Standalone output sidecar absence could not be terminally proved "
+            f"through the held parent descriptor: {output}",
+            details={"terminal_sidecar_revalidation": receipt},
+        )
+    return receipt
+
+
+def _terminal_public_standalone_output_receipt(
+    destination_binding: _BoundDirectory,
+    prepared: _BoundRegularFile,
+    output: Path,
+) -> dict[str, Any]:
+    """Rebind the public parent and re-prove the published main object."""
+
+    receipt: dict[str, Any] = {
+        "schema": "apple-notes-standalone-public-output-receipt/v1",
+        "display_path": str(output),
+        "verification": (
+            "public-parent-rebound-to-held-parent-and-main-rehashed-through-"
+            "rebound-parent"
+        ),
+        "evidence_status": "checked",
+    }
+    try:
+        held_before = _verify_bound_directory_namespace(destination_binding)
+        with _bind_existing_directory_with_trusted_alias(
+            output.parent,
+            trusted_alias=destination_binding.trusted_alias,
+        ) as public_parent:
+            public_before = _verify_bound_directory_namespace(public_parent)
+            if public_before["identity"] != held_before["identity"]:
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "The public standalone-output parent no longer identifies "
+                    f"the held publication parent: {output.parent}",
+                )
+            if public_before["access_policy"] != held_before["access_policy"]:
+                raise StoreSafetyError(
+                    "prepared-directory-access-policy-mismatch",
+                    "The public standalone-output parent access policy differs "
+                    f"from the held publication parent: {output.parent}",
+                )
+            main = _verify_bound_regular_file_at(
+                prepared,
+                PREPARED_FILE_CODES,
+                dir_fd=public_parent.fd,
+                basename=output.name,
+            )
+            held_after = _verify_bound_directory_namespace(destination_binding)
+            public_after = _verify_bound_directory_namespace(public_parent)
+            if (
+                held_after["identity"] != held_before["identity"]
+                or public_after["identity"] != held_before["identity"]
+            ):
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "The public or held standalone-output parent changed during "
+                    f"terminal main-file revalidation: {output.parent}",
+                )
+            if (
+                held_after["access_policy"] != held_before["access_policy"]
+                or public_after["access_policy"] != held_before["access_policy"]
+            ):
+                raise StoreSafetyError(
+                    "prepared-directory-access-policy-mismatch",
+                    "The public or held standalone-output parent access policy "
+                    f"changed during terminal main-file revalidation: {output.parent}",
+                )
+            main = _verify_bound_regular_file_at(
+                prepared,
+                PREPARED_FILE_CODES,
+                dir_fd=public_parent.fd,
+                basename=output.name,
+            )
+    except StoreSafetyError as exc:
+        receipt["evidence_status"] = "inconclusive"
+        receipt["reason_code"] = exc.code
+        receipt["error"] = str(exc)
+        receipt["safe_action"] = (
+            "preserve-descriptor-bound-main-and-observed-names-do-not-retry-"
+            "or-delete-quiesce-writer-and-rebind"
+        )
+        exc.details = _merge_recovery_details(
+            exc.details,
+            {"terminal_public_path_revalidation": receipt},
+        )
+        raise
+    receipt["parent"] = {
+        "identity": held_before["identity"],
+        "access_policy": held_before["access_policy"],
+    }
+    receipt["trusted_alias"] = held_before.get("trusted_alias")
+    receipt["main"] = main
+    return receipt
+
+
+def _revalidate_standalone_public_names_before_temp_create(
+    destination_binding: _BoundDirectory,
+    output: Path,
+) -> None:
+    """Linearize zero-write publication against the main and sidecar names."""
+
+    _verify_bound_directory_namespace(destination_binding)
+    if destination_binding.before_write is not None:
+        destination_binding.before_write()
+    for candidate in (
+        output,
+        output.with_name(f"{output.name}-wal"),
+        output.with_name(f"{output.name}-shm"),
+        output.with_name(f"{output.name}-journal"),
+    ):
+        state, _ = _observe_bound_name(
+            destination_binding.fd,
+            candidate.name,
+        )
+        if state == "present":
+            raise StoreSafetyError(
+                "destination-exists",
+                f"Recovery destination already exists: {candidate}",
+                details={"mutation_performed": False},
+            )
+        if state != "absent":
+            raise StoreSafetyError(
+                "prepared-directory-revalidation-inconclusive",
+                f"Cannot inspect descriptor-bound recovery destination: {candidate}",
+                details={"mutation_performed": False},
+            )
+
+
+def _write_standalone_backup_payload(
+    payload: bytes,
+    output: Path,
+    *,
+    destination_binding: _BoundDirectory | None = None,
+    pre_temp_create: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    if destination_binding is None:
+        with _bind_existing_directory_with_trusted_alias(
+            output.parent
+        ) as bound_destination:
+            return _write_standalone_backup_payload(
+                payload,
+                output,
+                destination_binding=bound_destination,
+                pre_temp_create=pre_temp_create,
+            )
+    if output.parent != destination_binding.path:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            f"Standalone output does not use the bound destination directory: {output}",
+        )
+    _verify_bound_directory_namespace(destination_binding)
+    if destination_binding.before_write is not None:
+        destination_binding.before_write()
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    expected_size = len(payload)
+    expected_mode = 0o600
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    if pre_temp_create is not None:
+        pre_temp_create()
+    try:
+        output_fd = os.open(
+            output.name,
+            flags,
+            0o600,
+            dir_fd=destination_binding.fd,
+        )
+    except OSError as exc:
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Cannot exclusively create standalone recovery output {output}: {exc}",
+        ) from exc
+    created: os.stat_result | None = None
+    verified_sha256: str | None = None
+    try:
+        try:
+            created = os.fstat(output_fd)
+        except OSError as exc:
+            raise StoreSafetyError(
+                "prepared-file-revalidation-inconclusive",
+                "Cannot inspect the exclusively created standalone recovery "
+                f"output before writing: {output}: {exc}",
+            ) from exc
+        _, expected_access_policy = _bind_created_regular_file_access_policy(
+            output_fd,
+            output,
+            destination_binding,
+            created=created,
+            expected_mode=expected_mode,
+        )
+        os.lseek(output_fd, 0, os.SEEK_SET)
+        os.ftruncate(output_fd, 0)
+        _write_all(output_fd, payload)
+        os.fsync(output_fd)
+        _verify_bound_directory_namespace(destination_binding)
+        _verify_created_regular_file_boundary(
+            output_fd,
+            output,
+            destination_binding,
+            created=created,
+            expected_access_policy=expected_access_policy,
+            phase="post-write pre-readback",
+        )
+        result = _terminal_standalone_output_receipt(
+            output_fd,
+            output,
+            destination_binding,
+            created=created,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+            expected_access_policy=expected_access_policy,
+        )
+        verified_sha256 = expected_sha256
+        return result
+    except Exception as exc:
+        retained = _retained_created_regular_file_details(
+            destination_binding,
+            output_fd,
+            created,
+            display_path=output,
+            candidate_basenames=(output.name,),
+            content_sha256=verified_sha256,
+        )
+        if isinstance(exc, StoreSafetyError):
+            exc.details = _merge_recovery_details(
+                exc.details,
+                retained,
+            )
+            raise
+        raise StoreSafetyError(
+            "prepared-file-revalidation-inconclusive",
+            f"Standalone recovery failed; the descriptor-bound partial file "
+            f"was retained: {output}: {exc}",
+            details=retained,
+        ) from exc
+    finally:
+        os.close(output_fd)
+
+
+def _backup_bound_store_to_standalone(
+    source: Union[_BoundRecoveryStore, _BoundSourceStore],
+    output: Path,
+    *,
+    destination_binding: _BoundDirectory | None = None,
+    pre_temp_create: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    recovered_payload = _bound_recovery_payload(source)
+    payload = _sqlite_backup_bytes_from_payload(
+        recovered_payload,
+        source.directory.path / source.main_name,
+    )
+    _verify_bound_recovery_input(source)
+    return _write_standalone_backup_payload(
+        payload,
+        output,
+        destination_binding=destination_binding,
+        pre_temp_create=pre_temp_create,
+    )
+
+
+def _backup_bound_regular_to_standalone(
+    source: _BoundRegularFile,
+    output: Path,
+    *,
+    destination_binding: _BoundDirectory | None = None,
+    pre_temp_create: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Back up an already validated standalone file without sidecar discovery."""
+
+    _verify_bound_regular_file(source, PREPARED_FILE_CODES)
+    source_payload = _read_bound_file_bytes(
+        source,
+        PREPARED_FILE_CODES,
+        max_bytes=source.opened.st_size,
+        too_large_code="prepared-file-content-mismatch",
+    )
+    payload = _sqlite_backup_bytes_from_payload(source_payload, source.path)
+    _verify_bound_regular_file(source, PREPARED_FILE_CODES)
+    result = _write_standalone_backup_payload(
+        payload,
+        output,
+        destination_binding=destination_binding,
+        pre_temp_create=pre_temp_create,
+    )
+    _verify_bound_regular_file(source, PREPARED_FILE_CODES)
+    return result
+
+
+def _backup_sqlite_to_standalone(
+    source: Union[_BoundRegularFile, _BoundRecoveryStore, _BoundSourceStore],
+    output: Path,
+    *,
+    destination_binding: _BoundDirectory | None = None,
+    pre_temp_create: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    if isinstance(source, (_BoundRecoveryStore, _BoundSourceStore)):
+        return _backup_bound_store_to_standalone(
+            source,
+            output,
+            destination_binding=destination_binding,
+            pre_temp_create=pre_temp_create,
+        )
+    return _backup_bound_regular_to_standalone(
+        source,
+        output,
+        destination_binding=destination_binding,
+        pre_temp_create=pre_temp_create,
+    )
+
+
+def _recover_validated_clone_to_standalone(
+    recovered_main: Path,
+    out: Path,
+    *,
+    source_db: Path,
+    recovery_evidence: dict[str, Any],
+    source_integrity: dict[str, Any],
+    source_revalidate: Callable[[], None] | None = None,
+    source_backup: Callable[
+        [Path, _BoundDirectory | None, Callable[[], None] | None],
+        dict[str, Any],
+    ]
+    | None = None,
+    output_parent_binding: _BoundDirectory | None = None,
+) -> dict[str, Any]:
+    if source_backup is None:
+        with _bind_recovery_store(recovered_main) as recovered_store:
+            _require_authoritative_wal(recovered_store, recovery_evidence)
+
+            def revalidate_bound_source() -> None:
+                _verify_bound_recovery_store(recovered_store)
+                _require_authoritative_wal(recovered_store, recovery_evidence)
+
+            return _recover_validated_clone_to_standalone(
+                recovered_main,
+                out,
+                source_db=source_db,
+                recovery_evidence=recovery_evidence,
+                source_integrity=source_integrity,
+                source_revalidate=revalidate_bound_source,
+                source_backup=lambda output, destination_binding, pre_temp_create: (
+                    _backup_sqlite_to_standalone(
+                        recovered_store,
+                        output,
+                        destination_binding=destination_binding,
+                        pre_temp_create=pre_temp_create,
+                    )
+                ),
+                output_parent_binding=output_parent_binding,
+            )
+    publication_guard: dict[str, Any] = {}
+    with (
+        _post_publication_failure_guard(
+            publication_guard,
+            destination=out,
+            phase="standalone-output-transaction-teardown",
+            message=(
+                "The standalone database was published, but a later output "
+                "transaction revalidation or teardown failed"
+            ),
+        ),
+        ExitStack() as output_stack,
+    ):
+        if output_parent_binding is None:
+            output_parent_binding = output_stack.enter_context(
+                _bind_existing_directory_with_trusted_alias(out.parent)
+            )
+        elif output_parent_binding.path != out.parent:
+            raise StoreSafetyError(
+                "prepared-directory-identity-mismatch",
+                f"Recovery output does not use the supplied bound parent: {out}",
+            )
+        _verify_bound_directory_namespace(output_parent_binding)
+        _revalidate_standalone_public_names_before_temp_create(
+            output_parent_binding,
+            out,
+        )
+        temp_out = out.parent / f".{out.name}.tmp-{uuid.uuid4().hex}"
+        if source_revalidate is not None:
+            source_revalidate()
+        temp_receipt = source_backup(
+            temp_out,
+            output_parent_binding,
+            lambda: _revalidate_standalone_public_names_before_temp_create(
+                output_parent_binding,
+                out,
+            ),
+        )
+        with _bind_prepared_regular_file_with_failure_receipt(
+            temp_out,
+            output_parent_binding,
+            temp_receipt,
+        ) as prepared:
+            with _pre_publication_regular_file_failure_guard(
+                output_parent_binding,
+                prepared,
+                temp_receipt,
+                display_path=temp_out,
+                candidate_basenames=(temp_out.name,),
+            ):
+                _assert_bound_matches_receipt(
+                    prepared,
+                    temp_receipt,
+                    dir_fd=output_parent_binding.fd,
+                    basename=temp_out.name,
+                )
+                if source_revalidate is not None:
+                    source_revalidate()
+                output_integrity = _sqlite_integrity(
+                    prepared,
+                    parent=output_parent_binding,
+                )
+                _verify_bound_regular_file_at(
+                    prepared,
+                    PREPARED_FILE_CODES,
+                    dir_fd=output_parent_binding.fd,
+                    basename=temp_out.name,
+                )
+                try:
+                    os.fsync(prepared.fd)
+                except OSError as exc:
+                    raise StoreSafetyError(
+                        "destination-install-failed",
+                        "The prepared recovered database could not be made durable "
+                        f"before publication: {temp_out}: {exc}",
+                        details=_publication_details(
+                            "uncommitted",
+                            prepared=prepared,
+                            destination=out,
+                            retry_safe=True,
+                        ),
+                    ) from exc
+            fingerprint = _publish_file_no_replace_from_parent(
+                prepared,
+                out,
+                output_parent_binding.fd,
+                publication_guard=publication_guard,
+            )
+            publication_guard["committed"] = True
+            try:
+                terminal_sidecars = _terminal_standalone_sidecar_absence_receipt(
+                    output_parent_binding,
+                    out,
+                )
+                terminal_public_output = _terminal_public_standalone_output_receipt(
+                    output_parent_binding,
+                    prepared,
+                    out,
+                )
+                descriptor_bound_destination = _descriptor_bound_destination_receipt(
+                    output_parent_binding.fd,
+                    prepared,
+                    out,
+                )
+                if terminal_public_output.get("trusted_alias") is not None:
+                    descriptor_bound_destination["trusted_alias"] = (
+                        terminal_public_output["trusted_alias"]
+                    )
+                publication_guard["descriptor_bound_destination"] = (
+                    descriptor_bound_destination
+                )
+                publication_guard["additional_details"] = {
+                    "terminal_sidecar_revalidation": terminal_sidecars,
+                    "terminal_public_path_revalidation": terminal_public_output,
+                }
+            except Exception as exc:
+                descriptor_bound_prepared_file = (
+                    _descriptor_bound_file_recovery_evidence(
+                        output_parent_binding.fd,
+                        prepared,
+                        out,
+                        terminal_error=exc,
+                    )
+                )
+                descriptor_bound_destination: dict[str, Any] | None = None
+                try:
+                    descriptor_bound_destination = (
+                        _descriptor_bound_destination_receipt(
+                            output_parent_binding.fd,
+                            prepared,
+                            out,
+                        )
+                    )
+                except Exception:
+                    descriptor_bound_destination = None
+                details = _publication_details(
+                    "uncertain",
+                    prepared=prepared,
+                    destination=out,
+                    retry_safe=False,
+                    descriptor_bound_destination=descriptor_bound_destination,
+                    descriptor_bound_prepared_file=(descriptor_bound_prepared_file),
+                )
+                if isinstance(exc, StoreSafetyError):
+                    details = _merge_recovery_details(details, exc.details)
+                    details["terminal_output_error_code"] = exc.code
+                    if "terminal_sidecar_revalidation" in exc.details:
+                        details["terminal_sidecar_error_code"] = exc.code
+                else:
+                    details["terminal_output_error_type"] = type(exc).__name__
+                    details["terminal_output_errno"] = getattr(exc, "errno", None)
+                raise StoreSafetyError(
+                    "destination-install-uncertain",
+                    "The standalone database was published and its main-file "
+                    "receipt completed, but its terminal sidecar/public-path "
+                    f"state is unconfirmed: {out}: {exc}",
+                    details=details,
+                ) from exc
+    return {
+        "source_db": source_db,
+        "standalone_db": out,
+        "source_recovery": recovery_evidence,
+        "source_integrity": source_integrity,
+        "output_integrity": output_integrity,
+        "sha256": fingerprint["sha256"],
+        "size": fingerprint["size"],
+        "identity": fingerprint["identity"],
+        "access_policy": fingerprint["access_policy"],
+        "terminal_sidecar_revalidation": terminal_sidecars,
+        "terminal_public_path_revalidation": terminal_public_output,
+        "descriptor_bound_destination": descriptor_bound_destination,
+    }
+
+
+def _recover_to_standalone(
+    src: Path,
+    out: Path,
+    *,
+    output_parent_binding: _BoundDirectory | None = None,
+) -> dict[str, Any]:
+    publication_guard: dict[str, Any] = {}
+    with (
+        _post_publication_failure_guard(
+            publication_guard,
+            destination=out,
+            phase="source-store-transaction-teardown",
+            message=(
+                "The standalone database was published, but final source-store "
+                "revalidation or teardown failed"
+            ),
+        ),
+        _bind_source_store(src) as source_store,
+    ):
+        evidence = {
+            "capture": _capture_bound_source_store(source_store),
+            "sidecars": _inspect_bound_sidecars(source_store),
+        }
+        _require_authoritative_wal(source_store, evidence)
+        source_integrity = _bound_recovery_integrity(source_store)
+
+        def revalidate_bound_source() -> None:
+            _verify_bound_source_store(source_store)
+            _require_authoritative_wal(source_store, evidence)
+
+        recovered = _recover_validated_clone_to_standalone(
+            src,
+            out,
+            source_db=src,
+            recovery_evidence=evidence,
+            source_integrity=source_integrity,
+            source_revalidate=revalidate_bound_source,
+            source_backup=lambda output, destination_binding, pre_temp_create: (
+                _backup_sqlite_to_standalone(
+                    source_store,
+                    output,
+                    destination_binding=destination_binding,
+                    pre_temp_create=pre_temp_create,
+                )
+            ),
+            output_parent_binding=output_parent_binding,
+        )
+        publication_guard["committed"] = True
+        publication_guard["descriptor_bound_destination"] = recovered.get(
+            "descriptor_bound_destination"
+        )
+        publication_guard["additional_details"] = {
+            "terminal_sidecar_revalidation": recovered["terminal_sidecar_revalidation"],
+            "terminal_public_path_revalidation": recovered[
+                "terminal_public_path_revalidation"
+            ],
+        }
+    return recovered
+
+
+def _preflight_copy_notes_state(*, require_notes_quit: bool) -> bool:
+    try:
+        notes_running = notes_is_running()
+    except StoreSafetyError as exc:
+        exc.details = _merge_recovery_details(
+            exc.details,
+            {"mutation_performed": False},
+        )
+        raise
+    if require_notes_quit and notes_running:
+        raise StoreSafetyError(
+            "notes-running",
+            "Notes.app is running; quit it before using --require-notes-quit",
+            details={"mutation_performed": False},
+        )
+    return notes_running
+
+
+def copy_db(
+    paths: NoteStorePaths,
+    *,
+    dest: Path | None,
+    require_notes_quit: bool,
+    _destination_preflight: _LiveDestinationPreflight | None = None,
+    _notes_running: bool | None = None,
+    _command_cwd: str | None = None,
+) -> dict[str, Any]:
+    command_cwd = os.getcwd() if _command_cwd is None else _command_cwd
+    requested_destination = _absolute_path_from_cwd(
+        dest or _timestamped_tmp_dir("apple-notes-probe"),
+        command_cwd,
+    )
+    notes_running = (
+        _preflight_copy_notes_state(require_notes_quit=require_notes_quit)
+        if _notes_running is None
+        else _notes_running
+    )
+    if require_notes_quit and notes_running:
+        raise StoreSafetyError(
+            "notes-running",
+            "Notes.app is running; quit it before using --require-notes-quit",
+            details={"mutation_performed": False},
+        )
+
+    if _lexists(requested_destination):
+        raise StoreSafetyError(
+            "destination-exists",
+            f"Destination already exists: {requested_destination}",
+            details={"mutation_performed": False},
+        )
+    if _destination_preflight is not None:
+        if _destination_preflight.requested_destination != requested_destination:
+            raise StoreSafetyError(
+                "snapshot-destination-scope-inconclusive",
+                "The held zero-write destination preflight names a different "
+                "snapshot artifact",
+                details={
+                    "destination": str(requested_destination),
+                    "preflight_destination": str(
+                        _destination_preflight.requested_destination
+                    ),
+                    "mutation_performed": False,
+                },
+            )
+        _assert_destination_preflight_name_absent(
+            _destination_preflight,
+            exists_code="destination-exists",
+            inconclusive_code="snapshot-destination-scope-inconclusive",
+            label="Destination",
+        )
+        destination_parent_context = _commit_live_safe_destination_parent(
+            _destination_preflight
+        )
+    else:
+        destination_parent_context = _bind_live_safe_destination_parent(
+            paths,
+            requested_destination,
+        )
+    publication_guard: dict[str, Any] = {}
+    try:
+        with (
+            _post_publication_failure_guard(
+                publication_guard,
+                destination=requested_destination,
+                phase="snapshot-transaction-teardown",
+                message=(
+                    "The snapshot was published, but a later transaction "
+                    "revalidation or teardown failed"
+                ),
+            ),
+            destination_parent_context as destination_scope,
+            _create_bound_artifact_partial_after_destination_revalidation(
+                destination_scope,
+            ) as bound_root,
+            ExitStack() as snapshot_stack,
+        ):
+            destination = destination_scope.destination
+            partial = bound_root.path
+            if _lexists(destination):
+                raise StoreSafetyError(
+                    "destination-exists",
+                    f"Destination already exists: {requested_destination}",
+                )
+            store_dir = partial / "group.com.apple.notes"
+            bound_store = snapshot_stack.enter_context(
+                _create_bound_directory(
+                    store_dir,
+                    parent_binding=bound_root,
+                )
+            )
+            with _bind_source_store(
+                paths.group_container / NOTE_STORE_MAIN
+            ) as source_store:
+                captured = _capture_bound_source_store(
+                    source_store,
+                    store_dir,
+                    destination_binding=bound_store,
+                )
+                source_binding = _live_source_binding_receipt(
+                    paths.group_container,
+                    _verify_bound_source_store(source_store)["directory"],
+                )
+            _verify_bound_directory(bound_root)
+            expected_names = {
+                str(record["basename"]): stat.S_IFREG for record in captured
+            }
+            recovery_file_receipts = {
+                str(record["basename"]): record["copy"] for record in captured
+            }
+            recovery_store_receipt = _recovery_store_creation_receipt(
+                bound_store,
+                NOTE_STORE_MAIN,
+                recovery_file_receipts,
+            )
+            store_receipt = {
+                "identity": dict(recovery_store_receipt.directory_identity),
+                "access_policy": dict(recovery_store_receipt.directory_access_policy),
+                "entry_types": dict(recovery_store_receipt.entry_types),
+            }
+            with _bind_recovery_store_from_directory(
+                bound_store,
+                NOTE_STORE_MAIN,
+                creation_receipt=recovery_store_receipt,
+            ) as copied_store:
+                sidecars = _inspect_bound_sidecars(copied_store)
+                recovery_evidence = {
+                    "capture": captured,
+                    "sidecars": sidecars,
+                }
+                _require_authoritative_wal(copied_store, recovery_evidence)
+                sqlite_integrity = _bound_recovery_integrity(copied_store)
+                _assert_recovery_store_matches_receipt(
+                    copied_store,
+                    recovery_store_receipt,
+                )
+            manifest_files = []
+            for record in captured:
+                source = record["source"]
+                copied = record["copy"]
+                manifest_files.append(
+                    {
+                        "basename": record["basename"],
+                        "relative_path": str(
+                            Path("group.com.apple.notes") / record["basename"]
+                        ),
+                        "sha256": copied["sha256"],
+                        "size": copied["size"],
+                        "source": source,
+                        "copy": {
+                            "identity": copied["identity"],
+                            "access_policy": copied["access_policy"],
+                        },
+                    }
+                )
+            manifest = {
+                "schema": SNAPSHOT_SCHEMA,
+                "created_at": _utc_now(),
+                "source_root": str(paths.group_container),
+                "source_binding": source_binding,
+                "notes_running": notes_running,
+                "notes_quit_required": require_notes_quit,
+                "classification": (
+                    "tentative-open-notes"
+                    if notes_running
+                    else "writeback-baseline"
+                    if require_notes_quit
+                    else "read-only-snapshot"
+                ),
+                "protected_properties": {
+                    "object_identity": ["device", "inode", "file_type"],
+                    "content_stability": ["sha256", "size"],
+                    "access_policy": ["mode", "uid", "gid", "flags"],
+                    "metadata_only_transitions_are_reported": [
+                        "mtime_ns",
+                        "ctime_ns",
+                        "link_count",
+                        "platform_flags",
+                    ],
+                },
+                "external_creation_receipt": {
+                    "schema": MANIFEST_CREATION_RECEIPT_SCHEMA,
+                    "artifact_kind": "snapshot",
+                    "manifest_name": SNAPSHOT_MANIFEST,
+                    "required_before_manifest_consumption": True,
+                },
+                "creation_receipts": {
+                    "snapshot_directory": {
+                        "identity": _identity(bound_root.opened),
+                        "access_policy": _access_policy(bound_root.opened),
+                    },
+                    "store_directory": {
+                        "identity": store_receipt["identity"],
+                        "access_policy": store_receipt["access_policy"],
+                    },
+                },
+                "files": manifest_files,
+                "sidecar_consistency": sidecars,
+                "sqlite_validation": sqlite_integrity,
+            }
+            if require_notes_quit:
+                _require_notes_quit_during_capture(
+                    phase="pre-manifest-publication",
+                )
+            manifest_receipt = _write_json_atomic(
+                partial / SNAPSHOT_MANIFEST,
+                manifest,
+                parent_binding=bound_root,
+            )
+            manifest_creation_receipt = _manifest_creation_receipt_payload(
+                artifact_kind="snapshot",
+                artifact_schema=SNAPSHOT_SCHEMA,
+                manifest_name=SNAPSHOT_MANIFEST,
+                manifest_receipt=manifest_receipt,
+            )
+            manifest_creation_destination_scope = destination_scope.revalidate()
+            root_receipt = _scan_exact_prepared_directory_entries(
+                bound_root,
+                {
+                    "group.com.apple.notes": stat.S_IFDIR,
+                    SNAPSHOT_MANIFEST: stat.S_IFREG,
+                },
+                missing_code="prepared-directory-identity-mismatch",
+            )
+            file_receipts = {
+                Path("group.com.apple.notes") / str(record["basename"]): record["copy"]
+                for record in captured
+            }
+            prepared_tree_receipt = {
+                "schema": "apple-notes-prepared-tree-receipt/v1",
+                "root": root_receipt,
+                "directories": {
+                    "group.com.apple.notes": store_receipt,
+                },
+                "files": {
+                    SNAPSHOT_MANIFEST: manifest_receipt,
+                    **{
+                        str(relative_path): receipt
+                        for relative_path, receipt in file_receipts.items()
+                    },
+                },
+            }
+            with _bind_prepared_regular_files(
+                partial,
+                root_binding=bound_root,
+                directory_bindings={
+                    Path("group.com.apple.notes"): bound_store,
+                },
+                manifest_name=SNAPSHOT_MANIFEST,
+                manifest_payload=manifest,
+                manifest_receipt=manifest_receipt,
+                file_receipts=file_receipts,
+            ) as prepared_files:
+
+                def verify_before_snapshot_rename() -> None:
+                    destination_scope.revalidate()
+                    _scan_exact_prepared_directory_entries(
+                        bound_store,
+                        expected_names,
+                        missing_code="prepared-file-missing",
+                    )
+                    _revalidate_published_regular_files(
+                        partial,
+                        prepared_files,
+                        manifest_name=SNAPSHOT_MANIFEST,
+                        manifest_payload=manifest,
+                        manifest_receipt=manifest_receipt,
+                        file_receipts=file_receipts,
+                    )
+                    # Copied files are individually fsynced by _copy_fd. Persist
+                    # the nested store directory, then its containing snapshot
+                    # root, before publishing the root name.
+                    _fsync_bound_directory_descriptor(bound_store)
+                    _scan_exact_prepared_directory_entries(
+                        bound_store,
+                        expected_names,
+                        missing_code="prepared-file-missing",
+                    )
+                    _revalidate_published_regular_files(
+                        partial,
+                        prepared_files,
+                        manifest_name=SNAPSHOT_MANIFEST,
+                        manifest_payload=manifest,
+                        manifest_receipt=manifest_receipt,
+                        file_receipts=file_receipts,
+                    )
+                    _fsync_bound_directory_descriptor(bound_root)
+                    _scan_exact_prepared_directory_entries(
+                        bound_store,
+                        expected_names,
+                        missing_code="prepared-file-missing",
+                    )
+                    _revalidate_published_regular_files(
+                        partial,
+                        prepared_files,
+                        manifest_name=SNAPSHOT_MANIFEST,
+                        manifest_payload=manifest,
+                        manifest_receipt=manifest_receipt,
+                        file_receipts=file_receipts,
+                    )
+                    _scan_exact_prepared_directory_entries(
+                        bound_root,
+                        {
+                            "group.com.apple.notes": stat.S_IFDIR,
+                            SNAPSHOT_MANIFEST: stat.S_IFREG,
+                        },
+                        missing_code="prepared-directory-identity-mismatch",
+                    )
+                    destination_scope.revalidate()
+                    if require_notes_quit:
+                        _require_notes_quit_during_capture(
+                            phase="before-publication-rename",
+                        )
+
+                def build_descriptor_snapshot_tree_receipt(
+                    published_basename: str,
+                ) -> dict[str, Any]:
+                    return _descriptor_bound_prepared_tree_receipt(
+                        bound_root,
+                        published_basename=published_basename,
+                        root_receipt=root_receipt,
+                        nested_directories={
+                            Path("group.com.apple.notes"): (
+                                bound_store,
+                                store_receipt,
+                            ),
+                        },
+                        bindings=prepared_files,
+                        manifest_name=SNAPSHOT_MANIFEST,
+                        manifest_payload=manifest,
+                        manifest_receipt=manifest_receipt,
+                        file_receipts=file_receipts,
+                    )
+
+                _verify_bound_directory(bound_root)
+                publication_receipt = _publish_directory_no_replace(
+                    partial,
+                    destination,
+                    binding=bound_root,
+                    before_rename=verify_before_snapshot_rename,
+                    prepared_tree_receipt=prepared_tree_receipt,
+                    descriptor_tree_receipt_builder=(
+                        build_descriptor_snapshot_tree_receipt
+                    ),
+                    publication_guard=publication_guard,
+                )
+                publication_guard["committed"] = True
+                publication_guard["descriptor_bound_destination"] = publication_receipt
+                if require_notes_quit:
+                    _post_publication_notes_quit_check(
+                        bound_root,
+                        destination,
+                        publication_receipt=publication_receipt,
+                        descriptor_tree_receipt_builder=(
+                            build_descriptor_snapshot_tree_receipt
+                        ),
+                        publication_guard=publication_guard,
+                    )
+                try:
+                    destination_scope.revalidate()
+                    _scan_exact_prepared_directory_entries(
+                        bound_root,
+                        {
+                            "group.com.apple.notes": stat.S_IFDIR,
+                            SNAPSHOT_MANIFEST: stat.S_IFREG,
+                        },
+                        missing_code="prepared-directory-identity-mismatch",
+                    )
+                    _scan_exact_prepared_directory_entries(
+                        bound_store,
+                        expected_names,
+                        missing_code="prepared-file-missing",
+                    )
+                    _revalidate_published_regular_files(
+                        destination,
+                        prepared_files,
+                        manifest_name=SNAPSHOT_MANIFEST,
+                        manifest_payload=manifest,
+                        manifest_receipt=manifest_receipt,
+                        file_receipts=file_receipts,
+                    )
+                    terminal_destination_scope = destination_scope.revalidate()
+                    publication_guard["additional_details"] = {
+                        "terminal_destination_scope": terminal_destination_scope,
+                    }
+                except Exception as exc:
+                    raise StoreSafetyError(
+                        "destination-install-uncertain",
+                        "Snapshot publication committed, but the exact prepared "
+                        f"tree could not be revalidated: {destination}: {exc}",
+                        details=_publication_details(
+                            "uncertain",
+                            prepared=None,
+                            destination=destination,
+                            retry_safe=False,
+                            descriptor_bound_destination=publication_receipt,
+                        ),
+                    ) from exc
+    except StoreSafetyError:
+        raise
+
+    return {
+        "dest": requested_destination,
+        "manifest": requested_destination / SNAPSHOT_MANIFEST,
+        "manifest_creation_receipt": manifest_creation_receipt,
+        "manifest_creation_destination_scope": (manifest_creation_destination_scope),
+        "terminal_destination_scope": terminal_destination_scope,
+        "descriptor_bound_destination": publication_receipt,
+        "notes_running": notes_running,
+        "notes_quit_required": require_notes_quit,
+        "classification": manifest["classification"],
+        "copied_files": [
+            {
+                "source": row["source"]["path"],
+                "dest": requested_destination / row["relative_path"],
+                "size": row["size"],
+                "sha256": row["sha256"],
+            }
+            for row in manifest["files"]
+        ],
+        "sidecar_consistency": manifest["sidecar_consistency"],
+        "sqlite_validation": manifest["sqlite_validation"],
+    }
+
+
+@contextmanager
+def _validated_snapshot_artifact(
+    snapshot_dir: Path | _SnapshotArtifactPaths,
+    manifest_creation_receipt: dict[str, Any] | None,
+    *,
+    manifest_creation_receipt_file: Path | None = None,
+    artifact_root_binding: _BoundDirectory | None = None,
+) -> Iterator[_ValidatedSnapshotArtifact]:
+    """Bind snapshot inputs and expose only a private validated recovery clone."""
+
+    artifact_paths = _snapshot_artifact_paths(snapshot_dir)
+    snapshot_dir = artifact_paths.root
+    manifest_path = artifact_paths.manifest
+    store_dir = artifact_paths.store
+    manifest_creation_receipt_file = _optional_absolute_path(
+        manifest_creation_receipt_file
+    )
+    with ExitStack() as stack:
+        if artifact_root_binding is None:
+            artifact_root = stack.enter_context(
+                _bind_artifact_root(
+                    snapshot_dir,
+                    missing_code="snapshot-missing",
+                )
+            )
+        else:
+            artifact_root = artifact_root_binding
+            if artifact_root.path != Path(os.path.abspath(os.fspath(snapshot_dir))):
+                raise StoreSafetyError(
+                    "snapshot-directory-identity-mismatch",
+                    "The supplied snapshot-root binding does not match the "
+                    f"requested artifact: binding={artifact_root.path}, "
+                    f"requested={snapshot_dir}",
+                )
+            _verify_bound_artifact_directory(
+                artifact_root,
+                missing_code="snapshot-missing",
+                identity_code="snapshot-directory-identity-mismatch",
+                access_policy_code="snapshot-directory-access-policy-mismatch",
+                inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+                mismatch_code="snapshot-file-set-mismatch",
+            )
+        external_receipt = _manifest_creation_receipt_for_bound_artifact(
+            artifact_root,
+            manifest_creation_receipt=manifest_creation_receipt,
+            manifest_creation_receipt_file=manifest_creation_receipt_file,
+            artifact_kind="snapshot",
+            artifact_schema=READ_ONLY_SNAPSHOT_SCHEMAS,
+            manifest_name=SNAPSHOT_MANIFEST,
+        )
+        snapshot_directory = _scan_exact_bound_directory_entries(
+            artifact_root,
+            {
+                "group.com.apple.notes": stat.S_IFDIR,
+                SNAPSHOT_MANIFEST: stat.S_IFREG,
+            },
+            missing_code="snapshot-missing",
+            identity_code="snapshot-directory-identity-mismatch",
+            access_policy_code="snapshot-directory-access-policy-mismatch",
+            inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+            mismatch_code="snapshot-file-set-mismatch",
+        )
+        try:
+            manifest_bound = stack.enter_context(
+                _bind_regular_file_at(
+                    manifest_path,
+                    artifact_root,
+                    SNAPSHOT_FILE_CODES,
+                )
+            )
+        except StoreSafetyError as exc:
+            if exc.code == SNAPSHOT_FILE_CODES.missing:
+                raise StoreSafetyError(
+                    "manifest-missing",
+                    f"Manifest is missing: {manifest_path}",
+                ) from exc
+            raise
+        _assert_bound_manifest_creation_receipt(
+            manifest_bound,
+            external_receipt,
+            SNAPSHOT_FILE_CODES,
+            parent=artifact_root,
+        )
+        manifest = _load_bound_manifest(
+            manifest_bound,
+            SNAPSHOT_FILE_CODES,
+            external_receipt["artifact_schema"],
+            parent=artifact_root,
+        )
+        _assert_manifest_external_anchor_declaration(
+            manifest,
+            artifact_kind="snapshot",
+            manifest_name=SNAPSHOT_MANIFEST,
+        )
+        snapshot_schema = manifest["schema"]
+        if snapshot_schema == SNAPSHOT_SCHEMA_V3 and "source_binding" in manifest:
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Snapshot v3 must not contain the v4-only live source binding",
+            )
+        source_binding = (
+            _snapshot_manifest_source_binding(manifest)
+            if snapshot_schema == SNAPSHOT_SCHEMA
+            else None
+        )
+        writeback_grade = _snapshot_manifest_writeback_grade(
+            manifest,
+            source_binding,
+        )
+        creation_receipts = manifest.get("creation_receipts")
+        if not isinstance(creation_receipts, dict):
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Snapshot manifest has no creation receipts",
+            )
+        _assert_manifest_protection_receipt(
+            snapshot_directory,
+            creation_receipts.get("snapshot_directory"),
+            label="snapshot directory",
+            identity_code="snapshot-directory-identity-mismatch",
+            access_policy_code="snapshot-directory-access-policy-mismatch",
+        )
+        rows = manifest.get("files")
+        if (
+            not isinstance(rows, list)
+            or not rows
+            or any(type(row) is not dict for row in rows)
+        ):
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Snapshot manifest has no files",
+            )
+        manifest_names: list[str] = []
+        for row in rows:
+            basename = row.get("basename")
+            if type(basename) is not str or basename not in NOTE_STORE_BASENAMES:
+                raise StoreSafetyError(
+                    "manifest-invalid",
+                    "Snapshot manifest has an invalid database file entry",
+                )
+            manifest_names.append(basename)
+        expected_names = set(manifest_names)
+        if (
+            len(expected_names) != len(manifest_names)
+            or NOTE_STORE_MAIN not in expected_names
+        ):
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Snapshot manifest has duplicate or unsupported database file entries",
+            )
+        expected_store_types = {name: stat.S_IFREG for name in expected_names}
+        store_binding = stack.enter_context(
+            _bind_directory_at(
+                store_dir,
+                artifact_root,
+                missing_code="snapshot-missing",
+                identity_code="snapshot-directory-identity-mismatch",
+                access_policy_code="snapshot-directory-access-policy-mismatch",
+                inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+            )
+        )
+        store_directory = _scan_exact_bound_directory_entries(
+            store_binding,
+            expected_store_types,
+            missing_code="snapshot-missing",
+            identity_code="snapshot-directory-identity-mismatch",
+            access_policy_code="snapshot-directory-access-policy-mismatch",
+            inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+            mismatch_code="snapshot-file-set-mismatch",
+        )
+        _assert_manifest_protection_receipt(
+            store_directory,
+            creation_receipts.get("store_directory"),
+            label="snapshot store directory",
+            identity_code="snapshot-directory-identity-mismatch",
+            access_policy_code="snapshot-directory-access-policy-mismatch",
+        )
+        manifest_by_name = {row["basename"]: row for row in rows}
+        for basename, row in manifest_by_name.items():
+            expected_relative = Path("group.com.apple.notes") / basename
+            if Path(str(row.get("relative_path"))) != expected_relative:
+                raise StoreSafetyError(
+                    "manifest-invalid",
+                    f"Manifest path is not canonical for {basename}: "
+                    f"{row.get('relative_path')}",
+                )
+
+        bound_files: dict[str, _BoundRegularFile] = {}
+        for basename in NOTE_STORE_BASENAMES:
+            if basename in expected_names:
+                bound_files[basename] = stack.enter_context(
+                    _bind_regular_file_at(
+                        store_dir / basename,
+                        store_binding,
+                        SNAPSHOT_FILE_CODES,
+                    )
+                )
+                current_file = _verify_bound_regular_file_at(
+                    bound_files[basename],
+                    SNAPSHOT_FILE_CODES,
+                    dir_fd=store_binding.fd,
+                    basename=basename,
+                )
+                row = manifest_by_name[basename]
+                _assert_manifest_protection_receipt(
+                    current_file,
+                    row.get("copy"),
+                    label=f"snapshot file {basename}",
+                    identity_code=SNAPSHOT_FILE_CODES.identity,
+                    access_policy_code=SNAPSHOT_FILE_CODES.access_policy,
+                )
+        snapshot_store = _BoundRecoveryStore(
+            directory=store_binding,
+            main_name=NOTE_STORE_MAIN,
+            files=bound_files,
+            entry_types=expected_store_types,
+            file_codes=SNAPSHOT_FILE_CODES,
+            file_set_mismatch_code="snapshot-file-set-mismatch",
+        )
+        capture_records = [
+            {
+                "basename": basename,
+                "source": _verify_bound_regular_file_at(
+                    bound_file,
+                    SNAPSHOT_FILE_CODES,
+                    dir_fd=store_binding.fd,
+                    basename=basename,
+                ),
+            }
+            for basename, bound_file in bound_files.items()
+        ]
+        recovery_evidence = {
+            "capture": capture_records,
+            "sidecars": _inspect_bound_sidecars(snapshot_store),
+        }
+        for record in capture_records:
+            basename = record["basename"]
+            row = manifest_by_name.get(basename)
+            source = record["source"]
+            if (
+                row is None
+                or source["sha256"] != row.get("sha256")
+                or source["size"] != row.get("size")
+            ):
+                raise StoreSafetyError(
+                    "snapshot-content-mismatch",
+                    f"Snapshot bytes no longer match the manifest: {basename}",
+                )
+        _require_authoritative_wal(snapshot_store, recovery_evidence)
+        sqlite_integrity = _bound_recovery_integrity(snapshot_store)
+        validated_recovery_payload = _sqlite_backup_bytes_from_payload(
+            _bound_recovery_payload(snapshot_store),
+            store_dir / NOTE_STORE_MAIN,
+        )
+        validated_recovery_sha256 = hashlib.sha256(
+            validated_recovery_payload
+        ).hexdigest()
+        validated_recovery_integrity = _sqlite_integrity_from_payload(
+            validated_recovery_payload,
+            store_dir / NOTE_STORE_MAIN,
+        )
+
+        def revalidate_recovery_clone() -> None:
+            _verify_bound_recovery_store(snapshot_store)
+            if (
+                hashlib.sha256(validated_recovery_payload).hexdigest()
+                != validated_recovery_sha256
+            ):
+                raise StoreSafetyError(
+                    "snapshot-content-mismatch",
+                    "The in-memory validated recovery payload changed",
+                )
+
+        def backup_recovery_clone(
+            output: Path,
+            destination_binding: _BoundDirectory | None = None,
+            pre_temp_create: Callable[[], None] | None = None,
+        ) -> dict[str, Any]:
+            return _backup_bound_store_to_standalone(
+                snapshot_store,
+                output,
+                destination_binding=destination_binding,
+                pre_temp_create=pre_temp_create,
+            )
+
+        def revalidate_artifact() -> None:
+            _scan_exact_bound_directory_entries(
+                artifact_root,
+                {
+                    "group.com.apple.notes": stat.S_IFDIR,
+                    SNAPSHOT_MANIFEST: stat.S_IFREG,
+                },
+                missing_code="snapshot-missing",
+                identity_code="snapshot-directory-identity-mismatch",
+                access_policy_code="snapshot-directory-access-policy-mismatch",
+                inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+                mismatch_code="snapshot-file-set-mismatch",
+            )
+            _scan_exact_bound_directory_entries(
+                store_binding,
+                expected_store_types,
+                missing_code="snapshot-missing",
+                identity_code="snapshot-directory-identity-mismatch",
+                access_policy_code="snapshot-directory-access-policy-mismatch",
+                inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+                mismatch_code="snapshot-file-set-mismatch",
+            )
+            _verify_bound_regular_file_at(
+                manifest_bound,
+                SNAPSHOT_FILE_CODES,
+                dir_fd=artifact_root.fd,
+                basename=SNAPSHOT_MANIFEST,
+            )
+            for basename, bound_file in bound_files.items():
+                _verify_bound_regular_file_at(
+                    bound_file,
+                    SNAPSHOT_FILE_CODES,
+                    dir_fd=store_binding.fd,
+                    basename=basename,
+                )
+
+        revalidate_artifact()
+        verified = [
+            _verify_bound_regular_file_at(
+                bound_files[basename],
+                SNAPSHOT_FILE_CODES,
+                dir_fd=store_binding.fd,
+                basename=basename,
+            )
+            for basename in NOTE_STORE_BASENAMES
+            if basename in bound_files
+        ]
+        manifest_integrity = _verify_bound_regular_file_at(
+            manifest_bound,
+            SNAPSHOT_FILE_CODES,
+            dir_fd=artifact_root.fd,
+            basename=SNAPSHOT_MANIFEST,
+        )
+        source_integrity = {
+            "protected_properties": {
+                "object_identity": ["device", "inode", "file_type"],
+                "content_stability": ["sha256", "size"],
+                "access_policy": ["mode", "uid", "gid", "flags"],
+                "benign_metadata_transitions": [
+                    "mtime_ns",
+                    "ctime_ns",
+                    "link_count",
+                    "platform_flags",
+                ],
+            },
+            "directories": {
+                "snapshot": snapshot_directory,
+                "store": store_directory,
+            },
+            "manifest": manifest_integrity,
+            "files": verified,
+        }
+        if source_binding is not None:
+            source_integrity["live_source_binding"] = source_binding
+        public_result = {
+            "snapshot_dir": snapshot_dir,
+            "snapshot_schema": snapshot_schema,
+            "writeback_grade": writeback_grade,
+            "manifest": manifest,
+            "manifest_creation_receipt": external_receipt,
+            "verified_files": verified,
+            "sidecar_consistency": recovery_evidence["sidecars"],
+            "sqlite_validation": sqlite_integrity,
+            "validated_recovery_integrity": validated_recovery_integrity,
+            "source_integrity": source_integrity,
+        }
+        yield _ValidatedSnapshotArtifact(
+            public_result=public_result,
+            artifact_root=artifact_root,
+            recovered_main=store_dir / NOTE_STORE_MAIN,
+            recovery_evidence=recovery_evidence,
+            source_integrity=source_integrity,
+            revalidate_recovery_clone=revalidate_recovery_clone,
+            backup_recovery_clone=backup_recovery_clone,
+            revalidate_artifact=revalidate_artifact,
+        )
+        if not _writeback_close_only():
+            revalidate_artifact()
+
+
+def validate_snapshot(
+    snapshot_dir: Path,
+    manifest_creation_receipt: dict[str, Any] | None = None,
+    *,
+    manifest_creation_receipt_file: Path | None = None,
+    _command_cwd: str | None = None,
+) -> dict[str, Any]:
+    command_cwd = os.getcwd() if _command_cwd is None else _command_cwd
+    requested_snapshot = _absolute_path_from_cwd(snapshot_dir, command_cwd)
+    requested_receipt = _optional_absolute_path_from_cwd(
+        manifest_creation_receipt_file,
+        command_cwd,
+    )
+    artifact_paths = _snapshot_artifact_paths(
+        requested_snapshot,
+        cwd=command_cwd,
+    )
+    with _validated_snapshot_artifact(
+        artifact_paths,
+        manifest_creation_receipt,
+        manifest_creation_receipt_file=requested_receipt,
+    ) as artifact:
+        return artifact.public_result
+
+
+def _merge_source_snapshot_root(src: Path) -> Path | None:
+    """Return the conservative artifact root for a canonical snapshot layout."""
+
+    if src.name != NOTE_STORE_MAIN or src.parent.name != "group.com.apple.notes":
+        return None
+    return src.parent.parent
+
+
+def _default_merge_output(src: Path, snapshot_root: Path | None) -> Path:
+    """Select a new analysis output outside a possible snapshot artifact."""
+
+    output_parent = (
+        snapshot_root.parent
+        if snapshot_root is not None
+        else Path(tempfile.gettempdir())
+    )
+    return output_parent / (
+        f".apple-notes-merged-for-analysis-{uuid.uuid4().hex}.sqlite"
+    )
+
+
+def _assert_merge_output_lexically_external(
+    output: Path,
+    snapshot_root: Path,
+) -> None:
+    """Reject requested/canonical alias overlap before any destination mutation."""
+
+    output_forms = _trusted_alias_scope_forms(output)
+    snapshot_forms = _trusted_alias_scope_forms(snapshot_root)
+    for output_form, output_path in output_forms:
+        output_parts = _normalized_scope_parts(output_path)
+        for snapshot_form, snapshot_path in snapshot_forms:
+            snapshot_parts = _normalized_scope_parts(snapshot_path)
+            output_inside_snapshot = (
+                output_parts[: len(snapshot_parts)] == snapshot_parts
+            )
+            snapshot_inside_output = snapshot_parts[: len(output_parts)] == output_parts
+            if not output_inside_snapshot and not snapshot_inside_output:
+                continue
+            raise StoreSafetyError(
+                "merge-output-inside-snapshot",
+                "Merge output must be external to the source snapshot in both "
+                "requested and registered-canonical alias forms: "
+                f"output={output}, snapshot={snapshot_root}",
+                details={
+                    "output": str(output),
+                    "snapshot": str(snapshot_root),
+                    "output_scope_form": output_form,
+                    "output_scope_path": str(output_path),
+                    "snapshot_scope_form": snapshot_form,
+                    "snapshot_scope_path": str(snapshot_path),
+                    "overlap_detection": (
+                        "normalized-lexical-output-inside-snapshot"
+                        if output_inside_snapshot
+                        else "normalized-lexical-snapshot-inside-output"
+                    ),
+                    "mutation_performed": False,
+                },
+            )
+
+
+def _preflight_merge_output_outside_snapshot(
+    snapshot_binding: _BoundDirectory,
+    output: Path,
+) -> None:
+    try:
+        _preflight_recovery_output_outside_snapshot(snapshot_binding, output)
+    except StoreSafetyError as exc:
+        code = (
+            "merge-output-inside-snapshot"
+            if exc.code == "recovery-output-inside-snapshot"
+            else "merge-output-scope-inconclusive"
+        )
+        raise StoreSafetyError(
+            code,
+            "Cannot prove that merge output is external to the descriptor-bound "
+            f"source snapshot: output={output}, "
+            f"snapshot={snapshot_binding.path}: {exc}",
+            details=_merge_recovery_details(
+                exc.details,
+                {"mutation_performed": False},
+            ),
+        ) from exc
+
+
+@contextmanager
+def _bind_merge_output_parent_outside_snapshot(
+    snapshot_binding: _BoundDirectory,
+    output: Path,
+    *,
+    output_parent_binding: _BoundDirectory,
+) -> Iterator[_BoundDirectory]:
+    try:
+        with _bind_recovery_output_parent_outside_snapshot(
+            snapshot_binding,
+            output,
+            output_parent_binding=output_parent_binding,
+        ) as parent:
+            yield parent
+    except StoreSafetyError as exc:
+        code = (
+            "merge-output-inside-snapshot"
+            if exc.code == "recovery-output-inside-snapshot"
+            else "merge-output-scope-inconclusive"
+        )
+        raise StoreSafetyError(
+            code,
+            "Merge output or its held parent no longer proves externality from "
+            f"the source snapshot: output={output}, "
+            f"snapshot={snapshot_binding.path}: {exc}",
+            details=exc.details,
+        ) from exc
+
+
+def merge_db(
+    src: Path,
+    out: Path | None,
+    *,
+    paths: NoteStorePaths | None = None,
+) -> dict[str, Any]:
+    cwd = os.getcwd()
+    src = _absolute_path_from_cwd(src, cwd)
+    snapshot_root = _merge_source_snapshot_root(src)
+    requested_output = _absolute_path_from_cwd(
+        out or _default_merge_output(src, snapshot_root),
+        cwd,
+    )
+    if snapshot_root is not None:
+        _assert_merge_output_lexically_external(
+            requested_output,
+            snapshot_root,
+        )
+    publication_guard: dict[str, Any] = {}
+    with (
+        _post_publication_failure_guard(
+            publication_guard,
+            destination=requested_output,
+            phase="merge-destination-scope-teardown",
+            message=(
+                "The standalone database was published, but its destination "
+                "scope could not be revalidated or closed cleanly"
+            ),
+        ),
+        ExitStack() as transaction,
+    ):
+        snapshot_binding: _BoundDirectory | None = None
+        if snapshot_root is not None:
+            snapshot_binding = transaction.enter_context(
+                _bind_artifact_root(
+                    snapshot_root,
+                    missing_code="source-missing",
+                )
+            )
+            _preflight_merge_output_outside_snapshot(
+                snapshot_binding,
+                requested_output,
+            )
+        destination_scope = transaction.enter_context(
+            _bind_live_safe_destination_parent(
+                paths or NoteStorePaths(),
+                requested_output,
+            )
+        )
+        output_parent = destination_scope.parent
+        if snapshot_binding is not None:
+            output_parent = transaction.enter_context(
+                _bind_merge_output_parent_outside_snapshot(
+                    snapshot_binding,
+                    destination_scope.destination,
+                    output_parent_binding=destination_scope.parent,
+                )
+            )
+        result = _recover_to_standalone(
+            src,
+            destination_scope.destination,
+            output_parent_binding=output_parent,
+        )
+        publication_guard["committed"] = True
+        publication_guard["descriptor_bound_destination"] = result.get(
+            "descriptor_bound_destination"
+        )
+        terminal_destination_scope = destination_scope.revalidate()
+        publication_guard["additional_details"] = {
+            "terminal_destination_scope": terminal_destination_scope,
+            "terminal_sidecar_revalidation": result["terminal_sidecar_revalidation"],
+            "terminal_public_path_revalidation": result[
+                "terminal_public_path_revalidation"
+            ],
+        }
+    result["standalone_db"] = requested_output
+    result["terminal_destination_scope"] = terminal_destination_scope
+    return {
+        **result,
+        "merged_db": requested_output,
+    }
+
+
+def _directory_identity_key(value: os.stat_result) -> tuple[int, int]:
+    return value.st_dev, value.st_ino
+
+
+@contextmanager
+def _bind_existing_directory_following_aliases(
+    path: Path,
+) -> Iterator[tuple[int, os.stat_result]]:
+    """Bind the directory reached by a stable path, including symlink aliases."""
+
+    fd: int | None = None
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        before = os.stat(path)
+        fd = os.open(path, flags)
+        opened = os.fstat(fd)
+        after = os.stat(path)
+    except OSError as exc:
+        if fd is not None:
+            os.close(fd)
+        raise StoreSafetyError(
+            "recovery-output-scope-inconclusive",
+            f"Cannot bind existing recovery-output ancestor {path}: {exc}",
+        ) from exc
+    if (
+        not stat.S_ISDIR(before.st_mode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(after.st_mode)
+        or not _same_identity(before, opened)
+        or not _same_identity(opened, after)
+    ):
+        os.close(fd)
+        raise StoreSafetyError(
+            "recovery-output-scope-inconclusive",
+            "Recovery-output ancestor changed identity while binding through "
+            f"aliases: {path}",
+        )
+    if _access_policy(before) != _access_policy(opened) or _access_policy(
+        opened
+    ) != _access_policy(after):
+        os.close(fd)
+        raise StoreSafetyError(
+            "recovery-output-scope-inconclusive",
+            "Recovery-output ancestor changed access policy while binding "
+            f"through aliases: {path}",
+        )
+    try:
+        yield fd, opened
+    finally:
+        os.close(fd)
+
+
+def _nearest_existing_output_ancestor_following_aliases(
+    output_parent: Path,
+) -> tuple[Path, tuple[str, ...]]:
+    """Locate an ancestor for read-only overlap probes; never use it to mutate."""
+
+    candidate = Path(os.path.abspath(os.fspath(output_parent)))
+    missing_components: list[str] = []
+    while True:
+        try:
+            observed = os.stat(candidate)
+        except FileNotFoundError:
+            parent = candidate.parent
+            if parent == candidate:
+                raise StoreSafetyError(
+                    "recovery-output-scope-inconclusive",
+                    "Cannot locate an existing destination ancestor for a "
+                    f"read-only alias probe: {output_parent}",
+                )
+            missing_components.append(candidate.name)
+            candidate = parent
+            continue
+        except OSError as exc:
+            raise StoreSafetyError(
+                "recovery-output-scope-inconclusive",
+                "Cannot inspect a candidate destination ancestor during the "
+                f"read-only alias probe: {candidate}: {exc}",
+            ) from exc
+        if not stat.S_ISDIR(observed.st_mode):
+            raise StoreSafetyError(
+                "recovery-output-scope-inconclusive",
+                "The nearest existing destination ancestor is not a directory "
+                f"during the read-only alias probe: {candidate}",
+            )
+        return candidate, tuple(reversed(missing_components))
+
+
+def _descriptor_directory_ancestor_chain(
+    start_fd: int,
+    *,
+    display_path: Path,
+) -> list[dict[str, int]]:
+    current_fd: int | None = None
+    flags = _directory_open_flags()
+    chain: list[dict[str, int]] = []
+    try:
+        start = os.fstat(start_fd)
+        current_fd = os.open(".", flags, dir_fd=start_fd)
+        current = os.fstat(current_fd)
+        if (
+            not stat.S_ISDIR(start.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or not _same_identity(start, current)
+        ):
+            raise StoreSafetyError(
+                "recovery-output-scope-inconclusive",
+                "Recovery-output ancestor descriptor changed identity before "
+                f"ancestor traversal: {display_path}",
+            )
+        for _ in range(1024):
+            current = os.fstat(current_fd)
+            if not stat.S_ISDIR(current.st_mode):
+                raise StoreSafetyError(
+                    "recovery-output-scope-inconclusive",
+                    "Recovery-output ancestor traversal reached a non-directory: "
+                    f"{display_path}",
+                )
+            chain.append(
+                {
+                    "device": current.st_dev,
+                    "inode": current.st_ino,
+                }
+            )
+            parent_fd: int | None = None
+            try:
+                parent_fd = os.open("..", flags, dir_fd=current_fd)
+                parent = os.fstat(parent_fd)
+            except OSError:
+                if parent_fd is not None:
+                    os.close(parent_fd)
+                raise
+            if not stat.S_ISDIR(parent.st_mode):
+                os.close(parent_fd)
+                raise StoreSafetyError(
+                    "recovery-output-scope-inconclusive",
+                    "Recovery-output ancestor traversal reached a non-directory "
+                    f"parent: {display_path}",
+                )
+            if _directory_identity_key(parent) == _directory_identity_key(current):
+                os.close(parent_fd)
+                return chain
+            os.close(current_fd)
+            current_fd = parent_fd
+    except StoreSafetyError:
+        raise
+    except OSError as exc:
+        raise StoreSafetyError(
+            "recovery-output-scope-inconclusive",
+            "Cannot traverse recovery-output ancestors through held directory "
+            f"descriptors: {display_path}: {exc}",
+        ) from exc
+    finally:
+        if current_fd is not None:
+            os.close(current_fd)
+    raise StoreSafetyError(
+        "recovery-output-scope-inconclusive",
+        "Recovery-output ancestor traversal exceeded its bounded depth: "
+        f"{display_path}",
+    )
+
+
+def _assert_output_ancestors_exclude_snapshot(
+    output_fd: int,
+    snapshot: os.stat_result,
+    *,
+    display_path: Path,
+) -> list[dict[str, int]]:
+    chain = _descriptor_directory_ancestor_chain(
+        output_fd,
+        display_path=display_path,
+    )
+    snapshot_key = _directory_identity_key(snapshot)
+    if any((row["device"], row["inode"]) == snapshot_key for row in chain):
+        raise StoreSafetyError(
+            "recovery-output-inside-snapshot",
+            "Recovery output resolves inside the immutable snapshot object, "
+            "including through a case-insensitive or symlink alias: "
+            f"{display_path}",
+        )
+    return chain
+
+
+def _exception_chain_contains_permission_error(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, PermissionError):
+            return True
+        current = current.__cause__
+    return False
+
+
+@contextmanager
+def _bind_manifest_creation_receipt_parent(
+    path: Path,
+    *,
+    trusted_alias: _TrustedDirectoryAlias | None = None,
+) -> Iterator[_BoundDirectory]:
+    """Bind a receipt parent while preserving the public receipt taxonomy."""
+
+    entered = False
+    try:
+        requested, _, alias_spec = _trusted_alias_paths(path)
+        carried_alias = (
+            trusted_alias
+            if (
+                trusted_alias is not None
+                and alias_spec == (trusted_alias.alias, trusted_alias.target)
+            )
+            else None
+        )
+        with _bind_existing_directory_with_trusted_alias(
+            requested,
+            trusted_alias=carried_alias,
+        ) as binding:
+            entered = True
+            yield binding
+    except StoreSafetyError as exc:
+        if entered and exc.code not in {
+            "prepared-directory-missing",
+            "prepared-directory-identity-mismatch",
+            "prepared-directory-access-policy-mismatch",
+            "prepared-directory-revalidation-inconclusive",
+            "snapshot-destination-scope-inconclusive",
+        }:
+            raise
+        if exc.code == "prepared-directory-missing":
+            code = "manifest-creation-receipt-missing"
+        elif _exception_chain_contains_permission_error(exc):
+            code = "manifest-creation-receipt-unreadable"
+        else:
+            code = "manifest-creation-receipt-scope-inconclusive"
+        raise StoreSafetyError(
+            code,
+            "Cannot bind the manifest creation receipt parent with stable "
+            f"identity and access-policy evidence: {path}: {exc}",
+        ) from exc
+
+
+def _load_external_manifest_creation_receipt(
+    receipt_file: Path,
+    *,
+    artifact_root: _BoundDirectory,
+    artifact_kind: str,
+    artifact_schema: str | Collection[str],
+    manifest_name: str,
+) -> dict[str, Any]:
+    """Read one stable caller-preserved receipt from outside its artifact."""
+
+    missing_code = (
+        "snapshot-missing" if artifact_kind == "snapshot" else "stage-missing"
+    )
+    identity_code = (
+        "snapshot-directory-identity-mismatch"
+        if artifact_kind == "snapshot"
+        else "stage-directory-identity-mismatch"
+    )
+    access_policy_code = (
+        "snapshot-directory-access-policy-mismatch"
+        if artifact_kind == "snapshot"
+        else "stage-directory-access-policy-mismatch"
+    )
+    inconclusive_code = (
+        SNAPSHOT_FILE_CODES.inconclusive
+        if artifact_kind == "snapshot"
+        else PATCH_FILE_CODES.inconclusive
+    )
+    mismatch_code = (
+        "snapshot-file-set-mismatch"
+        if artifact_kind == "snapshot"
+        else "patch-file-set-mismatch"
+    )
+    _verify_bound_artifact_directory(
+        artifact_root,
+        missing_code=missing_code,
+        identity_code=identity_code,
+        access_policy_code=access_policy_code,
+        inconclusive_code=inconclusive_code,
+        mismatch_code=mismatch_code,
+    )
+    with _bind_manifest_creation_receipt_parent(
+        receipt_file.parent,
+        trusted_alias=artifact_root.trusted_alias,
+    ) as bound_receipt_parent:
+        try:
+            _assert_output_ancestors_exclude_snapshot(
+                bound_receipt_parent.fd,
+                artifact_root.opened,
+                display_path=receipt_file.parent,
+            )
+        except StoreSafetyError as exc:
+            code = (
+                "manifest-creation-receipt-not-external"
+                if exc.code == "recovery-output-inside-snapshot"
+                else "manifest-creation-receipt-scope-inconclusive"
+            )
+            raise StoreSafetyError(
+                code,
+                "Manifest creation receipt must be preserved outside the "
+                "artifact tree: "
+                f"receipt={receipt_file}, artifact={artifact_root.path}: "
+                f"{exc}",
+            ) from exc
+        receipt_bound = False
+        try:
+            with _bind_regular_file_at(
+                receipt_file,
+                bound_receipt_parent,
+                MANIFEST_RECEIPT_FILE_CODES,
+            ) as bound_receipt:
+                receipt_bound = True
+                payload_bytes = _read_bound_file_bytes(
+                    bound_receipt,
+                    MANIFEST_RECEIPT_FILE_CODES,
+                    max_bytes=MANIFEST_MAX_BYTES,
+                    too_large_code="manifest-creation-receipt-too-large",
+                    dir_fd=bound_receipt_parent.fd,
+                    basename=receipt_file.name,
+                )
+        except StoreSafetyError as exc:
+            if not _exception_chain_contains_permission_error(exc):
+                raise
+            code = (
+                "manifest-creation-receipt-revalidation-unreadable"
+                if receipt_bound
+                else "manifest-creation-receipt-unreadable"
+            )
+            raise StoreSafetyError(
+                code,
+                "Manifest creation receipt could not be read with stable "
+                f"descriptor evidence: {receipt_file}: {exc}",
+            ) from exc
+    _verify_bound_artifact_directory(
+        artifact_root,
+        missing_code=missing_code,
+        identity_code=identity_code,
+        access_policy_code=access_policy_code,
+        inconclusive_code=inconclusive_code,
+        mismatch_code=mismatch_code,
+    )
+    try:
+        payload_text = payload_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise StoreSafetyError(
+            "manifest-creation-receipt-invalid",
+            f"Cannot parse manifest creation receipt {receipt_file}: {exc}",
+        ) from exc
+    try:
+        payload = _bounded_json_loads(payload_text)
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise StoreSafetyError(
+            "manifest-creation-receipt-invalid",
+            f"Cannot parse manifest creation receipt {receipt_file}: {exc}",
+        ) from exc
+    return _normalized_manifest_creation_receipt(
+        payload,
+        artifact_kind=artifact_kind,
+        artifact_schema=artifact_schema,
+        manifest_name=manifest_name,
+    )
+
+
+def _manifest_creation_receipt_for_bound_artifact(
+    artifact_root: _BoundDirectory,
+    *,
+    manifest_creation_receipt: dict[str, Any] | None,
+    manifest_creation_receipt_file: Path | None,
+    artifact_kind: str,
+    artifact_schema: str | Collection[str],
+    manifest_name: str,
+) -> dict[str, Any]:
+    if (
+        manifest_creation_receipt is not None
+        and manifest_creation_receipt_file is not None
+    ):
+        raise StoreSafetyError(
+            "manifest-creation-receipt-invalid",
+            "Supply either an in-memory manifest creation receipt or an "
+            "artifact-external receipt file, not both",
+        )
+    if manifest_creation_receipt_file is not None:
+        return _load_external_manifest_creation_receipt(
+            manifest_creation_receipt_file,
+            artifact_root=artifact_root,
+            artifact_kind=artifact_kind,
+            artifact_schema=artifact_schema,
+            manifest_name=manifest_name,
+        )
+    return _normalized_manifest_creation_receipt(
+        manifest_creation_receipt,
+        artifact_kind=artifact_kind,
+        artifact_schema=artifact_schema,
+        manifest_name=manifest_name,
+    )
+
+
+def _preflight_recovery_output_outside_snapshot(
+    snapshot_binding: _BoundDirectory,
+    out: Path,
+) -> None:
+    """Prove output scope without creating any output-parent component."""
+
+    snapshot_receipt = _verify_bound_artifact_directory(
+        snapshot_binding,
+        missing_code="snapshot-missing",
+        identity_code="snapshot-directory-identity-mismatch",
+        access_policy_code="snapshot-directory-access-policy-mismatch",
+        inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+        mismatch_code="snapshot-file-set-mismatch",
+    )
+    snapshot = os.fstat(snapshot_binding.fd)
+    if (
+        _identity(snapshot) != snapshot_receipt["identity"]
+        or _access_policy(snapshot) != snapshot_receipt["access_policy"]
+    ):
+        raise StoreSafetyError(
+            "snapshot-directory-identity-mismatch",
+            "Held snapshot root differs from its transaction receipt before "
+            f"recovery-output scope validation: {snapshot_binding.path}",
+        )
+    try:
+        output_existing = os.stat(out)
+    except FileNotFoundError:
+        output_existing = None
+    except OSError as exc:
+        raise StoreSafetyError(
+            "recovery-output-scope-inconclusive",
+            f"Cannot inspect the recovery output before parent creation: {out}: {exc}",
+        ) from exc
+    if (
+        output_existing is not None
+        and stat.S_ISDIR(output_existing.st_mode)
+        and _directory_identity_key(output_existing)
+        == _directory_identity_key(snapshot)
+    ):
+        raise StoreSafetyError(
+            "recovery-output-inside-snapshot",
+            f"Recovery output resolves to the immutable snapshot root: {out}",
+        )
+    nearest_path, _ = _nearest_existing_output_ancestor_following_aliases(out.parent)
+    with _bind_existing_directory_following_aliases(nearest_path) as (
+        ancestor_fd,
+        _,
+    ):
+        _assert_output_ancestors_exclude_snapshot(
+            ancestor_fd,
+            snapshot,
+            display_path=nearest_path,
+        )
+    _verify_bound_artifact_directory(
+        snapshot_binding,
+        missing_code="snapshot-missing",
+        identity_code="snapshot-directory-identity-mismatch",
+        access_policy_code="snapshot-directory-access-policy-mismatch",
+        inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+        mismatch_code="snapshot-file-set-mismatch",
+    )
+
+
+@contextmanager
+def _bind_recovery_output_parent_outside_snapshot(
+    snapshot_binding: _BoundDirectory,
+    out: Path,
+    *,
+    output_parent_binding: _BoundDirectory | None = None,
+) -> Iterator[_BoundDirectory]:
+    """Create and bind an output parent whose descriptor ancestry excludes snapshot."""
+
+    snapshot_dir = snapshot_binding.path
+    snapshot_receipt = _verify_bound_artifact_directory(
+        snapshot_binding,
+        missing_code="snapshot-missing",
+        identity_code="snapshot-directory-identity-mismatch",
+        access_policy_code="snapshot-directory-access-policy-mismatch",
+        inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+        mismatch_code="snapshot-file-set-mismatch",
+    )
+    snapshot = os.fstat(snapshot_binding.fd)
+    if _identity(snapshot) != snapshot_receipt["identity"]:
+        raise StoreSafetyError(
+            "snapshot-directory-identity-mismatch",
+            f"Held snapshot root differs from its transaction receipt: {snapshot_dir}",
+        )
+    if _access_policy(snapshot) != snapshot_receipt["access_policy"]:
+        raise StoreSafetyError(
+            "snapshot-directory-access-policy-mismatch",
+            "Held snapshot root access policy differs from its transaction "
+            f"receipt: {snapshot_dir}",
+        )
+    if output_parent_binding is None:
+        raise StoreSafetyError(
+            "recovery-output-scope-inconclusive",
+            "Recovery requires the live-safe component-bound output parent; "
+            f"an unbound fallback is forbidden: {out}",
+        )
+    if output_parent_binding.path != out.parent:
+        raise StoreSafetyError(
+            "recovery-output-scope-inconclusive",
+            "Recovery output does not use the live-safe bound parent: "
+            f"output={out}, parent={output_parent_binding.path}",
+        )
+    _verify_bound_directory_namespace(output_parent_binding)
+    _assert_output_ancestors_exclude_snapshot(
+        output_parent_binding.fd,
+        snapshot,
+        display_path=out.parent,
+    )
+    yield output_parent_binding
+    _verify_bound_directory_namespace(output_parent_binding)
+    _assert_output_ancestors_exclude_snapshot(
+        output_parent_binding.fd,
+        snapshot,
+        display_path=out.parent,
+    )
+    _verify_bound_artifact_directory(
+        snapshot_binding,
+        missing_code="snapshot-missing",
+        identity_code="snapshot-directory-identity-mismatch",
+        access_policy_code="snapshot-directory-access-policy-mismatch",
+        inconclusive_code=SNAPSHOT_FILE_CODES.inconclusive,
+        mismatch_code="snapshot-file-set-mismatch",
+    )
+
+
+def recover_snapshot(
+    snapshot_dir: Path,
+    out: Path,
+    manifest_creation_receipt: dict[str, Any] | None = None,
+    *,
+    manifest_creation_receipt_file: Path | None = None,
+    paths: NoteStorePaths | None = None,
+    _command_cwd: str | None = None,
+) -> dict[str, Any]:
+    command_cwd = os.getcwd() if _command_cwd is None else _command_cwd
+    requested_snapshot = _absolute_path_from_cwd(snapshot_dir, command_cwd)
+    requested_receipt = _optional_absolute_path_from_cwd(
+        manifest_creation_receipt_file,
+        command_cwd,
+    )
+    requested_out = _absolute_path_from_cwd(out, command_cwd)
+    artifact_paths = _snapshot_artifact_paths(
+        requested_snapshot,
+        cwd=command_cwd,
+    )
+    snapshot_dir = artifact_paths.root
+    source = artifact_paths.store / NOTE_STORE_MAIN
+    recovered: dict[str, Any] | None = None
+    result: dict[str, Any] | None = None
+    try:
+        with ExitStack() as transaction:
+            artifact_root = transaction.enter_context(
+                _bind_artifact_root(
+                    snapshot_dir,
+                    missing_code="snapshot-missing",
+                )
+            )
+            _preflight_recovery_output_outside_snapshot(
+                artifact_root,
+                requested_out,
+            )
+            destination_scope = transaction.enter_context(
+                _bind_live_safe_destination_parent(
+                    paths or NoteStorePaths(),
+                    requested_out,
+                )
+            )
+            with _validated_snapshot_artifact(
+                artifact_paths,
+                manifest_creation_receipt,
+                manifest_creation_receipt_file=requested_receipt,
+                artifact_root_binding=artifact_root,
+            ) as artifact:
+                validation = artifact.public_result
+                with _bind_recovery_output_parent_outside_snapshot(
+                    artifact.artifact_root,
+                    destination_scope.destination,
+                    output_parent_binding=destination_scope.parent,
+                ) as output_parent:
+                    recovered = _recover_validated_clone_to_standalone(
+                        artifact.recovered_main,
+                        destination_scope.destination,
+                        source_db=source,
+                        recovery_evidence=artifact.recovery_evidence,
+                        source_integrity=artifact.source_integrity,
+                        source_revalidate=artifact.revalidate_recovery_clone,
+                        source_backup=artifact.backup_recovery_clone,
+                        output_parent_binding=output_parent,
+                    )
+                    destination_scope.revalidate()
+                recovered["standalone_db"] = requested_out
+                recovered["terminal_destination_scope"] = destination_scope.revalidate()
+            result = {
+                "snapshot_dir": snapshot_dir,
+                "snapshot_validation": {
+                    "snapshot_schema": validation["snapshot_schema"],
+                    "writeback_grade": validation["writeback_grade"],
+                    "sqlite_validation": validation["sqlite_validation"],
+                    "sidecar_consistency": validation["sidecar_consistency"],
+                    "source_integrity": artifact.source_integrity,
+                    "manifest_creation_receipt": validation[
+                        "manifest_creation_receipt"
+                    ],
+                },
+                "recovered": recovered,
+            }
+    except Exception as exc:
+        if recovered is None:
+            raise
+        descriptor_bound_destination = recovered.get("descriptor_bound_destination")
+        error = _post_publication_uncertain_error(
+            exc,
+            destination=requested_out,
+            descriptor_bound_destination=(
+                descriptor_bound_destination
+                if isinstance(descriptor_bound_destination, dict)
+                else None
+            ),
+            phase="snapshot-recovery-transaction-teardown",
+            message=(
+                "The standalone database was published and its public main-file "
+                "receipt completed, but a later transaction-scoped parent, "
+                "ancestor, or snapshot revalidation failed"
+            ),
+            additional_details={
+                "terminal_sidecar_revalidation": recovered[
+                    "terminal_sidecar_revalidation"
+                ],
+                "terminal_public_path_revalidation": recovered[
+                    "terminal_public_path_revalidation"
+                ],
+            },
+        )
+        raise error from exc
+    assert result is not None
+    return result
+
+
+def stage_patch(
+    src: Path,
+    dest: Path,
+    *,
+    paths: NoteStorePaths | None = None,
+    _destination_preflight: _LiveDestinationPreflight | None = None,
+) -> dict[str, Any]:
+    cwd = os.getcwd()
+    src = _absolute_path_from_cwd(src, cwd)
+    requested_dest = _absolute_path_from_cwd(dest, cwd)
+    if _lexists(requested_dest):
+        raise StoreSafetyError(
+            "destination-exists",
+            f"Patch stage already exists: {requested_dest}",
+            details={"mutation_performed": False},
+        )
+    if _destination_preflight is not None:
+        if _destination_preflight.requested_destination != requested_dest:
+            raise StoreSafetyError(
+                "snapshot-destination-scope-inconclusive",
+                "The held zero-write destination preflight names a different "
+                "patch-stage artifact",
+                details={
+                    "destination": str(requested_dest),
+                    "preflight_destination": str(
+                        _destination_preflight.requested_destination
+                    ),
+                    "mutation_performed": False,
+                },
+            )
+        _assert_destination_preflight_name_absent(
+            _destination_preflight,
+            exists_code="destination-exists",
+            inconclusive_code="snapshot-destination-scope-inconclusive",
+            label="Patch stage",
+        )
+        destination_parent_context = _commit_live_safe_destination_parent(
+            _destination_preflight
+        )
+    else:
+        destination_parent_context = _bind_live_safe_destination_parent(
+            paths or NoteStorePaths(),
+            requested_dest,
+        )
+    publication_guard: dict[str, Any] = {}
+    try:
+        with (
+            _post_publication_failure_guard(
+                publication_guard,
+                destination=requested_dest,
+                phase="patch-stage-transaction-teardown",
+                message=(
+                    "The patch stage was published, but a later transaction "
+                    "revalidation or teardown failed"
+                ),
+            ),
+            destination_parent_context as destination_scope,
+            _create_bound_artifact_partial_after_destination_revalidation(
+                destination_scope,
+            ) as bound_root,
+        ):
+            dest = destination_scope.destination
+            partial = bound_root.path
+            if _lexists(dest):
+                raise StoreSafetyError(
+                    "destination-exists",
+                    f"Patch stage already exists: {requested_dest}",
+                )
+            staged_db = partial / NOTE_STORE_MAIN
+            recovery = _recover_to_standalone(
+                src,
+                staged_db,
+                output_parent_binding=bound_root,
+            )
+            fingerprint = {
+                "path": staged_db,
+                "sha256": recovery["sha256"],
+                "size": recovery["size"],
+                "identity": recovery["identity"],
+                "access_policy": recovery["access_policy"],
+            }
+            _verify_bound_directory(bound_root)
+            manifest = {
+                "schema": PATCH_SCHEMA,
+                "created_at": _utc_now(),
+                "source_db": str(src),
+                "database": {
+                    "basename": NOTE_STORE_MAIN,
+                    "relative_path": NOTE_STORE_MAIN,
+                    "sha256": fingerprint["sha256"],
+                    "size": fingerprint["size"],
+                    "identity": fingerprint["identity"],
+                    "access_policy": fingerprint["access_policy"],
+                },
+                "creation_receipts": {
+                    "stage_directory": {
+                        "identity": _identity(bound_root.opened),
+                        "access_policy": _access_policy(bound_root.opened),
+                    },
+                },
+                "external_creation_receipt": {
+                    "schema": MANIFEST_CREATION_RECEIPT_SCHEMA,
+                    "artifact_kind": "patch-stage",
+                    "manifest_name": PATCH_MANIFEST,
+                    "required_before_manifest_consumption": True,
+                },
+                "sqlite_validation": recovery["output_integrity"],
+                "sidecar_policy": {
+                    "allowed": False,
+                    "reason": "A patch stage must be a standalone SQLite database",
+                },
+            }
+            manifest_receipt = _write_json_atomic(
+                partial / PATCH_MANIFEST,
+                manifest,
+                parent_binding=bound_root,
+            )
+            manifest_creation_receipt = _manifest_creation_receipt_payload(
+                artifact_kind="patch-stage",
+                artifact_schema=PATCH_SCHEMA,
+                manifest_name=PATCH_MANIFEST,
+                manifest_receipt=manifest_receipt,
+            )
+            manifest_creation_destination_scope = destination_scope.revalidate()
+            root_receipt = _scan_exact_prepared_directory_entries(
+                bound_root,
+                {
+                    NOTE_STORE_MAIN: stat.S_IFREG,
+                    PATCH_MANIFEST: stat.S_IFREG,
+                },
+                missing_code="prepared-directory-identity-mismatch",
+            )
+            file_receipts = {Path(NOTE_STORE_MAIN): fingerprint}
+            prepared_tree_receipt = {
+                "schema": "apple-notes-prepared-tree-receipt/v1",
+                "root": root_receipt,
+                "directories": {},
+                "files": {
+                    PATCH_MANIFEST: manifest_receipt,
+                    NOTE_STORE_MAIN: fingerprint,
+                },
+            }
+            with _bind_prepared_regular_files(
+                partial,
+                root_binding=bound_root,
+                directory_bindings={},
+                manifest_name=PATCH_MANIFEST,
+                manifest_payload=manifest,
+                manifest_receipt=manifest_receipt,
+                file_receipts=file_receipts,
+            ) as prepared_files:
+
+                def verify_before_stage_rename() -> None:
+                    destination_scope.revalidate()
+                    _revalidate_published_regular_files(
+                        partial,
+                        prepared_files,
+                        manifest_name=PATCH_MANIFEST,
+                        manifest_payload=manifest,
+                        manifest_receipt=manifest_receipt,
+                        file_receipts=file_receipts,
+                    )
+                    _scan_exact_prepared_directory_entries(
+                        bound_root,
+                        {
+                            NOTE_STORE_MAIN: stat.S_IFREG,
+                            PATCH_MANIFEST: stat.S_IFREG,
+                        },
+                        missing_code="prepared-directory-identity-mismatch",
+                    )
+                    destination_scope.revalidate()
+
+                def build_descriptor_stage_tree_receipt(
+                    published_basename: str,
+                ) -> dict[str, Any]:
+                    return _descriptor_bound_prepared_tree_receipt(
+                        bound_root,
+                        published_basename=published_basename,
+                        root_receipt=root_receipt,
+                        nested_directories={},
+                        bindings=prepared_files,
+                        manifest_name=PATCH_MANIFEST,
+                        manifest_payload=manifest,
+                        manifest_receipt=manifest_receipt,
+                        file_receipts=file_receipts,
+                    )
+
+                _verify_bound_directory(bound_root)
+                publication_receipt = _publish_directory_no_replace(
+                    partial,
+                    dest,
+                    binding=bound_root,
+                    before_rename=verify_before_stage_rename,
+                    prepared_tree_receipt=prepared_tree_receipt,
+                    descriptor_tree_receipt_builder=(
+                        build_descriptor_stage_tree_receipt
+                    ),
+                    publication_guard=publication_guard,
+                )
+                publication_guard["committed"] = True
+                publication_guard["descriptor_bound_destination"] = publication_receipt
+                try:
+                    destination_scope.revalidate()
+                    _scan_exact_prepared_directory_entries(
+                        bound_root,
+                        {
+                            NOTE_STORE_MAIN: stat.S_IFREG,
+                            PATCH_MANIFEST: stat.S_IFREG,
+                        },
+                        missing_code="prepared-directory-identity-mismatch",
+                    )
+                    _revalidate_published_regular_files(
+                        dest,
+                        prepared_files,
+                        manifest_name=PATCH_MANIFEST,
+                        manifest_payload=manifest,
+                        manifest_receipt=manifest_receipt,
+                        file_receipts=file_receipts,
+                    )
+                    terminal_destination_scope = destination_scope.revalidate()
+                    publication_guard["additional_details"] = {
+                        "terminal_destination_scope": terminal_destination_scope,
+                    }
+                except Exception as exc:
+                    raise StoreSafetyError(
+                        "destination-install-uncertain",
+                        "Patch-stage publication committed, but the exact prepared "
+                        f"tree could not be revalidated: {dest}: {exc}",
+                        details=_publication_details(
+                            "uncertain",
+                            prepared=None,
+                            destination=dest,
+                            retry_safe=False,
+                            descriptor_bound_destination=publication_receipt,
+                        ),
+                    ) from exc
+    except StoreSafetyError:
+        raise
+    return {
+        "stage_dir": requested_dest,
+        "manifest": requested_dest / PATCH_MANIFEST,
+        "manifest_creation_receipt": manifest_creation_receipt,
+        "manifest_creation_destination_scope": (manifest_creation_destination_scope),
+        "terminal_destination_scope": terminal_destination_scope,
+        "descriptor_bound_destination": publication_receipt,
+        "database": requested_dest / NOTE_STORE_MAIN,
+        "sha256": manifest["database"]["sha256"],
+        "size": manifest["database"]["size"],
+        "sqlite_validation": manifest["sqlite_validation"],
+        "live_mutation_performed": False,
+    }
+
+
+@contextmanager
+def _validated_patch_stage_artifact(
+    stage_dir: Path | _PatchArtifactPaths,
+    manifest_creation_receipt: dict[str, Any] | None = None,
+    *,
+    manifest_creation_receipt_file: Path | None = None,
+) -> Iterator[_ValidatedPatchStageArtifact]:
+    """Bind a patch stage until its consumer and terminal checks complete."""
+
+    artifact_paths = _patch_artifact_paths(stage_dir)
+    stage_dir = artifact_paths.root
+    manifest_creation_receipt_file = _optional_absolute_path(
+        manifest_creation_receipt_file
+    )
+    expected_stage_types = {
+        NOTE_STORE_MAIN: stat.S_IFREG,
+        PATCH_MANIFEST: stat.S_IFREG,
+    }
+    with ExitStack() as stack:
+        artifact_root = stack.enter_context(
+            _bind_artifact_root(
+                stage_dir,
+                missing_code="stage-missing",
+            )
+        )
+        external_receipt = _manifest_creation_receipt_for_bound_artifact(
+            artifact_root,
+            manifest_creation_receipt=manifest_creation_receipt,
+            manifest_creation_receipt_file=manifest_creation_receipt_file,
+            artifact_kind="patch-stage",
+            artifact_schema=PATCH_SCHEMA,
+            manifest_name=PATCH_MANIFEST,
+        )
+        stage_directory = _scan_exact_bound_directory_entries(
+            artifact_root,
+            expected_stage_types,
+            missing_code="stage-missing",
+            identity_code="stage-directory-identity-mismatch",
+            access_policy_code="stage-directory-access-policy-mismatch",
+            inconclusive_code=PATCH_FILE_CODES.inconclusive,
+            mismatch_code="patch-file-set-mismatch",
+        )
+        manifest_bound = stack.enter_context(
+            _bind_regular_file_at(
+                artifact_paths.manifest,
+                artifact_root,
+                PATCH_FILE_CODES,
+            )
+        )
+        _assert_bound_manifest_creation_receipt(
+            manifest_bound,
+            external_receipt,
+            PATCH_FILE_CODES,
+            parent=artifact_root,
+        )
+        manifest = _load_bound_manifest(
+            manifest_bound,
+            PATCH_FILE_CODES,
+            PATCH_SCHEMA,
+            parent=artifact_root,
+        )
+        _assert_manifest_external_anchor_declaration(
+            manifest,
+            artifact_kind="patch-stage",
+            manifest_name=PATCH_MANIFEST,
+        )
+        creation_receipts = manifest.get("creation_receipts")
+        if not isinstance(creation_receipts, dict):
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Patch manifest has no creation receipts",
+            )
+        _assert_manifest_protection_receipt(
+            stage_directory,
+            creation_receipts.get("stage_directory"),
+            label="patch stage directory",
+            identity_code="stage-directory-identity-mismatch",
+            access_policy_code="stage-directory-access-policy-mismatch",
+        )
+        database = manifest.get("database")
+        if not isinstance(database, dict):
+            raise StoreSafetyError(
+                "manifest-invalid", "Patch manifest has no database entry"
+            )
+        if (
+            database.get("basename") != NOTE_STORE_MAIN
+            or database.get("relative_path") != NOTE_STORE_MAIN
+        ):
+            raise StoreSafetyError(
+                "manifest-invalid",
+                "Patch manifest database path is not canonical",
+            )
+        database_bound = stack.enter_context(
+            _bind_regular_file_at(
+                artifact_paths.database,
+                artifact_root,
+                PATCH_FILE_CODES,
+            )
+        )
+        database_creation_receipt = {
+            "identity": database.get("identity"),
+            "access_policy": database.get("access_policy"),
+        }
+        _assert_manifest_protection_receipt(
+            _verify_bound_regular_file_at(
+                database_bound,
+                PATCH_FILE_CODES,
+                dir_fd=artifact_root.fd,
+                basename=NOTE_STORE_MAIN,
+            ),
+            database_creation_receipt,
+            label="patch database",
+            identity_code=PATCH_FILE_CODES.identity,
+            access_policy_code=PATCH_FILE_CODES.access_policy,
+        )
+        fingerprint = _verify_bound_regular_file_at(
+            database_bound,
+            PATCH_FILE_CODES,
+            dir_fd=artifact_root.fd,
+            basename=NOTE_STORE_MAIN,
+        )
+        if fingerprint["sha256"] != database.get("sha256") or fingerprint[
+            "size"
+        ] != database.get("size"):
+            raise StoreSafetyError(
+                "patch-content-mismatch",
+                "Patch database no longer matches its manifest",
+            )
+        integrity = _sqlite_integrity(
+            database_bound,
+            parent=artifact_root,
+            file_codes=PATCH_FILE_CODES,
+        )
+
+        def revalidate_artifact() -> None:
+            _scan_exact_bound_directory_entries(
+                artifact_root,
+                expected_stage_types,
+                missing_code="stage-missing",
+                identity_code="stage-directory-identity-mismatch",
+                access_policy_code="stage-directory-access-policy-mismatch",
+                inconclusive_code=PATCH_FILE_CODES.inconclusive,
+                mismatch_code="patch-file-set-mismatch",
+            )
+            _verify_bound_regular_file_at(
+                manifest_bound,
+                PATCH_FILE_CODES,
+                dir_fd=artifact_root.fd,
+                basename=PATCH_MANIFEST,
+            )
+            _verify_bound_regular_file_at(
+                database_bound,
+                PATCH_FILE_CODES,
+                dir_fd=artifact_root.fd,
+                basename=NOTE_STORE_MAIN,
+            )
+
+        revalidate_artifact()
+        database_integrity = _verify_bound_regular_file_at(
+            database_bound,
+            PATCH_FILE_CODES,
+            dir_fd=artifact_root.fd,
+            basename=NOTE_STORE_MAIN,
+        )
+        manifest_integrity = _verify_bound_regular_file_at(
+            manifest_bound,
+            PATCH_FILE_CODES,
+            dir_fd=artifact_root.fd,
+            basename=PATCH_MANIFEST,
+        )
+        public_result = {
+            "stage_dir": stage_dir,
+            "manifest": manifest,
+            "manifest_creation_receipt": external_receipt,
+            "fingerprint": fingerprint,
+            "sqlite_validation": integrity,
+            "source_integrity": {
+                "protected_properties": {
+                    "object_identity": ["device", "inode", "file_type"],
+                    "content_stability": ["sha256", "size"],
+                    "access_policy": ["mode", "uid", "gid", "flags"],
+                    "benign_metadata_transitions": [
+                        "mtime_ns",
+                        "ctime_ns",
+                        "link_count",
+                        "platform_flags",
+                    ],
+                },
+                "stage_directory": stage_directory,
+                "manifest": manifest_integrity,
+                "database": database_integrity,
+            },
+        }
+        yield _ValidatedPatchStageArtifact(
+            public_result=public_result,
+            artifact_root=artifact_root,
+            database=database_bound,
+            revalidate_artifact=revalidate_artifact,
+        )
+        if not _writeback_close_only():
+            revalidate_artifact()
+
+
+def validate_patch_stage(
+    stage_dir: Path,
+    manifest_creation_receipt: dict[str, Any] | None = None,
+    *,
+    manifest_creation_receipt_file: Path | None = None,
+    _command_cwd: str | None = None,
+) -> dict[str, Any]:
+    command_cwd = os.getcwd() if _command_cwd is None else _command_cwd
+    requested_stage = _absolute_path_from_cwd(stage_dir, command_cwd)
+    requested_receipt = _optional_absolute_path_from_cwd(
+        manifest_creation_receipt_file,
+        command_cwd,
+    )
+    artifact_paths = _patch_artifact_paths(
+        requested_stage,
+        cwd=command_cwd,
+    )
+    result: dict[str, Any] | None = None
+    with _validated_patch_stage_artifact(
+        artifact_paths,
+        manifest_creation_receipt,
+        manifest_creation_receipt_file=requested_receipt,
+    ) as artifact:
+        result = artifact.public_result
+    assert result is not None
+    return result
+
+
+def _fingerprint_bound_note_store(
+    paths: NoteStorePaths,
+    source_store: _BoundSourceStore,
+) -> dict[str, Any]:
+    records = _capture_bound_source_store(source_store)
+    return {
+        "source_root": paths.group_container,
+        "files": [
+            {
+                "basename": record["basename"],
+                **record["source"],
+            }
+            for record in records
+        ],
+        "protected_properties": {
+            "object_identity": ["device", "inode", "file_type"],
+            "content_stability": ["sha256", "size"],
+            "access_policy": ["mode", "uid", "gid", "flags"],
+        },
+    }
+
+
+def fingerprint_note_store(paths: NoteStorePaths) -> dict[str, Any]:
+    with _bind_source_store(paths.group_container / NOTE_STORE_MAIN) as source_store:
+        return _fingerprint_bound_note_store(paths, source_store)
+
+
+def _source_manifest_map(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    rows = manifest.get("files")
+    if not isinstance(rows, list) or any(
+        not isinstance(row, dict)
+        or not isinstance(row.get("basename"), str)
+        or not isinstance(row.get("source"), dict)
+        for row in rows
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid", "Snapshot manifest file list is invalid"
+        )
+    result = {str(row["basename"]): row["source"] for row in rows}
+    if len(result) != len(rows) or NOTE_STORE_MAIN not in result:
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "Snapshot manifest has duplicate or missing database file entries",
+        )
+    required_source_fields = {"sha256", "size", "identity", "access_policy"}
+    if any(
+        not required_source_fields.issubset(source)
+        or type(source.get("sha256")) is not str
+        or len(source["sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in source["sha256"])
+        or type(source.get("size")) is not int
+        or source["size"] < 0
+        or not isinstance(source["identity"], dict)
+        or not isinstance(source["access_policy"], dict)
+        for source in result.values()
+    ):
+        raise StoreSafetyError(
+            "manifest-invalid",
+            "Snapshot manifest source evidence is incomplete",
+        )
+    normalized: dict[str, dict[str, Any]] = {}
+    for basename, source in result.items():
+        protection = _manifest_protection_receipt(
+            source,
+            label=f"snapshot source {basename}",
+        )
+        normalized[basename] = {
+            **source,
+            **protection,
+        }
+    return normalized
+
+
+def _fingerprint_map(fingerprint: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {str(row["basename"]): row for row in fingerprint["files"]}
+
+
+def _compare_live_to_baseline(
+    fingerprint: dict[str, Any],
+    baseline_manifest: dict[str, Any],
+) -> None:
+    current = _fingerprint_map(fingerprint)
+    baseline = _source_manifest_map(baseline_manifest)
+    if set(current) != set(baseline):
+        raise StoreSafetyError(
+            "baseline-file-set-mismatch",
+            "Live SQLite/WAL/SHM membership differs from the backup baseline",
+        )
+    for basename in sorted(current):
+        current_row = current[basename]
+        baseline_row = baseline[basename]
+        if current_row["identity"] != baseline_row["identity"]:
+            raise StoreSafetyError(
+                "baseline-identity-mismatch",
+                f"Live object identity changed since backup: {basename}",
+            )
+        if (
+            current_row["sha256"] != baseline_row["sha256"]
+            or current_row["size"] != baseline_row["size"]
+        ):
+            raise StoreSafetyError(
+                "baseline-content-mismatch",
+                f"Live bytes changed since backup: {basename}",
+            )
+        if current_row["access_policy"] != baseline_row["access_policy"]:
+            raise StoreSafetyError(
+                "baseline-access-policy-mismatch",
+                f"Live access policy changed since backup: {basename}",
+            )
+
+
+def _require_writeback_grade_snapshot_schema(manifest: dict[str, Any]) -> None:
+    if manifest.get("schema") != SNAPSHOT_SCHEMA:
+        raise StoreSafetyError(
+            "backup-not-writeback-grade",
+            "Writeback requires an exact snapshot v4 manifest with its strict "
+            "live source binding; read-only v3 snapshots cannot be upgraded",
+        )
+
+
+def preflight_writeback(
+    paths: NoteStorePaths,
+    *,
+    backup_dir: Path,
+    stage_dir: Path,
+    backup_manifest_creation_receipt: dict[str, Any] | None = None,
+    stage_manifest_creation_receipt: dict[str, Any] | None = None,
+    backup_manifest_creation_receipt_file: Path | None = None,
+    stage_manifest_creation_receipt_file: Path | None = None,
+    _command_cwd: str | None = None,
+) -> dict[str, Any]:
+    command_cwd = os.getcwd() if _command_cwd is None else _command_cwd
+    requested_backup = _absolute_path_from_cwd(backup_dir, command_cwd)
+    requested_stage = _absolute_path_from_cwd(stage_dir, command_cwd)
+    requested_backup_receipt = _optional_absolute_path_from_cwd(
+        backup_manifest_creation_receipt_file,
+        command_cwd,
+    )
+    requested_stage_receipt = _optional_absolute_path_from_cwd(
+        stage_manifest_creation_receipt_file,
+        command_cwd,
+    )
+    backup_dir = _snapshot_artifact_paths(
+        requested_backup,
+        cwd=command_cwd,
+    ).root
+    stage_dir = _patch_artifact_paths(
+        requested_stage,
+        cwd=command_cwd,
+    ).root
+    if notes_is_running():
+        raise StoreSafetyError(
+            "notes-running", "Notes.app must stay quit for writeback preflight"
+        )
+    result: dict[str, Any] | None = None
+    with _writeback_linearized_transaction() as transaction:
+        backup_artifact = transaction.enter_context(
+            _validated_snapshot_artifact(
+                _snapshot_artifact_paths(backup_dir),
+                backup_manifest_creation_receipt,
+                manifest_creation_receipt_file=requested_backup_receipt,
+            )
+        )
+        backup = backup_artifact.public_result
+        manifest = backup["manifest"]
+        _require_writeback_grade_snapshot_schema(manifest)
+        if (
+            manifest.get("notes_running") is not False
+            or manifest.get("notes_quit_required") is not True
+        ):
+            raise StoreSafetyError(
+                "backup-not-writeback-grade",
+                "Backup was not captured with Notes quit and --require-notes-quit",
+            )
+        if Path(str(manifest.get("source_root"))) != paths.group_container:
+            raise StoreSafetyError(
+                "backup-source-mismatch",
+                "Backup source root does not match the selected live store",
+            )
+        stage_artifact = transaction.enter_context(
+            _validated_patch_stage_artifact(
+                _patch_artifact_paths(stage_dir),
+                stage_manifest_creation_receipt,
+                manifest_creation_receipt_file=requested_stage_receipt,
+            )
+        )
+        live_store = transaction.enter_context(
+            _bind_source_store(paths.group_container / NOTE_STORE_MAIN)
+        )
+
+        def revalidate_joint_inputs() -> dict[str, Any]:
+            backup_artifact.revalidate_artifact()
+            stage_artifact.revalidate_artifact()
+            _compare_live_source_binding(live_store, manifest)
+            current_live = _fingerprint_bound_note_store(paths, live_store)
+            _compare_live_to_baseline(current_live, manifest)
+            return current_live
+
+        live = revalidate_joint_inputs()
+        stage = stage_artifact.public_result
+        current_names = sorted(_fingerprint_map(live))
+        result = {
+            "ready_for_explicit_writeback": True,
+            "live_mutation_performed": False,
+            "backup_dir": backup_dir,
+            "stage_dir": stage_dir,
+            "live_source_root": paths.group_container,
+            "live_files": current_names,
+            "stage_sha256": stage["fingerprint"]["sha256"],
+            "manifest_creation_receipts": {
+                "backup": backup["manifest_creation_receipt"],
+                "stage": stage["manifest_creation_receipt"],
+            },
+            "required_whole_store_boundary": {
+                "install": [NOTE_STORE_MAIN],
+                "remove_or_restore_as_one_boundary": [
+                    name for name in current_names if name != NOTE_STORE_MAIN
+                ],
+                "multi_file_atomic_swap_available": False,
+                "notes_must_remain_quit": True,
+                "retain_backup_until_user_acceptance": True,
+            },
+        }
+        if notes_is_running():
+            raise StoreSafetyError(
+                "notes-started-during-preflight",
+                "Notes.app started during writeback preflight",
+            )
+        revalidate_joint_inputs()
+        transaction.mark_joint_success()
+    assert result is not None
+    return result
+
+
+def verify_writeback(
+    paths: NoteStorePaths,
+    *,
+    backup_dir: Path,
+    stage_dir: Path,
+    backup_manifest_creation_receipt: dict[str, Any] | None = None,
+    stage_manifest_creation_receipt: dict[str, Any] | None = None,
+    backup_manifest_creation_receipt_file: Path | None = None,
+    stage_manifest_creation_receipt_file: Path | None = None,
+    _command_cwd: str | None = None,
+) -> dict[str, Any]:
+    command_cwd = os.getcwd() if _command_cwd is None else _command_cwd
+    requested_backup = _absolute_path_from_cwd(backup_dir, command_cwd)
+    requested_stage = _absolute_path_from_cwd(stage_dir, command_cwd)
+    requested_backup_receipt = _optional_absolute_path_from_cwd(
+        backup_manifest_creation_receipt_file,
+        command_cwd,
+    )
+    requested_stage_receipt = _optional_absolute_path_from_cwd(
+        stage_manifest_creation_receipt_file,
+        command_cwd,
+    )
+    backup_dir = _snapshot_artifact_paths(
+        requested_backup,
+        cwd=command_cwd,
+    ).root
+    stage_dir = _patch_artifact_paths(
+        requested_stage,
+        cwd=command_cwd,
+    ).root
+    if notes_is_running():
+        raise StoreSafetyError(
+            "notes-running", "Notes.app must stay quit for writeback verification"
+        )
+    result: dict[str, Any] | None = None
+    with _writeback_linearized_transaction() as transaction:
+        backup_artifact = transaction.enter_context(
+            _validated_snapshot_artifact(
+                _snapshot_artifact_paths(backup_dir),
+                backup_manifest_creation_receipt,
+                manifest_creation_receipt_file=requested_backup_receipt,
+            )
+        )
+        backup = backup_artifact.public_result
+        baseline_manifest = backup["manifest"]
+        _require_writeback_grade_snapshot_schema(baseline_manifest)
+        if (
+            baseline_manifest.get("notes_running") is not False
+            or baseline_manifest.get("notes_quit_required") is not True
+        ):
+            raise StoreSafetyError(
+                "backup-not-writeback-grade",
+                "Backup was not captured with Notes quit and --require-notes-quit",
+            )
+        if Path(str(baseline_manifest.get("source_root"))) != paths.group_container:
+            raise StoreSafetyError(
+                "backup-source-mismatch",
+                "Backup source root does not match the selected live store",
+            )
+        stage_artifact = transaction.enter_context(
+            _validated_patch_stage_artifact(
+                _patch_artifact_paths(stage_dir),
+                stage_manifest_creation_receipt,
+                manifest_creation_receipt_file=requested_stage_receipt,
+            )
+        )
+        live_store = transaction.enter_context(
+            _bind_source_store(paths.group_container / NOTE_STORE_MAIN)
+        )
+        baseline_main = _source_manifest_map(baseline_manifest)[NOTE_STORE_MAIN]
+        stage = stage_artifact.public_result
+        staged_fingerprint = stage["fingerprint"]
+
+        def revalidate_joint_inputs() -> dict[str, Any]:
+            backup_artifact.revalidate_artifact()
+            stage_artifact.revalidate_artifact()
+            _compare_live_source_binding(live_store, baseline_manifest)
+            current_live = _validate_bound_database_recovery(live_store)
+            current = {
+                record["basename"]: record["source"]
+                for record in current_live["capture"]
+            }
+            if set(current) != {NOTE_STORE_MAIN}:
+                raise StoreSafetyError(
+                    "post-writeback-file-set-mismatch",
+                    "Post-writeback live store contains missing or stale WAL/SHM files",
+                )
+            if current[NOTE_STORE_MAIN]["identity"] == baseline_main["identity"]:
+                raise StoreSafetyError(
+                    "post-writeback-identity-mismatch",
+                    "Live NoteStore.sqlite was not replaced as a whole object",
+                )
+            if (
+                current[NOTE_STORE_MAIN]["sha256"] != staged_fingerprint["sha256"]
+                or current[NOTE_STORE_MAIN]["size"] != staged_fingerprint["size"]
+            ):
+                raise StoreSafetyError(
+                    "post-writeback-content-mismatch",
+                    "Live NoteStore.sqlite does not match the staged patch",
+                )
+            if (
+                current[NOTE_STORE_MAIN]["access_policy"]
+                != baseline_main["access_policy"]
+            ):
+                raise StoreSafetyError(
+                    "post-writeback-access-policy-mismatch",
+                    "Live NoteStore.sqlite did not preserve the baseline access policy",
+                )
+            return current_live
+
+        live = revalidate_joint_inputs()
+        result = {
+            "writeback_verified": True,
+            "notes_running": False,
+            "live_source_root": paths.group_container,
+            "backup_dir": backup_dir,
+            "stage_dir": stage_dir,
+            "sha256": staged_fingerprint["sha256"],
+            "sqlite_validation": live["sqlite_integrity"],
+            "sidecars_absent": True,
+            "manifest_creation_receipts": {
+                "backup": backup["manifest_creation_receipt"],
+                "stage": stage["manifest_creation_receipt"],
+            },
+        }
+        if notes_is_running():
+            raise StoreSafetyError(
+                "notes-started-during-verification",
+                "Notes.app started during writeback verification",
+            )
+        revalidate_joint_inputs()
+        transaction.mark_joint_success()
+    assert result is not None
+    return result
+
+
+def _assert_note_tags_database_outside_live_containers(
+    db_path: Path,
+    paths: NoteStorePaths,
+) -> None:
+    normalized_name = unicodedata.normalize("NFD", db_path.name).casefold()
+    if normalized_name.endswith(("-wal", "-shm", "-journal")):
+        raise StoreSafetyError(
+            "note-tags-sidecar-input",
+            "note-tags accepts a standalone main database, not a SQLite "
+            f"sidecar path: {db_path}",
+            details={"database": str(db_path)},
+        )
+    database_forms = _trusted_alias_scope_forms(db_path)
+    for live_container in (paths.group_container, paths.app_container):
+        for database_form, database_path in database_forms:
+            database_parts = _normalized_scope_parts(database_path)
+            for live_form, live_path in _trusted_alias_scope_forms(live_container):
+                live_parts = _normalized_scope_parts(live_path)
+                if database_parts[: len(live_parts)] != live_parts:
+                    continue
+                raise StoreSafetyError(
+                    "note-tags-live-container",
+                    "note-tags accepts only a recovered standalone database, "
+                    f"not an Apple Notes live-container path: {db_path}",
+                    details={
+                        "database": str(db_path),
+                        "database_scope_form": database_form,
+                        "database_scope_path": str(database_path),
+                        "live_container_scope_form": live_form,
+                        "live_container_scope_path": str(live_path),
+                    },
+                )
+
+
+def _note_tags_live_source_inconclusive_error(
+    live_path: Path,
+    message: str,
+    *,
+    cause: BaseException | None = None,
+    underlying_error_code: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> StoreSafetyError:
+    merged_details: dict[str, Any] = {}
+    if isinstance(cause, StoreSafetyError):
+        merged_details.update(cause.details)
+        underlying_error_code = underlying_error_code or cause.code
+    elif isinstance(cause, PermissionError):
+        underlying_error_code = (
+            underlying_error_code or "source-revalidation-unreadable"
+        )
+    elif isinstance(cause, FileNotFoundError):
+        underlying_error_code = underlying_error_code or "source-missing-after-read"
+    elif isinstance(cause, OSError):
+        underlying_error_code = (
+            underlying_error_code or "source-revalidation-inconclusive"
+        )
+    if details is not None:
+        merged_details.update(details)
+    merged_details["live_database"] = str(live_path)
+    merged_details["underlying_error_code"] = (
+        underlying_error_code or "source-revalidation-inconclusive"
+    )
+    return StoreSafetyError(
+        "note-tags-live-source-inconclusive",
+        message,
+        details=merged_details,
+    )
+
+
+@contextmanager
+def _bind_note_tags_live_parent(
+    live_path: Path,
+) -> Iterator[tuple[_BoundDirectory, tuple[str, ...]]]:
+    """Keep live-parent setup and teardown inside the note-tags taxonomy."""
+
+    body_error: BaseException | None = None
+    try:
+        with _bind_nearest_existing_directory_with_trusted_alias(
+            live_path.parent,
+            allow_missing=True,
+        ) as binding:
+            try:
+                yield binding
+            except BaseException as exc:
+                body_error = exc
+                raise
+    except (OSError, StoreSafetyError) as exc:
+        if exc is body_error or (
+            isinstance(exc, StoreSafetyError)
+            and exc.code == "note-tags-live-source-inconclusive"
+        ):
+            raise
+        raise _note_tags_live_source_inconclusive_error(
+            live_path,
+            "Cannot bind or revalidate the nearest existing ancestor of the "
+            f"live NoteStore path: {live_path}: {exc}",
+            cause=exc,
+            details={"live_source_phase": "parent-component-binding"},
+        ) from exc
+
+
+@contextmanager
+def _bind_note_tags_present_live_store(
+    live_path: Path,
+) -> Iterator[_BoundSourceStore]:
+    """Keep present live-store setup and teardown inside the note-tags taxonomy."""
+
+    body_error: BaseException | None = None
+    try:
+        with _bind_source_store(live_path) as store:
+            try:
+                yield store
+            except BaseException as exc:
+                body_error = exc
+                raise
+    except (OSError, StoreSafetyError) as exc:
+        if exc is body_error or (
+            isinstance(exc, StoreSafetyError)
+            and exc.code == "note-tags-live-source-inconclusive"
+        ):
+            raise
+        raise _note_tags_live_source_inconclusive_error(
+            live_path,
+            "Cannot safely bind or revalidate the initially present live "
+            f"NoteStore: {live_path}: {exc}",
+            cause=exc,
+            details={"live_source_phase": "present-store-binding"},
+        ) from exc
+
+
+def _verify_note_tags_live_ancestor(
+    binding: _BoundAbsentNoteTagsLiveSource,
+    phase: str,
+) -> dict[str, Any]:
+    details = {
+        "initial_missing_error_code": binding.initial_missing_error_code,
+        "nearest_existing_ancestor": str(binding.ancestor.path),
+        "missing_components": list(binding.missing_components),
+        "live_source_phase": phase,
+    }
+    try:
+        return _verify_bound_source_directory(binding.ancestor)
+    except (OSError, StoreSafetyError) as exc:
+        raise _note_tags_live_source_inconclusive_error(
+            binding.path,
+            "Cannot revalidate the held ancestor of the initially absent live "
+            f"NoteStore path: {binding.path}: {exc}",
+            cause=exc,
+            details=details,
+        ) from exc
+
+
+def _verify_note_tags_absent_live_source(
+    binding: _BoundAbsentNoteTagsLiveSource,
+) -> dict[str, Any]:
+    """Prove the first missing component still excludes the complete suffix."""
+
+    details = {
+        "initial_missing_error_code": binding.initial_missing_error_code,
+        "nearest_existing_ancestor": str(binding.ancestor.path),
+        "missing_components": list(binding.missing_components),
+        "live_source_phase": "absence-revalidation",
+    }
+    ancestor_before = _verify_note_tags_live_ancestor(
+        binding,
+        "before-live-source-absence",
+    )
+    try:
+        observed = os.stat(
+            binding.missing_components[0],
+            dir_fd=binding.ancestor.fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        ancestor_after = _verify_note_tags_live_ancestor(
+            binding,
+            "after-live-source-absence",
+        )
+        return {
+            "status": "absent",
+            "ancestor_before": ancestor_before,
+            "ancestor_after": ancestor_after,
+            **details,
+        }
+    except PermissionError as exc:
+        raise _note_tags_live_source_inconclusive_error(
+            binding.path,
+            "Cannot prove that the initially absent live NoteStore path "
+            f"remains absent because its namespace is unreadable: "
+            f"{binding.path}: {exc}",
+            cause=exc,
+            details={**details, "live_source_revalidation_state": "unreadable"},
+        ) from exc
+    except OSError as exc:
+        raise _note_tags_live_source_inconclusive_error(
+            binding.path,
+            "Cannot conclusively revalidate the initially absent live "
+            f"NoteStore path: {binding.path}: {exc}",
+            cause=exc,
+            details={**details, "live_source_revalidation_state": "inconclusive"},
+        ) from exc
+    raise _note_tags_live_source_inconclusive_error(
+        binding.path,
+        "The initially absent live NoteStore path appeared while note-tags "
+        f"was running: {binding.path}",
+        underlying_error_code="source-identity-mismatch",
+        details={
+            **details,
+            "live_source_revalidation_state": "present",
+            "appeared_component": binding.missing_components[0],
+            "appeared_component_identity": _identity(observed),
+            "appeared_component_access_policy": _access_policy(observed),
+        },
+    )
+
+
+def _verify_note_tags_present_binding_continuity(
+    live_path: Path,
+    ancestor: _BoundDirectory,
+    initial_leaf: os.stat_result,
+    store: _BoundSourceStore,
+) -> None:
+    """Connect the first present observation to the held live-store object."""
+
+    try:
+        ancestor_before = _verify_bound_source_directory(ancestor)
+        current_leaf = os.stat(
+            live_path.name,
+            dir_fd=ancestor.fd,
+            follow_symlinks=False,
+        )
+        live = _verify_bound_source_store(store, verify_content=False)
+        ancestor_after = _verify_bound_source_directory(ancestor)
+    except (OSError, StoreSafetyError) as exc:
+        raise _note_tags_live_source_inconclusive_error(
+            live_path,
+            "Cannot connect the initially present live NoteStore observation "
+            f"to its held store binding: {live_path}: {exc}",
+            cause=exc,
+            details={"live_source_phase": "present-binding-continuity"},
+        ) from exc
+    live_main = live["files"][NOTE_STORE_MAIN]
+    if (
+        not stat.S_ISREG(initial_leaf.st_mode)
+        or not stat.S_ISREG(current_leaf.st_mode)
+        or not _same_identity(initial_leaf, current_leaf)
+        or live_main["identity"] != _identity(initial_leaf)
+        or ancestor_before["identity"] != live["directory"]["identity"]
+        or ancestor_after["identity"] != live["directory"]["identity"]
+    ):
+        raise _note_tags_live_source_inconclusive_error(
+            live_path,
+            "The initially present live NoteStore changed object identity "
+            f"before its held binding was established: {live_path}",
+            underlying_error_code="source-identity-mismatch",
+            details={"live_source_phase": "present-binding-continuity"},
+        )
+    if (
+        _access_policy(initial_leaf) != _access_policy(current_leaf)
+        or live_main["access_policy"] != _access_policy(initial_leaf)
+        or ancestor_before["access_policy"] != live["directory"]["access_policy"]
+        or ancestor_after["access_policy"] != live["directory"]["access_policy"]
+    ):
+        raise _note_tags_live_source_inconclusive_error(
+            live_path,
+            "The initially present live NoteStore changed access policy "
+            f"before its held binding was established: {live_path}",
+            underlying_error_code="source-access-policy-mismatch",
+            details={"live_source_phase": "present-binding-continuity"},
+        )
+
+
+def _bind_note_tags_live_store(
+    transaction: ExitStack,
+    paths: NoteStorePaths,
+) -> _BoundSourceStore | _BoundAbsentNoteTagsLiveSource:
+    """Bind a present live store or retain proof that its path was absent."""
+
+    live_path = _absolute_path(paths.group_container / NOTE_STORE_MAIN)
+    ancestor, missing_parent_components = transaction.enter_context(
+        _bind_note_tags_live_parent(live_path)
+    )
+    if missing_parent_components:
+        binding = _BoundAbsentNoteTagsLiveSource(
+            path=live_path,
+            ancestor=ancestor,
+            missing_components=(*missing_parent_components, live_path.name),
+            initial_missing_error_code="prepared-directory-missing",
+        )
+        _verify_note_tags_absent_live_source(binding)
+        return binding
+
+    try:
+        _verify_bound_source_directory(ancestor)
+        initial_leaf = os.stat(
+            live_path.name,
+            dir_fd=ancestor.fd,
+            follow_symlinks=False,
+        )
+        _verify_bound_source_directory(ancestor)
+    except FileNotFoundError:
+        binding = _BoundAbsentNoteTagsLiveSource(
+            path=live_path,
+            ancestor=ancestor,
+            missing_components=(live_path.name,),
+            initial_missing_error_code="source-missing",
+        )
+        _verify_note_tags_absent_live_source(binding)
+        return binding
+    except PermissionError as exc:
+        raise _note_tags_live_source_inconclusive_error(
+            live_path,
+            f"Cannot inspect the live NoteStore leaf: {live_path}: {exc}",
+            cause=exc,
+            underlying_error_code="source-unreadable",
+            details={"live_source_phase": "initial-leaf-observation"},
+        ) from exc
+    except (OSError, StoreSafetyError) as exc:
+        raise _note_tags_live_source_inconclusive_error(
+            live_path,
+            "Cannot establish the initial live NoteStore namespace state: "
+            f"{live_path}: {exc}",
+            cause=exc,
+            details={"live_source_phase": "initial-leaf-observation"},
+        ) from exc
+
+    store = transaction.enter_context(_bind_note_tags_present_live_store(live_path))
+    _verify_note_tags_present_binding_continuity(
+        live_path,
+        ancestor,
+        initial_leaf,
+        store,
+    )
+    return store
+
+
+def _assert_note_tags_input_not_live_store(
+    parent: _BoundDirectory,
+    database: _BoundRegularFile,
+    live_source: _BoundSourceStore | _BoundAbsentNoteTagsLiveSource,
+    *,
+    standalone: dict[str, Any] | None = None,
+    verify_content: bool = True,
+) -> dict[str, Any]:
+    """Reject a lexical standalone path that aliases the held live main object."""
+
+    if isinstance(live_source, _BoundAbsentNoteTagsLiveSource):
+        return _verify_note_tags_absent_live_source(live_source)
+    if standalone is None:
+        verify_file = (
+            _verify_bound_regular_file_at
+            if verify_content
+            else _verify_bound_regular_file_properties_at
+        )
+        standalone = verify_file(
+            database,
+            SOURCE_FILE_CODES,
+            dir_fd=parent.fd,
+            basename=database.path.name,
+        )
+    try:
+        live = _verify_bound_source_store(
+            live_source,
+            verify_content=verify_content,
+        )
+    except (OSError, StoreSafetyError) as exc:
+        raise _note_tags_live_source_inconclusive_error(
+            live_source.directory.path / live_source.main_name,
+            "The held live NoteStore changed while note-tags excluded "
+            f"object-identity overlap: {live_source.directory.path}: {exc}",
+            cause=exc,
+            details={"live_source_phase": "present-store-revalidation"},
+        ) from exc
+    live_main = live["files"][NOTE_STORE_MAIN]
+    if standalone["identity"] == live_main["identity"]:
+        live_names = list(live["membership"])
+        raise StoreSafetyError(
+            "note-tags-live-object",
+            "note-tags refuses a standalone-looking path that is a hard link "
+            "to the live NoteStore.sqlite object",
+            details={
+                "database": str(database.path),
+                "live_database": str(
+                    live_source.directory.path / live_source.main_name
+                ),
+                "live_file_set": live_names,
+                "live_sidecars_present": [
+                    name for name in live_names if name != NOTE_STORE_MAIN
+                ],
+            },
+        )
+    return live
+
+
+def _verify_note_tags_standalone_input(
+    parent: _BoundDirectory,
+    database: _BoundRegularFile,
+    *,
+    verify_content: bool = True,
+) -> dict[str, Any]:
+    """Revalidate one held main file and prove its sidecar names absent."""
+
+    _verify_bound_source_directory(parent)
+    _verify_bound_regular_file_properties_at(
+        database,
+        SOURCE_FILE_CODES,
+        dir_fd=parent.fd,
+        basename=database.path.name,
+    )
+    for _pass_index in range(2):
+        _verify_bound_source_directory(parent)
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar_name = f"{database.path.name}{suffix}"
+            sidecar_path = database.path.with_name(sidecar_name)
+            try:
+                observed = os.stat(
+                    sidecar_name,
+                    dir_fd=parent.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            except PermissionError as exc:
+                raise StoreSafetyError(
+                    "note-tags-sidecar-unreadable",
+                    f"Cannot prove standalone sidecar absence: {sidecar_path}: {exc}",
+                ) from exc
+            except OSError as exc:
+                raise StoreSafetyError(
+                    "note-tags-sidecar-revalidation-inconclusive",
+                    f"Cannot revalidate standalone sidecar absence: "
+                    f"{sidecar_path}: {exc}",
+                ) from exc
+            raise StoreSafetyError(
+                "note-tags-sidecar-present",
+                "note-tags requires a sidecar-free standalone database: "
+                f"{sidecar_path}",
+                details={
+                    "database": str(database.path),
+                    "sidecar": str(sidecar_path),
+                    "sidecar_file_type": stat.S_IFMT(observed.st_mode),
+                },
+            )
+        _verify_bound_source_directory(parent)
+    verify_file = (
+        _verify_bound_regular_file_at
+        if verify_content
+        else _verify_bound_regular_file_properties_at
+    )
+    main = verify_file(
+        database,
+        SOURCE_FILE_CODES,
+        dir_fd=parent.fd,
+        basename=database.path.name,
+    )
+    _verify_bound_source_directory(parent)
+    return main
+
+
+def _verify_note_tags_input_state(
+    parent: _BoundDirectory,
+    database: _BoundRegularFile,
+    live_source: _BoundSourceStore | _BoundAbsentNoteTagsLiveSource,
+    *,
+    verify_content: bool,
+) -> None:
+    """Revalidate one complete note-tags input boundary or callback point."""
+
+    standalone_before = _verify_bound_regular_file_properties_at(
+        database,
+        SOURCE_FILE_CODES,
+        dir_fd=parent.fd,
+        basename=database.path.name,
+    )
+    _assert_note_tags_input_not_live_store(
+        parent,
+        database,
+        live_source,
+        standalone=standalone_before,
+        verify_content=verify_content,
+    )
+    standalone = _verify_note_tags_standalone_input(
+        parent,
+        database,
+        verify_content=verify_content,
+    )
+    _assert_note_tags_input_not_live_store(
+        parent,
+        database,
+        live_source,
+        standalone=standalone,
+        verify_content=False,
+    )
+
+
+@dataclass
+class _NoteTagsInputVerifier:
+    """Keep full hashes at consumption boundaries and callbacks lightweight."""
+
+    parent: _BoundDirectory
+    database: _BoundRegularFile
+    live_source: _BoundSourceStore | _BoundAbsentNoteTagsLiveSource
+    phase: str = "before-consumption"
+    boundary_content_receipt: tuple[tuple[str, str, int], ...] | None = None
+
+    def _require_phase(self, expected: str, operation: str) -> None:
+        if self.phase != expected:
+            raise StoreSafetyError(
+                "note-tags-query-failed",
+                "note-tags input verification entered an invalid phase while "
+                f"attempting to {operation}: expected {expected}, observed "
+                f"{self.phase}",
+            )
+
+    def start(self) -> None:
+        self._require_phase("before-consumption", "start SQLite consumption")
+        _verify_note_tags_input_state(
+            self.parent,
+            self.database,
+            self.live_source,
+            verify_content=True,
+        )
+        live_files = (
+            ()
+            if isinstance(self.live_source, _BoundAbsentNoteTagsLiveSource)
+            else tuple(self.live_source.files.values())
+        )
+        self.boundary_content_receipt = tuple(
+            (str(bound.path), bound.sha256, int(bound.opened.st_size))
+            for bound in (self.database, *live_files)
+        )
+        self.phase = "consuming"
+
+    def verify_callback(self) -> None:
+        self._require_phase("consuming", "revalidate an SQLite callback boundary")
+        if self.boundary_content_receipt is None:
+            raise StoreSafetyError(
+                "note-tags-query-failed",
+                "note-tags has no full-hash boundary receipt for callback revalidation",
+            )
+        _verify_note_tags_input_state(
+            self.parent,
+            self.database,
+            self.live_source,
+            verify_content=False,
+        )
+
+    def finish(self) -> None:
+        self._require_phase("consuming", "finish SQLite consumption")
+        _verify_note_tags_input_state(
+            self.parent,
+            self.database,
+            self.live_source,
+            verify_content=True,
+        )
+        self.phase = "finished"
+
+
+def _sqlite_text_expression(value: str, *, source_path: Path) -> str:
+    try:
+        encoded = value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise StoreSafetyError(
+            "note-tags-query-failed",
+            f"Note title is not valid Unicode for SQLite: {source_path}",
+        ) from exc
+    return f"CAST(X'{encoded.hex()}' AS TEXT)"
+
+
+def _note_tags_integer(
+    value: str | None,
+    *,
+    field: str,
+    source_path: Path,
+    optional: bool = False,
+) -> int | None:
+    if value is None:
+        if optional:
+            return None
+        raise StoreSafetyError(
+            "note-tags-query-failed",
+            f"SQLite returned a null {field} value for {source_path}",
+        )
+    try:
+        return int(value, 10)
+    except ValueError as exc:
+        raise StoreSafetyError(
+            "note-tags-query-failed",
+            f"SQLite returned an invalid {field} value for {source_path}",
+        ) from exc
+
+
+def _query_note_tags_from_image(
+    image: _DeserializedSQLiteImage,
+    db_path: Path,
+    note_title: str,
+) -> dict[str, Any]:
+    title_expression = _sqlite_text_expression(note_title, source_path=db_path)
+    note_rows = _native_sqlite_query_rows(
+        image,
+        """
+        SELECT Z_PK, ZIDENTIFIER, ZTITLE1, ZNOTEDATA
+        FROM ZICCLOUDSYNCINGOBJECT
+        WHERE ZTITLE1 = """
+        + title_expression
+        + """
+        ORDER BY Z_PK
+        LIMIT 1
+        """,
+        db_path,
+        error_code="note-tags-query-failed",
+    )
+    if not note_rows:
+        raise StoreSafetyError(
+            "note-tags-query-failed",
+            f"Note not found in database: {note_title}",
+        )
+    note_row = note_rows[0]
+    if len(note_row) != 4:
+        raise StoreSafetyError(
+            "note-tags-query-failed",
+            f"SQLite returned an incomplete note row for {db_path}",
+        )
+    note_pk = _note_tags_integer(
+        note_row[0],
+        field="note primary key",
+        source_path=db_path,
+    )
+    assert note_pk is not None
+    tag_rows = _native_sqlite_query_rows(
+        image,
+        """
+        SELECT Z_PK, ZIDENTIFIER, ZNOTE1, ZALTTEXT,
+               ZTOKENCONTENTIDENTIFIER, ZTYPEUTI1
+        FROM ZICCLOUDSYNCINGOBJECT
+        WHERE ZNOTE1 = """
+        + str(note_pk)
+        + """
+          AND ZTYPEUTI1 = 'com.apple.notes.inlinetextattachment.hashtag'
+        ORDER BY Z_PK
+        """,
+        db_path,
+        error_code="note-tags-query-failed",
+    )
+    if any(len(row) != 6 for row in tag_rows):
+        raise StoreSafetyError(
+            "note-tags-query-failed",
+            f"SQLite returned an incomplete tag row for {db_path}",
+        )
+    return {
+        "note": {
+            "pk": note_pk,
+            "identifier": note_row[1],
+            "title": note_row[2],
+            "note_data_pk": _note_tags_integer(
+                note_row[3],
+                field="note-data primary key",
+                source_path=db_path,
+                optional=True,
+            ),
+        },
+        "tags": [
+            {
+                "pk": _note_tags_integer(
+                    row[0],
+                    field="tag primary key",
+                    source_path=db_path,
+                ),
+                "identifier": row[1],
+                "note_fk": _note_tags_integer(
+                    row[2],
+                    field="tag note foreign key",
+                    source_path=db_path,
+                ),
+                "tag_text": row[3],
+                "tag_token": row[4],
+                "type_uti": row[5],
+            }
+            for row in tag_rows
+        ],
+    }
+
+
+def query_note_tags(
+    db_path: Path,
+    note_title: str,
+    *,
+    paths: NoteStorePaths | None = None,
+) -> dict[str, Any]:
+    db_path = _absolute_path(db_path)
+    paths = paths or NoteStorePaths()
+    _assert_note_tags_database_outside_live_containers(db_path, paths)
+    parent: _BoundDirectory | None = None
+    try:
+        with ExitStack() as transaction:
+            parent = transaction.enter_context(
+                _bind_existing_directory_with_trusted_alias(db_path.parent)
+            )
+            database = transaction.enter_context(
+                _bind_regular_file_at(
+                    db_path,
+                    parent,
+                    SOURCE_FILE_CODES,
+                )
+            )
+            live_source = _bind_note_tags_live_store(transaction, paths)
+            input_verifier = _NoteTagsInputVerifier(
+                parent=parent,
+                database=database,
+                live_source=live_source,
+            )
+            input_verifier.start()
+            query_error: Exception | None = None
+            result: dict[str, Any] | None = None
+            try:
+                with _deserialized_sqlite_image(
+                    database,
+                    db_path,
+                    verify_bound=input_verifier.verify_callback,
+                    error_code="note-tags-query-failed",
+                    require_backup=False,
+                    file_codes=SOURCE_FILE_CODES,
+                ) as image:
+                    result = _query_note_tags_from_image(
+                        image,
+                        db_path,
+                        note_title,
+                    )
+            except Exception as exc:
+                query_error = exc
+            try:
+                input_verifier.finish()
+            except Exception as terminal_error:
+                if query_error is None:
+                    raise
+                secondary = _sqlite_secondary_failure_evidence(
+                    query_error,
+                    phase="note-tags-query-or-setup",
+                )
+                if isinstance(terminal_error, StoreSafetyError):
+                    terminal_error.details = dict(terminal_error.details)
+                    terminal_error.details["note_tags_query_secondary_failure"] = (
+                        secondary
+                    )
+                    raise terminal_error from query_error
+                raise StoreSafetyError(
+                    "source-revalidation-inconclusive",
+                    "note-tags terminal input revalidation failed for "
+                    f"{db_path}: {_sqlite_exception_text(terminal_error)}",
+                    details={
+                        "note_tags_query_secondary_failure": secondary,
+                        "terminal_revalidation_failure": (
+                            _sqlite_exception_evidence(terminal_error)
+                        ),
+                    },
+                ) from terminal_error
+            if query_error is not None:
+                raise query_error
+            assert result is not None
+            return result
+    except StoreSafetyError as exc:
+        if parent is not None and exc.code in {
+            "directory-identity-mismatch",
+            "directory-access-policy-mismatch",
+            "prepared-directory-missing",
+            "prepared-directory-identity-mismatch",
+            "prepared-directory-access-policy-mismatch",
+            "prepared-directory-revalidation-inconclusive",
+        }:
+            raise _source_directory_revalidation_error(parent, exc) from exc
+        raise
+
+
+def _paths_from_args(
+    args: argparse.Namespace,
+    *,
+    cwd: str | None = None,
+) -> NoteStorePaths:
+    captured_cwd = os.getcwd() if cwd is None else cwd
+    return NoteStorePaths(
+        group_container=_absolute_path_from_cwd(
+            args.group_container,
+            captured_cwd,
+        ),
+        app_container=_absolute_path_from_cwd(
+            args.app_container,
+            captured_cwd,
+        ),
+    )
+
+
+def _assert_creator_result_file_lexically_external(
+    result_file: Path,
+    artifact: Path,
+) -> None:
+    result_requested, result_canonical, _ = _trusted_alias_paths(result_file)
+    artifact_requested, artifact_canonical, _ = _trusted_alias_paths(artifact)
+    for result_path in {result_requested, result_canonical}:
+        result_parts = _normalized_scope_parts(result_path)
+        for artifact_path in {artifact_requested, artifact_canonical}:
+            artifact_parts = _normalized_scope_parts(artifact_path)
+            result_inside_artifact = (
+                result_parts[: len(artifact_parts)] == artifact_parts
+            )
+            artifact_inside_result = artifact_parts[: len(result_parts)] == result_parts
+            if not result_inside_artifact and not artifact_inside_result:
+                continue
+            raise StoreSafetyError(
+                "result-file-not-external",
+                "Creator result file must be a separate path outside the "
+                f"published artifact: result={result_file}, artifact={artifact}",
+                details={
+                    "result_file": str(result_file),
+                    "artifact": str(artifact),
+                    "mutation_performed": False,
+                    "overlap_detection": (
+                        "normalized-lexical-result-inside-artifact"
+                        if result_inside_artifact
+                        else "normalized-lexical-artifact-inside-result"
+                    ),
+                },
+            )
+
+
+def _assert_creator_result_name_absent(
+    result_scope: _LiveDestinationScope,
+) -> None:
+    state, _ = _observe_bound_name(
+        result_scope.parent.fd,
+        result_scope.destination.name,
+    )
+    if state == "present":
+        raise StoreSafetyError(
+            "result-file-exists",
+            "Creator result file already exists; refusing to replace or truncate "
+            f"it: {result_scope.destination}",
+            details={"mutation_performed": False},
+        )
+    if state != "absent":
+        raise StoreSafetyError(
+            "result-file-scope-inconclusive",
+            "Cannot prove that the descriptor-bound creator result name is "
+            f"absent: {result_scope.destination}",
+            details={"mutation_performed": False},
+        )
+
+
+def _revalidate_creator_result_before_temp_create(
+    result_scope: _LiveDestinationScope,
+) -> None:
+    """Set the result writer's zero-write linearization point."""
+
+    result_scope.revalidate()
+    _assert_creator_result_name_absent(result_scope)
+
+
+@contextmanager
+def _preflight_creator_destinations_raw(
+    paths: NoteStorePaths,
+    result_file: Path | None,
+    artifact: Path,
+) -> Iterator[_CreatorDestinationPreflights]:
+    """Acquire both zero-write creator destination proofs."""
+
+    requested_artifact = Path(os.path.abspath(os.fspath(artifact)))
+    requested_result = (
+        Path(os.path.abspath(os.fspath(result_file)))
+        if result_file is not None
+        else None
+    )
+    if _lexists(requested_artifact):
+        raise StoreSafetyError(
+            "destination-exists",
+            f"Creator artifact already exists: {requested_artifact}",
+            details={
+                "destination": str(requested_artifact),
+                "mutation_performed": False,
+            },
+        )
+    if requested_result is not None:
+        _assert_creator_result_file_lexically_external(
+            requested_result,
+            requested_artifact,
+        )
+    with ExitStack() as stack:
+        artifact_preflight = stack.enter_context(
+            _preflight_live_safe_destination_parent(
+                paths,
+                requested_artifact,
+            )
+        )
+        _assert_destination_preflight_name_absent(
+            artifact_preflight,
+            exists_code="destination-exists",
+            inconclusive_code="snapshot-destination-scope-inconclusive",
+            label="Creator artifact",
+        )
+        result_preflight: _LiveDestinationPreflight | None = None
+        if requested_result is not None:
+            result_preflight = stack.enter_context(
+                _preflight_live_safe_destination_parent(
+                    paths,
+                    requested_result,
+                )
+            )
+            _assert_destination_preflight_name_absent(
+                result_preflight,
+                exists_code="result-file-exists",
+                inconclusive_code="result-file-scope-inconclusive",
+                label="Creator result file",
+            )
+
+        # Revalidate the first proof only after the second proof is complete.
+        # This makes replacement between the two read-only windows fail before
+        # either destination is allowed to cross the creator boundary.
+        _assert_destination_preflight_name_absent(
+            artifact_preflight,
+            exists_code="destination-exists",
+            inconclusive_code="snapshot-destination-scope-inconclusive",
+            label="Creator artifact",
+        )
+        if result_preflight is not None:
+            _assert_creator_result_file_lexically_external(
+                result_preflight.requested_destination,
+                artifact_preflight.requested_destination,
+            )
+            _assert_destination_preflight_name_absent(
+                result_preflight,
+                exists_code="result-file-exists",
+                inconclusive_code="result-file-scope-inconclusive",
+                label="Creator result file",
+            )
+        yield _CreatorDestinationPreflights(
+            artifact=artifact_preflight,
+            result=result_preflight,
+        )
+
+
+@contextmanager
+def _preflight_creator_destinations(
+    paths: NoteStorePaths,
+    result_file: Path | None,
+    artifact: Path,
+) -> Iterator[_CreatorDestinationPreflights]:
+    """Carry publication latches across held destination-proof teardown."""
+
+    requested_artifact = Path(os.path.abspath(os.fspath(artifact)))
+    requested_result = (
+        Path(os.path.abspath(os.fspath(result_file)))
+        if result_file is not None
+        else None
+    )
+    destination_preflights: _CreatorDestinationPreflights | None = None
+    try:
+        with _preflight_creator_destinations_raw(
+            paths,
+            requested_result,
+            requested_artifact,
+        ) as destination_preflights:
+            yield destination_preflights
+    except Exception as exc:
+        if (
+            destination_preflights is None
+            or destination_preflights.published_artifact_payload is None
+        ):
+            raise
+        if requested_result is not None:
+            destination = destination_preflights.result_destination
+            if destination is None:
+                destination = _CreatorResultDestination(
+                    artifact=requested_artifact,
+                    result_file=requested_result,
+                    artifact_payload=(
+                        destination_preflights.published_artifact_payload
+                    ),
+                )
+            error = _creator_result_publication_failure(destination, exc)
+            if (
+                isinstance(exc, StoreSafetyError)
+                and exc.code == "result-file-publication-failed"
+            ):
+                exc.details = error.details
+                raise
+            raise error from exc
+
+        payload = destination_preflights.published_artifact_payload
+        descriptor = payload.get("descriptor_bound_destination")
+        evidence = _creator_artifact_publication_evidence(
+            requested_artifact,
+            payload,
+        )
+        error = _post_publication_uncertain_error(
+            exc,
+            destination=requested_artifact,
+            descriptor_bound_destination=(
+                descriptor if isinstance(descriptor, dict) else None
+            ),
+            phase="creator-destination-preflight-teardown",
+            message=(
+                "Creator artifact publication committed, but its retained "
+                "destination preflight could not close safely"
+            ),
+            additional_details=evidence,
+        )
+        if (
+            isinstance(exc, StoreSafetyError)
+            and exc.code == "destination-install-uncertain"
+        ):
+            exc.details = error.details
+            raise
+        raise error from exc
+
+
+def _creator_artifact_publication_evidence(
+    artifact: Path,
+    payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return latched creator-artifact publication and recovery evidence."""
+
+    details: dict[str, Any] = {
+        "artifact": str(artifact),
+        "artifact_mutation_performed": True,
+        "artifact_publication_state": "committed",
+        "mutation_performed": True,
+        "retry_safe": False,
+        "recovery_locators": {"destination": str(artifact)},
+    }
+    if payload is None:
+        return details
+    descriptor = payload.get("descriptor_bound_destination")
+    if isinstance(descriptor, dict):
+        details["recovery_locators"]["descriptor_bound_destination"] = descriptor
+        details["recovery_locators"]["artifact_descriptor_bound_destination"] = (
+            descriptor
+        )
+    terminal_scope = payload.get("terminal_destination_scope")
+    if isinstance(terminal_scope, dict):
+        details["artifact_terminal_destination_scope"] = terminal_scope
+    return details
+
+
+def _creator_artifact_parent_component_receipts(
+    payload: dict[str, Any],
+) -> dict[Path, dict[str, Any]]:
+    try:
+        terminal_scope = payload["terminal_destination_scope"]
+        parent = terminal_scope["parent"]
+        component_path = parent["component_path_binding"]
+        created_components = component_path["created_components"]["components"]
+    except (KeyError, TypeError) as exc:
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator artifact result has no complete parent-creation receipt",
+        ) from exc
+    if not isinstance(created_components, list):
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator artifact parent-creation component list is malformed",
+        )
+    receipts: dict[Path, dict[str, Any]] = {}
+    for index, row in enumerate(created_components):
+        if not isinstance(row, dict):
+            raise StoreSafetyError(
+                "prepared-tree-receipt-invalid",
+                "Creator artifact parent-creation component receipt is malformed",
+            )
+        try:
+            path = _absolute_path(Path(os.fspath(row["path"])))
+        except (KeyError, TypeError, ValueError, OSError) as exc:
+            raise StoreSafetyError(
+                "prepared-tree-receipt-invalid",
+                "Creator artifact parent-creation path is malformed",
+            ) from exc
+        protection = _normalized_creator_artifact_protection_receipt(
+            row,
+            label=f"artifact parent component {index}",
+        )
+        if not isinstance(row.get("creation_install_receipt"), dict):
+            raise StoreSafetyError(
+                "prepared-tree-receipt-invalid",
+                "Creator artifact parent component lacks its no-replace "
+                "creation receipt",
+            )
+        if path in receipts:
+            raise StoreSafetyError(
+                "prepared-tree-receipt-invalid",
+                "Creator artifact parent-creation receipt repeats a component "
+                f"path: {path}",
+            )
+        receipts[path] = {
+            **protection,
+            "creation_install_receipt": row["creation_install_receipt"],
+        }
+    return receipts
+
+
+@contextmanager
+def _refresh_result_preflight_after_artifact_commit(
+    paths: NoteStorePaths,
+    preflight: _LiveDestinationPreflight,
+    artifact_payload: dict[str, Any] | None,
+) -> Iterator[_LiveDestinationPreflight]:
+    """Advance only across parent components proved created by the artifact."""
+
+    try:
+        _assert_destination_preflight_name_absent(
+            preflight,
+            exists_code="result-file-exists",
+            inconclusive_code="result-file-scope-inconclusive",
+            label="Creator result file",
+        )
+    except StoreSafetyError:
+        if not preflight.missing_parent_components or artifact_payload is None:
+            raise
+        state, _ = _observe_bound_name(
+            preflight.ancestor.fd,
+            preflight.missing_parent_components[0],
+        )
+        if state != "present":
+            raise
+    else:
+        yield preflight
+        return
+
+    creation_receipts = _creator_artifact_parent_component_receipts(artifact_payload)
+    old_requested_ancestor = preflight.ancestor.path
+    old_canonical_ancestor = _bound_directory_canonical_path(preflight.ancestor)
+    _verify_bound_directory_namespace(preflight.ancestor)
+    with (
+        _preflight_live_safe_destination_parent(
+            paths,
+            preflight.requested_destination,
+            trusted_alias=preflight.trusted_alias,
+        ) as refreshed,
+        ExitStack() as stack,
+    ):
+        new_canonical_ancestor = _bound_directory_canonical_path(refreshed.ancestor)
+        try:
+            newly_existing = new_canonical_ancestor.relative_to(
+                old_canonical_ancestor
+            ).parts
+        except ValueError as exc:
+            raise StoreSafetyError(
+                "result-file-scope-inconclusive",
+                "The result destination escaped its held ancestor after artifact "
+                "parent creation",
+                details={"mutation_performed": True},
+            ) from exc
+        expected_prefix = preflight.missing_parent_components[: len(newly_existing)]
+        if (
+            not newly_existing
+            or newly_existing != expected_prefix
+            or len(newly_existing) > len(preflight.missing_parent_components)
+        ):
+            raise StoreSafetyError(
+                "result-file-scope-inconclusive",
+                "The result destination acquired an unproved parent-component "
+                "path after artifact creation",
+                details={"mutation_performed": True},
+            )
+        for index in range(1, len(newly_existing) + 1):
+            requested_component = old_requested_ancestor.joinpath(
+                *newly_existing[:index]
+            )
+            canonical_component = old_canonical_ancestor.joinpath(
+                *newly_existing[:index]
+            )
+            receipt = creation_receipts.get(canonical_component)
+            if receipt is None:
+                raise StoreSafetyError(
+                    "result-file-scope-inconclusive",
+                    "A newly present result-parent component has no matching "
+                    "artifact creator receipt: "
+                    f"{requested_component}",
+                    details={"mutation_performed": True},
+                )
+            binding = stack.enter_context(
+                _bind_existing_directory_with_trusted_alias(
+                    requested_component,
+                    trusted_alias=preflight.trusted_alias,
+                )
+            )
+            current = _verify_bound_directory_namespace(binding)
+            if current["identity"] != receipt["identity"]:
+                raise StoreSafetyError(
+                    "prepared-directory-identity-mismatch",
+                    "A shared result-parent component differs from the artifact "
+                    f"creation receipt: {requested_component}",
+                    details={"mutation_performed": True},
+                )
+            if current["access_policy"] != receipt["access_policy"]:
+                raise StoreSafetyError(
+                    "prepared-directory-access-policy-mismatch",
+                    "A shared result-parent component access policy differs "
+                    f"from the artifact creation receipt: {requested_component}",
+                    details={"mutation_performed": True},
+                )
+        _assert_destination_preflight_name_absent(
+            refreshed,
+            exists_code="result-file-exists",
+            inconclusive_code="result-file-scope-inconclusive",
+            label="Creator result file",
+        )
+        yield refreshed
+
+
+@contextmanager
+def _bind_creator_result_destination(
+    paths: NoteStorePaths,
+    result_file: Path | None,
+    artifact: Path,
+    *,
+    preflight: _LiveDestinationPreflight | None = None,
+    artifact_mutation_performed: bool = False,
+    artifact_payload: dict[str, Any] | None = None,
+) -> Iterator[_CreatorResultDestination | None]:
+    if result_file is None:
+        if preflight is not None:
+            raise StoreSafetyError(
+                "result-file-scope-inconclusive",
+                "A creator result preflight was supplied without a result file",
+                details={"mutation_performed": artifact_mutation_performed},
+            )
+        yield None
+        return
+    requested_result = Path(os.path.abspath(os.fspath(result_file)))
+    requested_artifact = Path(os.path.abspath(os.fspath(artifact)))
+    _assert_creator_result_file_lexically_external(
+        requested_result,
+        requested_artifact,
+    )
+    destination = _CreatorResultDestination(
+        artifact=requested_artifact,
+        result_file=requested_result,
+        artifact_payload=artifact_payload,
+    )
+    with ExitStack() as stack:
+        result_preflight = preflight
+        if result_preflight is None:
+            result_preflight = stack.enter_context(
+                _preflight_live_safe_destination_parent(
+                    paths,
+                    requested_result,
+                )
+            )
+        elif result_preflight.requested_destination != requested_result:
+            raise StoreSafetyError(
+                "result-file-scope-inconclusive",
+                "The held zero-write result preflight names a different result file",
+                details={
+                    "result_file": str(requested_result),
+                    "preflight_destination": str(
+                        result_preflight.requested_destination
+                    ),
+                    "mutation_performed": artifact_mutation_performed,
+                },
+            )
+        try:
+            result_preflight = stack.enter_context(
+                _refresh_result_preflight_after_artifact_commit(
+                    paths,
+                    result_preflight,
+                    artifact_payload if artifact_mutation_performed else None,
+                )
+            )
+            with _commit_live_safe_destination_parent(result_preflight) as result_scope:
+                destination.scope = result_scope
+                result_scope.revalidate()
+                _assert_creator_result_name_absent(result_scope)
+                yield destination
+        except Exception as exc:
+            if artifact_mutation_performed and not (
+                isinstance(exc, StoreSafetyError)
+                and exc.code == "result-file-publication-failed"
+            ):
+                raise _creator_result_publication_failure(destination, exc) from exc
+            if destination.publication_receipt is not None and not (
+                isinstance(exc, StoreSafetyError)
+                and exc.code == "result-file-publication-failed"
+            ):
+                raise _creator_result_publication_failure(destination, exc) from exc
+            raise
+
+
+def _creator_result_publication_failure(
+    destination: _CreatorResultDestination,
+    exc: Exception,
+) -> StoreSafetyError:
+    publication_receipt = destination.publication_receipt
+    if (
+        publication_receipt is None
+        and isinstance(exc, StoreSafetyError)
+        and exc.code == "result-file-publication-failed"
+        and isinstance(exc.details.get("result_file_receipt"), dict)
+    ):
+        publication_receipt = exc.details["result_file_receipt"]
+    details = _creator_artifact_publication_evidence(
+        destination.artifact,
+        destination.artifact_payload,
+    )
+    if isinstance(exc, StoreSafetyError):
+        details = _merge_recovery_details(details, exc.details)
+    if (
+        isinstance(exc, StoreSafetyError)
+        and exc.code == "result-file-publication-failed"
+    ):
+        underlying_error_code = str(
+            exc.details.get("underlying_error_code", "unexpected-error")
+        )
+        underlying_error_type = str(
+            exc.details.get("underlying_error_type", type(exc).__name__)
+        )
+    else:
+        underlying_error_code = (
+            exc.code if isinstance(exc, StoreSafetyError) else "unexpected-error"
+        )
+        underlying_error_type = type(exc).__name__
+    details.update(
+        {
+            "artifact": str(destination.artifact),
+            "artifact_mutation_performed": True,
+            "result_file": str(destination.result_file),
+            "mutation_performed": True,
+            "result_file_publication_state": (
+                "committed" if publication_receipt is not None else "uncertain"
+            ),
+            "retry_safe": False,
+            "underlying_error_code": underlying_error_code,
+            "underlying_error_type": underlying_error_type,
+        }
+    )
+    recovery_locators = dict(details.get("recovery_locators", {}))
+    recovery_locators["result_file"] = str(destination.result_file)
+    if publication_receipt is not None:
+        details["result_file_receipt"] = publication_receipt
+        recovery_locators["result_file_receipt"] = publication_receipt
+    details["recovery_locators"] = recovery_locators
+    details["mutation_performed"] = True
+    details["retry_safe"] = False
+    return StoreSafetyError(
+        "result-file-publication-failed",
+        "The artifact was created, but its external creator result-file "
+        f"transaction could not complete safely: {destination.result_file}: {exc}",
+        details=details,
+    )
+
+
+def _normalized_creator_artifact_protection_receipt(
+    value: Any,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    try:
+        return _manifest_protection_receipt(value, label=label)
+    except StoreSafetyError as exc:
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            f"Creator artifact creation receipt is malformed for {label}",
+        ) from exc
+
+
+def _normalized_creator_artifact_directory_receipt(
+    value: Any,
+    *,
+    expected_entry_types: dict[str, int],
+    label: str,
+) -> dict[str, Any]:
+    protection = _normalized_creator_artifact_protection_receipt(
+        value,
+        label=label,
+    )
+    if not isinstance(value, dict) or value.get("entry_types") != expected_entry_types:
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            f"Creator artifact directory membership receipt is malformed for {label}",
+        )
+    return {
+        **protection,
+        "entry_types": dict(expected_entry_types),
+    }
+
+
+def _normalized_creator_artifact_file_receipt(
+    value: Any,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    protection = _normalized_creator_artifact_protection_receipt(
+        value,
+        label=label,
+    )
+    if not isinstance(value, dict):
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            f"Creator artifact file receipt is malformed for {label}",
+        )
+    sha256 = value.get("sha256")
+    size = value.get("size")
+    if (
+        not isinstance(sha256, str)
+        or len(sha256) != 64
+        or any(character not in "0123456789abcdef" for character in sha256)
+        or type(size) is not int
+        or size < 0
+    ):
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            f"Creator artifact content receipt is malformed for {label}",
+        )
+    return {
+        **protection,
+        "sha256": sha256,
+        "size": size,
+    }
+
+
+def _creator_artifact_receipt_contract(
+    artifact: Path,
+    payload: dict[str, Any],
+) -> _CreatorArtifactReceiptContract:
+    artifact_keys = [key for key in ("dest", "stage_dir") if key in payload]
+    if len(artifact_keys) != 1:
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator result does not identify exactly one supported artifact",
+        )
+    artifact_key = artifact_keys[0]
+    if artifact_key == "dest":
+        artifact_kind = "snapshot"
+        artifact_schema = SNAPSHOT_SCHEMA
+        manifest_name = SNAPSHOT_MANIFEST
+    else:
+        artifact_kind = "patch-stage"
+        artifact_schema = PATCH_SCHEMA
+        manifest_name = PATCH_MANIFEST
+    try:
+        payload_artifact = _absolute_path(Path(os.fspath(payload[artifact_key])))
+    except (TypeError, ValueError, OSError) as exc:
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator result artifact path is malformed",
+        ) from exc
+    if payload_artifact != artifact:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            "Creator result artifact path differs from the requested artifact: "
+            f"receipt={payload_artifact}, requested={artifact}",
+        )
+
+    manifest_creation_receipt = _normalized_manifest_creation_receipt(
+        payload.get("manifest_creation_receipt"),
+        artifact_kind=artifact_kind,
+        artifact_schema=artifact_schema,
+        manifest_name=manifest_name,
+    )
+    destination_receipt = payload.get("descriptor_bound_destination")
+    if not isinstance(destination_receipt, dict):
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator result has no descriptor-bound destination receipt",
+        )
+    try:
+        receipt_artifact = _absolute_path(
+            Path(os.fspath(destination_receipt.get("display_path")))
+        )
+    except (TypeError, ValueError, OSError) as exc:
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Descriptor-bound destination receipt path is malformed",
+        ) from exc
+    if receipt_artifact != artifact:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            "Descriptor-bound destination receipt names a different artifact: "
+            f"receipt={receipt_artifact}, requested={artifact}",
+        )
+
+    tree_receipt = destination_receipt.get("tree_receipt")
+    if (
+        not isinstance(tree_receipt, dict)
+        or set(tree_receipt) != {"schema", "root", "directories", "files"}
+        or tree_receipt.get("schema") != "apple-notes-prepared-tree-receipt/v1"
+        or not isinstance(tree_receipt.get("directories"), dict)
+        or not isinstance(tree_receipt.get("files"), dict)
+    ):
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Descriptor-bound creator artifact tree receipt is malformed",
+        )
+
+    raw_directories = tree_receipt["directories"]
+    raw_files = tree_receipt["files"]
+    if any(type(name) is not str for name in (*raw_directories, *raw_files)):
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator artifact tree receipt paths must be strings",
+        )
+    directory_paths = {Path(name) for name in raw_directories}
+    file_paths = {Path(name) for name in raw_files}
+    if any(
+        path.is_absolute() or str(path) != name
+        for name, path in zip(
+            raw_directories,
+            (Path(name) for name in raw_directories),
+        )
+    ) or any(
+        path.is_absolute() or str(path) != name
+        for name, path in zip(
+            raw_files,
+            (Path(name) for name in raw_files),
+        )
+    ):
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator artifact tree receipt paths are not canonical relative paths",
+        )
+
+    manifest_relative = Path(manifest_name)
+    if artifact_kind == "snapshot":
+        store_relative = Path("group.com.apple.notes")
+        data_paths = file_paths - {manifest_relative}
+        if (
+            directory_paths != {store_relative}
+            or manifest_relative not in file_paths
+            or not data_paths
+            or any(
+                len(path.parts) != 2
+                or path.parent != store_relative
+                or path.name not in NOTE_STORE_BASENAMES
+                for path in data_paths
+            )
+            or NOTE_STORE_MAIN not in {path.name for path in data_paths}
+        ):
+            raise StoreSafetyError(
+                "prepared-tree-receipt-invalid",
+                "Snapshot creator receipt does not describe the exact supported tree",
+            )
+        expected_root_types = {
+            str(store_relative): stat.S_IFDIR,
+            manifest_name: stat.S_IFREG,
+        }
+        expected_directory_types = {
+            store_relative: {path.name: stat.S_IFREG for path in data_paths},
+        }
+    else:
+        if directory_paths or file_paths != {
+            Path(NOTE_STORE_MAIN),
+            manifest_relative,
+        }:
+            raise StoreSafetyError(
+                "prepared-tree-receipt-invalid",
+                "Patch-stage creator receipt does not describe the exact supported tree",
+            )
+        expected_root_types = {
+            NOTE_STORE_MAIN: stat.S_IFREG,
+            manifest_name: stat.S_IFREG,
+        }
+        expected_directory_types = {}
+
+    parent = _normalized_creator_artifact_protection_receipt(
+        {
+            "identity": destination_receipt.get("parent_identity"),
+            "access_policy": destination_receipt.get("parent_access_policy"),
+        },
+        label="creator artifact parent",
+    )
+    destination_root = _normalized_creator_artifact_protection_receipt(
+        {
+            "identity": destination_receipt.get("directory_identity"),
+            "access_policy": destination_receipt.get("directory_access_policy"),
+        },
+        label="creator artifact destination",
+    )
+    root = _normalized_creator_artifact_directory_receipt(
+        tree_receipt.get("root"),
+        expected_entry_types=expected_root_types,
+        label="creator artifact root",
+    )
+    if (
+        root["identity"] != destination_root["identity"]
+        or root["access_policy"] != destination_root["access_policy"]
+    ):
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator artifact root receipt disagrees with its destination receipt",
+        )
+
+    directories = {
+        relative_path: _normalized_creator_artifact_directory_receipt(
+            raw_directories[str(relative_path)],
+            expected_entry_types=expected_directory_types[relative_path],
+            label=f"creator artifact directory {relative_path}",
+        )
+        for relative_path in expected_directory_types
+    }
+    files = {
+        relative_path: _normalized_creator_artifact_file_receipt(
+            raw_files[str(relative_path)],
+            label=f"creator artifact file {relative_path}",
+        )
+        for relative_path in file_paths
+    }
+    if files[manifest_relative] != manifest_creation_receipt["manifest"]:
+        raise StoreSafetyError(
+            "prepared-tree-receipt-invalid",
+            "Creator artifact manifest receipt disagrees with its external "
+            "creation receipt",
+        )
+    return _CreatorArtifactReceiptContract(
+        parent=parent,
+        root=root,
+        directories=directories,
+        files=files,
+    )
+
+
+def _assert_creator_artifact_parent_matches_receipt(
+    artifact_root: _BoundDirectory,
+    receipt: dict[str, Any],
+) -> None:
+    if artifact_root.parent_fd is None:
+        raise StoreSafetyError(
+            "prepared-directory-revalidation-inconclusive",
+            f"Creator artifact has no held parent descriptor: {artifact_root.path}",
+        )
+    current = _verify_bound_parent_descriptor(
+        artifact_root.parent_fd,
+        artifact_root.parent_opened,
+        display_path=artifact_root.path.parent,
+        identity_code="prepared-directory-identity-mismatch",
+        access_policy_code="prepared-directory-access-policy-mismatch",
+        inconclusive_code="prepared-directory-revalidation-inconclusive",
+    )
+    if _identity(current) != receipt["identity"]:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            "Creator artifact parent differs from its creation receipt: "
+            f"{artifact_root.path.parent}",
+        )
+    if _access_policy(current) != receipt["access_policy"]:
+        raise StoreSafetyError(
+            "prepared-directory-access-policy-mismatch",
+            "Creator artifact parent access policy differs from its creation "
+            f"receipt: {artifact_root.path.parent}",
+        )
+
+
+def _assert_creator_artifact_directory_matches_receipt(
+    binding: _BoundDirectory,
+    receipt: dict[str, Any],
+    *,
+    missing_code: str,
+) -> None:
+    current = _scan_exact_prepared_directory_entries(
+        binding,
+        receipt["entry_types"],
+        missing_code=missing_code,
+    )
+    if current["identity"] != receipt["identity"]:
+        raise StoreSafetyError(
+            "prepared-directory-identity-mismatch",
+            "Creator artifact directory differs from its creation receipt: "
+            f"{binding.path}",
+        )
+    if current["access_policy"] != receipt["access_policy"]:
+        raise StoreSafetyError(
+            "prepared-directory-access-policy-mismatch",
+            "Creator artifact directory access policy differs from its creation "
+            f"receipt: {binding.path}",
+        )
+
+
+@contextmanager
+def _bind_creator_artifact_creation_receipt(
+    artifact_root: _BoundDirectory,
+    artifact: Path,
+    payload: dict[str, Any],
+) -> Iterator[Callable[[], None]]:
+    contract = _creator_artifact_receipt_contract(artifact, payload)
+    _verify_bound_directory_namespace(artifact_root)
+    _assert_creator_artifact_parent_matches_receipt(
+        artifact_root,
+        contract.parent,
+    )
+    _assert_creator_artifact_directory_matches_receipt(
+        artifact_root,
+        contract.root,
+        missing_code="prepared-directory-identity-mismatch",
+    )
+    with ExitStack() as stack:
+        directory_bindings: dict[Path, _BoundDirectory] = {
+            Path("."): artifact_root,
+        }
+        for relative_path in sorted(
+            contract.directories,
+            key=lambda path: (len(path.parts), str(path)),
+        ):
+            parent = directory_bindings.get(relative_path.parent)
+            if parent is None:
+                raise StoreSafetyError(
+                    "prepared-directory-revalidation-inconclusive",
+                    f"Creator artifact receipt has no held parent for {relative_path}",
+                )
+            directory_bindings[relative_path] = stack.enter_context(
+                _bind_directory_at(
+                    artifact / relative_path,
+                    parent,
+                    missing_code="prepared-directory-identity-mismatch",
+                    identity_code="prepared-directory-identity-mismatch",
+                    access_policy_code=("prepared-directory-access-policy-mismatch"),
+                    inconclusive_code=("prepared-directory-revalidation-inconclusive"),
+                )
+            )
+            _assert_creator_artifact_directory_matches_receipt(
+                directory_bindings[relative_path],
+                contract.directories[relative_path],
+                missing_code="prepared-directory-identity-mismatch",
+            )
+
+        file_bindings: dict[Path, _BoundRegularFile] = {}
+        for relative_path in sorted(contract.files, key=str):
+            parent = directory_bindings.get(relative_path.parent)
+            if parent is None:
+                raise StoreSafetyError(
+                    "prepared-directory-revalidation-inconclusive",
+                    f"Creator artifact receipt has no held file parent for "
+                    f"{relative_path}",
+                )
+            file_bindings[relative_path] = stack.enter_context(
+                _bind_regular_file_at(
+                    artifact / relative_path,
+                    parent,
+                    PREPARED_FILE_CODES,
+                )
+            )
+            _assert_bound_matches_receipt(
+                file_bindings[relative_path],
+                contract.files[relative_path],
+                dir_fd=parent.fd,
+                basename=relative_path.name,
+            )
+
+        def revalidate() -> None:
+            _verify_bound_directory_namespace(artifact_root)
+            _assert_creator_artifact_parent_matches_receipt(
+                artifact_root,
+                contract.parent,
+            )
+            _assert_creator_artifact_directory_matches_receipt(
+                artifact_root,
+                contract.root,
+                missing_code="prepared-directory-identity-mismatch",
+            )
+            for relative_path, directory in directory_bindings.items():
+                if relative_path == Path("."):
+                    continue
+                _assert_creator_artifact_directory_matches_receipt(
+                    directory,
+                    contract.directories[relative_path],
+                    missing_code="prepared-directory-identity-mismatch",
+                )
+            for relative_path, bound in file_bindings.items():
+                parent = directory_bindings[relative_path.parent]
+                _assert_bound_matches_receipt(
+                    bound,
+                    contract.files[relative_path],
+                    dir_fd=parent.fd,
+                    basename=relative_path.name,
+                )
+
+        revalidate()
+        try:
+            yield revalidate
+        except Exception:
+            raise
+        else:
+            revalidate()
+
+
+def _write_creator_result_file(
+    destination: _CreatorResultDestination,
+    artifact: Path,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Atomically publish a 0600 creator result outside its artifact."""
+
+    result_scope = destination.scope
+    requested_artifact = Path(os.path.abspath(os.fspath(artifact)))
+    destination.artifact = requested_artifact
+    try:
+        if result_scope is None:
+            raise StoreSafetyError(
+                "result-file-scope-inconclusive",
+                "Creator result publication has no committed destination scope",
+            )
+        _assert_creator_result_file_lexically_external(
+            result_scope.destination,
+            requested_artifact,
+        )
+        result_scope.revalidate()
+        _assert_creator_result_name_absent(result_scope)
+        _, _, artifact_alias_spec = _trusted_alias_paths(requested_artifact)
+        carried_alias = (
+            result_scope.trusted_alias
+            if (
+                result_scope.trusted_alias is not None
+                and artifact_alias_spec
+                == (
+                    result_scope.trusted_alias.alias,
+                    result_scope.trusted_alias.target,
+                )
+            )
+            else None
+        )
+        with _bind_existing_directory_with_trusted_alias(
+            requested_artifact,
+            trusted_alias=carried_alias,
+        ) as artifact_root:
+            with _bind_creator_artifact_creation_receipt(
+                artifact_root,
+                requested_artifact,
+                payload,
+            ) as revalidate_artifact:
+                _assert_output_ancestors_exclude_snapshot(
+                    result_scope.parent.fd,
+                    artifact_root.opened,
+                    display_path=result_scope.destination.parent,
+                )
+                revalidate_artifact()
+                publication_receipt = _write_json_atomic(
+                    result_scope.destination,
+                    payload,
+                    parent_binding=result_scope.parent,
+                    ensure_ascii=True,
+                    pre_temp_create=lambda: (
+                        _revalidate_creator_result_before_temp_create(result_scope)
+                    ),
+                )
+                destination.publication_receipt = publication_receipt
+                revalidate_artifact()
+                _assert_output_ancestors_exclude_snapshot(
+                    result_scope.parent.fd,
+                    artifact_root.opened,
+                    display_path=result_scope.destination.parent,
+                )
+        result_scope.revalidate()
+        return publication_receipt
+    except Exception as exc:
+        raise _creator_result_publication_failure(destination, exc) from exc
+
+
+def _add_container_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--group-container",
+        type=Path,
+        default=GROUP_CONTAINER,
+        help="Apple Notes group-container root.",
+    )
+    parser.add_argument(
+        "--app-container",
+        type=Path,
+        default=APP_CONTAINER,
+        help="Apple Notes app-container root.",
+    )
+
+
+def _add_directory_creator_supervisor_option(
+    parser: argparse.ArgumentParser,
+) -> None:
+    parser.add_argument(
+        "--directory-creator-fd",
+        type=int,
+        help=(
+            "Inherited connected AF_UNIX/SOCK_DGRAM supervisor FD used for "
+            "identity-bound directory creation via SCM_RIGHTS."
+        ),
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    probe_parser = subparsers.add_parser(
+        "probe-db-access",
+        help="Probe NoteStore access without copying.",
+    )
+    _add_container_options(probe_parser)
+
+    copy_parser = subparsers.add_parser(
+        "copy-db", help="Copy and validate NoteStore files."
+    )
+    _add_container_options(copy_parser)
+    _add_directory_creator_supervisor_option(copy_parser)
+    copy_parser.add_argument("--dest", type=Path, help="New snapshot directory.")
+    copy_parser.add_argument(
+        "--result-file",
+        type=Path,
+        help=(
+            "Atomically create a new owner-only JSON result file outside the "
+            "snapshot; existing names and symlinks are never replaced."
+        ),
+    )
+    copy_parser.add_argument(
+        "--require-notes-quit",
+        action="store_true",
+        help="Fail unless Notes.app is quit; required for a writeback-grade baseline.",
+    )
+
+    merge_parser = subparsers.add_parser(
+        "merge-db",
+        help="Recover a copied store into a standalone analysis DB.",
+    )
+    _add_container_options(merge_parser)
+    _add_directory_creator_supervisor_option(merge_parser)
+    merge_parser.add_argument(
+        "--src", type=Path, required=True, help="Copied NoteStore.sqlite."
+    )
+    merge_parser.add_argument("--out", type=Path, help="New standalone output DB.")
+
+    validate_parser = subparsers.add_parser(
+        "validate-snapshot",
+        help="Revalidate a snapshot manifest, sidecars, and SQLite integrity.",
+    )
+    validate_parser.add_argument("--snapshot-dir", type=Path, required=True)
+    validate_parser.add_argument(
+        "--manifest-creation-receipt-file",
+        type=Path,
+        required=True,
+        help="Caller-preserved copy-db JSON output stored outside the snapshot.",
+    )
+
+    recover_parser = subparsers.add_parser(
+        "recover-snapshot",
+        help="Recover a validated snapshot to a standalone SQLite DB.",
+    )
+    _add_container_options(recover_parser)
+    _add_directory_creator_supervisor_option(recover_parser)
+    recover_parser.add_argument("--snapshot-dir", type=Path, required=True)
+    recover_parser.add_argument("--out", type=Path, required=True)
+    recover_parser.add_argument(
+        "--manifest-creation-receipt-file",
+        type=Path,
+        required=True,
+        help="Caller-preserved copy-db JSON output stored outside the snapshot.",
+    )
+
+    stage_parser = subparsers.add_parser(
+        "stage-patch",
+        help="Normalize an edited DB into a validated, sidecar-free patch stage.",
+    )
+    _add_container_options(stage_parser)
+    _add_directory_creator_supervisor_option(stage_parser)
+    stage_parser.add_argument("--src", type=Path, required=True)
+    stage_parser.add_argument("--dest", type=Path, required=True)
+    stage_parser.add_argument(
+        "--result-file",
+        type=Path,
+        help=(
+            "Atomically create a new owner-only JSON result file outside the "
+            "stage; existing names and symlinks are never replaced."
+        ),
+    )
+
+    validate_stage_parser = subparsers.add_parser(
+        "validate-patch-stage",
+        help="Revalidate a patch stage against its external manifest receipt.",
+    )
+    validate_stage_parser.add_argument("--stage-dir", type=Path, required=True)
+    validate_stage_parser.add_argument(
+        "--manifest-creation-receipt-file",
+        type=Path,
+        required=True,
+        help="Caller-preserved stage-patch JSON output stored outside the stage.",
+    )
+
+    preflight_parser = subparsers.add_parser(
+        "preflight-writeback",
+        help="Read-only gate for an explicit whole-store writeback.",
+    )
+    _add_container_options(preflight_parser)
+    preflight_parser.add_argument("--backup-dir", type=Path, required=True)
+    preflight_parser.add_argument("--stage-dir", type=Path, required=True)
+    preflight_parser.add_argument(
+        "--backup-manifest-creation-receipt-file",
+        type=Path,
+        required=True,
+        help="Caller-preserved copy-db JSON output outside the backup.",
+    )
+    preflight_parser.add_argument(
+        "--stage-manifest-creation-receipt-file",
+        type=Path,
+        required=True,
+        help="Caller-preserved stage-patch JSON output outside the stage.",
+    )
+
+    verify_parser = subparsers.add_parser(
+        "verify-writeback",
+        help="Verify live bytes, sidecar absence, and integrity after writeback.",
+    )
+    _add_container_options(verify_parser)
+    verify_parser.add_argument("--backup-dir", type=Path, required=True)
+    verify_parser.add_argument("--stage-dir", type=Path, required=True)
+    verify_parser.add_argument(
+        "--backup-manifest-creation-receipt-file",
+        type=Path,
+        required=True,
+        help="Caller-preserved copy-db JSON output outside the backup.",
+    )
+    verify_parser.add_argument(
+        "--stage-manifest-creation-receipt-file",
+        type=Path,
+        required=True,
+        help="Caller-preserved stage-patch JSON output outside the stage.",
+    )
+
+    tags_parser = subparsers.add_parser(
+        "note-tags",
+        help="Read hashtag rows for a note title from a DB copy.",
+    )
+    _add_container_options(tags_parser)
+    tags_parser.add_argument("--db", type=Path, required=True)
+    tags_parser.add_argument("--title", required=True)
+
+    fingerprint_parser = subparsers.add_parser(
+        "fingerprint-db",
+        help="Stably fingerprint live NoteStore sqlite/wal/shm files.",
+    )
+    _add_container_options(fingerprint_parser)
+
+    return parser
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    command_cwd = os.getcwd()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    command_stack = ExitStack()
+    try:
+        supervisor_fd = getattr(args, "directory_creator_fd", None)
+        if supervisor_fd is not None:
+            command_stack.enter_context(directory_creator_supervisor(supervisor_fd))
+        if args.command == "probe-db-access":
+            emit_json(probe_db_access(_paths_from_args(args, cwd=command_cwd)))
+        elif args.command == "copy-db":
+            paths = _paths_from_args(args, cwd=command_cwd)
+            copy_destination = _absolute_path_from_cwd(
+                args.dest or _timestamped_tmp_dir("apple-notes-probe"),
+                command_cwd,
+            )
+            copy_result_file = _optional_absolute_path_from_cwd(
+                args.result_file,
+                command_cwd,
+            )
+            notes_running = _preflight_copy_notes_state(
+                require_notes_quit=args.require_notes_quit
+            )
+            with _preflight_creator_destinations(
+                paths,
+                copy_result_file,
+                copy_destination,
+            ) as destination_preflights:
+                result = copy_db(
+                    paths,
+                    dest=copy_destination,
+                    require_notes_quit=args.require_notes_quit,
+                    _destination_preflight=destination_preflights.artifact,
+                    _notes_running=notes_running,
+                    _command_cwd=command_cwd,
+                )
+                destination_preflights.published_artifact_payload = result
+                if destination_preflights.result is not None:
+                    with _bind_creator_result_destination(
+                        paths,
+                        copy_result_file,
+                        copy_destination,
+                        preflight=destination_preflights.result,
+                        artifact_mutation_performed=True,
+                        artifact_payload=result,
+                    ) as result_destination:
+                        assert result_destination is not None
+                        destination_preflights.result_destination = result_destination
+                        _write_creator_result_file(
+                            result_destination,
+                            Path(result["dest"]),
+                            result,
+                        )
+            emit_json(result)
+        elif args.command == "merge-db":
+            merge_source = _absolute_path_from_cwd(args.src, command_cwd)
+            merge_output = _optional_absolute_path_from_cwd(
+                args.out,
+                command_cwd,
+            )
+            emit_json(
+                merge_db(
+                    merge_source,
+                    merge_output,
+                    paths=_paths_from_args(args, cwd=command_cwd),
+                )
+            )
+        elif args.command == "validate-snapshot":
+            snapshot_dir = _absolute_path_from_cwd(
+                args.snapshot_dir,
+                command_cwd,
+            )
+            snapshot_receipt = _absolute_path_from_cwd(
+                args.manifest_creation_receipt_file,
+                command_cwd,
+            )
+            emit_json(
+                validate_snapshot(
+                    snapshot_dir,
+                    manifest_creation_receipt_file=snapshot_receipt,
+                    _command_cwd=command_cwd,
+                )
+            )
+        elif args.command == "recover-snapshot":
+            snapshot_dir = _absolute_path_from_cwd(
+                args.snapshot_dir,
+                command_cwd,
+            )
+            recovery_output = _absolute_path_from_cwd(
+                args.out,
+                command_cwd,
+            )
+            snapshot_receipt = _absolute_path_from_cwd(
+                args.manifest_creation_receipt_file,
+                command_cwd,
+            )
+            emit_json(
+                recover_snapshot(
+                    snapshot_dir,
+                    recovery_output,
+                    manifest_creation_receipt_file=snapshot_receipt,
+                    paths=_paths_from_args(args, cwd=command_cwd),
+                    _command_cwd=command_cwd,
+                )
+            )
+        elif args.command == "stage-patch":
+            paths = _paths_from_args(args, cwd=command_cwd)
+            stage_source = _absolute_path_from_cwd(args.src, command_cwd)
+            stage_destination = _absolute_path_from_cwd(args.dest, command_cwd)
+            stage_result_file = (
+                _absolute_path_from_cwd(args.result_file, command_cwd)
+                if args.result_file is not None
+                else None
+            )
+            with _preflight_creator_destinations(
+                paths,
+                stage_result_file,
+                stage_destination,
+            ) as destination_preflights:
+                result = stage_patch(
+                    stage_source,
+                    stage_destination,
+                    paths=paths,
+                    _destination_preflight=destination_preflights.artifact,
+                )
+                destination_preflights.published_artifact_payload = result
+                if destination_preflights.result is not None:
+                    with _bind_creator_result_destination(
+                        paths,
+                        stage_result_file,
+                        stage_destination,
+                        preflight=destination_preflights.result,
+                        artifact_mutation_performed=True,
+                        artifact_payload=result,
+                    ) as result_destination:
+                        assert result_destination is not None
+                        destination_preflights.result_destination = result_destination
+                        _write_creator_result_file(
+                            result_destination,
+                            Path(result["stage_dir"]),
+                            result,
+                        )
+            emit_json(result)
+        elif args.command == "validate-patch-stage":
+            stage_dir = _absolute_path_from_cwd(
+                args.stage_dir,
+                command_cwd,
+            )
+            stage_receipt = _absolute_path_from_cwd(
+                args.manifest_creation_receipt_file,
+                command_cwd,
+            )
+            emit_json(
+                validate_patch_stage(
+                    stage_dir,
+                    manifest_creation_receipt_file=stage_receipt,
+                    _command_cwd=command_cwd,
+                )
+            )
+        elif args.command == "preflight-writeback":
+            paths = _paths_from_args(args, cwd=command_cwd)
+            backup_dir = _absolute_path_from_cwd(
+                args.backup_dir,
+                command_cwd,
+            )
+            stage_dir = _absolute_path_from_cwd(
+                args.stage_dir,
+                command_cwd,
+            )
+            backup_receipt = _absolute_path_from_cwd(
+                args.backup_manifest_creation_receipt_file,
+                command_cwd,
+            )
+            stage_receipt = _absolute_path_from_cwd(
+                args.stage_manifest_creation_receipt_file,
+                command_cwd,
+            )
+            emit_json(
+                preflight_writeback(
+                    paths,
+                    backup_dir=backup_dir,
+                    stage_dir=stage_dir,
+                    backup_manifest_creation_receipt_file=backup_receipt,
+                    stage_manifest_creation_receipt_file=stage_receipt,
+                    _command_cwd=command_cwd,
+                )
+            )
+        elif args.command == "verify-writeback":
+            paths = _paths_from_args(args, cwd=command_cwd)
+            backup_dir = _absolute_path_from_cwd(
+                args.backup_dir,
+                command_cwd,
+            )
+            stage_dir = _absolute_path_from_cwd(
+                args.stage_dir,
+                command_cwd,
+            )
+            backup_receipt = _absolute_path_from_cwd(
+                args.backup_manifest_creation_receipt_file,
+                command_cwd,
+            )
+            stage_receipt = _absolute_path_from_cwd(
+                args.stage_manifest_creation_receipt_file,
+                command_cwd,
+            )
+            emit_json(
+                verify_writeback(
+                    paths,
+                    backup_dir=backup_dir,
+                    stage_dir=stage_dir,
+                    backup_manifest_creation_receipt_file=backup_receipt,
+                    stage_manifest_creation_receipt_file=stage_receipt,
+                    _command_cwd=command_cwd,
+                )
+            )
+        elif args.command == "note-tags":
+            emit_json(
+                query_note_tags(
+                    _absolute_path_from_cwd(args.db, command_cwd),
+                    args.title,
+                    paths=_paths_from_args(args, cwd=command_cwd),
+                )
+            )
+        elif args.command == "fingerprint-db":
+            emit_json(fingerprint_note_store(_paths_from_args(args, cwd=command_cwd)))
+        else:
+            parser.error(f"Unsupported command: {args.command}")
+    except StoreSafetyError as exc:
+        payload = {
+            "error": str(exc),
+            "error_code": exc.code,
+            "command": args.command,
+        }
+        if exc.details:
+            payload["details"] = exc.details
+        emit_json(payload)
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        emit_json(
+            {
+                "error": str(exc),
+                "error_code": "unexpected-error",
+                "command": args.command,
+            }
+        )
+        return 1
+    finally:
+        command_stack.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,961 @@
+---
+id: 20260724-andb001
+title: Apple Notes Publication And Creator Failure Hardening
+status: active
+created: 2026-07-24
+updated: 2026-08-03
+branch: codex/apple-db-hardening
+pr: https://github.com/Joey-Tools/codex-apple-notes-toolkit/pull/3
+supersedes: []
+superseded_by:
+---
+
+# Apple Notes Publication And Creator Failure Hardening
+
+## Summary
+
+- Closed three fail-closed gaps in untrusted leaf opening, post-rename publication classification, and identity-bound directory creation failure recovery.
+- Closed three remaining zero-write races by making the committed artifact
+  scope, standalone public-name set, and creator result scope revalidate at
+  their actual temporary-object creation boundaries.
+- Closed the follow-up production gap by adding a packaged inherited-supervisor creator protocol and conservative malformed-result ownership handling.
+- Replaced the impractical no-create capability gate with a packaged
+  cooperative same-UID supervisor that randomizes the private name, creates
+  descriptor-relatively under a controlled umask, binds the returned
+  directory/name/parent properties, and transfers the directory FD without
+  claiming isolation from a malicious same-UID peer.
+- Upgraded snapshots to the exact v4 live-source binding contract and kept
+  snapshot, patch-stage, and live-store descriptors held through one joint
+  writeback comparison, Notes probe, and terminal revalidation point before
+  descriptor teardown.
+- Closed the final fresh-review gaps in anonymous recovered-image binding, exact SQLite header normalization, and structured native SQLite cleanup.
+- Closed the formal single-review gaps in shell-redirection receipt creation, post-write access-policy baselines, and ctypes row-callback exception propagation.
+- Closed the final formal follow-up gaps in cross-root creator-result alias binding, post-result-commit teardown classification, and standalone pre-write access-policy binding.
+- Closed the final safety-resumption gaps in creator-result artifact creation-receipt binding and simultaneous SQLite callback/revalidation failure evidence.
+- Closed the post-open descriptor-relative source error-classification gap so
+  disappearance, unreadability, and other revalidation uncertainty remain
+  stable probe results instead of escaping as `unexpected-error`.
+- Closed the remaining pre-open source-binding classification gap so a
+  discovered member's dedicated re-stat and descriptor-relative pre-open
+  `stat`/`open` preserve missing, unreadable, and inconclusive outcomes.
+- Closed the remaining bound-file, wrapped-directory, and post-close probe
+  taxonomy gaps so causal OS failures remain missing, unreadable, or
+  inconclusive while only proved property comparisons report mismatches.
+- Closed the terminal live-store boundary after all file hashes so persistent
+  late WAL/rollback-journal membership and held-parent replacement cannot
+  escape the writeback baseline.
+- Closed the artifact-directory translation gap so snapshot and patch-stage
+  scans retain their caller-specific identity, access-policy, and
+  revalidation codes.
+- Closed the absent-live Darwin root-alias overlap gap so `/tmp` and
+  `/private/tmp` forms are compared in both directions before any component
+  binding or creation.
+- Closed the creator-result ordering gap so `copy-db` and `stage-patch`
+  complete independent zero-write artifact/result destination preflights
+  before any parent creator, then defer result-parent creation until artifact
+  publication succeeds.
+- Closed the retained-preflight teardown gap so a late artifact/result
+  destination-scope failure cannot overwrite already committed publication
+  receipts with a false zero-write claim.
+- Closed the destination-parent component latch gap so a successful
+  no-replace directory install retains its exact receipt and all previously
+  installed component identities across later validation and teardown
+  failures.
+- Closed the destination-parent durability gap so every newly installed
+  component fsyncs its held parent before the transaction can descend, while a
+  post-install fsync failure retains the exact component identity and reports
+  the committed internal component-name installation with unverified
+  durability without claiming that the enclosing artifact was published.
+- Closed the live-source directory final-exit gap so the generic component
+  context cannot leak `prepared-directory-*` after source-specific terminal
+  validation.
+- Closed the Python compatibility, merge-output containment, and required-quit
+  publication-boundary gaps found in GitHub review. Legacy executable write
+  commands now use the packaged supervisor; copied-snapshot merges stay
+  outside the snapshot; a late Notes restart quarantines the exact published
+  object before any writeback-grade success result.
+- Closed the final source-open and quarantine-reporting review gaps: access
+  policy remains bound to the pre-open observation across descriptor and
+  descriptor-relative pathname checks, and nested Notes probe evidence cannot
+  upgrade an unverified namespace move to a verified quarantine.
+- Closed the three current-head GitHub Codex follow-ups in patch-stage
+  integrity taxonomy, retained-partial mutation receipts, and direct-API
+  destination absence revalidation.
+- Closed the follow-up retained-receipt evidence-failure edge: even a
+  non-domain exception while inventorying an already-created sensitive
+  partial keeps `mutation_performed: true` alongside bounded
+  preserved-or-incomplete recovery evidence.
+- Closed the worker helper-source replacement window: the production launcher,
+  parent/service protocol module, and worker now use one immutable bounded
+  capture, with no child pathname reopen or production custom-helper execution.
+- Closed the probe terminal-consistency gaps so post-sample container failures
+  retain source taxonomy across every dependent file row, including when
+  group/app paths are equal.
+- Closed the compatibility-entry source-loading gap so the wrapper first
+  captures the packaged supervisor and then reuses that module's single helper
+  capture for legacy API calls, the parent/service protocol, and the worker.
+- Closed the initial group-bind dependency gap so permission and I/O failures
+  remain visible on every NoteStore file row that could not be checked, while
+  true initial absence and app-only failures remain isolated.
+
+## Current State
+
+- All existing untrusted regular-file leaf opens combine `O_NOFOLLOW` and `O_NONBLOCK`, then reject non-regular or replaced descriptors.
+- Successful or proved-committed file and directory renames set one monotonic commit latch before terminal or fallback evidence construction.
+- Trusted directory creators can transfer create-then-fail evidence through a structured exception; unstructured failures conservatively report possible mutation and inconclusive cleanup.
+- `copy-db`, `merge-db`, `recover-snapshot`, and `stage-patch` accept an inherited connected supervisor FD and exchange parent/created directory descriptors with request-bound `SCM_RIGHTS` messages.
+- `None`, unexpected mappings or objects, missing fields, and wrong field types are classified after possible creation; recoverable FDs are evidence-captured and closed, and locator/cleanup conclusions merge conservatively.
+- Supervisor provider details now pass a bounded closed schema before merging; malformed nested locators cannot remove a received FD from cleanup ownership, and any evidence-construction failure closes all received descriptors before emitting a fixed conservative locator.
+- Provider response and recovery-evidence strings now reject lone surrogates before retention, while ASCII-escaped CLI JSON remains writable to strict UTF-8 stdout.
+- Provider `publication_state` is retained only as an unverified provider-scoped claim; post-request transport failures derive top-level `publication_state: uncertain` from local evidence.
+- Recovery-detail merging keeps mutation, retry, cleanup, and locator conclusions conservative.
+- Standalone recovery now descriptor-binds its private `.tmp-*` database before the second source revalidation and routes source, receipt, integrity, and durability failures through one retained-file recovery path.
+- SQLite no longer reopens anonymous Linux `O_TMPFILE` objects through `/dev/fd`; native read-only deserialization consumes only bytes reread from the held descriptor, with descriptor and SQLite-buffer checks around every integrity or backup boundary.
+- WAL recovery normalizes header read/write versions only after applying the committed frame prefix, then binds those exact normalized bytes as the anonymous descriptor content authority.
+- Native SQLite teardown closes the connection before freeing its input buffer and retains the allocation with explicit cleanup evidence if close is unproved.
+- Anonymous recovery pre-binds the accepted payload length, SHA-256, and `0600` policy before writing, then requires two consecutive same-descriptor readbacks before establishing the baseline.
+- SQLite header versions accept only exact `1/1` passthrough or exact `2/2` normalization to `1/1`; mixed and invalid pairs fail before deserialization.
+- Ordinary native runtime and `ctypes` failures retain structured input/backup cleanup evidence. Backup finish, serialized-buffer free, and destination close are independently attempted when safe, while process-control exceptions remain untranslated.
+- If consumer and terminal revalidation both fail, revalidation remains the primary cause and the consumer failure is retained as structured secondary evidence.
+- `copy-db` and `stage-patch` now expose `--result-file`, which binds an artifact-external parent, rejects every existing leaf, creates a descriptor-relative no-follow temporary file exclusively, enforces effective UID/GID and mode `0600`, and fsyncs an atomic no-replace publication.
+- Copied database files and JSON temporary files bind their exact identity and full access policy before writing, then revalidate that creation baseline around consecutive content readbacks and every publication/name boundary.
+- Creator result publication carries a trusted Darwin alias only when the artifact and result use the same exact registry pair; cross-root paths bind independently.
+- Creator result publication now binds the reopened artifact parent, root, exact directory membership, and every file's identity/access policy/SHA-256/size to the successful creation tree receipt, keeps those descriptors through result publication, and revalidates the full tree after commit.
+- A terminal result-file receipt is latched as committed before later scope teardown, so post-yield failures retain the artifact mutation, exact receipt, and non-retryable classification.
+- Standalone recovery files correct and bind effective UID/GID, mode `0600`, flags, identity, and the descriptor-relative leaf before the first sensitive write, then revalidate that baseline at the post-write boundary.
+- Native SQLite row callbacks capture their first `BaseException` inside the ctypes boundary and abort `sqlite3_exec`; ordinary failures keep their cause and cleanup evidence, while `KeyboardInterrupt` and `SystemExit` are re-raised after input teardown.
+- Ordinary SQLite row-callback failures are classified before terminal buffer/binding revalidation; a simultaneous revalidation failure remains primary while structured secondary evidence retains the callback and nested `sqlite_callback_failure`.
+- Descriptor-relative source opens now map post-open descriptor, name, and
+  held-parent revalidation failures through the shared source taxonomy:
+  `source-missing-after-read`, `source-revalidation-unreadable`, or
+  `source-revalidation-inconclusive`. The access probe retains those codes in
+  the affected file record.
+- The same source taxonomy now covers each discovered member's dedicated
+  re-stat plus the bound helper's pre-open descriptor-relative `stat` and
+  `open`. `EACCES` and `EPERM` are unreadable, while non-source callers retain
+  their domain-specific inconclusive codes; rollback journals keep the policy
+  result and record the source cause in `details.reason_code`.
+- Bound source files apply that taxonomy across descriptor stat, path stat, and
+  repeated hashing while still closing the opened descriptor on every failure.
+  Held source-directory translation inspects wrapped OS causes before generic
+  prepared-directory codes, and the probe's post-close parent check now stays
+  inside the affected file result.
+- After all bound source files complete terminal double hashing, the helper
+  revalidates the held parent chain, rescans only the reserved
+  main/WAL/SHM/rollback-journal names, compares them with the binding baseline,
+  and returns a final post-scan directory receipt. Persistent late sidecars or
+  parent replacement fail closed; unrelated transient child churn remains
+  benign when the selected properties stay stable.
+- Snapshot and patch-stage directory validation now translates lower scan-time
+  identity, access-policy, membership, and I/O failures with the exact codes
+  supplied by the artifact caller instead of generic `directory-*` codes.
+- Live-safe destination preflight now compares every destination requested /
+  registry-canonical form against every requested / registry-canonical live
+  container form before binding or creating any component. An absent live
+  leaf therefore remains protected across `/tmp` and `/private/tmp`, while
+  alias retargeting or same-target replacement still fails closed through the
+  held alias identity and access-policy proof before the creator can run.
+- Creator commands now hold separate artifact and result nearest-ancestor,
+  missing-suffix, absent-leaf, live-container, and trusted-alias proofs. The
+  artifact proof is revalidated after the result proof completes, so
+  replacement between the two read-only windows fails with zero creator
+  calls.
+- Result-parent creation is a post-artifact commit phase. A shared missing
+  parent prefix may advance only through exact object-identity and
+  access-policy matches against the artifact's retained no-replace component
+  creation receipts; the original trusted-alias object remains the
+  authorization boundary.
+- Pre-creator failures report `mutation_performed: false`. Failures after
+  artifact or result-parent creation conservatively retain both
+  `mutation_performed: true` and `artifact_mutation_performed: true` where
+  applicable.
+- The zero-write preflight wrapper now marks only failures before its first
+  held proof as non-mutating. Creator commands latch the successful artifact
+  payload and result destination across the original preflight contexts:
+  artifact-only teardown failures retain the descriptor-bound artifact
+  recovery locator, while result-committed failures retain both that artifact
+  identity and the exact result-file SHA-256/size/identity receipt.
+- A directory component's exact creator-held installation receipt is prepared
+  before rename and latched in the first state update after a successful
+  no-replace install. Parent creation then preserves every latched component
+  receipt through next-component checks, post-install validation, yielded
+  consumer errors, post-yield validation, and descriptor teardown, always
+  reporting mutation and a non-retryable result.
+- Each successful component receipt now also proves
+  `directory-entry-durability`: the held parent descriptor is fsynced and the
+  target is revalidated before the helper returns or creates a deeper
+  component. An fsync failure keeps the installed name and object recovery
+  receipt, marks durability `unverified`, records the internal name commit in
+  `directory_component_commit`, and prevents every later component from being
+  created. It does not set top-level `publication_state: committed` before the
+  enclosing artifact publication rename. If the component is nested under an
+  unpublished private partial root, the outer scope still retains and merges
+  that root's descriptor-bound locator and sensitive inventory. Existing
+  parent components remain read-only and are not spuriously fsynced. This
+  boundary is independent of the later fsync for a populated private snapshot
+  or stage directory.
+- The complete live-source binding lifecycle now owns the underlying generic
+  directory context's final exit. Missing, permission, other stat, proved
+  identity, and proved access-policy failures in that final window remain
+  stable `source-*` classifications for fingerprint, copy, and merge.
+- Bound source files compare the pre-open pathname, opened descriptor, and
+  immediate post-open pathname for object identity and access policy before
+  hashing. Tests cover mode, UID, GID, protected-flag, and post-`fstat`
+  pathname-only drift while preserving benign metadata transitions.
+- Post-publication Notes checks now retain the terminal state proved by the
+  quarantine attempt after merging nested probe details. Only a complete
+  parent-durability, directory-policy, tree-receipt, and public-alias proof can
+  report `quarantined` / `retained`; incomplete namespace moves remain
+  `namespace-moved-unverified` / `inconclusive`.
+- Patch-stage SQLite descriptor capture and terminal integrity revalidation use
+  the patch-specific identity, content, access-policy, and inconclusive codes.
+- A retained or possibly retained partial always sets
+  `mutation_performed: true`, even when the primary pre-publication failure
+  originally reported false.
+- Direct public output APIs prove the requested leaf is still absent through
+  the held parent after committing the destination parent and immediately
+  before creating a private partial. Standalone and creator-result writers
+  likewise revalidate their final public names immediately before their actual
+  `O_EXCL` temporary-file opens.
+- Worker launch no longer snapshots parent descriptors before starting the
+  child. Before either child exists, the launcher no-follow/nonblocking-opens
+  the fixed packaged helper, binds identity/access policy and a 2-MiB ceiling,
+  and requires two identical reads around descriptor/path revalidation.
+  Production rejects every other `--helper` path before capture or execution.
+- CPython closes all non-allowlisted descriptors after the fork snapshot,
+  retaining only the exact supervisor channel and a launch-only anonymous
+  source-pipe reader. A fixed parent-memory bootstrap validates the framed
+  length/SHA-256, rejects truncation/trailing bytes, closes the source FD,
+  restores the exact selected signal defaults/mask, and compiles the captured
+  bytes with the pathname used only for diagnostics.
+- Helper-source delivery is nonblocking and deadline-bounded. Timeout,
+  BrokenPipe, malformed-frame, or early child exit closes both pipe ends and
+  enters bounded worker kill/reap. Atomic path replacement and pre-held
+  in-place overwrite after capture cannot change executed bytes.
+- Once the compatibility wrapper source is already executing, it captures the
+  fixed supervisor through a no-follow/nonblocking/close-on-exec regular-file
+  descriptor, binds identity/access policy and a 2-MiB ceiling, requires two
+  identical reads, and compile-executes only those bytes. That supervisor's
+  exact `HELPER_CAPTURE` / `HELPER` supplies the legacy API and both supervised
+  consumers; neither dependency loader writes source-tree bytecode. This does
+  not authenticate or revalidate the already executing wrapper itself or
+  protect process memory from a malicious same-UID debugger/`ptrace` peer.
+- `probe-db-access` gives each container its own enter/body/exit result
+  boundary. After a successful sample, explicit terminal-check and exit-only
+  generic component-chain failures translate from their caught evidence into
+  the corresponding `source-*` classification instead of becoming initial
+  absence/container taxonomy or aborting the complete probe.
+- If the retained group-container context fails its final exit after NoteStore
+  file inspection, all dependent file rows become unreadable under that same
+  source error and discard size, identity, and access-policy authority.
+- Probe iteration carries explicit group/app roles. Equal configured container
+  paths still close two independent contexts exactly once and cannot overwrite
+  the retained group ExitStack.
+- Before a group binding exists, initial permission and generic I/O failures
+  propagate `container-unreadable` or
+  `container-revalidation-inconclusive` to every dependent file row.
+  `prepared-directory-missing` remains ordinary absence, and an app-only bind
+  failure does not taint group-derived file evidence.
+- Container child samples enforce a complete 64-entry and 4-KiB raw-name
+  budget, stop on overflow, and sort only the bounded set before retaining five
+  names.
+- Snapshot manifests now require `apple-notes-snapshot/v4` and an exact
+  `apple-notes-live-source-binding/v1` receipt produced from the same held
+  capture store as the database files. The receipt binds the requested live
+  root, terminal directory identity/access policy, ordered canonical
+  component chain, no-symlink/reparse policy, and registered Darwin alias or
+  explicit null while excluding benign directory timestamp, link-count, and
+  unrelated raw-flag churn. Snapshot v3 remains non-writeback-grade and fails
+  closed at the schema gate.
+- Writeback preflight and verification share one `ExitStack` for the validated
+  snapshot, validated patch stage, and held live source, then establish one
+  joint success linearization point while all three remain bound. Persistent
+  backup, stage, live-file, container-identity, or container-access-policy
+  replacement before that point fails closed; benign unrelated child churn
+  remains outside the selected protected properties. The resulting receipt is
+  point-in-time evidence and cannot authorize a later write without a new
+  write transaction and revalidation.
+- Note-tag snapshotting and native serialization consume descriptor-bound
+  database inputs, reject live-path/sidecar escape, and revalidate at the
+  terminal boundary. Creator zero-write checks run immediately before the
+  provider call, and exclusive writers retain conservative recovery evidence
+  when their first post-create identity read fails.
+
+## Next Steps
+
+- Freeze the final signed head, run named review and exact-secret admission,
+  push the canonical PR update, and require current-head CI before landing.
+- Propagate the landed canonical checkout and digest to the private overlay so
+  packaging can add the canonical sync rule/inventory and update the
+  work-report integration without duplicating this helper.
+
+## Evidence
+
+- Zero-write creator-boundary follow-up base:
+  `26d9ba3308be4866d245f9892a4b0b93bb8be6ee`.
+- Final focused regressions: Python `3.13.0` passed five methods covering the
+  two artifact creators, all four standalone public names, creator-result
+  revalidation injection, and the two existing held-parent swap/restore
+  controls (`5` tests in `0.942s`).
+- Final full regressions: Python `3.13.0` passed all `341` tests with two
+  sandbox-scoped fixed-`/usr/bin/pgrep` skips in `59.124s`; system Python
+  `3.9.6` passed the same `341` tests with two skips in `72.063s`.
+- Static gates: Ruff `0.13.2` full-repository check and changed-Python format
+  check; `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators;
+  and `git diff --check`.
+- Base commit: `393a87d57d3e6e03d625a384b8fbb16a2538df58`
+- Fresh-review follow-up base: `fdd702dcd774a8331c0505d5d9da4b04c7245d18`
+- Transport-evidence follow-up base: `2c6f77c798e7d57e52f359ca3efec5a86b883e39`
+- Unicode/publication-authority follow-up base: `f133f57da4d9a1559bf4dc1b73574494868b00b2`
+- Standalone temp-backup follow-up base: `9b06f7dbb52f1447845c9b3a47c22efd1bbf2259`
+- Linux descriptor-reopen follow-up base: `48e0869ca19f7b905ebbfbbd7cf0dcd9a4e271fc`
+- Final fresh-review safety follow-up base: `0206b99509fda94b005cb5dc0408a6ebc3cc551d`
+- Formal single-review follow-up base: `06b45f4eb3ab01027eb1d70314196b0ff74f0083`
+- Final formal-review follow-up base: `6590340811403af7b796b61dea5bb4a824fac2fc`
+- Final safety-resumption base: `95ec4d293179c59c9ea10934fef454f9a9d744a6`
+- Source-open/quarantine terminal-state follow-up base:
+  `9bbac3abae3f58581dde2b7e1736df70fed3ac2b`
+- Source-open/quarantine focused regressions: Python `3.13.0`,
+  `python3 -B -m unittest <seven focused test cases>` (`7` tests passed).
+- Source-open/quarantine full suite: Python `3.13.0`,
+  `python3 -B -m unittest tests.test_apple_notes_helper` (`304` tests passed,
+  `2` skipped, `36.461s`).
+- Source-open/quarantine static gates: Ruff check and format check over both
+  changed Python files, `python3 -B -m py_compile`, and `git diff --check`.
+- Current-head GitHub Codex three-P2 follow-up base:
+  `93739e6a0e137029b6d7ad4bf81d44945676eaa3`.
+- Current-head focused regressions: Python `3.13.0`,
+  `python3 -B -m unittest <nine focused test cases>` (`9` tests passed,
+  including three patch-integrity race subtests).
+- Current-head full suite: Python `3.13.0`,
+  `python3 -B -m unittest tests.test_apple_notes_helper` (`306` tests passed,
+  `2` skipped, `37.815s`).
+- Current-head static and documentation gates: full-repository Ruff `0.13.2`,
+  changed-Python format check, `bash -n`, ShellCheck `0.11.0`, skill validation,
+  project-journal validation, and `git diff --check`.
+- Fresh-review launch/probe follow-up base:
+  `c4dc449ddadd01176bdb9b086dd7f718cffc09ed`.
+- Fresh-review focused regressions: Python `3.13.0` and system Python `3.9.6`
+  each passed `13` tests covering a last-moment inheritable descriptor,
+  supervisor-path-independent bootstrap argv, ignored signal dispositions,
+  bounded container samples, both container exit windows, and existing
+  per-file source classification.
+- Fresh-review full regressions: Python `3.13.0` passed all `313` tests with
+  `2` sandbox-scoped fixed-`/usr/bin/pgrep` skips in `41.000s`; system Python
+  `3.9.6` passed the same `313` tests with `2` skips in `49.427s`.
+- Fresh-review static and documentation gates: full-repository Ruff `0.13.2`,
+  changed-Python format check, Python `3.13.0` and `3.9.6` isolated
+  `py_compile`, `bash -n`, ShellCheck `0.11.0`, skill validation,
+  project-journal validation, and `git diff --check`.
+- Helper-source capture follow-up base:
+  `c4dc449ddadd01176bdb9b086dd7f718cffc09ed`.
+- Helper-source focused regressions: Python `3.13.0` and system Python `3.9.6`
+  each passed `21` tests covering post-capture atomic replacement and pre-held
+  in-place overwrite, no-follow/nonblocking capture races, canonical-only
+  production launch, parent/service/worker source identity, frame
+  truncation/digest/trailing/oversize rejection, real full-pipe timeout,
+  delivery-error reap, exact source-FD closure, signal defaults/mask, bounded
+  container samples, and per-container exit failures.
+- Helper-source full regressions: Python `3.13.0` passed all `322` tests with
+  `2` sandbox-scoped fixed-`/usr/bin/pgrep` skips in `44.995s`; system Python
+  `3.9.6` passed the same `322` tests with `2` skips in `52.439s`.
+- Helper-source static and documentation gates: full-repository Ruff `0.13.2`;
+  changed-Python format check; Python `3.13.0` and `3.9.6` isolated
+  `py_compile`; `bash -n`; ShellCheck `0.11.0`; skill validation;
+  project-journal validation; and `git diff --check`.
+- A fresh read-only implementation audit found no remaining production
+  blocker, P1, or P2 in capture, source delivery, descriptor inheritance,
+  cleanup, or signal restoration.
+- Probe terminal-consistency focused regressions: Python `3.13.0` and system
+  Python `3.9.6` each passed `7` tests covering post-open file errors, explicit
+  terminal missing/permission/EIO/identity/access failure, final context-exit
+  propagation to every dependent file row, equal-path role ownership and FD
+  closure, bounded samples, and per-file post-close revalidation.
+- Probe terminal-consistency full regressions: Python `3.13.0` passed all `324`
+  tests with `2` sandbox-scoped fixed-`/usr/bin/pgrep` skips in `42.770s`;
+  system Python `3.9.6` passed the same `324` tests with `2` skips in `50.560s`.
+- Probe terminal-consistency static and documentation gates:
+  full-repository Ruff `0.13.2`; changed-Python format check; Python `3.13.0`
+  and `3.9.6` isolated `py_compile`; `bash -n`; ShellCheck `0.11.0`; skill
+  validation; project-journal validation; and `git diff --check`.
+- A final fresh read-only implementation audit found no remaining concrete P1
+  or P2 in probe role ownership, terminal taxonomy, or dependent file-row
+  invalidation.
+- Compatibility-entry and initial-bind follow-up base:
+  `05e7de7952ae325022d8e9c8396494514e6e038c`.
+- Compatibility-entry focused regressions: Python `3.13.0` and system Python
+  `3.9.6` each passed `9` tests covering helper symlink / atomic-replacement /
+  in-place-mutation rejection before execution, supervisor no-follow and
+  access-policy capture, no source-tree bytecode under a direct no-`-B`
+  compatibility entry, exact API/supervisor capture identity, existing
+  service/worker capture identity, initial group permission/EIO/missing
+  propagation, app-only isolation, and terminal source taxonomy.
+- Compatibility-entry full regressions: Python `3.13.0` passed all `329` tests
+  with `2` sandbox-scoped fixed-`/usr/bin/pgrep` skips in `39.577s`; system
+  Python `3.9.6` passed the same `329` tests with `2` skips in `46.780s`.
+- Compatibility-entry static and documentation gates: full-repository Ruff
+  `0.13.2`; changed-Python format check; Python `3.13.0` and `3.9.6` isolated
+  `py_compile`; `bash -n`; ShellCheck `0.11.0`; skill validation;
+  project-journal validation; and `git diff --check`.
+- Hosted Linux failure evidence: GitHub Actions run `30126900959`, job `89592422565`, head `48e0869ca19f7b905ebbfbbd7cf0dcd9a4e271fc` (`182` `unable to open database file` occurrences rooted at anonymous descriptor URI consumption)
+- Targeted adversarial tests: `python3 -m unittest <eight focused test cases>` (`8` tests passed)
+- Supervisor/malformed-result tests: `python3 -m unittest <four focused test cases>` (`4` tests passed)
+- Malformed provider-locator transport test: `python3 -m unittest tests.test_apple_notes_helper.AppleNotesHelperTests.test_supervisor_malformed_provider_locators_never_leak_received_fd` (`1` test with normal-merge and forced-merge-failure subtests passed)
+- Surrogate transport and strict-output tests: `python3 -m unittest <two focused test cases>` (`2` tests passed)
+- Standalone temp-backup regression tests: Python `3.14.3`, `python3 -B -m unittest <seven focused test cases>` (`7` tests passed, including identity/content/access-policy adversarial subtests and an mtime-only negative control)
+- Descriptor-deserialization regressions: Python `3.14.x`, `python3 -B -m unittest <six focused test cases>` (`6` tests passed, including simulated Linux `O_TMPFILE` reopen failure, descriptor/buffer adversarial mutations, native cleanup, namespace swap, and invalid WAL-header version)
+- Native Linux validation availability: Apple Container was installed but had no default kernel; starting it required a separately authorized kernel download, so this local-only gate used the deterministic pseudo-path-reopen failure regression and left hosted Linux rerun to the next pushed head
+- Python compatibility regressions: system Python `3.9.6`, `python3 -B -m unittest <five focused test cases>` (`5` tests passed)
+- Final safety regressions: Homebrew Python `3.14.3`, `python3 -B -m unittest <ten focused test cases>` (`10` tests passed)
+- Final Python compatibility regressions: system Python `3.9.6`, `python3 -B -m unittest <ten focused test cases>` (`10` tests passed)
+- Full repository suite before final runtime selection: Python `3.14.2`, `python3 -B -m unittest tests.test_apple_notes_helper` (`216` tests passed outside the nested sandbox required by the fixed `/usr/bin/pgrep` probe)
+- Final full repository suite: Homebrew Python `3.14.3` (highest compatible installed runtime), `python3 -B -m unittest tests.test_apple_notes_helper` (`217` tests passed outside the nested sandbox required by the fixed `/usr/bin/pgrep` probe)
+- Final fresh-review full repository suite: Homebrew Python `3.14.3`, `python3 -B -m unittest tests.test_apple_notes_helper` (`225` tests passed outside the nested sandbox required by the fixed `/usr/bin/pgrep` probe)
+- Formal single-review follow-up full suite: Homebrew Python `3.14.3`, `/opt/homebrew/bin/python3.14 -B -m unittest tests.test_apple_notes_helper` (`234` tests passed outside the nested sandbox required by the fixed `/usr/bin/pgrep` probe)
+- Formal single-review Python compatibility suite: system Python `3.9.6`, `/usr/bin/python3 -B -m unittest tests.test_apple_notes_helper` (`234` tests passed outside the nested sandbox required by the fixed `/usr/bin/pgrep` probe)
+- Formal follow-up regressions cover safe copy/stage result-file packaging, existing-file/symlink/non-external rejection, restrictive-umask mode enforcement, creation/write-phase `chmod` races, and ordinary/process-control ctypes callback failures.
+- Final formal-review regressions: Python `3.14.3` and `3.9.6`, six focused tests passed for `/Users`/`/tmp` and distinct-registry-pair creator results, committed-receipt post-yield failure mapping, standalone inherited-group correction, and creation/write-boundary policy drift.
+- Final formal-review full suites: Homebrew Python `3.14.3` and system Python `3.9.6` each passed all `239` tests outside the nested sandbox required by the fixed `/usr/bin/pgrep` probe.
+- Final safety-resumption regressions: Python `3.14.3` and `3.9.6` passed pre-bind artifact replacement, post-result-commit in-place content mutation, and simultaneous callback plus terminal buffer/binding failure cases.
+- Final safety-resumption full suites: Homebrew Python `3.14.3` and system Python `3.9.6` each passed all `243` tests outside the nested sandbox required by the fixed `/usr/bin/pgrep` probe.
+- Post-open source-classification regressions: two focused tests passed on
+  Python `3.14.3` and system Python `3.9.6`, covering open-then-disappear,
+  post-open permission/EIO, descriptor `fstat`, held-parent revalidation, and
+  `probe-db-access` result preservation.
+- Final post-open source-classification full suites: Python `3.14.3` and system
+  Python `3.9.6` each passed all `245` tests. The fixed `/usr/bin/pgrep`
+  supervisor case was rerun outside the nested sandbox because sandboxed
+  process-table access returned an intentionally inconclusive probe result.
+- Final causal source-taxonomy regressions: Python `3.14.3` and `3.9.6` each
+  passed nine focused tests covering post-open descriptor/path errno mapping
+  and close, wrapped directory causes versus proved identity mismatch, and
+  post-close probe parent failures retained per file.
+- Final causal source-taxonomy full suites: Python `3.14.3` and `3.9.6` each
+  passed all `249` tests outside the nested sandbox required by the fixed
+  `/usr/bin/pgrep` probe.
+- Terminal live-store and artifact-directory regressions: Python `3.14.3` and
+  system Python `3.9.6` each passed nine focused tests covering persistent WAL,
+  persistent rollback journal, persistent held-parent replacement, benign
+  unrelated transient churn, and real scan-time identity/access-policy/EIO
+  translation for snapshot and patch-stage callers.
+- Terminal-boundary full suites: Python `3.14.3` and system Python `3.9.6`
+  each passed all `253` tests outside the nested sandbox required by the fixed
+  `/usr/bin/pgrep` probe.
+- Static checks: full-repository `ruff check`; changed-file `ruff format --check`; `python3 -m py_compile`; CI-scoped `bash -n` and `shellcheck`; and `git diff --check`
+- Formal follow-up static checks: full-repository `ruff check .`; changed-Python `ruff format --check`; Python `3.14.3` and `3.9.6` `py_compile`; `bash -n` and `shellcheck` over both shell scripts; and `git diff --check`
+- Final formal-review static checks: full-repository Ruff `0.13.2`; changed-Python format check; Python `3.14.3` and `3.9.6` bytecode compilation; `bash -n` and ShellCheck over both shell scripts; and `git diff --check`.
+- Final safety-resumption static checks: full-repository Ruff `0.13.2`; changed-Python format check; Python `3.14.3` and `3.9.6` bytecode compilation; `bash -n` and ShellCheck `0.11.0` over both shell scripts; and `git diff --check`.
+- Post-open source-classification static checks: Ruff check/format, Python
+  `3.14.3` and `3.9.6` bytecode compilation with a task-scoped cache,
+  `git diff --check`, and isolated `quick_validate.py` with cached `PyYAML`.
+- Final causal source-taxonomy static checks: full-repository Ruff `0.13.2`;
+  changed-Python format check; Python `3.14.3` and `3.9.6` bytecode
+  compilation with task-scoped caches; `bash -n`; ShellCheck `0.11.0`; and
+  `git diff --check`.
+- Terminal-boundary static checks: full-repository Ruff `0.13.2`; changed
+  Python format check; Python `3.14.3` and `3.9.6` bytecode compilation with
+  separate task-scoped caches; `bash -n`; ShellCheck `0.11.0`; skill and
+  project-journal validators; and `git diff --check`.
+- GitHub Codex root-alias follow-up base:
+  `2ce9735b06133914a1a88b148469f3a8f399b6be`.
+- Root-alias zero-write regressions: Python `3.14.3` and system Python `3.9.6`
+  each passed the two focused tests covering absent `/tmp` /
+  `/private/tmp` live containers in both directions plus pre-creation alias
+  retargeting and same-target replacement. The tests prove the live binder and
+  identity-bound directory creator were not called for lexical overlap, and
+  prove the creator was not called after alias identity drift.
+- Root-alias full suites: Python `3.14.3` and system Python `3.9.6` each passed
+  all `255` tests outside the nested sandbox required by the fixed
+  `/usr/bin/pgrep` process-state probe.
+- Root-alias static checks: full-repository Ruff `0.13.2`; changed Python
+  format check; Python `3.14.3` and `3.9.6` bytecode compilation with separate
+  task-scoped caches; `bash -n`; ShellCheck `0.11.0`; and `git diff --check`.
+- Root-alias skill validation: the installed wrapper could not import local
+  `PyYAML`; the documented isolated `uv run --with pyyaml` fallback returned
+  `Skill is valid!`. Project-journal validation also passed.
+- Zero-write creator-destination follow-up base:
+  `169a164d8d03563699728effc1ce68cc13e41307`.
+- Zero-write creator-destination regressions cover copy/stage artifact
+  existence, Notes-running, live overlap, result/artifact containment,
+  replacement between the two preflights, missing result-parent preservation,
+  shared artifact-created parent prefixes, and post-artifact result-commit
+  mutation evidence.
+- Zero-write creator-destination full suites: Homebrew Python `3.14.3` and
+  system Python `3.9.6` each passed all `259` tests outside the nested sandbox
+  required by the fixed `/usr/bin/pgrep` process-state probe.
+- Zero-write creator-destination static gates: full-repository Ruff `0.13.2`;
+  changed-Python format check; Python `3.14.3` and `3.9.6` bytecode
+  compilation with separate task-scoped caches; `bash -n`; ShellCheck
+  `0.11.0`; skill and project-journal validators; and `git diff --check`.
+- Retained-preflight teardown follow-up base:
+  `6fc7bd89d08205f6c66786374645a8d38ca640e4`.
+- Retained-preflight teardown regressions: Homebrew Python `3.14.3` and
+  system Python `3.9.6` each passed four focused tests covering artifact-only
+  and result-committed original-preflight exit failures plus the existing
+  result-scope teardown and pre-result-commit mutation paths.
+- Retained-preflight teardown full suites: Homebrew Python `3.14.3` and
+  system Python `3.9.6` each passed all `261` tests outside the nested sandbox
+  required by the fixed `/usr/bin/pgrep` process-state probe.
+- Retained-preflight teardown static gates: full-repository Ruff `0.13.2`;
+  changed-Python format check; Python `3.14.3` and `3.9.6` bytecode
+  compilation with separate task-scoped caches; `bash -n`; ShellCheck
+  `0.11.0`; skill and project-journal validators; and `git diff --check`.
+- Directory-install/source-final-exit follow-up base:
+  `bc19e5d19c8a0e02366b706410a34874bd15e1b8`.
+- Directory-install/source-final-exit focused regressions: Homebrew Python
+  `3.14.3` and system Python `3.9.6` each passed ten focused tests. Coverage
+  includes install-success followed by scope failure, multi-component
+  post-install and post-yield failures with exact receipts, and final-window
+  missing, unreadable, EIO, identity, and access-policy classifications across
+  fingerprint, copy, and merge.
+- Directory-install/source-final-exit full suites: Homebrew Python `3.14.3`
+  and system Python `3.9.6` each passed all `265` tests outside the nested
+  sandbox required by the fixed `/usr/bin/pgrep` process-state probe.
+- Directory-install/source-final-exit static gates: full-repository Ruff
+  `0.13.2`; changed-Python format check; Python `3.14.3` and `3.9.6` bytecode
+  compilation with separate task-scoped caches; `bash -n`; ShellCheck
+  `0.11.0`; isolated skill validation with `PyYAML`; project-journal
+  validation; and `git diff --check`.
+- Skill validation: isolated `quick_validate.py` with `PyYAML` (`Skill is valid!`; direct local validation lacked that dependency)
+- Final skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)
+- Formal follow-up skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)
+- Final formal-review skill validation: `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails` (`Skill is valid!`)
+- Final safety-resumption skill validation: isolated `quick_validate.py` with cached `PyYAML` (`Skill is valid!`; direct Homebrew Python validation lacked `yaml`)
+- Final causal source-taxonomy skill validation:
+  `codex_skill_validate.py .agents/skills/apple-notes-db-guardrails`
+  (`Skill is valid!`).
+- Final post-fix read-only full-diff review: no findings
+- Journal validation: `project_journal.py validate --repo <worktree>`
+- Formal follow-up journal validation: `project_journal.py validate --repo <worktree>` (`Project journal validation passed.`)
+- Final formal-review journal validation: `project_journal.py validate --repo <worktree>` (`Project journal validation passed.`)
+- Final safety-resumption journal validation: `project_journal.py validate --repo <worktree>` (`Project journal validation passed.`)
+- Final causal source-taxonomy journal validation:
+  `project_journal.py validate --repo <worktree>`
+  (`Project journal validation passed.`).
+- Packaged-supervisor follow-up base:
+  `aa44c7c4205ea92d1d8e2df536b8d44ed56a16f6`.
+- The shell wrapper now launches a skill-relative supervisor automatically for
+  `copy-db`, `merge-db`, `recover-snapshot`, and `stage-patch` when the caller
+  did not supply a stronger inherited supervisor channel. The launcher creates
+  a private datagram socketpair, keeps a separate service process alive for the
+  command, passes only the connected client FD to the DB helper, and performs
+  bounded process-group teardown on every launcher terminal path. The service
+  child closes inherited descriptors outside the fixed standard-stream plus
+  supervisor-channel allowlist before it serves a request.
+- The packaged service opens a randomized private source directory before
+  atomically publishing that held object under the distinct protocol-visible
+  staging name with the platform no-replace directory rename. It binds parent
+  and directory identity/access policy before and after publication and keeps
+  the exact directory FD open through the response.
+- Notes process-state collection now treats `KeyboardInterrupt` and
+  `SystemExit` as process-control failures: it first performs bounded
+  process-group termination/reaping and closes both pipes, then re-raises the
+  original exception object unchanged.
+- Packaged-supervisor focused validation: Python `3.13.0` and system Python
+  `3.9.6` each passed five focused tests covering skill packaging, a
+  fixture-free real `stage-patch` wrapper invocation, both process-control
+  exceptions, timeout/exec failure cleanup, and the closed Notes probe matrix.
+  The existing inherited-supervisor `copy-db` smoke is skipped only when the
+  fixed `/usr/bin/pgrep` probe is unavailable in the current sandbox.
+- Packaged-supervisor signal teardown validation: Python `3.13.0` and system
+  Python `3.9.6` each proved that `SIGTERM` becomes cleanup-owning control
+  flow, returns `143`, and reaps the independently sessioned helper process
+  within the bounded deadline.
+- Packaged-supervisor full validation: Python `3.13.0` and system Python
+  `3.9.6` each passed all `268` tests with the single sandbox-scoped fixed
+  `/usr/bin/pgrep` skip. Both runtimes also compiled the DB helper,
+  supervisor, and compatibility launcher successfully; Python `3.9.6`
+  compilation used a separate task-scoped cache.
+- Packaged-supervisor static gates: full-repository Ruff, changed-Python format
+  check, Python `3.13.0` and `3.9.6` bytecode compilation, `bash -n` and
+  ShellCheck over both shell scripts, skill and project-journal validators, and
+  `git diff --check`.
+- Supervisor launch-window follow-up base:
+  `5d03a9607e14bb6c9f473863aa96897a2c207a26`.
+- The launcher now blocks termination signals before either child starts,
+  installs non-raising first-signal latches, and creates the worker with
+  `posix_spawn`, an explicit descriptor allowlist, a restored child signal
+  mask, and a new session. A source channel already occupying the preferred
+  child FD is relocated so a no-op self-dup cannot preserve `FD_CLOEXEC`. The
+  parent owns the returned PID before unblocking. Latches remain installed
+  through bounded worker/service kill, drain, and reap; repeated signals are
+  ignored until cleanup completes. The terminal boundary consumes only one
+  pending-signal snapshot before restoring the original handlers/mask and
+  re-delivering the first signal, so a signal storm cannot make teardown
+  unbounded.
+- Before either raw-waitpid child exists, the launcher blocks `SIGCHLD` and
+  temporarily normalizes its disposition to `SIG_DFL`; the worker also
+  receives default `SIGCHLD`. This prevents an inherited `SIGCHLD=SIG_IGN`
+  from auto-reaping worker or service, while terminal cleanup restores the
+  caller's exact disposition and mask. A residual `ECHILD` maps the worker to
+  conservative exit code `1`; it treats the service as already terminal but
+  fails the launcher because the service status is unavailable. Neither path
+  can escape `finally`, skip signal restoration, or authorize a signal against
+  a possibly reused PID.
+- Service-child setup is wholly child-owned and exits with the bounded service
+  failure code, so an initialization exception cannot fall into parent cleanup
+  with PID `0`. A zero-duration reap probe now performs one real `waitpid`
+  before any process-group signal, avoiding teardown signals against an
+  already-exited child.
+- The dedicated service now blocks every blockable signal, scopes `umask(0)`
+  only around `mkdir(0700)`, restores the exact inherited umask in `finally`,
+  and only then restores the prior signal mask. A production wrapper smoke
+  runs under inherited umask `0777`, proves the stage succeeds with mode
+  `0700`, and proves no private supervisor source residue remains. Direct
+  success/failure tests prove exact umask restoration, while an asynchronous
+  handler regression proves no handler can observe the zero-umask window.
+- Python `3.13.0` and system Python `3.9.6` each passed eight focused supervisor
+  regressions covering strict-umask production creation, exact residue
+  cleanup, launch-window signal arrival, repeated cleanup-time signals,
+  snapshot-bounded pending-signal consumption, worker reap, original signal
+  re-delivery, colliding-FD relocation across exec, direct success/failure
+  umask restore, asynchronous-handler isolation, inherited
+  `SIGCHLD=SIG_IGN`, exact signal-state restoration, and defensive `ECHILD`
+  classification.
+- Supervisor launch-window full validation: Python `3.13.0` and system Python
+  `3.9.6` each passed all `274` tests with the single sandbox-scoped fixed
+  `/usr/bin/pgrep` skip, including the final child-setup and immediate-reap
+  hardening.
+- Snapshot-manifest basename follow-up base:
+  `59b1b5830990ae511c49be1fa049ae8872940081`.
+- Snapshot validation now completes exact entry-object and basename
+  string/allowlist validation before constructing a set, dictionary, hash key,
+  or path. Malformed list, object, null, and boolean basenames return stable
+  `manifest-invalid` without echoing the untrusted value.
+- Snapshot-manifest malformed-basename regressions: Python `3.13.0` and system
+  Python `3.9.6` each passed the focused API/CLI classification test and the
+  full `275`-test suite with the single sandbox-scoped fixed
+  `/usr/bin/pgrep` skip.
+- Container-path, Darwin-flags, and bounded-JSON follow-up base:
+  `2097f3d9e695d41681192dcbb1bbcd3dc3940bcb`.
+- `NoteStorePaths` now freezes both public container inputs to lexical absolute
+  paths using one captured working directory. API and CLI regressions change
+  CWD after destination preflight and prove source reads, manifest
+  `source_root`, fingerprints, and returned paths remain bound to the original
+  containers.
+- Darwin `st_flags` are split by protected property. Immutable, append-only,
+  Data Vault, restricted, and no-unlink bits remain access-policy signals;
+  benign raw flag transitions are recorded as `platform_flags` metadata.
+  Legacy receipts that stored all raw bits are normalized at manifest and
+  writeback boundaries without weakening the protected mask.
+- Manifest and external creation-receipt JSON now have fixed nesting and
+  integer-digit limits before decoding untrusted structures. Limit failures
+  and decoder recursion map to stable `manifest-invalid` or
+  `manifest-creation-receipt-invalid` results.
+- Focused regressions: Python `3.13.0` and system Python `3.9.6` each passed
+  five tests covering post-preflight CWD changes, benign versus protected
+  Darwin flags, legacy raw-flag receipts, excessive nesting, oversized
+  integers, and decoder recursion.
+- Full regressions: Python `3.13.0` and system Python `3.9.6` each passed all
+  `280` tests with the single sandbox-scoped fixed `/usr/bin/pgrep` skip.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.
+- Multi-path CWD-freeze follow-up base:
+  `cf8f852c93a760c4ab8027c84f02c4e44ffb3005`.
+- Copy, snapshot/stage validation, recovery, and writeback preflight/verification
+  now freeze every related artifact, external receipt, live-container, and
+  output path from one public API-entry CWD before the first probe or callback.
+  CLI dispatch captures the same command CWD before argument parsing and passes
+  it through nested helpers instead of independently resolving each path.
+- API and CLI regressions deliberately change CWD at the first Notes/path
+  callback, provide a second valid live-container namespace, and prove copied
+  source roots, snapshot/stage receipts, recovery outputs, and writeback inputs
+  remain bound to the original namespace.
+- Focused regressions and full suites passed under Python `3.13.0` and system
+  Python `3.9.6`; each full run completed all `290` tests with the single
+  sandbox-scoped fixed `/usr/bin/pgrep` skip.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.
+- Stage/merge path-freeze and bounded-directory-scan follow-up base:
+  `638c58986174a3033b464bf6db5c635a60c7800a`.
+- `merge-db` and `stage-patch` now capture one CWD at each public API boundary
+  and freeze the source plus every output before destination preflight. Their
+  CLI adapters capture once before parsing/dispatch and pass absolute source,
+  artifact, result-file, and live-container paths into the APIs. Manifests and
+  result payloads use only the frozen paths.
+- Prepared and artifact directory scans receive a small expected raw-name
+  namespace before enumeration. The first unexpected name fails before
+  per-entry `stat`; expected and observed scans each have 64-entry and 4-KiB
+  aggregate raw-name limits, reject duplicate/raw-decoded collisions, and
+  compare raw-name/type plus decoded-name/type maps across both passes.
+- Focused regressions: Python `3.13.0` and system Python `3.9.6` each passed
+  five tests covering API/CLI stage and merge CWD changes after preflight,
+  early rejection of a simulated 65,536-entry extra set, entry/raw-name byte
+  limits, surrogate-escaped raw names, and duplicate collision rejection.
+- Full regressions: Python `3.13.0` and system Python `3.9.6` each passed all
+  `285` tests with the single sandbox-scoped fixed `/usr/bin/pgrep` skip.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.
+- Retained-partial bounded-enumeration follow-up base:
+  `95938d7671fbe39760a33927904bc5b62dcbe263`.
+- Retained sensitive-partial inventories now enumerate lazily through held
+  directory descriptors, apply one 64-entry and 4-KiB aggregate raw-name
+  budget across each complete recursive pass, and stop on the 65th item before
+  metadata lookup. Oversized recovery evidence keeps the original failure
+  primary and returns only bounded structured namespace/parent locators.
+- The packaged creator supervisor's source-directory emptiness proof reads at
+  most one descriptor-relative entry instead of materializing the directory.
+- Focused regressions: Python `3.13.0` and system Python `3.9.6` each passed
+  seven tests covering lazy million-entry supervisor input, a simulated
+  65,536-entry retained inventory, raw-name byte overflow, and the existing
+  root/leaf replacement plus inventory-error classifications.
+- Full regressions: Python `3.13.0` and system Python `3.9.6` each passed all
+  `288` tests with the single sandbox-scoped fixed `/usr/bin/pgrep` skip.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.
+- GitHub-review follow-up base:
+  `2f28bf3831465fa8f59b622c17ba305d9793888e`.
+- The legacy Python compatibility module now re-exports its complete historical
+  public surface, including `notes_is_running` and `emit_json`, without
+  starting a child process or mutating Notes data during module loading. Its
+  four write-producing CLI commands automatically route through the packaged
+  supervisor unless an explicit supervisor FD is already present.
+- `merge-db` now chooses a randomized external sibling output for canonical
+  copied-snapshot sources when `--out` is omitted. Explicit/default outputs
+  reject requested, canonical-alias, and descriptor-resolved containment in
+  either direction before mutation and retain the root/output separation
+  binding through publication.
+- Required-quit `copy-db` now probes Notes at preflight, at the final
+  before-rename callback boundary, and immediately after publication before
+  success/result publication. A running or unknown final state moves the exact
+  held snapshot to a no-replace hidden quarantine sibling, reports
+  non-writeback-grade primary/recovery evidence, and leaves no successful
+  artifact at the requested destination.
+- Deterministic focused regressions cover compatibility exports and supervisor
+  routing, real compatibility-launcher copy behavior, external merge defaults,
+  lexical/descriptor alias overlap rejection, a pre-rename Notes restart, and
+  a post-publication restart with exact quarantine evidence.
+- Full regressions: Python `3.13.0` and system Python `3.9.6` each passed all
+  `298` tests with two sandbox-scoped skips for the fixed `/usr/bin/pgrep`
+  process probe.
+- Direct Claude Code review is omitted under Joey's explicit temporary waiver
+  for work completed before 2026-08-01; no substitute reviewer is counted as
+  that lane.
+- Fresh single-review follow-up base:
+  `277ef08e8a3ee19a211e3be6fd849d8555d3682e`.
+- Regular-file binding now rejects same-object mode, ownership, or protected
+  flag drift unless the pre-open path, opened descriptor, and immediate
+  post-open descriptor-relative path retain one access-policy baseline before
+  the first hash.
+- A quarantine namespace move is reported as
+  `namespace-moved-unverified` with inconclusive cleanup unless
+  descriptor-relative directory policy, parent durability, complete-tree
+  receipt, and terminal public-alias proofs all succeed.
+- Focused regressions passed four tests covering deterministic mode/protected-
+  flag `os.open` races, the verified quarantine path, and all four
+  post-rename quarantine-proof failures.
+- Full regressions: Python `3.13.0` and system Python `3.9.6` each passed all
+  `301` tests with two sandbox-scoped skips for the fixed `/usr/bin/pgrep`
+  process probe.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.
+- Packaged-supervisor creation-identity follow-up base:
+  `82983f1c071e8ce559a750624f175643759d79bb`.
+- A fresh named-single review proved that the old bundled service could not
+  attest the object returned by `mkdir`: a same-UID process could move that
+  object and install a same-owner mode-`0700` replacement before the service's
+  later `open`, after which every FD/name/stat check described only the
+  replacement.
+- Platform capability review found no public macOS or Linux primitive that
+  atomically creates a directory and returns the FD for that exact new object.
+  `mkdir`, `mkdirat`, `mkdtemp`, and `mkdtempat_np` all require a later
+  name-based open; file-creation primitives do not create directories.
+- The packaged service now validates the request and returns an exact typed
+  `unavailable-before-create` receipt without `mkdir`, `open`, or a returned
+  descriptor. The client accepts the no-mutation claim only for the closed
+  schema, request nonce, null basename/proof, zero FDs, and canonical JSON
+  details reconstructed locally. Every near-match remains
+  `mutation_performed: true`, `publication_state: uncertain`, and
+  `cleanup_state: inconclusive`.
+- Explicit `--directory-creator-fd` remains the success path for a genuinely
+  stronger platform or privileged authority. The default shell and
+  compatibility launchers remain lifecycle-safe capability gates and fail
+  before filesystem mutation when creation is required.
+- Deterministic regressions intercept the former mkdir boundary, park the
+  original object, install a same-UID replacement, and allow the subsequent
+  real open; the fixed service invokes neither operation. End-to-end tests
+  verify the pre-creation receipt and conservative handling of returned FDs,
+  basename/proof fields, changed details, bool-as-int details, and unknown
+  fields.
+- Focused regressions: Python `3.13.0` and system Python `3.9.6` each passed
+  all eight tests with two sandbox-scoped skips for the fixed `/usr/bin/pgrep`
+  process probe.
+- Full regressions: Python `3.13.0` and system Python `3.9.6` each passed all
+  `302` tests with two sandbox-scoped skips for the fixed `/usr/bin/pgrep`
+  process probe.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.
+- Fresh source-binding classification follow-up base:
+  `c9284d13fef8bc61c9b4628d53b1b7c41551f494`.
+- Discovered live-source members now use the shared source OS-error classifier
+  for their dedicated re-stat and the bound helper's descriptor-relative
+  pre-open `stat`/`open`. `EACCES` and `EPERM` remain
+  `source-revalidation-unreadable`; missing and other I/O failures remain
+  distinct, and snapshot callers retain their own inconclusive code.
+- Rollback-journal binding keeps `rollback-journal-present` as the policy
+  result while recording a permission failure as
+  `details.reason_code: source-revalidation-unreadable`.
+- Focused regressions: Python `3.13.0` and system Python `3.9.6` each passed
+  four test methods covering the complete initial stat/open taxonomy,
+  non-source isolation, fingerprint/copy/merge propagation across three
+  binding stages for `EACCES` and `EPERM`, and rollback-journal reason
+  retention.
+- Full regressions: Python `3.13.0` and system Python `3.9.6` each passed all
+  `333` tests with two sandbox-scoped skips for the fixed `/usr/bin/pgrep`
+  process probe.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.13.0` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.
+- Python 3.14 CI bytecode-baseline follow-up base:
+  `8efee8076e59204793a1d0caed277bc761af841a`.
+- The CI failure occurred before the compatibility subprocess: importing the
+  unittest module without `-B` had already created legitimate runner-owned
+  `__pycache__` entries in an inspected packaged source root, while the test
+  incorrectly required the complete baseline inventory to contain no cache.
+  Preexisting cache is not evidence that the compatibility entry wrote it.
+- The regression now snapshots the complete wrapper and packaged source trees
+  before and after the direct compatibility entry. Equality binds every
+  entry's device/inode/type identity, mode/owner/group/protected-flags access
+  policy, `mtime_ns`, and regular-file size/SHA-256 or symlink target. The
+  subprocess still runs directly without `-B`, with
+  `PYTHONDONTWRITEBYTECODE` and `PYTHONPYCACHEPREFIX` removed.
+- A deterministic temporary-tree regression seeds separate wrapper and
+  packaged `__pycache__` files before launch and proves the entry preserves
+  the entire preexisting inventory instead of requiring an empty baseline.
+  The clean-baseline case uses a separate disposable copied tree as well, so a
+  proved regression cannot leave cache in the checkout and then be absorbed
+  as a valid baseline by a later single-test rerun.
+- Focused regressions: Python `3.14.3` and system Python `3.9.6` each passed
+  both compatibility bytecode/cache tests.
+- Full regressions: Python `3.14.3` and system Python `3.9.6` each passed all
+  `334` tests with two sandbox-scoped skips for the fixed `/usr/bin/pgrep`
+  process probe.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.14.3` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.
+- Destination-parent directory-entry durability follow-up base:
+  `8c233e5b256d2a06d362ed3c6c0211cd7a796455`.
+- Focused regressions: Python `3.14.3` and system Python `3.9.6` each passed
+  seven tests covering successful install/fsync/descent ordering, first- and
+  second-level parent-fsync failures, exact post-install recovery identity,
+  pre-install collision classification, existing-parent non-mutation, and
+  separation from the final snapshot-publication parent fsync.
+- Full regressions: Python `3.14.3` passed all `337` tests with two
+  sandbox-scoped fixed-`/usr/bin/pgrep` skips in `38.241s`; system Python
+  `3.9.6` passed the same `337` tests with two skips in `45.925s`.
+- One preceding Python `3.14.3` full-suite attempt observed the existing
+  signal-teardown fixture reading its worker PID file before content appeared.
+  That unrelated test passed alone, and the bounded full-suite retry above
+  passed.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.14.3` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.
+- Component-commit/artifact-publication separation follow-up base:
+  `8c233e5b256d2a06d362ed3c6c0211cd7a796455`.
+- A nested `group.com.apple.notes` install whose held-parent fsync fails now
+  records only the internal `directory_component_commit`; it does not claim
+  top-level artifact publication. The enclosing unpublished partial root still
+  contributes its exact namespace/identity locators and sensitive inventory,
+  while the failed component retains its own exact identity and
+  `directory-entry-durability: unverified` receipt.
+- Focused regressions: Python `3.14.3` and system Python `3.9.6` each passed
+  six methods covering successful component fsync ordering, first- and
+  second-level component failures, nested partial-root recovery evidence,
+  existing-parent non-mutation, and unchanged true final-publication
+  `committed` semantics.
+- Full regressions: Python `3.14.3` passed all `338` tests with two
+  sandbox-scoped fixed-`/usr/bin/pgrep` skips in `42.643s`; system Python
+  `3.9.6` passed the same `338` tests with two skips in `50.368s`.
+- Static gates: full-repository Ruff `0.13.2`; changed-Python format check;
+  Python `3.14.3` and `3.9.6` bytecode compilation with isolated caches;
+  `bash -n`; ShellCheck `0.11.0`; skill and project-journal validators; and
+  `git diff --check`.
+- Cooperative-supervisor, snapshot-v4, and joint-writeback follow-up:
+  `2026-08-03` working tree based on
+  `8e065d651c14112274cb4dee0e22b24136c81627`.
+- The packaged supervisor now creates one CSPRNG-named owner-private directory
+  descriptor-relatively, no-follow opens it, and binds the FD/name/parent
+  identity and access policy before `SCM_RIGHTS` transfer. This is a practical
+  cooperative same-UID model, not isolation from a malicious debugger or
+  namespace racer running under the same UID.
+- Snapshot manifests now use exact `apple-notes-snapshot/v4` and carry the
+  strict `apple-notes-live-source-binding/v1` receipt from the same held source
+  capture. Reanchored malformed schema wrappers, missing alias schema, unknown
+  fields, malformed SHA-256/size, terminal replacement, nonterminal ancestor
+  identity/access-policy drift, registered-alias replacement, and persistent
+  sidecar changes fail closed; unrelated child and ancestor sibling churn stays
+  benign because it does not change the selected properties.
+- Writeback preflight and verification now establish one explicit success
+  linearization point while the backup, patch stage, and live source remain
+  jointly bound. The final artifact/live/Notes checks occur before that point;
+  teardown is close-only and performs no new filesystem reads. The receipt is
+  point-in-time evidence and intentionally does not claim stability against a
+  same-UID change after the joint point.
+- Focused writeback regressions: Python `3.13.0` passed all `16` tests in
+  `13.306s`. The complete helper module passed `368` tests with two
+  sandbox-scoped fixed-`/usr/bin/pgrep` skips in `58.436s`.
+- Final repository discovery: Python `3.13.0` passed all `378` tests with two
+  skips in `66.459s`; system Python `3.9.6` passed the same `378` tests with two
+  skips in `73.500s`.
+- Final static gates: Ruff `0.13.2` check and format check over all changed
+  Python; `bash -n`; ShellCheck `0.11.0`; project-journal validation; and
+  `git diff --check`. The system skill validator could not import its local
+  PyYAML dependency, so a no-install Ruby `YAML.safe_load` fallback checked the
+  same frontmatter name/description/key constraints, parsed
+  `agents/openai.yaml`, and verified all packaged runtime/reference resources.
+
+### Final writeback review follow-up (`2026-08-03`)
+
+- Follow-up base: `ddb4168ad71790e4a191accf55d8b07a574af4da`.
+- Preflight and verification now rerun the complete held backup/stage/live
+  validation after the final Notes probe and immediately before joint success;
+  close-only teardown tests forbid subsequent stat, open, read, seek,
+  readlink, or directory-scan operations.
+- Exact externally anchored snapshot v3 remains accepted for read-only
+  validation/recovery, while both writeback gates reject it as
+  `backup-not-writeback-grade` without heuristic v4 upgrade. A v3 manifest
+  carrying v4-only `source_binding` is invalid; normalized validation/recovery
+  results expose authoritative `snapshot_schema` and `writeback_grade`; and
+  the v4 gate precedes every stage/live open or validation.
+- `note-tags` holds the configured live store alongside the standalone input,
+  rejects external hard links to live `NoteStore.sqlite`, and keeps live
+  main/WAL/SHM membership under terminal revalidation.
+- Generic pre-open `EIO`/`ESTALE` from both absolute and descriptor-relative
+  source helpers now remains `source-revalidation-inconclusive`, including in
+  `probe-db-access` rows.
+- The existing v4 source component-chain receipt and the existing
+  first-`fstat` recovery handling for all three `O_EXCL` writers were audited
+  against the review report; their exact regression methods remain passing.
+- CI keeps the existing required Ubuntu `test` job and adds full native macOS
+  discovery on Python 3.9 and current 3.x. Hosted results remain pending the
+  next pushed head; no hosted run is claimed here.
+- Final focused P1/P2 regression set: Python `3.13.0` passed all `13` methods
+  in `8.577s`; system Python `3.9.6` passed the same set in `9.888s`. The
+  sandbox-skipped compatibility publication test also passed separately
+  outside the sandbox on both runtimes (`0.929s` and `0.855s`).
+- Final full repository discovery: Python `3.13.0` passed all `387` tests with
+  two sandbox-scoped fixed-`/usr/bin/pgrep` skips in `96.088s`. The system
+  Python `3.9.6` single-process run reached the final portion before the host
+  filesystem fell to `238 MiB` free and returned only `ENOSPC` temporary-file
+  errors; a bounded fresh-process rerun then passed the identical discovered
+  set of `387` test IDs across `16` chunks, with the same two skips. No
+  unrelated temporary or user artifact was deleted to manufacture space.
+- Static gates: full-repository Ruff check; changed-Python Ruff format check;
+  isolated Python `3.13.0` and `3.9.6` bytecode compilation; `bash -n`;
+  ShellCheck `0.11.0`; `actionlint`; skill validation through isolated PyYAML;
+  project-journal validation; and `git diff --check`.

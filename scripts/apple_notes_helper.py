@@ -1,269 +1,304 @@
 #!/usr/bin/env python3
-"""Stable Apple Notes helper for read-only export and DB-copy workflows."""
+"""Compatibility launcher for the packaged Apple Notes DB guardrail helper."""
 
 from __future__ import annotations
 
-import argparse
 import hashlib
-import json
 import os
-import shutil
-import sqlite3
-import subprocess
+import stat
 import sys
-from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from types import ModuleType
+from typing import Iterable
 
 
-GROUP_CONTAINER = Path.home() / "Library/Group Containers/group.com.apple.notes"
-APP_CONTAINER = Path.home() / "Library/Containers/com.apple.Notes"
-NOTE_STORE_BASENAMES = (
-    "NoteStore.sqlite",
-    "NoteStore.sqlite-wal",
-    "NoteStore.sqlite-shm",
+REPO_ROOT = Path(__file__).resolve().parent.parent
+HELPER_PATH = (
+    REPO_ROOT
+    / ".agents"
+    / "skills"
+    / "apple-notes-db-guardrails"
+    / "scripts"
+    / "apple_notes_db.py"
 )
+DIRECTORY_SUPERVISOR_PATH = HELPER_PATH.with_name("apple_notes_directory_supervisor.py")
+SUPERVISOR_SOURCE_MAX_BYTES = 2 * 1024 * 1024
+SUPERVISOR_SOURCE_READ_CHUNK_BYTES = 64 * 1024
+_DARWIN_ACCESS_POLICY_FLAG_MASK = sum(
+    (
+        0x00000002,  # UF_IMMUTABLE
+        0x00000004,  # UF_APPEND
+        0x00000080,  # UF_DATAVAULT
+        0x00020000,  # SF_IMMUTABLE
+        0x00040000,  # SF_APPEND
+        0x00080000,  # SF_RESTRICTED
+        0x00100000,  # SF_NOUNLINK
+    )
+)
+WRITE_PRODUCING_COMMANDS = frozenset(
+    {
+        "copy-db",
+        "merge-db",
+        "recover-snapshot",
+        "stage-patch",
+    }
+)
+
+
 @dataclass(frozen=True)
-class NoteStorePaths:
-    group_container: Path = GROUP_CONTAINER
-    app_container: Path = APP_CONTAINER
-
-    def note_store_files(self) -> list[Path]:
-        return [self.group_container / name for name in NOTE_STORE_BASENAMES]
-
-
-def _json_default(value: Any) -> Any:
-    if isinstance(value, Path):
-        return str(value)
-    raise TypeError(f"Unsupported JSON value: {value!r}")
+class _CapturedSupervisorSource:
+    display_path: Path
+    source: bytes
+    sha256: str
+    identity: tuple[int, int, int]
+    access_policy: tuple[int, int, int, int]
 
 
-def emit_json(payload: Any) -> None:
-    json.dump(payload, sys.stdout, indent=2, ensure_ascii=False, default=_json_default)
-    sys.stdout.write("\n")
+def _source_identity(value: os.stat_result) -> tuple[int, int, int]:
+    return (value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode))
 
 
-def notes_is_running() -> bool:
-    result = subprocess.run(
-        ["pgrep", "-x", "Notes"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0
-
-
-def probe_db_access(paths: NoteStorePaths) -> dict[str, Any]:
-    entries: list[dict[str, Any]] = []
-    for path in (paths.group_container, paths.app_container):
-        record: dict[str, Any] = {
-            "path": path,
-            "exists": path.exists(),
-            "readable": False,
-        }
-        try:
-            children = sorted(child.name for child in path.iterdir())
-            record["readable"] = True
-            record["sample_children"] = children[:5]
-        except PermissionError as exc:
-            record["error"] = str(exc)
-        except FileNotFoundError:
-            record["sample_children"] = []
-        entries.append(record)
-    file_records: list[dict[str, Any]] = []
-    for db_file in paths.note_store_files():
-        file_record: dict[str, Any] = {
-            "path": db_file,
-            "exists": db_file.exists(),
-            "readable": False,
-        }
-        try:
-            stat_result = db_file.stat()
-            file_record["readable"] = True
-            file_record["size"] = stat_result.st_size
-            file_record["mtime"] = stat_result.st_mtime
-        except PermissionError as exc:
-            file_record["error"] = str(exc)
-        except FileNotFoundError:
-            pass
-        file_records.append(file_record)
-    return {
-        "paths": entries,
-        "note_store_files": file_records,
-    }
-
-
-def _timestamped_tmp_dir(prefix: str) -> Path:
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    return Path("/tmp") / f"{prefix}-{timestamp}"
-
-
-def copy_db(paths: NoteStorePaths, *, dest: Path | None, require_notes_quit: bool) -> dict[str, Any]:
-    notes_running = notes_is_running()
-    if require_notes_quit and notes_running:
-        raise RuntimeError("Notes.app is running; quit it before using --require-notes-quit")
-
-    destination = dest or _timestamped_tmp_dir("apple-notes-probe")
-    group_dest = destination / "group.com.apple.notes"
-    app_dest = destination / "com.apple.Notes"
-    group_dest.mkdir(parents=True, exist_ok=True)
-    app_dest.mkdir(parents=True, exist_ok=True)
-
-    copied_files: list[dict[str, Any]] = []
-    for basename in NOTE_STORE_BASENAMES:
-        src = paths.group_container / basename
-        if not src.exists():
-            continue
-        dst = group_dest / basename
-        shutil.copy2(src, dst)
-        copied_files.append(
-            {
-                "source": src,
-                "dest": dst,
-                "size": dst.stat().st_size,
-            }
-        )
-
-    return {
-        "dest": destination,
-        "notes_running": notes_running,
-        "notes_quit_required": require_notes_quit,
-        "copied_files": copied_files,
-    }
-
-
-def merge_db(src: Path, out: Path | None) -> dict[str, Any]:
-    output = out or src.with_name("NoteStore-merged-for-analysis.sqlite")
-    with closing(sqlite3.connect(src)) as source_conn, closing(sqlite3.connect(output)) as output_conn:
-        source_conn.backup(output_conn)
-    return {
-        "source_db": src,
-        "merged_db": output,
-        "size": output.stat().st_size,
-    }
-
-
-def query_note_tags(db_path: Path, note_title: str) -> dict[str, Any]:
-    with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
-        conn.row_factory = sqlite3.Row
-        note_row = conn.execute(
-            """
-            SELECT Z_PK, ZIDENTIFIER, ZTITLE1, ZNOTEDATA
-            FROM ZICCLOUDSYNCINGOBJECT
-            WHERE ZTITLE1 = ?
-            """,
-            (note_title,),
-        ).fetchone()
-        if note_row is None:
-            raise RuntimeError(f"Note not found in database: {note_title}")
-        tag_rows = conn.execute(
-            """
-            SELECT Z_PK, ZIDENTIFIER, ZNOTE1, ZALTTEXT, ZTOKENCONTENTIDENTIFIER, ZTYPEUTI1
-            FROM ZICCLOUDSYNCINGOBJECT
-            WHERE ZNOTE1 = ?
-              AND ZTYPEUTI1 = 'com.apple.notes.inlinetextattachment.hashtag'
-            ORDER BY Z_PK
-            """,
-            (note_row["Z_PK"],),
-        ).fetchall()
-    return {
-        "note": {
-            "pk": note_row["Z_PK"],
-            "identifier": note_row["ZIDENTIFIER"],
-            "title": note_row["ZTITLE1"],
-            "note_data_pk": note_row["ZNOTEDATA"],
-        },
-        "tags": [
-            {
-                "pk": row["Z_PK"],
-                "identifier": row["ZIDENTIFIER"],
-                "note_fk": row["ZNOTE1"],
-                "tag_text": row["ZALTTEXT"],
-                "tag_token": row["ZTOKENCONTENTIDENTIFIER"],
-                "type_uti": row["ZTYPEUTI1"],
-            }
-            for row in tag_rows
-        ],
-    }
-
-
-def fingerprint_note_store(paths: NoteStorePaths) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = []
-    for file_path in paths.note_store_files():
-        if not file_path.exists():
-            continue
-        digest = hashlib.sha256()
-        with file_path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        stat_result = file_path.stat()
-        rows.append(
-            {
-                "path": file_path,
-                "sha256": digest.hexdigest(),
-                "size": stat_result.st_size,
-                "mtime": stat_result.st_mtime,
-            }
-        )
-    return {"files": rows}
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    subparsers.add_parser("probe-db-access", help="Probe NoteStore access without copying.")
-
-    copy_parser = subparsers.add_parser("copy-db", help="Copy NoteStore files into /tmp.")
-    copy_parser.add_argument("--dest", type=Path, help="Destination directory. Defaults to /tmp timestamped dir.")
-    copy_parser.add_argument(
-        "--require-notes-quit",
-        action="store_true",
-        help="Fail if Notes.app is currently running.",
+def _source_access_policy(
+    value: os.stat_result,
+) -> tuple[int, int, int, int]:
+    return (
+        stat.S_IMODE(value.st_mode),
+        value.st_uid,
+        value.st_gid,
+        int(getattr(value, "st_flags", 0)) & _DARWIN_ACCESS_POLICY_FLAG_MASK,
     )
 
-    merge_parser = subparsers.add_parser("merge-db", help="Create a merged analysis DB from a copied NoteStore.")
-    merge_parser.add_argument("--src", type=Path, required=True, help="Copied NoteStore.sqlite path.")
-    merge_parser.add_argument("--out", type=Path, help="Output merged DB path.")
 
-    tags_parser = subparsers.add_parser("note-tags", help="Read hashtag rows for a note title from a DB copy.")
-    tags_parser.add_argument("--db", type=Path, required=True, help="Merged or copied sqlite path.")
-    tags_parser.add_argument("--title", required=True, help="Exact note title.")
+def _read_source_pass(descriptor: int, expected_size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = expected_size
+    while remaining:
+        chunk = os.read(
+            descriptor,
+            min(remaining, SUPERVISOR_SOURCE_READ_CHUNK_BYTES),
+        )
+        if not chunk:
+            raise RuntimeError(
+                "packaged directory supervisor source became truncated during capture"
+            )
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(descriptor, 1):
+        raise RuntimeError(
+            "packaged directory supervisor source grew during bounded capture"
+        )
+    return b"".join(chunks)
 
-    subparsers.add_parser("fingerprint-db", help="Hash live NoteStore sqlite/wal/shm files.")
 
-    return parser
+def _capture_directory_supervisor_source(
+    path: Path,
+) -> _CapturedSupervisorSource:
+    """Capture one stable no-follow supervisor byte object before execution."""
 
-
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
-    paths = NoteStorePaths()
-
+    display_path = Path(os.path.abspath(os.fspath(path)))
     try:
-        if args.command == "probe-db-access":
-            emit_json(probe_db_access(paths))
-            return 0
-        if args.command == "copy-db":
-            emit_json(copy_db(paths, dest=args.dest, require_notes_quit=args.require_notes_quit))
-            return 0
-        if args.command == "merge-db":
-            emit_json(merge_db(args.src, args.out))
-            return 0
-        if args.command == "note-tags":
-            emit_json(query_note_tags(args.db, args.title))
-            return 0
-        if args.command == "fingerprint-db":
-            emit_json(fingerprint_note_store(paths))
-            return 0
-    except Exception as exc:  # noqa: BLE001
-        emit_json({"error": str(exc), "command": args.command})
-        return 1
+        before_path = os.stat(display_path, follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cannot inspect packaged directory supervisor: {display_path}: {exc}"
+        ) from exc
+    if not stat.S_ISREG(before_path.st_mode):
+        raise RuntimeError(
+            f"Packaged directory supervisor is not a regular file: {display_path}"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    nonblock = getattr(os, "O_NONBLOCK", None)
+    if nofollow is None or cloexec is None or nonblock is None:
+        raise RuntimeError(
+            "Packaged directory supervisor capture requires "
+            "O_NOFOLLOW, O_CLOEXEC, and O_NONBLOCK"
+        )
+    try:
+        descriptor = os.open(
+            display_path,
+            os.O_RDONLY | nofollow | cloexec | nonblock,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cannot open packaged directory supervisor safely: {display_path}: {exc}"
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _source_identity(opened) != _source_identity(before_path)
+            or _source_access_policy(opened) != _source_access_policy(before_path)
+        ):
+            raise RuntimeError(
+                "Packaged directory supervisor changed across no-follow open: "
+                f"{display_path}"
+            )
+        expected_size = opened.st_size
+        if expected_size < 1 or expected_size > SUPERVISOR_SOURCE_MAX_BYTES:
+            raise RuntimeError(
+                "Packaged directory supervisor size is outside the bounded "
+                f"capture contract: {display_path}: {expected_size}"
+            )
+        first = _read_source_pass(descriptor, expected_size)
+        middle = os.fstat(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        second = _read_source_pass(descriptor, expected_size)
+        after = os.fstat(descriptor)
+        try:
+            after_path = os.stat(display_path, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError(
+                "Cannot terminally inspect packaged directory supervisor: "
+                f"{display_path}: {exc}"
+            ) from exc
+    finally:
+        os.close(descriptor)
 
-    parser.error(f"Unsupported command: {args.command}")
-    return 2
+    identity = _source_identity(opened)
+    access_policy = _source_access_policy(opened)
+    if any(
+        _source_identity(value) != identity for value in (middle, after, after_path)
+    ):
+        raise RuntimeError(
+            "Packaged directory supervisor identity changed during capture: "
+            f"{display_path}"
+        )
+    if any(
+        _source_access_policy(value) != access_policy
+        for value in (middle, after, after_path)
+    ):
+        raise RuntimeError(
+            "Packaged directory supervisor access policy changed during capture: "
+            f"{display_path}"
+        )
+    if any(value.st_size != expected_size for value in (middle, after, after_path)):
+        raise RuntimeError(
+            f"Packaged directory supervisor size changed during capture: {display_path}"
+        )
+    if first != second:
+        raise RuntimeError(
+            "Packaged directory supervisor content changed during capture: "
+            f"{display_path}"
+        )
+    return _CapturedSupervisorSource(
+        display_path=display_path,
+        source=first,
+        sha256=hashlib.sha256(first).hexdigest(),
+        identity=identity,
+        access_policy=access_policy,
+    )
+
+
+def _load_directory_supervisor(
+    capture: _CapturedSupervisorSource,
+    *,
+    module_name: str = "packaged_apple_notes_directory_supervisor",
+) -> ModuleType:
+    module = ModuleType(module_name)
+    module.__file__ = os.fspath(capture.display_path)
+    module.__package__ = ""
+    module.__cached__ = None
+    module.__captured_source_sha256__ = capture.sha256
+    sys.modules[module_name] = module
+    try:
+        code = compile(
+            capture.source,
+            os.fspath(capture.display_path),
+            "exec",
+            dont_inherit=True,
+        )
+        exec(code, module.__dict__, module.__dict__)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+DIRECTORY_SUPERVISOR_CAPTURE = _capture_directory_supervisor_source(
+    DIRECTORY_SUPERVISOR_PATH
+)
+_SUPERVISOR = _load_directory_supervisor(DIRECTORY_SUPERVISOR_CAPTURE)
+HELPER_CAPTURE = _SUPERVISOR.HELPER_CAPTURE
+_HELPER = _SUPERVISOR.HELPER
+
+# Preserve the complete legacy public Python API while keeping one implementation.
+GROUP_CONTAINER = _HELPER.GROUP_CONTAINER
+APP_CONTAINER = _HELPER.APP_CONTAINER
+NOTE_STORE_BASENAMES = _HELPER.NOTE_STORE_BASENAMES
+NoteStorePaths = _HELPER.NoteStorePaths
+StoreSafetyError = _HELPER.StoreSafetyError
+emit_json = _HELPER.emit_json
+notes_is_running = _HELPER.notes_is_running
+copy_db = _HELPER.copy_db
+directory_creator_supervisor = _HELPER.directory_creator_supervisor
+fingerprint_note_store = _HELPER.fingerprint_note_store
+merge_db = _HELPER.merge_db
+probe_db_access = _HELPER.probe_db_access
+query_note_tags = _HELPER.query_note_tags
+build_parser = _HELPER.build_parser
+
+# The packaged implementation also exposes the newer artifact workflows through
+# this stable import location. Existing callers remain source-compatible, while
+# new callers do not need to bypass the compatibility module.
+recover_snapshot = _HELPER.recover_snapshot
+stage_patch = _HELPER.stage_patch
+validate_database_recovery = _HELPER.validate_database_recovery
+validate_patch_stage = _HELPER.validate_patch_stage
+validate_snapshot = _HELPER.validate_snapshot
+preflight_writeback = _HELPER.preflight_writeback
+verify_writeback = _HELPER.verify_writeback
+
+__all__ = [
+    "APP_CONTAINER",
+    "GROUP_CONTAINER",
+    "NOTE_STORE_BASENAMES",
+    "NoteStorePaths",
+    "StoreSafetyError",
+    "build_parser",
+    "copy_db",
+    "directory_creator_supervisor",
+    "emit_json",
+    "fingerprint_note_store",
+    "main",
+    "merge_db",
+    "notes_is_running",
+    "preflight_writeback",
+    "probe_db_access",
+    "query_note_tags",
+    "recover_snapshot",
+    "stage_patch",
+    "validate_database_recovery",
+    "validate_patch_stage",
+    "validate_snapshot",
+    "verify_writeback",
+]
+
+
+def _has_directory_creator_fd(arguments: Iterable[str]) -> bool:
+    return any(
+        argument == "--directory-creator-fd"
+        or argument.startswith("--directory-creator-fd=")
+        for argument in arguments
+    )
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    """Run the legacy CLI, supervising every write-producing command."""
+
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if (
+        arguments
+        and arguments[0] in WRITE_PRODUCING_COMMANDS
+        and not _has_directory_creator_fd(arguments)
+    ):
+        return _SUPERVISOR.run_supervised(
+            HELPER_CAPTURE.display_path,
+            arguments,
+            python_bin=sys.executable,
+        )
+    return _HELPER.main(arguments)
 
 
 if __name__ == "__main__":

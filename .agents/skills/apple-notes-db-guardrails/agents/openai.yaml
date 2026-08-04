@@ -1,0 +1,4 @@
+interface:
+  display_name: "Apple Notes DB Guardrails"
+  short_description: "Safely audit, recover, and stage Apple Notes stores"
+  default_prompt: "Use $apple-notes-db-guardrails to audit, recover, stage, or verify this macOS Apple Notes store safely."
