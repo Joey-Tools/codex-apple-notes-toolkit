@@ -3,6 +3,21 @@ import unittest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+REQUIRED_CALL_INPUTS = """on:
+  workflow_call:
+    inputs:
+      repository:
+        required: true
+        type: string
+      ref:
+        required: true
+        type: string
+
+permissions:"""
+CHECKOUT_BINDING = """- uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}"""
 
 
 def top_level_job_ids(workflow: str) -> list[str]:
@@ -19,13 +34,41 @@ def top_level_job_ids(workflow: str) -> list[str]:
     return job_ids
 
 
+def checkout_steps(workflow: str) -> list[str]:
+    lines = workflow.splitlines()
+    steps: list[str] = []
+    for index, line in enumerate(lines):
+        if not line.lstrip().startswith("- uses: actions/checkout@"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        end = index + 1
+        while end < len(lines):
+            candidate = lines[end]
+            candidate_indent = len(candidate) - len(candidate.lstrip())
+            if candidate.strip() and (
+                candidate_indent < indent
+                or (candidate_indent == indent and candidate.lstrip().startswith("- "))
+            ):
+                break
+            end += 1
+        steps.append("\n".join(lines[index:end]))
+    return steps
+
+
 class RequiredCiWorkflowTests(unittest.TestCase):
     def test_entry_wraps_only_the_required_linux_test(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/required-ci.yml").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn("on:\n  workflow_call:\n", workflow)
+        self.assertIn(REQUIRED_CALL_INPUTS, workflow)
+        checkout = checkout_steps(workflow)
+        self.assertGreater(len(checkout), 0)
+        self.assertTrue(all(CHECKOUT_BINDING in step for step in checkout))
+        self.assertEqual(
+            workflow.count("repository: ${{ inputs.repository }}"), len(checkout)
+        )
+        self.assertEqual(workflow.count("ref: ${{ inputs.ref }}"), len(checkout))
         self.assertIn("permissions:\n  contents: read\n", workflow)
         self.assertEqual(top_level_job_ids(workflow), ["test"])
         self.assertIn("runs-on: ubuntu-latest", workflow)
