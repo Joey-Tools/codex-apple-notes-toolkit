@@ -1,0 +1,22 @@
+name: Required CI
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Shell syntax
+        run: bash -n scripts/apple_notes_helper.sh scripts/apple_notes_osascript_context_probe.sh
+      - name: Shell lint
+        run: shellcheck scripts/apple_notes_helper.sh scripts/apple_notes_osascript_context_probe.sh
+      - name: Run tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
