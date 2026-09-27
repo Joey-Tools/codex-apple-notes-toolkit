@@ -198,3 +198,5 @@ CI preserves the required Ubuntu `test` job, including ShellCheck, and also
 runs full test discovery on macOS with Python 3.9 and the current 3.x release
 so Darwin publication and trusted-root-alias behavior execute on their native
 platform.
+
+<!-- Temporary post-cutover v2 gate canary; close this pull request unmerged after the cohort audit. -->
