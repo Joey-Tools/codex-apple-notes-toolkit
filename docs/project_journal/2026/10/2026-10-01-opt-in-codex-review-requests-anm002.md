@@ -24,7 +24,10 @@ superseded_by:
 - Automatic requests remain opt-in; this change does not enable a repository or
   organization variable.
 - The earlier head-SHA finding is not adopted: `workflow_run.head_sha` is the
-  verifier's pull-request head, while the synthetic merge SHA is `github.sha`.
+  upstream verifier run's pull-request feature head. The verifier's own
+  `pull_request` context may use a synthetic merge SHA for `github.sha`; the
+  controller's `workflow_run` context is separate, and the action independently
+  validates the associated pull request's current head.
 
 ## Next Steps
 
