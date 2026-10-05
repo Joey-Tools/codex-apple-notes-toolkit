@@ -11,6 +11,14 @@ CONTROLLER = REPO_ROOT / ".github/workflows/codex-review-gate-controller.yml"
 class ReviewGateControllerTests(unittest.TestCase):
     def test_auto_request_is_opt_in_and_begins_review_at_run_head(self) -> None:
         workflow = CONTROLLER.read_text(encoding="utf-8")
+        concurrency = workflow.split("concurrency:\n", 1)[1].split("\njobs:", 1)[0]
+
+        self.assertIn(
+            "github.event.workflow_run.pull_requests[0].number || "
+            "github.event.issue.number || inputs.pr_number || "
+            "github.event.workflow_run.id || github.run_id",
+            concurrency,
+        )
 
         for contract in (
             "  workflow_run:\n    workflows: [Codex Review Gate Verifier]\n    types: [completed]",
@@ -44,7 +52,8 @@ class ReviewGateControllerTests(unittest.TestCase):
             "github.event.workflow_run.path == "
             "'.github/workflows/codex-review-gate.yml'",
             "startsWith(github.event.workflow_run.path, "
-            "'.github/workflows/codex-review-gate.yml@')",
+            "'.github/workflows/codex-review-gate.yml@refs/pull/')",
+            "endsWith(github.event.workflow_run.path, '/merge')",
             "!github.event.workflow_run.pull_requests[1]",
         ):
             with self.subTest(contract=contract):
@@ -62,6 +71,14 @@ class ReviewGateControllerTests(unittest.TestCase):
                 self.assertNotIn(request_only_guard, job_condition)
 
         action_inputs = workflow.split("        with:\n", 1)[1]
+        pr_number = next(
+            line.strip()
+            for line in action_inputs.splitlines()
+            if line.startswith("          pr_number: ")
+        )
+        self.assertIn("pull_requests[0].number || '0'", pr_number)
+        self.assertNotIn("workflow_run.id", pr_number)
+        self.assertNotIn("github.run_id", pr_number)
         operation = next(
             line.strip()
             for line in action_inputs.splitlines()
@@ -125,6 +142,14 @@ class ReviewGateControllerTests(unittest.TestCase):
             job_condition,
         )
         self.assertIn(
+            f"startsWith(github.event.workflow_run.path, '{canonical_path}@refs/pull/')",
+            job_condition,
+        )
+        self.assertIn(
+            "endsWith(github.event.workflow_run.path, '/merge')",
+            job_condition,
+        )
+        self.assertNotIn(
             f"startsWith(github.event.workflow_run.path, '{canonical_path}@')",
             job_condition,
         )
